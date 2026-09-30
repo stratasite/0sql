@@ -61,6 +61,11 @@ fn node_to_sql<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, id
     }
 
     for (ctx_dim, allowed) in &node.security_filters {
+        let Some(allowed) = allowed else {
+            // Denied: the node yields no rows.
+            sql.r#where("1 = 0".to_string());
+            continue;
+        };
         let Some(context_ref) = node.field_refs.get(&RefKey::Field(ctx_dim.id)) else { continue };
         let context_sql = ref_to_sql_any(&cx, context_ref, node)?;
         let values: Vec<String> = allowed.iter().map(|v| graph.dialect.string_lit(&v.to_lowercase())).collect::<std::result::Result<_, _>>()?;
@@ -451,11 +456,13 @@ fn apply_security_mask<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, p: &Projected<'a>,
     let Some(field) = p.field() else { return Ok(sql) };
     let Some((_, ctx_dim, allowed, mask_value)) = node.security_masks.iter().find(|(fid, ..)| *fid == field.id) else { return Ok(sql) };
     let d = &cx.graph.dialect;
+    let mask_lit = if field.data_type == Some(DataType::String) { d.string_lit(mask_value)? } else { "NULL".to_string() };
+    // Denied: every value is the mask.
+    let Some(allowed) = allowed else { return Ok(mask_lit) };
     let Some(context_ref) = node.field_refs.get(&RefKey::Field(ctx_dim.id)) else {
         return Ok(d.string_lit(mask_value)?);
     };
     let context_sql = ref_to_sql_any(cx, context_ref, node)?;
-    let mask_lit = if field.data_type == Some(DataType::String) { d.string_lit(mask_value)? } else { "NULL".to_string() };
     let values: Vec<String> = allowed.iter().map(|v| d.string_lit(&v.to_lowercase())).collect::<std::result::Result<_, _>>()?;
     Ok(format!("CASE WHEN LOWER({}) IN ({}) THEN {} ELSE {} END", context_sql, values.join(", "), sql, mask_lit))
 }

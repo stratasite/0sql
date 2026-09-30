@@ -384,6 +384,21 @@ pub struct SecurityPolicy {
     pub bypass_system_admin: bool,
     #[serde(default)]
     pub bypass_project_admin: bool,
+    /// What a fired policy does when the context yields no allowed values.
+    #[serde(default)]
+    pub unresolved: Unresolved,
+}
+
+/// The outcome of a fired policy whose permission resolution found nothing
+/// for the user: no group carried the tag, no email was given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unresolved {
+    /// The user sees nothing: rows filtered to none, or every value masked.
+    #[default]
+    Deny,
+    /// The policy is skipped for the user (Rails' rule).
+    Allow,
 }
 
 fn default_true() -> bool {

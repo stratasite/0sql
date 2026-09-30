@@ -32,7 +32,14 @@ or interactive filters here; those belong to the caller.
 
 The security context travels with the request: an email, admin flags, the
 user's tags and groups with tags. Policies in the project decide from it
-which rows and values the user may see.
+which rows and values the user may see. A policy fires when the query
+projects a field it names by tag or by name; it then resolves the values
+of its context dimension the user is allowed, from the groups' names or
+tags or from the user's email or tags, and either filters rows to those
+values or masks the field outside them. A fired policy that resolves
+nothing denies by default (no rows, or every value masked); a policy may
+say `unresolved: allow` under `permission_resolution` to be skipped
+instead, which is what strata does. Bypass flags open the door explicitly.
 
 ```
 0sql check  --project ../myproject

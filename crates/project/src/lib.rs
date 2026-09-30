@@ -1101,6 +1101,11 @@ impl<'d> Builder<'d> {
                 Some("email") | Some("from_email") => PermissionValueFrom::FromEmail,
                 other => return Err(invalid(&file, format!("Policy '{name}' errors: Permission value from '{}' is not included in the list", other.unwrap_or("")))),
             };
+            let unresolved = match str_of(&resolution, "unresolved").map(|s| s.to_lowercase()).as_deref() {
+                None | Some("deny") => Unresolved::Deny,
+                Some("allow") => Unresolved::Allow,
+                Some(other) => return Err(invalid(&file, format!("Policy '{name}': unresolved '{other}' should be deny or allow"))),
+            };
             let bypass = get(pm, "bypass").and_then(as_map).cloned().unwrap_or_default();
             let uid = self.policy_slugs.take(&[name.clone()]);
             self.policies.push(SecurityPolicy {
@@ -1116,6 +1121,7 @@ impl<'d> Builder<'d> {
                 permission_tag_key: str_of(&resolution, "tag_key"),
                 bypass_system_admin: bool_of(&bypass, "system_admin").unwrap_or(true),
                 bypass_project_admin: bool_of(&bypass, "project_admin").unwrap_or(false),
+                unresolved,
             });
         }
         Ok(())

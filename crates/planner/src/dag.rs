@@ -250,9 +250,11 @@ pub struct Node<'a> {
     /// Set on nodes imported from a segment's plan.
     pub owner: Option<Rc<Owner>>,
     /// Security masks by field id: (context dimension, allowed values, mask value).
-    pub security_masks: Vec<(Id, &'a Field, Vec<String>, String)>,
+    /// (field, context dimension, allowed values or None for denied, mask value).
+    pub security_masks: Vec<(Id, &'a Field, Option<Vec<String>>, String)>,
     /// Security row filters: (context dimension, allowed values).
-    pub security_filters: Vec<(&'a Field, Vec<String>)>,
+    /// (context dimension, allowed values or None for denied).
+    pub security_filters: Vec<(&'a Field, Option<Vec<String>>)>,
     /// Inputs that attach through a strategy rather than the plain FROM.
     pub strategies: Vec<Strategy<'a>>,
     pub projections: Vec<Projected<'a>>,

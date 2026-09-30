@@ -1,13 +1,14 @@
-//! Rails `SecurityVisitor`: row-level security policies. A policy triggered
-//! by a projected field either masks that field or filters rows, keyed on
-//! a context dimension the principal is allowed to see values of.
+//! Row-level security policies. A policy triggered by a projected field
+//! either masks that field or filters rows, keyed on a context dimension
+//! the principal is allowed to see values of. A fired policy that resolves
+//! no allowed values denies unless it says `unresolved: allow`.
 
 use crate::dag::{Entity, Graph, NodeId, NodeKind, RefKey, Reference};
 use crate::universe::Subtree;
 use crate::visitors::grain::{exclusion_dimension_ids, inclusion_dimension_ids};
 use crate::{PlanError, Result};
 use zsql_spec::SecurityContext;
-use zsql_semantic::{ExclusionType, Field, FieldKind, FilterMode, PermissionSource, PermissionValueFrom, PolicyMode, SecurityPolicy, Universe};
+use zsql_semantic::{ExclusionType, Field, FieldKind, FilterMode, PermissionSource, PermissionValueFrom, PolicyMode, SecurityPolicy, Universe, Unresolved};
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, user: &SecurityContext) -> Result<()> {
     // Policies whose context dimension does not resolve are inert.
@@ -33,10 +34,19 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, user: &SecurityCon
             if triggered.is_empty() || bypassed_by(policy, user) {
                 continue;
             }
-            let Some(allowed) = allowed_values_for(policy, user) else { continue };
+            // None: nothing resolved for this user. With `allow` the policy
+            // is skipped; with `deny` it applies with no values, which the
+            // SQL visitor renders as no rows or every value masked.
+            let allowed = allowed_values_for(policy, user);
+            if allowed.is_none() && policy.unresolved == Unresolved::Allow {
+                continue;
+            }
+            let denied = allowed.is_none();
             match policy.mode {
                 PolicyMode::MaskData => {
-                    ensure_context_dim_ref(graph, id, universe, ctx_dim)?;
+                    if !denied {
+                        ensure_context_dim_ref(graph, id, universe, ctx_dim)?;
+                    }
                     for f in triggered {
                         let masks = &mut graph.nodes[id].security_masks;
                         masks.retain(|(fid, ..)| *fid != f.id);
@@ -44,7 +54,11 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, user: &SecurityCon
                     }
                 }
                 PolicyMode::FilterData => {
-                    if !skip_filter_for_node(&graph.nodes[id], universe, ctx_dim) {
+                    // A measure's own rule on the context dimension outranks a
+                    // resolved filter, never a denial.
+                    if denied {
+                        graph.nodes[id].security_filters.push((ctx_dim, None));
+                    } else if !skip_filter_for_node(&graph.nodes[id], universe, ctx_dim) {
                         ensure_context_dim_ref(graph, id, universe, ctx_dim)?;
                         graph.nodes[id].security_filters.push((ctx_dim, allowed));
                     }

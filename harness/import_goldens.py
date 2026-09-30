@@ -103,8 +103,15 @@ for name in sorted(os.listdir(os.path.join(src, "fixtures/golden/cases"))):
         with open(os.path.join(dst, "cases", name), "w") as f:
             for case in out:
                 f.write(json.dumps(case, sort_keys=True) + "\n")
+# Rails' policies fail open when a user resolves no permission; the service
+# defaults to deny, so imported policies state the Rails rule explicitly.
 for h in sorted(used):
-    shutil.copy(os.path.join(src, "fixtures/golden/universes", h + ".json.gz"), os.path.join(dst, "universes", h + ".json.gz"))
+    with gzip.open(os.path.join(src, "fixtures/golden/universes", h + ".json.gz"), "rt") as f:
+        snap = json.load(f)
+    for policy in snap.get("security_policies", []):
+        policy["unresolved"] = "allow"
+    with gzip.open(os.path.join(dst, "universes", h + ".json.gz"), "wt") as f:
+        json.dump(snap, f)
 manifest = json.load(open(os.path.join(src, "fixtures/golden/manifest.json")))
 json.dump({"imported_from": {"strata_sha": manifest.get("strata_sha"), "cases": total}, "cases": kept, "universes": len(used)},
           open(os.path.join(dst, "manifest.json"), "w"), indent=2)
