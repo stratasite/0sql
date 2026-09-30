@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/semantic",
+  "crates/formation",
+  "crates/dialect",
+  "crates/spec",
+  "crates/planner",
+  "crates/project",
+  "crates/golden",
+  "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+flate2 = "1"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+zsql-semantic = { path = "crates/semantic" }
+zsql-formation = { path = "crates/formation" }
+zsql-dialect = { path = "crates/dialect" }
+zsql-spec = { path = "crates/spec" }
+zsql-planner = { path = "crates/planner" }
+zsql-project = { path = "crates/project" }
+zsql-golden = { path = "crates/golden" }

@@ -1,0 +1,9 @@
+[package]
+name = "zsql-formation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Universe formation: join routes from each root table, computed from the join graph"
+
+[dependencies]
+zsql-semantic.workspace = true

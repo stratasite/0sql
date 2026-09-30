@@ -1,0 +1,17 @@
+[package]
+name = "zsql-golden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Loads the captured planner goldens and scores the planner against them"
+
+[dependencies]
+zsql-semantic.workspace = true
+zsql-dialect.workspace = true
+zsql-spec.workspace = true
+zsql-planner.workspace = true
+zsql-formation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+regex = "1"
