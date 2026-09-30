@@ -24,9 +24,10 @@ fn universe_with(fx: &Fixtures, hash: &str, unresolved: Unresolved) -> Universe 
 #[test]
 fn mask_policy_masks_everything_when_nothing_resolves() {
     let fx = Fixtures::open(Fixtures::default_root());
-    // "Admin Bypass Mask": mask_data on pii fields, groups' call_center_id tags.
-    let hash = "02ffa2aacb4e9679";
-    let spec = serde_json::json!({ "projections": [{ "field": "Country" }, { "field": "Net Paid" }] });
+    // mask_data on pii fields, keyed on Call Center ID from the groups' call_center_id tags
+    // (the universe of "mask mode wraps triggered projection in CASE expression").
+    let hash = "d0a3fb66df4f9a0c";
+    let spec = serde_json::json!({ "projections": [{ "field": "Country" }] });
     let stranger = SecurityContext { email: Some("nobody@example.com".into()), groups: vec![Group { name: Some("Guests".into()), tags: vec!["region:emea".into()] }], ..Default::default() };
 
     let deny = universe_with(&fx, hash, Unresolved::Deny);
@@ -37,7 +38,7 @@ fn mask_policy_masks_everything_when_nothing_resolves() {
 
     let allow = universe_with(&fx, hash, Unresolved::Allow);
     let sql = plan(&allow, &fx, spec.clone(), &stranger);
-    assert!(sql.contains("\"s_country\" AS \"Country\"") || sql.contains("\"ca_country\" AS \"Country\""), "policy skipped: {sql}");
+    assert!(sql.contains("country\" AS \"Country\"") && !sql.contains("#######"), "policy skipped: {sql}");
 
     // A user the policy resolves is masked per row, on either setting.
     let member = SecurityContext { groups: vec![Group { name: Some("CC-TMNT".into()), tags: vec!["call_center_id:TMNT".into()] }], ..Default::default() };
