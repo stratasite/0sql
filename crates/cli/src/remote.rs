@@ -102,7 +102,7 @@ pub fn print_drill(v: &Value, style: &dyn Fn(&str) -> String) {
         let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         println!("{:<40} {:<32} {}", f["uid"].as_str().unwrap_or(""), f["name"].as_str().unwrap_or(""), style(&tables.join(", ")));
     }
-    println!("{}", style(&format!("-- {} dimensions can be added, {} cannot · server {} us", dims.len(), v["refused"], v["total_us"])));
+    println!("{}", style(&format!("-- {} dimensions can be added · server {} us", dims.len(), v["total_us"])));
 }
 
 /// A dimension's sampled values by uid or name, else by a unique substring

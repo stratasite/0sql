@@ -174,6 +174,40 @@ impl<'a> Planner<'a> {
         self.plan_query_explained(query, principal, false)
     }
 
+    /// The dimensions the query can take on without losing a universe: a
+    /// walk of the formed universes rather than a plan per candidate. The
+    /// resolver's rule is that every measure needs a universe, in a
+    /// datasource holding all the measures, that reaches every dimension
+    /// of the query; a dimension can be added when that still holds.
+    /// Without measures, one universe must reach every dimension.
+    pub fn drillable(&self, query: zsql_spec::Query) -> Result<Vec<&'a zsql_semantic::Field>> {
+        let rquery = model::RQuery::resolve(self.universe, query)?;
+        let measures = resolver::measures(self.universe, &rquery);
+        let dimensions = resolver::dimensions(self.universe, &rquery);
+        let dim_ids: Vec<zsql_semantic::Id> = dimensions.iter().map(|f| f.id).collect();
+        let ds_ids = self.universes.datasources_with_all_measures(self.universe, &measures);
+        let bases: Vec<&universe::Base<'a>> = self
+            .universes
+            .bases
+            .iter()
+            .map(|b| b.as_ref())
+            .filter(|u| ds_ids.contains(&u.datasource.id) && u.all_dimensions(&dim_ids))
+            .collect();
+        Ok(self
+            .universe
+            .fields()
+            .iter()
+            .filter(|f| f.is_dimension() && !dim_ids.contains(&f.id))
+            .filter(|f| {
+                if measures.is_empty() {
+                    bases.iter().any(|u| u.has_field(f.id))
+                } else {
+                    measures.iter().all(|m| bases.iter().any(|u| u.has_measure(m.id) && u.has_field(f.id)))
+                }
+            })
+            .collect())
+    }
+
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {

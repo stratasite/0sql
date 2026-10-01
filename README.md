@@ -119,7 +119,7 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
 | `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
-| `POST /projects/{uid}/branches/{branch}/drill` | the same request, answered with the visible dimensions the query can add and still plan: `{dimensions: [{uid, name, data_type, tables}], refused, total_us}` |
+| `POST /projects/{uid}/branches/{branch}/drill` | the same request, answered with the visible dimensions the query can add and still resolve, from a walk of the formed universes: `{dimensions: [{uid, name, data_type, tables}], total_us}` |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
 | `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery: containing matches, then near matches with a `score` (hidden fields excluded by default) |
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |

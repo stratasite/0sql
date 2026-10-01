@@ -277,53 +277,33 @@ async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, S
     Ok(Json(ExplainResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
 }
 
-/// The dimensions a query can take on: every visible dimension not already
-/// projected whose addition still plans. Each candidate is planned for
-/// real, so the answer is exactly what the planner accepts.
+/// The dimensions a query can take on: every visible dimension the
+/// planner's universes can add to it, from a walk of the formed universes.
 #[derive(Serialize)]
 struct DrillResponse {
     dimensions: Vec<Value>,
-    /// How many candidates the planner refused, and the time spent.
-    refused: usize,
     total_us: u128,
 }
 
 async fn drill(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<DrillResponse>, ApiError> {
     let d = model(&app, &uid, &branch)?;
-    if req.context.is_none() && !d.universe.policies().is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
-    }
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
-    // The query as given must plan first; its projected fields are not candidates.
-    let spec = zsql_spec::Spec::from_value(req.spec.clone()).map_err(spec_error)?;
+    let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
     let query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
-    let projected: std::collections::HashSet<String> = query.projections.iter().filter_map(|p| p.field_uid.clone()).collect();
     let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
-    planner.plan_query(query, req.context.as_ref()).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
-
-    let mut dimensions = Vec::new();
-    let mut refused = 0;
-    for f in d.universe.fields().iter().filter(|f| f.kind == FieldKind::Dimension && !f.hidden && !projected.contains(&f.uid)) {
-        let mut with = req.spec.clone();
-        let projections = with.as_object_mut().and_then(|m| m.entry("projections").or_insert_with(|| json!([])).as_array_mut());
-        let Some(projections) = projections else { break };
-        projections.push(json!({ "field": f.uid, "field_type": "dimension" }));
-        let ok = zsql_spec::Spec::from_value(with)
-            .ok()
-            .and_then(|s| zsql_spec::lower(&s, &d.universe, &base).ok())
-            .and_then(|q| planner.plan_query(q, req.context.as_ref()).ok())
-            .is_some();
-        if ok {
-            dimensions.push(json!({
+    let fields = planner.drillable(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    let dimensions = fields
+        .into_iter()
+        .filter(|f| !f.hidden)
+        .map(|f| {
+            json!({
                 "uid": f.uid, "name": f.name, "data_type": f.data_type, "description": f.description,
                 "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
-            }));
-        } else {
-            refused += 1;
-        }
-    }
-    Ok(Json(DrillResponse { dimensions, refused, total_us: t0.elapsed().as_micros() }))
+            })
+        })
+        .collect();
+    Ok(Json(DrillResponse { dimensions, total_us: t0.elapsed().as_micros() }))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
