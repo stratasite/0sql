@@ -13,7 +13,10 @@ crates/spec       the query spec, its lowering into the typed query, the formula
 crates/planner    resolution, visitors, SQL generation
 crates/project    a project directory (YAML models) loaded into a snapshot
 crates/golden     golden cases and the scoreboard
-crates/cli        zsql: check, plan, repl, test, export, golden, bench, form
+crates/cli        zsql: init, deploy, and every server endpoint; no engine inside
+crates/devtool    zsql-dev: the engine on the command line (local plan, goldens, bench)
+crates/server     zsqld: deploy a project, plan specs
+crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
 harness/          import of goldens from a roundhouse/strata-rs capture
@@ -41,26 +44,52 @@ nothing denies by default (no rows, or every value masked); a policy may
 say `unresolved: allow` under `permission_resolution` to be skipped
 instead, which is what strata does. Bypass flags open the door explicitly.
 
+## The CLI
+
+`zsql` authors a project and talks to a server. It generates no SQL
+itself: planning, validation and tests all run on zsqld, so the engine
+never leaves the service. The CLI keeps the warehouse credentials, which
+is why value sampling runs there.
+
 ```
-zsql check  --project ../myproject
-zsql plan   --project ../myproject --expr "item category, month(date), store net paid > 100"
-zsql plan   --project ../myproject --spec q.json --context user.json
-zsql repl   --project ../myproject
-zsql test   --project ../myproject
-zsql export --project ../myproject --out model.json.gz
-zsql values sample --project ../myproject          # dimension values into values.jsonl.gz
-zsql values show   --project ../myproject category
-zsql golden                       # planner parity with the goldens
-zsql bench                        # phase timings (ZSQL_PROFILE=1 for detail)
+zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, samples/, git init
+zsql new table Orders --datasource warehouse [--domain sales]
+zsql new relation --datasource warehouse
+zsql new test smoke
+zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
+zsql check                        # validate on the server, keep nothing
+zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
+zsql test                         # the deployed branch's tests/*.yml
+zsql plan --expr "department, sales value, department = PRODUCE" [--context user.json] [--json]
+zsql repl [--context user.json]   # the shorthand, planned on the server; .branch switches branch
+zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
+zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]
+zsql remove --yes                 # drop the deployed branch
 ```
+
+Every command takes `--project DIR`, `--branch NAME`, `--server URL` and
+`--uid UID`; without them the project is found from `project.yml` here or
+above, the branch is the checked-out git branch, and the server comes from
+`ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` (for a self-hosted
+zsqld) or the local default. `project.yml`'s `production_branch` names the
+branch production reads; deploying to it is called out.
+
+Deploys carry the YAML models, tests, `security.yml`, `datasources.yml`
+with its secrets removed, and `samples/values.jsonl.gz`. The server
+answers with counts, warnings and the test results.
 
 The repl takes one comma-separated line and reads each item from its shape:
 a predicate makes it a filter, a formula with a bracket reference is a
 calculation (`Alias = formula` or `formula as Alias`), anything else is a
 projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
-field. Commands start with a dot: `.fields`, `.tables`, `.json {...}`,
-`.tojson <line>`, `.help`, `.quit`.
+field. Commands start with a dot: `.fields`, `.tables`, `.values`,
+`.json {...}`, `.tojson <line>`, `.branch`, `.help`, `.quit`.
+
+`zsql-dev` (the devtool crate) is the engine on the command line for its
+own developers: local planning over a snapshot or project directory, the
+golden scoreboard, the bench, formation checks and export. It is not part
+of the CLI release.
 
 ## The server
 
@@ -79,7 +108,11 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
 
 | route | what |
 |---|---|
-| `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets |
+| `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets; tests run, results in the answer |
+| `POST /projects/{uid}/branches/{branch}/validate` | the same, keeping nothing |
+| `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
+| `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
+| `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
 | `POST /projects/{uid}/branches/{branch}/plan` | `{spec, context?, explain?}` to `{sql, adapter, timings_us}`, or `{error: {class, message}}` |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
 | `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery (hidden fields excluded by default) |
@@ -89,36 +122,24 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
 
 A branch with security policies refuses to plan without a context.
 
-The CLI covers every endpoint, with `--server` defaulting to
-`http://127.0.0.1:3699` and the project uid read from `project.yml` when
-`--uid` is not given:
-
-```
-zsql deploy --project ../myproject
-zsql remote list
-zsql remote show   --uid myproject
-zsql remote plan   --uid myproject --expr "department, sales value" [--context user.json] [--json]
-zsql remote fields --uid myproject depart
-zsql remote tables --uid myproject
-zsql remote values --uid myproject department
-zsql remote repl   --uid myproject            # the repl, planned on the server
-zsql remote health
-```
+The CLI covers every endpoint; see above.
 
 ## Dimension values
 
-`zsql values sample` reads each listable dimension from the cheapest table
-that holds it and writes `values.jsonl.gz` in the project: for text, the
+`zsql values sample` asks the server which dimensions to sample and the SQL
+to run (the server knows the model), runs it against the project's
+warehouses with the local credentials, and writes `samples/values.jsonl.gz`:
+for text, the
 top `value_list_size` values by row count (default 1000) with their counts,
 or every value with `values: full` on the field (refused above 100k
 distinct); for numbers and dates, the min and max. Hidden dimensions,
 listing-disabled ones, `values: none`, and any dimension a security policy
 names are never sampled. The file is customer data: gitignore it unless
 you want it reviewed. `--dims a,b` limits the run, `--older-than 7`
-resamples only stale entries, `--dry-run` prints the SQL. Connections come
-from `datasources.yml`, secrets from `.strata` in the project (the strata
-CLI's credential file) or `ZSQL_DS_<KEY>_PASSWORD`; duckdb and postgres
-are the drivers so far.
+resamples only stale entries, `--dry-run` prints the SQL, `--deploy`
+redeploys afterwards. Connections come from `datasources.yml`, secrets from
+`.zsql` (or `.strata`) in the project or `ZSQL_DS_<KEY>_PASSWORD`; duckdb
+and postgres are the drivers so far.
 
 ## Parity
 
