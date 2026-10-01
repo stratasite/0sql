@@ -1,0 +1,24 @@
+[package]
+name = "zsql-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zsqld: deploy a project, get SQL back"
+
+[[bin]]
+name = "zsqld"
+path = "src/main.rs"
+
+[dependencies]
+zsql-semantic.workspace = true
+zsql-dialect.workspace = true
+zsql-spec.workspace = true
+zsql-planner.workspace = true
+zsql-project.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+flate2.workspace = true
+tar = "0.4"

@@ -9,6 +9,7 @@ use zsql_dialect::Dialects;
 use zsql_golden::{print_scoreboard, score, Fixtures, PathSource};
 use zsql_semantic::{Snapshot, Universe};
 use zsql_spec::SecurityContext;
+use serde_yaml as serde_yaml_value;
 
 #[derive(Parser)]
 #[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)")]
@@ -150,6 +151,19 @@ enum Command {
     Form {
         #[command(flatten)]
         source: Source,
+    },
+    /// Deploy the project directory to a zsqld server (model files and sampled values, no secrets).
+    Deploy {
+        #[arg(long)]
+        project: PathBuf,
+        /// The server, e.g. http://localhost:8080.
+        #[arg(long)]
+        server: String,
+        /// Project uid; defaults to project.yml's uid.
+        #[arg(long)]
+        uid: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
     },
     /// Sample dimension values from the project's warehouses into values.jsonl.gz, or show them.
     Values {
@@ -531,6 +545,29 @@ fn main() -> Result<()> {
             }
         }
         Command::Values { command } => values_command(command)?,
+        Command::Deploy { project, server, uid, branch } => {
+            let uid = match uid {
+                Some(u) => u,
+                None => {
+                    let text = std::fs::read_to_string(project.join("project.yml")).with_context(|| "reading project.yml")?;
+                    let v: serde_yaml_value::Value = serde_yaml_value::from_str(&text)?;
+                    v.get("uid").and_then(|u| u.as_str()).map(str::to_string).or_else(|| v.get("name").and_then(|n| n.as_str()).map(zsql_project::parameterize)).ok_or_else(|| anyhow::anyhow!("project.yml has no uid or name"))?
+                }
+            };
+            let archive = project_archive(&project)?;
+            let url = format!("{}/projects/{}/branches/{}/deploy", server.trim_end_matches('/'), uid, branch);
+            println!("deploying {} ({} bytes) to {url}", project.display(), archive.len());
+            let response = ureq::post(&url).header("content-type", "application/gzip").send(&archive[..]);
+            match response {
+                Ok(mut r) => {
+                    let text = r.body_mut().read_to_string()?;
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                Err(ureq::Error::StatusCode(code)) => bail!("server answered {code}"),
+                Err(e) => bail!("{e}"),
+            }
+        }
         Command::Form { source } => {
             let from_project = source.project.is_some();
             let model = source.load()?;
@@ -688,6 +725,74 @@ fn values_command(command: ValuesCommand) -> Result<()> {
             if failed > 0 {
                 bail!("{failed} dimension(s) failed to sample");
             }
+        }
+    }
+    Ok(())
+}
+
+/// The project as a tar.gz: YAML models, tests, security, datasources.yml
+/// with its secrets removed, and values.jsonl.gz. Never .strata, .git or
+/// data files.
+fn project_archive(project: &std::path::Path) -> Result<Vec<u8>> {
+    const SECRET_KEYS: [&str; 7] = ["password", "private_key", "personal_access_token", "secret_access_key", "access_key_id", "oauth_client_secret", "oauth_client_id"];
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        let mut add = |rel: &str, bytes: &[u8]| -> Result<()> {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, rel, bytes)?;
+            Ok(())
+        };
+        for name in ["project.yml", "security.yml"] {
+            if let Ok(bytes) = std::fs::read(project.join(name)) {
+                add(name, &bytes)?;
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(project.join("datasources.yml")) {
+            let mut v: serde_yaml_value::Value = serde_yaml_value::from_str(&text)?;
+            if let Some(map) = v.as_mapping_mut() {
+                for (_, ds) in map.iter_mut() {
+                    if let Some(entry) = ds.as_mapping_mut() {
+                        for k in SECRET_KEYS {
+                            entry.remove(serde_yaml_value::Value::String(k.into()));
+                        }
+                    }
+                }
+            }
+            add("datasources.yml", serde_yaml_value::to_string(&v)?.as_bytes())?;
+        }
+        if let Ok(bytes) = std::fs::read(project.join(zsql_project::values::FILE_NAME)) {
+            add(zsql_project::values::FILE_NAME, &bytes)?;
+        }
+        for dir in ["models", "tests", "migrations"] {
+            let root = project.join(dir);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut files = Vec::new();
+            walk_yaml(&root, &mut files)?;
+            files.sort();
+            for f in files {
+                let rel = f.strip_prefix(project)?.to_string_lossy().replace('\\', "/");
+                add(&rel, &std::fs::read(&f)?)?;
+            }
+        }
+        tar.into_inner()?.finish()?;
+    }
+    Ok(buf)
+}
+
+fn walk_yaml(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            walk_yaml(&path, out)?;
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("yml") | Some("yaml")) {
+            out.push(path);
         }
     }
     Ok(())

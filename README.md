@@ -62,6 +62,33 @@ projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 field. Commands start with a dot: `.fields`, `.tables`, `.json {...}`,
 `.tojson <line>`, `.help`, `.quit`.
 
+## The server
+
+`zsqld` is the light service: deploy a project, get SQL back. No accounts,
+users or keys yet. Deployed models live in memory and under `ZSQL_DATA_DIR`
+(default `data/`), so a restart reloads them. `ZSQL_BIND` sets the address
+(default `127.0.0.1:8080`).
+
+```
+cargo run --release -p zsql-server
+zsql deploy --project ../myproject --server http://localhost:8080
+curl -s -X POST localhost:8080/projects/myproject/branches/main/plan \
+     -H 'content-type: application/json' \
+     -d '{"spec": {"projections": [{"field": "department"}, {"field": "sales value"}]}, "context": {...}}'
+```
+
+| route | what |
+|---|---|
+| `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets |
+| `POST /projects/{uid}/branches/{branch}/plan` | `{spec, context?, explain?}` to `{sql, adapter, timings_us}`, or `{error: {class, message}}` |
+| `GET /projects/{uid}/branches/{branch}` | summary and warnings |
+| `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery (hidden fields excluded by default) |
+| `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |
+| `GET /projects/{uid}/branches/{branch}/values/{dim}` | sampled values of a dimension |
+| `GET /projects`, `GET /healthz` | every deployment; liveness |
+
+A branch with security policies refuses to plan without a context.
+
 ## Dimension values
 
 `zsql values sample` reads each listable dimension from the cheapest table
