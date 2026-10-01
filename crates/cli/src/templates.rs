@@ -76,12 +76,18 @@ cost: 10\n\
 # For a snapshot table (inventory, balances), the date dimension it snapshots on.\n\
 # snapshot: Date\n\
 \n\
-# Data the table does not hold, so the planner can avoid it:\n\
+# Data the table holds, so the planner prefers it for filters inside the\n\
+# range and avoids it for filters outside. Predicates: between,\n\
+# greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to\n\
+# (number or date dimensions) and in_list (any dimension).\n\
 # partitions:\n\
 #   - dimension: Date\n\
 #     predicate: between\n\
 #     filter_value: 2y\n\
 #     filter_value_end: 1d\n\
+#   - dimension: Region\n\
+#     predicate: in_list\n\
+#     filter_value: US, EU\n\
 \n\
 fields:\n\
   # - type: dimension                 # dimension | measure\n\

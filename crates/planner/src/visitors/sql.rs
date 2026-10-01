@@ -982,7 +982,7 @@ fn lit<'a>(cx: &Ctx<'_, 'a>, f: &Filtered<'a>, value: &str, is_ending: bool) -> 
 }
 
 /// Commas outside quotes split the list; quoted items keep their quotes.
-fn split_list(value: &str) -> Vec<String> {
+pub fn split_list(value: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;

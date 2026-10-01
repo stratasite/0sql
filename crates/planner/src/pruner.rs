@@ -113,9 +113,20 @@ pub fn partition_score(root: &Table, filters: &[Rc<RFilter>], universe: &Univers
     score
 }
 
-/// Rails `Partition#within_partition_range?`, for numeric and date partitions.
+/// Rails `Partition#within_partition_range?`, for numeric and date range
+/// partitions; a list partition holds the filter when every value the
+/// filter wants is listed.
 fn within_partition(part: &zsql_semantic::Partition, f: &RFilter) -> bool {
     use crate::sql::dates::parse_value;
+    if part.predicate == Predicate::InList {
+        let listed: HashSet<String> = part.filter_value.as_deref().map(split_list).unwrap_or_default().into_iter().collect();
+        let wanted: Vec<String> = match (f.def.predicate, f.def.filter_value.as_deref()) {
+            (Predicate::Equals, Some(v)) => vec![v.trim().to_lowercase()],
+            (Predicate::InList, Some(v)) => split_list(v),
+            _ => return false,
+        };
+        return !wanted.is_empty() && wanted.iter().all(|v| listed.contains(v));
+    }
     let numeric = f.field.data_type.map(|d| {
         matches!(d, zsql_semantic::DataType::Integer | zsql_semantic::DataType::Decimal | zsql_semantic::DataType::Bigint)
     });
@@ -146,5 +157,79 @@ fn within_partition(part: &zsql_semantic::Partition, f: &RFilter) -> bool {
         Predicate::Equals => cover(fv),
         Predicate::DoesNotEqual => !cover(fv),
         _ => false,
+    }
+}
+
+/// A list value's entries as the SQL visitor splits them (quotes honoured),
+/// trimmed and lower-cased.
+fn split_list(value: &str) -> Vec<String> {
+    crate::visitors::sql::split_list(value)
+        .iter()
+        .map(|v| v.trim().trim_matches(|c| c == '\'' || c == '"').trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsql_semantic::Partition;
+
+    fn field(data_type: &str) -> Field {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "uid": "region", "name": "Region", "type": "Semantic::Dimension", "data_type": data_type,
+            "display_type": "", "format": null, "exclusion_type": null, "inclusions": null,
+            "extended_blend_group": null, "snapshot": null, "value_list_size": 0, "description": null
+        }))
+        .unwrap()
+    }
+
+    fn filter<'a>(field: &'a Field, predicate: Predicate, value: &str, end: Option<&str>) -> RFilter<'a> {
+        RFilter {
+            fid: 0,
+            field,
+            def: zsql_spec::Filter {
+                reference: "f0".into(),
+                field_uid: field.uid.clone(),
+                field_kind: Some(field.kind),
+                predicate,
+                filter_value: Some(value.into()),
+                filter_value_end: end.map(str::to_string),
+                top_n_measure: None,
+                ordinal: 0,
+                source_ref: None,
+            },
+        }
+    }
+
+    fn partition(predicate: Predicate, value: &str, end: Option<&str>) -> Partition {
+        Partition { id: 1, table_id: 1, dimension_id: 1, predicate, filter_value: Some(value.into()), filter_value_end: end.map(str::to_string) }
+    }
+
+    #[test]
+    fn list_partition_holds_listed_values_only() {
+        let f = field("string");
+        let p = partition(Predicate::InList, "US, 'EU', apac", None);
+        assert!(within_partition(&p, &filter(&f, Predicate::Equals, "eu", None)));
+        assert!(within_partition(&p, &filter(&f, Predicate::InList, "us,APAC", None)));
+        assert!(!within_partition(&p, &filter(&f, Predicate::InList, "us,latam", None)));
+        assert!(!within_partition(&p, &filter(&f, Predicate::DoesNotEqual, "us", None)));
+        assert!(!within_partition(&p, &filter(&f, Predicate::GreaterThan, "1", None)));
+    }
+
+    #[test]
+    fn range_partitions_cover_comparison_filters() {
+        let f = field("integer");
+        let ge = partition(Predicate::GreaterThanOrEqualTo, "2020", None);
+        assert!(within_partition(&ge, &filter(&f, Predicate::GreaterThan, "2021", None)));
+        assert!(within_partition(&ge, &filter(&f, Predicate::Between, "2020", Some("2024"))));
+        assert!(!within_partition(&ge, &filter(&f, Predicate::Between, "2019", Some("2024"))));
+        assert!(!within_partition(&ge, &filter(&f, Predicate::LessThan, "2024", None)));
+        let gt = partition(Predicate::GreaterThan, "2020", None);
+        assert!(!within_partition(&gt, &filter(&f, Predicate::Equals, "2020", None)));
+        assert!(within_partition(&gt, &filter(&f, Predicate::Equals, "2021", None)));
+        let le = partition(Predicate::LessThanOrEqualTo, "2020", None);
+        assert!(within_partition(&le, &filter(&f, Predicate::LessThan, "2019", None)));
+        assert!(!within_partition(&le, &filter(&f, Predicate::GreaterThan, "2000", None)));
     }
 }

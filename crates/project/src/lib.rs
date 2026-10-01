@@ -894,8 +894,15 @@ impl<'d> Builder<'d> {
                 let predicate: Predicate = str_of(pm, "predicate")
                     .and_then(|p| serde_json::from_value(Json::String(p.to_lowercase())).ok())
                     .ok_or_else(|| invalid(&pt.file, format!("Partition errors: Predicate is not included in the list ({dim_name})")))?;
-                if !matches!(predicate, Predicate::Between | Predicate::InList) {
-                    self.warn(&pt.file, format!("partition on {dim_name}: only between and in_list predicates are supported"));
+                // Ranges need a number or date dimension to compare on; a
+                // list partition works on any type.
+                let ranged = matches!(predicate, Predicate::Between | Predicate::GreaterThan | Predicate::GreaterThanOrEqualTo | Predicate::LessThan | Predicate::LessThanOrEqualTo);
+                if !ranged && predicate != Predicate::InList {
+                    self.warn(&pt.file, format!("partition on {dim_name}: predicate {} is not supported (between, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, in_list); the partition will not rank the table", predicate.name()));
+                }
+                let numeric_or_date = matches!(self.fields[dim].data_type, Some(DataType::Integer | DataType::Decimal | DataType::Bigint | DataType::Date | DataType::DateTime));
+                if ranged && !numeric_or_date {
+                    self.warn(&pt.file, format!("partition on {dim_name}: a {} partition needs a number or date dimension", predicate.name()));
                 }
                 let id = self.partitions.len() as Id + 1;
                 self.partitions.push(Partition {
