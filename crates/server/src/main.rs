@@ -304,7 +304,7 @@ fn humantime(t: std::time::SystemTime) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(std::env::var("ZSQL_DATA_DIR").unwrap_or_else(|_| "data".into()));
-    let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:3699".into());
     std::fs::create_dir_all(&data_dir)?;
     let app: Shared = Arc::new(App { dialects: Dialects::builtin(), data_dir, models: RwLock::new(HashMap::new()) });
     let n = reload(&app)?;

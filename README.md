@@ -67,12 +67,12 @@ field. Commands start with a dot: `.fields`, `.tables`, `.json {...}`,
 `zsqld` is the light service: deploy a project, get SQL back. No accounts,
 users or keys yet. Deployed models live in memory and under `ZSQL_DATA_DIR`
 (default `data/`), so a restart reloads them. `ZSQL_BIND` sets the address
-(default `127.0.0.1:8080`).
+(default `127.0.0.1:3699`).
 
 ```
 cargo run --release -p zsql-server
-zsql deploy --project ../myproject --server http://localhost:8080
-curl -s -X POST localhost:8080/projects/myproject/branches/main/plan \
+zsql deploy --project ../myproject --server http://127.0.0.1:3699
+curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
      -H 'content-type: application/json' \
      -d '{"spec": {"projections": [{"field": "department"}, {"field": "sales value"}]}, "context": {...}}'
 ```
@@ -88,6 +88,22 @@ curl -s -X POST localhost:8080/projects/myproject/branches/main/plan \
 | `GET /projects`, `GET /healthz` | every deployment; liveness |
 
 A branch with security policies refuses to plan without a context.
+
+The CLI covers every endpoint, with `--server` defaulting to
+`http://127.0.0.1:3699` and the project uid read from `project.yml` when
+`--uid` is not given:
+
+```
+zsql deploy --project ../myproject
+zsql remote list
+zsql remote show   --uid myproject
+zsql remote plan   --uid myproject --expr "department, sales value" [--context user.json] [--json]
+zsql remote fields --uid myproject depart
+zsql remote tables --uid myproject
+zsql remote values --uid myproject department
+zsql remote repl   --uid myproject            # the repl, planned on the server
+zsql remote health
+```
 
 ## Dimension values
 
