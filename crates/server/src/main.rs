@@ -277,33 +277,74 @@ async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, S
     Ok(Json(ExplainResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
 }
 
-/// The dimensions a query can take on: every visible dimension the
-/// planner's universes can add to it, from a walk of the formed universes.
+/// What a query can take on: the visible dimensions and measures the
+/// planner's universes can add to it, from a walk of the formed
+/// universes, narrowed by a search term when one is given.
+#[derive(Deserialize)]
+struct ExploreRequest {
+    spec: Value,
+    /// Accepted for symmetry with sql and explain; exploring resolves
+    /// universes only, so no policy applies yet.
+    #[serde(default)]
+    #[allow(dead_code)]
+    context: Option<SecurityContext>,
+    /// Keep only fields whose name, uid or synonyms contain this, or come
+    /// close to it.
+    #[serde(default)]
+    q: Option<String>,
+}
+
 #[derive(Serialize)]
-struct DrillResponse {
+struct ExploreResponse {
     dimensions: Vec<Value>,
+    measures: Vec<Value>,
     total_us: u128,
 }
 
-async fn drill(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<DrillResponse>, ApiError> {
+async fn explore(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<ExploreRequest>) -> Result<Json<ExploreResponse>, ApiError> {
     let d = model(&app, &uid, &branch)?;
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
     let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
     let query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
     let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
-    let fields = planner.drillable(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
-    let dimensions = fields
-        .into_iter()
-        .filter(|f| !f.hidden)
-        .map(|f| {
-            json!({
-                "uid": f.uid, "name": f.name, "data_type": f.data_type, "description": f.description,
-                "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
+    let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    let q = req.q.as_deref().map(zsql_spec::fuzzy::normalize).filter(|q| !q.is_empty());
+    let wanted = |f: &zsql_semantic::Field| -> Option<f64> {
+        let Some(q) = &q else { return Some(1.0) };
+        let forms = std::iter::once(&f.name).chain(std::iter::once(&f.uid)).chain(f.synonyms.iter());
+        let mut best = 0.0f64;
+        for form in forms {
+            let n = zsql_spec::fuzzy::normalize(form);
+            if n.contains(q.as_str()) {
+                return Some(1.0);
+            }
+            best = best.max(zsql_spec::fuzzy::similarity(q, &n));
+        }
+        (best >= zsql_spec::fuzzy::FLOOR).then_some(best)
+    };
+    let describe = |fields: Vec<&zsql_semantic::Field>| -> Vec<Value> {
+        let mut out: Vec<(f64, Value)> = fields
+            .into_iter()
+            .filter(|f| !f.hidden)
+            .filter_map(|f| {
+                let score = wanted(f)?;
+                let mut v = json!({
+                    "uid": f.uid, "name": f.name, "data_type": f.data_type, "description": f.description,
+                    "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
+                });
+                if q.is_some() {
+                    v["score"] = json!((score * 100.0).round() / 100.0);
+                }
+                Some((score, v))
             })
-        })
-        .collect();
-    Ok(Json(DrillResponse { dimensions, total_us: t0.elapsed().as_micros() }))
+            .collect();
+        if q.is_some() {
+            out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        }
+        out.into_iter().map(|(_, v)| v).collect()
+    };
+    Ok(Json(ExploreResponse { dimensions: describe(x.dimensions), measures: describe(x.measures), total_us: t0.elapsed().as_micros() }))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
@@ -525,7 +566,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{uid}/branches/{branch}", delete(remove))
         .route("/projects/{uid}/branches/{branch}/sql", post(sql))
         .route("/projects/{uid}/branches/{branch}/explain", post(explain))
-        .route("/projects/{uid}/branches/{branch}/drill", post(drill))
+        .route("/projects/{uid}/branches/{branch}/explore", post(explore))
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(values))

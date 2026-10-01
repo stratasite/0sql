@@ -129,10 +129,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// The dimensions a query can take on: where it can drill to.
-    Drill {
+    /// What a query can take on: the dimensions to drill into and the measures to add.
+    Explore {
         #[command(flatten)]
         query: QueryArgs,
+        /// Keep only fields whose name, uid or synonyms contain this, or come close.
+        #[arg(long, short)]
+        q: Option<String>,
         /// Print the server's answer as JSON.
         #[arg(long)]
         json: bool,
@@ -283,13 +286,13 @@ fn main() -> Result<()> {
         }
         Command::Sql { query, explain, json } => query.run(at, explain, json),
         Command::Explain { query, json } => query.run(at, true, json),
-        Command::Drill { query, json } => {
+        Command::Explore { query, q, json } => {
             let (t, spec_value, context) = query.resolve(at)?;
-            let v = remote::drill(&t.client, &t.uid, &t.branch, spec_value, context.as_ref())?;
+            let v = remote::explore(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), q.as_deref())?;
             if json {
                 remote::print_json(&v)?;
             } else {
-                remote::print_drill(&v, &|s| s.to_string());
+                remote::print_explore(&v, &|s| s.to_string());
             }
             Ok(())
         }
@@ -838,10 +841,15 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                     }
                     Err(e) => println!("error: {e}"),
                 },
-                "" | "json" | "explain" | "drill" => {
+                "" | "json" | "explain" | "explore" => {
                     // A query: the shorthand, or a JSON spec after .json or
-                    // starting with a brace. .explain and .drill take either.
+                    // starting with a brace. .explain and .explore take
+                    // either; .explore narrows by a term after ` ? `.
                     let text = if cmd == "" { line } else { rest };
+                    let (text, term) = match cmd {
+                        "explore" => text.rsplit_once(" ? ").map(|(l, q)| (l.trim(), Some(q.trim()))).unwrap_or((text, None)),
+                        _ => (text, None),
+                    };
                     let spec: Result<Value, String> = if cmd == "json" || text.starts_with('{') {
                         serde_json::from_str(text).map_err(|e| e.to_string())
                     } else {
@@ -854,8 +862,8 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                     };
                     match spec {
                         Err(e) => println!("error: {e}"),
-                        Ok(spec) if cmd == "drill" => match remote::drill(&t.client, &t.uid, &t.branch, spec, context.as_ref()) {
-                            Ok(v) => remote::print_drill(&v, &dim),
+                        Ok(spec) if cmd == "explore" => match remote::explore(&t.client, &t.uid, &t.branch, spec, context.as_ref(), term) {
+                            Ok(v) => remote::print_explore(&v, &dim),
                             Err(e) => println!("error: {e}"),
                         },
                         Ok(spec) => {

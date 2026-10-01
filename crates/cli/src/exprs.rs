@@ -416,7 +416,7 @@ Type a comma-separated line. Each item is read from its shape:
                a formula with a [Name]@m, [Name]@d or [Alias] reference; unnamed, the formula is its alias
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
 [Name] or \"Name\" is always a field, whatever the name says: [Tables], \"Sales in Store\" > 5.
-Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .drill <line> (dimensions the query can add),
+Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explore <line> [? term] (what the query can add),
 .fields [text], .tables, .values <dim>,
 .json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
 

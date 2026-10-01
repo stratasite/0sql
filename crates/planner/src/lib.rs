@@ -31,6 +31,13 @@ pub struct Plan {
     pub explain: Option<Explain>,
 }
 
+/// What a query can take on: see [`Planner::explore`].
+#[derive(Debug, Clone)]
+pub struct Exploration<'a> {
+    pub dimensions: Vec<&'a zsql_semantic::Field>,
+    pub measures: Vec<&'a zsql_semantic::Field>,
+}
+
 /// How a plan came to be: what each planning phase cost and the DAG the
 /// visitors shaped, node by node.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -174,38 +181,55 @@ impl<'a> Planner<'a> {
         self.plan_query_explained(query, principal, false)
     }
 
-    /// The dimensions the query can take on without losing a universe: a
-    /// walk of the formed universes rather than a plan per candidate. The
+    /// What the query can take on without losing a universe, from a walk
+    /// of the formed universes rather than a plan per candidate. The
     /// resolver's rule is that every measure needs a universe, in a
-    /// datasource holding all the measures, that reaches every dimension
-    /// of the query; a dimension can be added when that still holds.
+    /// datasource whose root tables hold all the measures, that reaches
+    /// every dimension of the query. A dimension can be added when that
+    /// still holds; so can a measure, counting itself among the measures.
     /// Without measures, one universe must reach every dimension.
-    pub fn drillable(&self, query: zsql_spec::Query) -> Result<Vec<&'a zsql_semantic::Field>> {
+    pub fn explore(&self, query: zsql_spec::Query) -> Result<Exploration<'a>> {
+        use zsql_semantic::Id;
         let rquery = model::RQuery::resolve(self.universe, query)?;
         let measures = resolver::measures(self.universe, &rquery);
         let dimensions = resolver::dimensions(self.universe, &rquery);
-        let dim_ids: Vec<zsql_semantic::Id> = dimensions.iter().map(|f| f.id).collect();
-        let ds_ids = self.universes.datasources_with_all_measures(self.universe, &measures);
-        let bases: Vec<&universe::Base<'a>> = self
-            .universes
-            .bases
-            .iter()
-            .map(|b| b.as_ref())
-            .filter(|u| ds_ids.contains(&u.datasource.id) && u.all_dimensions(&dim_ids))
-            .collect();
-        Ok(self
+        let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
+        let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
+        let bases: Vec<&universe::Base<'a>> = self.universes.bases.iter().map(|b| b.as_ref()).collect();
+        let mut ds_ids: Vec<Id> = Vec::new();
+        for b in &bases {
+            if !ds_ids.contains(&b.datasource.id) {
+                ds_ids.push(b.datasource.id);
+            }
+        }
+        // A datasource holds a measure when one of its root tables does.
+        let holds = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && self.universe.expression_for(b.root.id, m).is_some());
+        // Every measure resolves in a datasource when a base there reaching
+        // the query's dimensions carries it.
+        let resolves = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && b.all_dimensions(&dim_ids) && b.has_measure(m));
+        let ds_with_all: Vec<Id> = ds_ids.iter().copied().filter(|ds| msr_ids.iter().all(|m| holds(*ds, *m))).collect();
+
+        let dimensions = self
             .universe
             .fields()
             .iter()
             .filter(|f| f.is_dimension() && !dim_ids.contains(&f.id))
             .filter(|f| {
                 if measures.is_empty() {
-                    bases.iter().any(|u| u.has_field(f.id))
+                    bases.iter().any(|u| u.all_dimensions(&dim_ids) && u.has_field(f.id))
                 } else {
-                    measures.iter().all(|m| bases.iter().any(|u| u.has_measure(m.id) && u.has_field(f.id)))
+                    ds_with_all.iter().any(|ds| msr_ids.iter().all(|m| bases.iter().any(|u| u.datasource.id == *ds && u.all_dimensions(&dim_ids) && u.has_measure(*m) && u.has_field(f.id))))
                 }
             })
-            .collect())
+            .collect();
+        let measures = self
+            .universe
+            .fields()
+            .iter()
+            .filter(|f| f.is_measure() && !msr_ids.contains(&f.id))
+            .filter(|f| ds_with_all.iter().any(|ds| holds(*ds, f.id) && resolves(*ds, f.id) && msr_ids.iter().all(|m| resolves(*ds, *m))))
+            .collect();
+        Ok(Exploration { dimensions, measures })
     }
 
     /// As `plan_query`; with `explain` the plan also carries every

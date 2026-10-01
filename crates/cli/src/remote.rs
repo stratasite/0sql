@@ -87,22 +87,34 @@ pub fn sql(client: &Client, uid: &str, branch: &str, spec: Value, context: Optio
     client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &body)
 }
 
-/// `/drill`: the dimensions the query can take on.
-pub fn drill(client: &Client, uid: &str, branch: &str, spec: Value, context: Option<&Value>) -> Result<Value> {
+/// `/explore`: the dimensions and measures the query can take on, narrowed
+/// by a search term.
+pub fn explore(client: &Client, uid: &str, branch: &str, spec: Value, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
     let mut body = json!({ "spec": spec });
     if let Some(c) = context {
         body["context"] = c.clone();
     }
-    client.post(&format!("{}/drill", branch_path(uid, branch)), &body)
+    if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+        body["q"] = json!(q);
+    }
+    client.post(&format!("{}/explore", branch_path(uid, branch)), &body)
 }
 
-pub fn print_drill(v: &Value, style: &dyn Fn(&str) -> String) {
-    let dims = v["dimensions"].as_array().cloned().unwrap_or_default();
-    for f in &dims {
-        let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        println!("{:<40} {:<32} {}", f["uid"].as_str().unwrap_or(""), f["name"].as_str().unwrap_or(""), style(&tables.join(", ")));
+pub fn print_explore(v: &Value, style: &dyn Fn(&str) -> String) {
+    let mut counts = Vec::new();
+    for (key, label) in [("dimensions", "dim"), ("measures", "msr")] {
+        let fields = v[key].as_array().cloned().unwrap_or_default();
+        for f in &fields {
+            let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let near = match f["score"].as_f64() {
+                Some(s) if s < 1.0 => format!(" ~{s:.2}"),
+                _ => String::new(),
+            };
+            println!("{:<40} {} {:<32} {}{near}", f["uid"].as_str().unwrap_or(""), label, f["name"].as_str().unwrap_or(""), style(&tables.join(", ")));
+        }
+        counts.push(format!("{} {key}", fields.len()));
     }
-    println!("{}", style(&format!("-- {} dimensions can be added · server {} us", dims.len(), v["total_us"])));
+    println!("{}", style(&format!("-- can add {} · server {} us", counts.join(", "), v["total_us"])));
 }
 
 /// A dimension's sampled values by uid or name, else by a unique substring
