@@ -3,13 +3,17 @@
 //! live in memory and under a data directory so a restart reloads them.
 //!
 //! ```text
-//! POST /projects/{uid}/branches/{branch}/deploy    body: tar.gz of the project
-//! POST /projects/{uid}/branches/{branch}/plan      {"spec": {...}, "context": {...}}
-//! GET  /projects/{uid}/branches/{branch}           summary and warnings
-//! GET  /projects/{uid}/branches/{branch}/fields    ?q=text&hidden=true
+//! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
+//! POST /projects/{uid}/branches/{branch}/validate      the same, keeping nothing
+//! POST /projects/{uid}/branches/{branch}/plan          {"spec": {...}, "context": {...}}
+//! POST /projects/{uid}/branches/{branch}/test          run the deployed tests/*.yml again
+//! GET  /projects/{uid}/branches/{branch}               summary and warnings
+//! GET  /projects/{uid}/branches/{branch}/fields        ?q=text&hidden=true
 //! GET  /projects/{uid}/branches/{branch}/tables
 //! GET  /projects/{uid}/branches/{branch}/values/{dim}
-//! GET  /projects                                   every deployed branch
+//! GET  /projects/{uid}/branches/{branch}/sampling-plan  the SQL the CLI runs to sample values
+//! DELETE /projects/{uid}/branches/{branch}
+//! GET  /projects                                       every deployed branch
 //! GET  /healthz
 //! ```
 
@@ -17,7 +21,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,6 +39,7 @@ struct Deployed {
     branch: String,
     universe: Universe,
     values: Option<ValueCatalog>,
+    tests: Vec<zsql_project::ProjectTest>,
     warnings: Vec<String>,
     deployed_at: String,
 }
@@ -76,13 +81,71 @@ fn summary(d: &Deployed) -> Value {
         "datasources": s.datasources.len(), "tables": s.tables.len(), "fields": s.fields.len(),
         "joins": s.join_defs.len(), "paths": s.paths.len(), "policies": s.security_policies.len(),
         "values": d.values.as_ref().map(|v| v.dimensions.len()).unwrap_or(0),
+        "tests": d.tests.len(),
         "warnings": d.warnings,
     })
+}
+
+/// Runs the deployed project's tests/*.yml: each projects its fields and
+/// compares the SQL with the assertion.
+fn run_tests(app: &App, d: &Deployed) -> Value {
+    let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
+    let base = match app.dialects.base() {
+        Ok(b) => b,
+        Err(e) => return json!({ "error": e.to_string() }),
+    };
+    let normalize = |sql: &str| sql.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut results = Vec::new();
+    let (mut passed, mut failed) = (0, 0);
+    for t in &d.tests {
+        let spec = zsql_spec::Spec {
+            projections: t.projections.iter().map(|f| zsql_spec::spec::ProjectionSpec { field: Some(Value::String(f.clone())), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let outcome = zsql_spec::lower(&spec, &d.universe, &base).map_err(|e| e.to_string()).and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
+        let (status, detail) = match (&outcome, &t.assert_sql, &t.assert_regex) {
+            (Err(e), _, _) => ("error", json!({ "message": e })),
+            (Ok(sql), Some(expected), _) => {
+                if normalize(sql) == normalize(expected) {
+                    ("passed", Value::Null)
+                } else {
+                    ("failed", json!({ "message": "Generated SQL does not match expected SQL", "expected_sql": expected, "generated_sql": sql }))
+                }
+            }
+            (Ok(sql), None, Some(pattern)) => match regex::RegexBuilder::new(pattern).case_insensitive(true).dot_matches_new_line(true).build() {
+                Ok(re) if re.is_match(sql) => ("passed", Value::Null),
+                Ok(_) => ("failed", json!({ "message": "Generated SQL does not match regex pattern", "pattern": pattern, "generated_sql": sql })),
+                Err(e) => ("error", json!({ "message": format!("bad assert_regex: {e}") })),
+            },
+            (Ok(_), None, None) => ("error", json!({ "message": "No assertion defined (assert_sql or assert_regex required)" })),
+        };
+        if status == "passed" {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+        let mut r = json!({ "name": t.name, "status": status, "file": t.file.file_name().map(|f| f.to_string_lossy().to_string()) });
+        if let Value::Object(extra) = detail {
+            for (k, v) in extra {
+                r[k] = v;
+            }
+        }
+        results.push(r);
+    }
+    json!({ "passed": passed, "failed": failed, "results": results })
 }
 
 // ------------------------------------------------------------------ deploy
 
 async fn deploy(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    deploy_or_validate(app, uid, branch, body, true)
+}
+
+async fn validate(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    deploy_or_validate(app, uid, branch, body, false)
+}
+
+fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
@@ -96,21 +159,27 @@ async fn deploy(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_project::load(&root, &app.dialects).map_err(|e| bad(e.to_string()))?;
         let universe = Universe::build(loaded.snapshot.clone()).map_err(|e| bad(e.to_string()))?;
-        // Keep the compiled model on disk so a restart reloads it.
-        let dir = app.data_dir.join(&uid).join(&branch);
-        std::fs::create_dir_all(&dir).map_err(|e| bad(e.to_string()))?;
-        write_gz(&dir.join("snapshot.json.gz"), &serde_json::to_vec(&loaded.snapshot).map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
-        match &loaded.values {
-            Some(v) => v.write(&dir.join(zsql_project::values::FILE_NAME)).map_err(|e| bad(e.to_string()))?,
-            None => {
-                let _ = std::fs::remove_file(dir.join(zsql_project::values::FILE_NAME));
-            }
-        }
         let mut warnings = loaded.warnings;
         warnings.extend(universe.warnings().iter().cloned());
-        let deployed = Arc::new(Deployed { uid: uid.clone(), branch: branch.clone(), universe, values: loaded.values, warnings, deployed_at: now() });
-        let out = summary(&deployed);
-        app.models.write().unwrap().insert(key(&uid, &branch), deployed);
+        let deployed = Arc::new(Deployed { uid: uid.clone(), branch: branch.clone(), universe, values: loaded.values, tests: loaded.tests, warnings, deployed_at: now() });
+        let mut out = summary(&deployed);
+        out["test_results"] = run_tests(&app, &deployed);
+        out["validated_only"] = Value::Bool(!keep);
+        if keep {
+            // Keep the compiled model on disk so a restart reloads it.
+            let dir = app.data_dir.join(&uid).join(&branch);
+            std::fs::create_dir_all(&dir).map_err(|e| bad(e.to_string()))?;
+            write_gz(&dir.join("snapshot.json.gz"), &serde_json::to_vec(&loaded.snapshot).map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
+            match &deployed.values {
+                Some(v) => v.write(&dir.join(zsql_project::values::FILE_NAME)).map_err(|e| bad(e.to_string()))?,
+                None => {
+                    let _ = std::fs::remove_file(dir.join(zsql_project::values::FILE_NAME));
+                }
+            }
+            let tests_json = serde_json::to_vec(&deployed.tests.iter().map(|t| json!({ "file": t.file.file_name().map(|f| f.to_string_lossy().to_string()), "name": t.name, "projections": t.projections, "assert_sql": t.assert_sql, "assert_regex": t.assert_regex })).collect::<Vec<_>>()).map_err(|e| bad(e.to_string()))?;
+            std::fs::write(dir.join("tests.json"), tests_json).map_err(|e| bad(e.to_string()))?;
+            app.models.write().unwrap().insert(key(&uid, &branch), deployed);
+        }
         Ok(out)
     })();
     let _ = std::fs::remove_dir_all(&work);
@@ -248,6 +317,52 @@ async fn values(State(app): State<Shared>, Path((uid, branch, dim)): Path<(Strin
     }
 }
 
+async fn test(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let d = model(&app, &uid, &branch)?;
+    Ok(Json(run_tests(&app, &d)))
+}
+
+async fn sampling_plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
+    let d = model(&app, &uid, &branch)?;
+    let dims: Vec<String> = q.dims.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
+        match app.dialects.get(adapter) {
+            Ok(dl) => zsql_planner::sql::expr::qualify(sql, columns, &dl, alias),
+            Err(_) => sql.to_string(),
+        }
+    };
+    let (jobs, skipped) = zsql_project::values::plan(&d.universe, &dims, q.full, &qualify);
+    let jobs: Vec<Value> = jobs
+        .iter()
+        .map(|j| {
+            json!({
+                "uid": j.uid, "name": j.name, "table": j.table_uid, "datasource": j.datasource_uid, "adapter": j.adapter,
+                "mode": j.mode, "cap": j.cap, "distinct_sql": j.distinct_sql, "values_sql": j.values_sql, "range_sql": j.range_sql,
+                "sampled_at": d.values.as_ref().and_then(|v| v.get(&j.uid)).map(|e| e.sampled_at.clone()),
+            })
+        })
+        .collect();
+    let skipped: Vec<Value> = skipped.iter().map(|(uid, why)| json!({ "uid": uid, "reason": why })).collect();
+    Ok(Json(json!({ "jobs": jobs, "skipped": skipped, "full_ceiling": zsql_project::values::FULL_CEILING })))
+}
+
+#[derive(Deserialize)]
+struct SamplingQuery {
+    #[serde(default)]
+    dims: String,
+    #[serde(default)]
+    full: bool,
+}
+
+async fn remove(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let removed = app.models.write().unwrap().remove(&key(&uid, &branch)).is_some();
+    if !removed {
+        return Err(not_found(&uid, &branch));
+    }
+    let _ = std::fs::remove_dir_all(app.data_dir.join(&uid).join(&branch));
+    Ok(Json(json!({ "removed": key(&uid, &branch) })))
+}
+
 async fn branch_summary(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let d = model(&app, &uid, &branch)?;
     Ok(Json(summary(&d)))
@@ -280,8 +395,21 @@ fn reload(app: &App) -> anyhow::Result<usize> {
             let snapshot = Snapshot::from_path(&snap_path)?;
             let universe = Universe::build(snapshot)?;
             let values = ValueCatalog::read(&b.path().join(zsql_project::values::FILE_NAME))?;
+            let tests: Vec<zsql_project::ProjectTest> = std::fs::read_to_string(b.path().join("tests.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| zsql_project::ProjectTest {
+                    file: PathBuf::from(v["file"].as_str().unwrap_or("")),
+                    name: v["name"].as_str().unwrap_or("").to_string(),
+                    projections: v["projections"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect(),
+                    assert_sql: v["assert_sql"].as_str().map(str::to_string),
+                    assert_regex: v["assert_regex"].as_str().map(str::to_string),
+                })
+                .collect();
             let deployed_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(|t| humantime(t)).unwrap_or_default();
-            app.models.write().unwrap().insert(key(&uid, &branch), Arc::new(Deployed { uid: uid.clone(), branch, universe, values, warnings: vec![], deployed_at }));
+            app.models.write().unwrap().insert(key(&uid, &branch), Arc::new(Deployed { uid: uid.clone(), branch, universe, values, tests, warnings: vec![], deployed_at }));
             n += 1;
         }
     }
@@ -315,6 +443,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects", get(projects))
         .route("/projects/{uid}/branches/{branch}", get(branch_summary))
         .route("/projects/{uid}/branches/{branch}/deploy", post(deploy))
+        .route("/projects/{uid}/branches/{branch}/validate", post(validate))
+        .route("/projects/{uid}/branches/{branch}/test", post(test))
+        .route("/projects/{uid}/branches/{branch}/sampling-plan", get(sampling_plan))
+        .route("/projects/{uid}/branches/{branch}", delete(remove))
         .route("/projects/{uid}/branches/{branch}/plan", post(plan))
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))

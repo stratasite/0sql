@@ -1,315 +1,287 @@
+//! zsql: author a semantic model, deploy it, query it. No SQL is generated
+//! here; every plan comes from a zsqld server.
+
+mod config;
 mod exprs;
 mod remote;
+mod templates;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use config::Project;
+use remote::Client;
+use serde_json::{json, Value};
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::PathBuf;
-use std::time::Instant;
-use zsql_dialect::Dialects;
-use zsql_golden::{print_scoreboard, score, Fixtures, PathSource};
-use zsql_semantic::{Snapshot, Universe};
-use zsql_spec::SecurityContext;
-use serde_yaml as serde_yaml_value;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)")]
+#[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-/// Where the semantic model comes from: a snapshot file, or a project
-/// directory (project.yml, datasources.yml, models/).
-#[derive(Args)]
-struct Source {
-    /// A snapshot JSON file (`.json` or `.json.gz`).
-    #[arg(long, conflicts_with = "project")]
-    snapshot: Option<PathBuf>,
-    /// A project directory, loaded and formed on the fly.
-    #[arg(long)]
+/// Which project and branch a command works on, and which server.
+#[derive(Args, Clone)]
+struct Where {
+    /// Project directory; defaults to the one holding project.yml here or above.
+    #[arg(long, global = true)]
     project: Option<PathBuf>,
-    /// Directory of dwh dialect settings; the settings compiled in are used by default.
-    #[arg(long)]
-    dialects: Option<PathBuf>,
+    /// Branch; defaults to the checked-out git branch.
+    #[arg(long, global = true)]
+    branch: Option<String>,
+    /// The zsqld server; defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
+    #[arg(long, global = true)]
+    server: Option<String>,
+    /// Project uid, when there is no project directory at hand.
+    #[arg(long, global = true)]
+    uid: Option<String>,
 }
 
-struct Model {
-    snapshot: Snapshot,
-    warnings: Vec<String>,
-    tests: Vec<zsql_project::ProjectTest>,
-    values: Option<zsql_project::values::ValueCatalog>,
-    dialects: Dialects,
+struct Target {
+    project: Option<Project>,
+    uid: String,
+    branch: String,
+    client: Client,
 }
 
-impl Source {
-    fn load(&self) -> Result<Model> {
-        let dialects = match &self.dialects {
-            Some(dir) => Dialects::new(dir),
-            None => Dialects::builtin(),
+impl Where {
+    fn resolve(&self) -> Result<Target> {
+        let project = match &self.project {
+            Some(dir) => Some(config::read_project(dir)?),
+            None => match (&self.uid, config::find_project(Path::new("."))) {
+                (_, Ok(p)) => Some(p),
+                (Some(_), Err(_)) => None,
+                (None, Err(e)) => return Err(e),
+            },
         };
-        match (&self.snapshot, &self.project) {
-            (Some(path), _) => Ok(Model { snapshot: Snapshot::from_path(path).with_context(|| path.display().to_string())?, warnings: vec![], tests: vec![], values: None, dialects }),
-            (None, Some(dir)) => {
-                let loaded = zsql_project::load(dir, &dialects)?;
-                Ok(Model { snapshot: loaded.snapshot, warnings: loaded.warnings, tests: loaded.tests, values: loaded.values, dialects })
-            }
-            (None, None) => bail!("give --snapshot <file> or --project <dir>"),
-        }
+        let uid = match (&self.uid, &project) {
+            (Some(u), _) => u.clone(),
+            (None, Some(p)) => p.uid.clone(),
+            (None, None) => bail!("give --uid or run inside a project"),
+        };
+        let branch = match (&self.branch, &project) {
+            (Some(b), _) => b.clone(),
+            (None, Some(p)) => config::git_branch(&p.dir)?,
+            (None, None) => "main".into(),
+        };
+        let server = config::server(self.server.as_deref(), project.as_ref());
+        let api_key = config::api_key(project.as_ref());
+        Ok(Target { project, uid, branch, client: Client::new(&server, api_key) })
     }
-}
-
-fn summary(snap: &Snapshot) -> String {
-    format!(
-        "{} / {}: {} datasources, {} tables, {} fields, {} expressions, {} joins, {} paths, {} policies",
-        snap.project.uid,
-        snap.branch.uid,
-        snap.datasources.len(),
-        snap.tables.len(),
-        snap.fields.len(),
-        snap.expressions.len(),
-        snap.join_defs.len(),
-        snap.paths.len(),
-        snap.security_policies.len()
-    )
-}
-
-fn read_context(path: Option<PathBuf>) -> Result<Option<SecurityContext>> {
-    Ok(match path {
-        Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| p.display().to_string())?)?),
-        None => None,
-    })
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Load the model, build the universe and report what is in it.
-    Check {
-        #[command(flatten)]
-        source: Source,
-    },
-    /// Plan one query against the model and print the SQL.
-    Plan {
-        #[command(flatten)]
-        source: Source,
-        /// A JSON file holding a query spec (fields by uid or name), or a golden case (its `spec` is used).
-        #[arg(long, conflicts_with = "expr")]
-        spec: Option<PathBuf>,
-        /// A comma-separated line of projections, filters and calculations, as the repl reads it.
+    /// Start a project here (or in DIR): project.yml, datasources.yml, models/, tests/, samples/, security.yml.
+    Init {
+        dir: Option<PathBuf>,
         #[arg(long)]
-        expr: Option<String>,
-        /// A JSON file holding the security context (email, admin flags, groups with tags).
-        #[arg(long)]
-        context: Option<PathBuf>,
-        /// Also print each node's alias and the identity string it hashes from.
-        #[arg(long)]
-        identity: bool,
-    },
-    /// Write the loaded model as a snapshot file (`.json`, or `.json.gz` when the name ends in .gz).
-    Export {
-        #[command(flatten)]
-        source: Source,
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Run the project's tests/*.yml planner assertions.
-    Test {
-        #[command(flatten)]
-        source: Source,
-    },
-    /// Plan interactively: a comma-separated line of projections, filters and calculations,
-    /// read from their shape; `.help` lists the forms.
-    Repl {
-        #[command(flatten)]
-        source: Source,
-        #[arg(long)]
-        context: Option<PathBuf>,
-    },
-    /// Score the planner against the golden cases.
-    Golden {
-        #[arg(long, default_value = "")]
-        filter: String,
-        #[arg(long)]
-        strict: bool,
-        #[arg(long)]
-        fixtures: Option<PathBuf>,
-        /// Write expected and produced SQL of every failing case into this directory.
-        #[arg(long)]
-        dump: Option<PathBuf>,
-        /// Join paths to plan over: `formed` (computed here) or `snapshot` (the stored paths).
-        #[arg(long, default_value = "formed")]
-        paths: String,
-    },
-    /// Time each phase over the golden cases: loading, formation, lowering and planning.
-    Bench {
-        #[arg(long)]
-        fixtures: Option<PathBuf>,
-        /// Plan each case this many times.
-        #[arg(long, default_value_t = 5)]
-        rounds: usize,
-    },
-    /// Form join paths for the model and, for a snapshot, compare them with the paths it stores.
-    Form {
-        #[command(flatten)]
-        source: Source,
-    },
-    /// Deploy the project directory to a zsqld server (model files and sampled values, no secrets).
-    Deploy {
-        #[arg(long)]
-        project: PathBuf,
-        /// The zsqld server.
-        #[arg(long, default_value = remote::DEFAULT_SERVER)]
-        server: String,
-        /// Project uid; defaults to project.yml's uid.
+        name: Option<String>,
         #[arg(long)]
         uid: Option<String>,
-        #[arg(long, default_value = "main")]
-        branch: String,
     },
-    /// Talk to a running zsqld: plan, discover, list deployments.
-    Remote {
+    /// Generate a model file from a template.
+    New {
         #[command(subcommand)]
-        command: RemoteCommand,
+        what: NewCommand,
     },
-    /// Sample dimension values from the project's warehouses into values.jsonl.gz, or show them.
-    Values {
-        #[command(subcommand)]
-        command: ValuesCommand,
-    },
-}
-
-/// Which deployment a remote command addresses.
-#[derive(Args)]
-struct Target {
-    /// The zsqld server.
-    #[arg(long, default_value = remote::DEFAULT_SERVER)]
-    server: String,
-    /// Project uid; defaults to the uid in --project's project.yml, or ./project.yml.
-    #[arg(long)]
-    uid: Option<String>,
-    #[arg(long)]
-    project: Option<PathBuf>,
-    #[arg(long, default_value = "main")]
-    branch: String,
-}
-
-#[derive(Subcommand)]
-enum RemoteCommand {
-    /// Liveness of the server.
-    Health {
-        #[arg(long, default_value = remote::DEFAULT_SERVER)]
-        server: String,
-    },
-    /// Every deployment on the server.
-    List {
-        #[arg(long, default_value = remote::DEFAULT_SERVER)]
-        server: String,
-    },
-    /// Summary and warnings of one deployment.
-    Show {
+    /// Store the API key (and optionally a server) in .zsql for this project.
+    Auth {
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        server: Option<String>,
         #[command(flatten)]
-        target: Target,
+        at: Where,
     },
-    /// Plan on the server: a spec file or a shorthand line.
+    /// Deploy the checked-out branch: the model files, tests and samples (never secrets).
+    Deploy {
+        #[command(flatten)]
+        at: Where,
+        /// Validate only; the server keeps nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Redeploy whenever a project file changes.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Validate the project on the server without deploying (deploy --dry-run).
+    Check {
+        #[command(flatten)]
+        at: Where,
+    },
+    /// Run the deployed branch's tests/*.yml on the server.
+    Test {
+        #[command(flatten)]
+        at: Where,
+    },
+    /// Plan one query on the server and print the SQL.
     Plan {
         #[command(flatten)]
-        target: Target,
+        at: Where,
+        /// A JSON file holding a query spec.
         #[arg(long, conflicts_with = "expr")]
         spec: Option<PathBuf>,
+        /// A comma-separated line of projections, filters and calculations.
         #[arg(long)]
         expr: Option<String>,
         /// A JSON file holding the security context.
         #[arg(long)]
         context: Option<PathBuf>,
-        /// Print the whole response, timings and identities included.
+        /// Print the whole response, timings included.
         #[arg(long)]
         json: bool,
     },
-    /// Fields of the deployment, filtered by text.
+    /// Plan interactively against the server.
+    Repl {
+        #[command(flatten)]
+        at: Where,
+        #[arg(long)]
+        context: Option<PathBuf>,
+    },
+    /// Fields of the deployed branch, filtered by text.
     Fields {
         #[command(flatten)]
-        target: Target,
+        at: Where,
         q: Option<String>,
         #[arg(long)]
         hidden: bool,
     },
-    /// Tables of the deployment.
+    /// Tables of the deployed branch.
     Tables {
         #[command(flatten)]
-        target: Target,
+        at: Where,
     },
     /// Sampled values of a dimension.
     Values {
-        #[command(flatten)]
-        target: Target,
-        dim: String,
+        #[command(subcommand)]
+        what: ValuesCommand,
     },
-    /// The interactive loop, planned on the server.
-    Repl {
+    /// Summary of the deployed branch.
+    Status {
         #[command(flatten)]
-        target: Target,
+        at: Where,
+    },
+    /// Every deployment on the server.
+    List {
+        #[command(flatten)]
+        at: Where,
+    },
+    /// Remove a deployed branch from the server.
+    Remove {
+        #[command(flatten)]
+        at: Where,
         #[arg(long)]
-        context: Option<PathBuf>,
+        yes: bool,
+    },
+    /// Liveness of the server.
+    Health {
+        #[command(flatten)]
+        at: Where,
+    },
+}
+
+#[derive(Subcommand)]
+enum NewCommand {
+    /// models/<domain>/tbl.<name>.yml
+    Table {
+        name: String,
+        #[arg(long)]
+        datasource: String,
+        #[arg(long)]
+        physical_name: Option<String>,
+        #[arg(long, default_value = "core")]
+        domain: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// models/<domain>/rel.<domain>.yml
+    Relation {
+        #[arg(long)]
+        datasource: String,
+        #[arg(long, default_value = "core")]
+        domain: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// tests/<name>.yml
+    Test {
+        name: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
 }
 
 #[derive(Subcommand)]
 enum ValuesCommand {
-    /// Sample the listable dimensions (top values by row count, or ranges for numbers and dates).
+    /// Show a dimension's sampled values from the deployed branch.
+    Show {
+        #[command(flatten)]
+        at: Where,
+        dim: String,
+    },
+    /// Sample the listable dimensions from the project's warehouses into samples/values.jsonl.gz.
+    /// The server says what to run (it knows the model); the SQL runs here, where the credentials are.
     Sample {
-        #[arg(long)]
-        project: PathBuf,
-        /// Only these dimensions (uids or names); default: every listable one.
+        #[command(flatten)]
+        at: Where,
+        /// Only these dimensions (uids or names).
         #[arg(long, value_delimiter = ',')]
         dims: Vec<String>,
-        /// Take every distinct value, not the top `value_list_size` (refused above 100k).
+        /// Every distinct value, not the top value_list_size (refused above the server's ceiling).
         #[arg(long)]
         full: bool,
-        /// Resample only dimensions sampled more than this many days ago (or never).
+        /// Resample only dimensions sampled more than this many days ago, or never.
         #[arg(long)]
         older_than: Option<i64>,
         /// Print the SQL that would run and stop.
         #[arg(long)]
         dry_run: bool,
-    },
-    /// Show what values.jsonl.gz holds, for one dimension or all.
-    Show {
+        /// Deploy the project afterwards so the server has the new values.
         #[arg(long)]
-        project: PathBuf,
-        /// A dimension uid or name.
-        dim: Option<String>,
+        deploy: bool,
     },
 }
 
 fn main() -> Result<()> {
-    // A closed pipe (`zsql ... | head`) ends the program quietly instead of panicking.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     match Cli::parse().command {
-        Command::Check { source } => {
-            let model = source.load()?;
-            println!("{}", summary(&model.snapshot));
-            let universe = Universe::build(model.snapshot)?;
-            for w in model.warnings.iter().chain(universe.warnings().iter()) {
-                println!("warning: {w}");
+        Command::Init { dir, name, uid } => init(dir, name, uid),
+        Command::New { what } => new_file(what),
+        Command::Auth { api_key, server, at } => {
+            let project = match &at.project {
+                Some(d) => config::read_project(d)?,
+                None => config::find_project(Path::new("."))?,
+            };
+            config::write_secret(&project.dir, "api_key", &api_key)?;
+            if let Some(s) = server {
+                config::write_secret(&project.dir, "server", &s)?;
             }
+            println!("saved to {}", project.dir.join(config::LOCAL_FILE).display());
+            Ok(())
         }
-        Command::Plan { source, spec, expr, context, identity } => {
-            let model = source.load()?;
-            for w in &model.warnings {
-                eprintln!("warning: {w}");
+        Command::Deploy { at, dry_run, watch } => deploy(at, dry_run, watch),
+        Command::Check { at } => deploy(at, true, false),
+        Command::Test { at } => {
+            let t = at.resolve()?;
+            let v = t.client.post(&format!("{}/test", remote::branch_path(&t.uid, &t.branch)), &json!({}))?;
+            if !remote::print_tests(&v) {
+                bail!("tests failed");
             }
-            let universe = Universe::build(model.snapshot)?;
-            let context = read_context(context)?;
-            let base = model.dialects.base()?;
-            let spec = match (spec, expr) {
+            Ok(())
+        }
+        Command::Plan { at, spec, expr, context, json } => {
+            let t = at.resolve()?;
+            let spec_value = match (spec, expr) {
                 (Some(path), _) => {
                     let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
-                    let value: serde_json::Value = serde_json::from_str(&text)?;
-                    let value = value.get("spec").cloned().unwrap_or(value);
-                    zsql_spec::Spec::from_value(value)?
+                    let value: Value = serde_json::from_str(&text)?;
+                    value.get("spec").cloned().unwrap_or(value)
                 }
                 (None, Some(line)) => {
                     let (spec, items) = exprs::parse_line(&line).map_err(|e| anyhow::anyhow!(e))?;
@@ -320,493 +292,208 @@ fn main() -> Result<()> {
                 }
                 (None, None) => bail!("plan needs --spec or --expr"),
             };
-            let query = zsql_spec::lower(&spec, &universe, &base)?;
-            let plan = zsql_planner::Planner::new(&universe, &model.dialects, None).plan_query_explained(query, context.as_ref(), identity)?;
-            println!("{}", plan.sql);
-            if identity {
-                for (alias, id) in &plan.identities {
-                    println!("\n== {alias}\n{id}");
-                }
-            }
-        }
-        Command::Export { source, out } => {
-            let model = source.load()?;
-            for w in &model.warnings {
-                eprintln!("warning: {w}");
-            }
-            let text = serde_json::to_string_pretty(&model.snapshot)?;
-            if out.extension().and_then(|e| e.to_str()) == Some("gz") {
-                let file = std::fs::File::create(&out).with_context(|| out.display().to_string())?;
-                let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-                enc.write_all(text.as_bytes())?;
-                enc.finish()?;
+            let context = read_json(context)?;
+            let v = remote::plan(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), json)?;
+            if json {
+                remote::print_json(&v)?;
             } else {
-                std::fs::write(&out, text).with_context(|| out.display().to_string())?;
+                println!("{}", v["sql"].as_str().unwrap_or(""));
             }
-            println!("wrote {} ({})", out.display(), summary(&model.snapshot));
+            Ok(())
         }
-        Command::Test { source } => {
-            let model = source.load()?;
-            if model.tests.is_empty() {
-                println!("no tests/*.yml in the project");
-                return Ok(());
-            }
-            let universe = Universe::build(model.snapshot)?;
-            let planner = zsql_planner::Planner::new(&universe, &model.dialects, None);
-            let base = model.dialects.base()?;
-            let normalize = |sql: &str| sql.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-            let (mut passed, mut failed) = (0, 0);
-            for t in &model.tests {
-                let spec = zsql_spec::Spec {
-                    projections: t.projections.iter().map(|f| zsql_spec::spec::ProjectionSpec { field: Some(serde_json::Value::String(f.clone())), ..Default::default() }).collect(),
-                    ..Default::default()
-                };
-                let outcome = zsql_spec::lower(&spec, &universe, &base)
-                    .map_err(|e| e.to_string())
-                    .and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
-                let verdict = match (&outcome, &t.assert_sql, &t.assert_regex) {
-                    (Err(e), _, _) => Err(format!("error: {e}")),
-                    (Ok(sql), Some(expected), _) => {
-                        if normalize(sql) == normalize(expected) {
-                            Ok(())
-                        } else {
-                            Err(format!("Generated SQL does not match expected SQL\n--- expected\n{expected}\n--- generated\n{sql}"))
-                        }
-                    }
-                    (Ok(sql), None, Some(pattern)) => match regex::RegexBuilder::new(pattern).case_insensitive(true).dot_matches_new_line(true).build() {
-                        Ok(re) if re.is_match(sql) => Ok(()),
-                        Ok(_) => Err(format!("Generated SQL does not match regex pattern {pattern}\n--- generated\n{sql}")),
-                        Err(e) => Err(format!("bad assert_regex: {e}")),
-                    },
-                    (Ok(_), None, None) => Err("No assertion defined (assert_sql or assert_regex required)".into()),
-                };
-                match verdict {
-                    Ok(()) => {
-                        passed += 1;
-                        println!("PASS {}", t.name);
-                    }
-                    Err(msg) => {
-                        failed += 1;
-                        println!("FAIL {} ({})\n{}", t.name, t.file.display(), msg);
-                    }
-                }
-            }
-            println!("{passed} passed, {failed} failed");
-            if failed > 0 {
-                bail!("{failed} test(s) failed");
-            }
+        Command::Repl { at, context } => repl(at.resolve()?, read_json(context)?),
+        Command::Fields { at, q, hidden } => {
+            let t = at.resolve()?;
+            remote::print_fields(&t.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&q.unwrap_or_default())))?);
+            Ok(())
         }
-        Command::Repl { source, context } => {
-            let t = Instant::now();
-            let model = source.load()?;
-            for w in &model.warnings {
-                eprintln!("warning: {w}");
-            }
-            let universe = Universe::build(model.snapshot.clone())?;
-            let context = read_context(context)?;
-            let planner = zsql_planner::Planner::new(&universe, &model.dialects, None);
-            let base = model.dialects.base()?;
-            let tty = std::io::stdout().is_terminal();
-            let dim = |s: &str| if tty { format!("\x1b[2m{s}\x1b[0m") } else { s.to_string() };
-            let bold = |s: &str| if tty { format!("\x1b[1m{s}\x1b[0m") } else { s.to_string() };
-            println!("{}", dim(&format!("{} in {:.0} ms", summary(universe.snapshot()), t.elapsed().as_secs_f64() * 1e3)));
-            println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
-
-            let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
-            let history = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zsql_history"));
-            if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-                let _ = ed.load_history(h);
-            }
-            let stdin = std::io::stdin();
-            loop {
-                let line = match editor.as_mut() {
-                    Some(ed) => match ed.readline("zsql> ") {
-                        Ok(l) => {
-                            let _ = ed.add_history_entry(l.as_str());
-                            l
-                        }
-                        Err(rustyline::error::ReadlineError::Interrupted) => continue,
-                        Err(_) => break,
-                    },
-                    None => {
-                        print!("zsql> ");
-                        std::io::stdout().flush()?;
-                        let mut l = String::new();
-                        if stdin.lock().read_line(&mut l)? == 0 {
-                            break;
-                        }
-                        l
-                    }
-                };
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                // Commands carry a leading dot, as in sqlite, so no field name can shadow them; the
-                // bare `help` and `quit` stay usable while no field is named that.
-                let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
-                let names_a_field = |w: &str| universe.fields().iter().any(|f| f.name.eq_ignore_ascii_case(w) || f.uid.eq_ignore_ascii_case(w));
-                let cmd = match word.strip_prefix('.') {
-                    Some(c) => c,
-                    None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
-                    None => "",
-                };
-                match cmd {
-                    "quit" | "exit" | "q" => break,
-                    "help" | "?" => println!("{}", exprs::HELP),
-                    "tables" => {
-                        for t in universe.tables() {
-                            let ds = universe.datasource(t.datasource_id).map(|d| d.uid.as_str()).unwrap_or("?");
-                            println!("{:<32} {:<32} {} cost {}", t.uid, t.physical_name, ds, t.cost);
-                        }
-                    }
-                    "fields" => {
-                        let needle = rest.to_lowercase();
-                        for f in universe.fields() {
-                            if needle.is_empty() || f.uid.to_lowercase().contains(&needle) || f.name.to_lowercase().contains(&needle) {
-                                let kind = match f.kind {
-                                    zsql_semantic::FieldKind::Dimension => "dim",
-                                    zsql_semantic::FieldKind::Measure => "msr",
-                                };
-                                println!("{:<40} {} {}{}", f.uid, kind, f.name, if f.hidden { " (hidden)" } else { "" });
-                            }
-                        }
-                    }
-                    "values" => match &model.values {
-                        None => println!("no values.jsonl.gz in the project; run `zsql values sample --project <dir>`"),
-                        Some(cat) => {
-                            let needle = rest.to_lowercase();
-                            for d in cat.dimensions.iter().filter(|d| needle.is_empty() || d.uid.to_lowercase().contains(&needle) || d.name.to_lowercase().contains(&needle)) {
-                                print_values(d, needle.is_empty());
-                            }
-                        }
-                    },
-                    "tojson" => {
-                        // The shorthand line as the JSON spec it lowers from, not planned.
-                        match exprs::parse_line(rest) {
-                            Ok((spec, items)) => {
-                                for d in exprs::describe(&items) {
-                                    println!("{}", dim(&d));
-                                }
-                                println!("{}", serde_json::to_string_pretty(&spec.to_value())?);
-                            }
-                            Err(e) => println!("error: {e}"),
-                        }
-                    }
-                    "" | "json" => {
-                        // A JSON spec (`.json {...}` or a bare object), else the shorthand line.
-                        let json_text = if cmd == "json" { Some(rest) } else if line.starts_with('{') { Some(line) } else { None };
-                        let t0 = Instant::now();
-                        let parsed: Result<zsql_spec::Spec, String> = match json_text {
-                            Some(text) => zsql_spec::Spec::from_json(text).map_err(|e| e.to_string()),
-                            None => exprs::parse_line(line).map(|(spec, items)| {
-                                for d in exprs::describe(&items) {
-                                    println!("{}", dim(&d));
-                                }
-                                spec
-                            }),
-                        };
-                        let lowered = parsed.and_then(|spec| zsql_spec::lower(&spec, &universe, &base).map_err(|e| e.to_string()));
-                        let t1 = Instant::now();
-                        let planned = lowered.and_then(|q| planner.plan_query(q, context.as_ref()).map_err(|e| format!("{}: {e}", e.rails_class())));
-                        let t2 = Instant::now();
-                        match planned {
-                            Ok(plan) => {
-                                println!("{}", bold(&plan.sql));
-                                println!(
-                                    "{}",
-                                    dim(&format!(
-                                        "-- {} · {:.2} ms (resolve {:.2} ms, plan {:.2} ms)",
-                                        plan.adapter,
-                                        (t2 - t0).as_secs_f64() * 1e3,
-                                        (t1 - t0).as_secs_f64() * 1e3,
-                                        (t2 - t1).as_secs_f64() * 1e3
-                                    ))
-                                );
-                            }
-                            Err(e) => println!("error: {e}"),
-                        }
-                    }
-                    other => println!("unknown command .{other}; .help lists them"),
-                }
-            }
-            if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-                let _ = ed.save_history(h);
-            }
+        Command::Tables { at } => {
+            let t = at.resolve()?;
+            remote::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?);
+            Ok(())
         }
-        Command::Golden { filter, strict, fixtures, dump, paths } => {
-            let source = if paths == "snapshot" { PathSource::Snapshot } else { PathSource::Formed };
-            let fx = Fixtures::open(fixtures.unwrap_or_else(Fixtures::default_root));
-            let report = score(&fx, &filter, source)?;
-            let (total, passed) = print_scoreboard(&report);
-            if let Some(dir) = dump {
-                std::fs::create_dir_all(&dir)?;
-                let cases = fx.cases()?;
-                for fs in report.values() {
-                    for (id, outcome) in &fs.failed {
-                        let case = cases.values().flatten().find(|c| &c.id == id).unwrap();
-                        let safe = id.replace(['#', '/', ' '], "_");
-                        let expected = match &case.expected {
-                            zsql_golden::Expected::Sql { sql } => sql.clone(),
-                            zsql_golden::Expected::Error { error } => format!("ERROR {}: {}", error.class, error.message),
-                        };
-                        let got = match outcome {
-                            zsql_golden::Outcome::SqlMismatch { got } | zsql_golden::Outcome::NoError { got } => got.clone(),
-                            zsql_golden::Outcome::WrongError { got } => format!("ERROR {got}"),
-                            other => format!("{other:?}"),
-                        };
-                        std::fs::write(dir.join(format!("{safe}.expected.sql")), expected)?;
-                        std::fs::write(dir.join(format!("{safe}.got.sql")), got)?;
-                        std::fs::write(dir.join(format!("{safe}.spec.json")), serde_json::to_string_pretty(&case.spec)?)?;
-                    }
-                }
-            }
-            if strict && passed != total {
-                bail!("{} of {} golden cases failing", total - passed, total);
-            }
+        Command::Values { what } => values(what),
+        Command::Status { at } => {
+            let t = at.resolve()?;
+            remote::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::Bench { fixtures, rounds } => {
-            use std::time::Duration;
-            let fx = Fixtures::open(fixtures.unwrap_or_else(Fixtures::default_root));
-            let dialects = fx.dialects();
-            let base = dialects.base()?;
-            let cases: Vec<_> = fx.cases()?.into_values().flatten().collect();
-            let hashes = fx.snapshot_hashes()?;
-
-            let t = Instant::now();
-            for h in &hashes {
-                fx.universe(h)?;
+        Command::List { at } => {
+            let server = config::server(at.server.as_deref(), at.resolve().ok().and_then(|t| t.project).as_ref());
+            let client = Client::new(&server, config::api_key(None));
+            let v = client.get("/projects")?;
+            for d in v["deployments"].as_array().into_iter().flatten() {
+                println!("{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests", d["project"].as_str().unwrap_or(""), d["branch"].as_str().unwrap_or(""), d["tables"], d["fields"], d["policies"], d["values"], d["tests"]);
             }
-            let load = t.elapsed();
-            let t = Instant::now();
-            for h in &hashes {
-                fx.formed_paths(h)?;
-            }
-            let form = t.elapsed();
-            let held: Vec<(String, std::sync::Arc<Universe>, std::sync::Arc<Vec<zsql_semantic::Path>>)> =
-                hashes.iter().map(|h| Ok((h.clone(), fx.universe(h)?, fx.formed_paths(h)?))).collect::<Result<_>>()?;
-            let t = Instant::now();
-            let planners: std::collections::HashMap<&str, zsql_planner::Planner<'_>> =
-                held.iter().map(|(h, u, p)| (h.as_str(), zsql_planner::Planner::new(u, dialects, Some(p)))).collect();
-            let index = t.elapsed();
-
-            let (mut lower_time, mut plan_time, mut compare_time) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-            let mut n = 0usize;
-            for _ in 0..rounds {
-                for case in &cases {
-                    let universe = fx.universe(&case.universe)?;
-                    let planner = &planners[case.universe.as_str()];
-                    let t = Instant::now();
-                    let lowered = zsql_spec::Spec::from_value(case.spec.clone()).and_then(|s| zsql_spec::lower(&s, &universe, &base));
-                    lower_time += t.elapsed();
-                    if let Ok(q) = lowered {
-                        let t = Instant::now();
-                        let planned = planner.plan_query(q, case.context.as_ref());
-                        plan_time += t.elapsed();
-                        n += 1;
-                        if let (Ok(p), zsql_golden::Expected::Sql { sql }) = (&planned, &case.expected) {
-                            let t = Instant::now();
-                            let _ = zsql_golden::structural_form(&p.sql) == zsql_golden::structural_form(sql);
-                            compare_time += t.elapsed();
-                        }
-                    }
-                }
-            }
-            let per = |d: Duration, n: usize| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
-            println!("{:<28} {:>10} {:>12}", "phase", "total ms", "per item us");
-            println!("{:<28} {:>10.1} {:>12.1}", format!("load {} universes", hashes.len()), load.as_secs_f64() * 1e3, per(load, hashes.len()));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("form {} universes", hashes.len()), form.as_secs_f64() * 1e3, per(form, hashes.len()));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("index {} universes", hashes.len()), index.as_secs_f64() * 1e3, per(index, hashes.len()));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("lower spec x{n}"), lower_time.as_secs_f64() * 1e3, per(lower_time, n));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("plan x{n}"), plan_time.as_secs_f64() * 1e3, per(plan_time, n));
-            println!("{:<28} {:>10.1} {:>12.1}", "structural compare", compare_time.as_secs_f64() * 1e3, per(compare_time, n));
-            let phases = zsql_planner::profile::report();
-            if !phases.is_empty() {
-                println!("\n{:<28} {:>10} {:>12} {:>8}", "planner phase", "total ms", "per call us", "calls");
-                for (name, d, calls) in phases {
-                    println!("{:<28} {:>10.1} {:>12.1} {:>8}", name, d.as_secs_f64() * 1e3, per(d, calls as usize), calls);
-                }
-            } else {
-                println!("\n(set ZSQL_PROFILE=1 for per-phase planner timings)");
-            }
+            Ok(())
         }
-        Command::Values { command } => values_command(command)?,
-        Command::Deploy { project, server, uid, branch } => {
-            let uid = remote::project_uid(uid, Some(&project))?;
-            let archive = project_archive(&project)?;
-            let client = remote::Client::new(&server);
-            println!("deploying {} ({} bytes) to {}/projects/{uid}/branches/{branch}", project.display(), archive.len(), client.server);
-            let v = client.post_bytes(&format!("/projects/{uid}/branches/{branch}/deploy"), "application/gzip", &archive)?;
-            remote::print_json(&v)?;
+        Command::Remove { at, yes } => {
+            let t = at.resolve()?;
+            if !yes {
+                bail!("this removes {}/{} from {}; add --yes to confirm", t.uid, t.branch, t.client.server);
+            }
+            remote::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::Remote { command } => remote_command(command)?,
-        Command::Form { source } => {
-            let from_project = source.project.is_some();
-            let model = source.load()?;
-            let stored = model.snapshot.paths.clone();
-            let universe = Universe::build(model.snapshot)?;
-            let formed = zsql_formation::form(&universe);
-            if from_project {
-                println!("{} paths over {} root tables", formed.paths.len(), universe.tables().len());
-            } else {
-                let report = zsql_golden::compare_paths(&universe, &stored, &formed.paths);
-                println!("{}", report.summary());
-                for line in report.mismatches.iter().take(20) {
-                    println!("  {line}");
-                }
-            }
-            println!("{} warnings", formed.warnings.len() + model.warnings.len());
-            for w in model.warnings.iter().chain(formed.warnings.iter()) {
-                println!("warning: {w}");
-            }
+        Command::Health { at } => {
+            let server = config::server(at.server.as_deref(), config::find_project(Path::new(".")).ok().as_ref());
+            let v = Client::new(&server, None).get("/healthz")?;
+            println!("{} {}", server, v.as_str().unwrap_or("ok"));
+            Ok(())
         }
-    }
-    Ok(())
-}
-
-fn print_values(d: &zsql_project::values::DimensionValues, brief: bool) {
-    let when = d.sampled_at.get(..10).unwrap_or(&d.sampled_at);
-    match (&d.range, d.values.is_empty()) {
-        (Some(r), _) => println!("{:<40} {} .. {}  (distinct {}, {})", d.uid, r.min, r.max, d.distinct.map(|n| n.to_string()).unwrap_or_else(|| "?".into()), when),
-        (None, false) => {
-            println!("{:<40} {} of {} values, {:?}, {}", d.uid, d.values.len(), d.distinct.map(|n| n.to_string()).unwrap_or_else(|| "?".into()), d.mode, when);
-            let shown = if brief { 5 } else { d.values.len() };
-            for v in d.values.iter().take(shown) {
-                println!("    {:<60} {}", v.v, v.n);
-            }
-            if shown < d.values.len() {
-                println!("    ... {} more", d.values.len() - shown);
-            }
-        }
-        (None, true) => println!("{:<40} no values ({})", d.uid, when),
     }
 }
 
-fn values_command(command: ValuesCommand) -> Result<()> {
-    use zsql_project::values::{DimensionValues, Range, ValueCatalog, ValueCount, FILE_NAME, FULL_CEILING};
-    match command {
-        ValuesCommand::Show { project, dim } => {
-            let catalog = ValueCatalog::read(&project.join(FILE_NAME))?;
-            let Some(catalog) = catalog else {
-                println!("no {FILE_NAME} in {}", project.display());
-                return Ok(());
-            };
-            let needle = dim.unwrap_or_default().to_lowercase();
-            for d in catalog.dimensions.iter().filter(|d| needle.is_empty() || d.uid.to_lowercase().contains(&needle) || d.name.to_lowercase().contains(&needle)) {
-                print_values(d, needle.is_empty());
-            }
+fn read_json(path: Option<PathBuf>) -> Result<Option<Value>> {
+    Ok(match path {
+        Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| p.display().to_string())?)?),
+        None => None,
+    })
+}
+
+// ------------------------------------------------------------------- init
+
+fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Result<()> {
+    let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    if dir.join("project.yml").exists() {
+        bail!("{} already holds a project", dir.display());
+    }
+    let name = name.unwrap_or_else(|| dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into()));
+    let uid = uid.map(|u| u.to_lowercase()).unwrap_or_else(|| config::slug(&name));
+    let write = |rel: &str, text: &str| -> Result<()> {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        ValuesCommand::Sample { project, dims, full, older_than, dry_run } => {
-            let dialects = Dialects::builtin();
-            let loaded = zsql_project::load(&project, &dialects)?;
-            for w in &loaded.warnings {
-                eprintln!("warning: {w}");
+        if path.exists() {
+            println!("keep   {rel}");
+            return Ok(());
+        }
+        std::fs::write(&path, text)?;
+        println!("create {rel}");
+        Ok(())
+    };
+    write("project.yml", &templates::project_yml(&name, &uid))?;
+    write("datasources.yml", templates::DATASOURCES_YML)?;
+    write("security.yml", templates::SECURITY_YML)?;
+    write("models/.keep", "")?;
+    write("tests/.keep", "")?;
+    write("samples/README.md", templates::SAMPLES_README)?;
+    let gi = dir.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    if !existing.contains(".zsql") {
+        std::fs::write(&gi, format!("{existing}{}{}", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }, templates::GITIGNORE))?;
+        println!("update .gitignore");
+    }
+    if !dir.join(".git").exists() {
+        let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&dir).status().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            println!("git init (branch main)");
+        }
+    }
+    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `zsql auth --api-key ...`, `zsql deploy`");
+    Ok(())
+}
+
+fn new_file(what: NewCommand) -> Result<()> {
+    let (project_dir, rel, text) = match what {
+        NewCommand::Table { name, datasource, physical_name, domain, project } => {
+            let p = project_of(project)?;
+            let file = config::slug(&name).replace('-', "_");
+            (p.dir, format!("models/{domain}/tbl.{file}.yml"), templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource))
+        }
+        NewCommand::Relation { datasource, domain, project } => {
+            let p = project_of(project)?;
+            (p.dir, format!("models/{domain}/rel.{domain}.yml"), templates::relation_yml(&datasource))
+        }
+        NewCommand::Test { name, project } => {
+            let p = project_of(project)?;
+            let file = config::slug(&name).replace('-', "_");
+            (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name))
+        }
+    };
+    let path = project_dir.join(&rel);
+    if path.exists() {
+        bail!("{} exists", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, text)?;
+    println!("create {rel}");
+    Ok(())
+}
+
+fn project_of(dir: Option<PathBuf>) -> Result<Project> {
+    match dir {
+        Some(d) => config::read_project(&d),
+        None => config::find_project(Path::new(".")),
+    }
+}
+
+// ----------------------------------------------------------------- deploy
+
+fn deploy(at: Where, dry_run: bool, watch: bool) -> Result<()> {
+    let t = at.resolve()?;
+    let Some(project) = &t.project else { bail!("deploy needs a project directory") };
+    let action = if dry_run { "validate" } else { "deploy" };
+    let once = |t: &Target| -> Result<bool> {
+        let archive = project_archive(&project.dir)?;
+        let note = if t.branch == project.production_branch { " (the production branch)" } else { "" };
+        println!("{action} {} ({} bytes) as {}/{}{note} to {}", project.name, archive.len(), t.uid, t.branch, t.client.server);
+        let v = t.client.post_bytes(&format!("{}/{action}", remote::branch_path(&t.uid, &t.branch)), "application/gzip", &archive)?;
+        Ok(remote::print_deploy(&v))
+    };
+    if !watch {
+        if !once(&t)? {
+            bail!("tests failed");
+        }
+        return Ok(());
+    }
+    let _ = once(&t);
+    println!("watching {} for changes (ctrl-c to stop)", project.dir.display());
+    let mut last = newest_mtime(&project.dir);
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = newest_mtime(&project.dir);
+        if now != last {
+            std::thread::sleep(Duration::from_millis(200));
+            println!();
+            if let Err(e) = once(&t) {
+                println!("error: {e}");
             }
-            let universe = Universe::build(loaded.snapshot)?;
-            let mut catalog = loaded.values.unwrap_or_default();
-            let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
-                match dialects.get(adapter) {
-                    Ok(d) => zsql_planner::sql::expr::qualify(sql, columns, &d, alias),
-                    Err(_) => sql.to_string(),
-                }
-            };
-            let (jobs, skipped) = zsql_project::values::plan(&universe, &dims, full, &qualify);
-            for (uid, why) in &skipped {
-                if !dims.is_empty() {
-                    println!("skip {uid}: {why}");
-                }
+            last = newest_mtime(&project.dir);
+        }
+    }
+}
+
+fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "target" {
+                continue;
             }
-            let now = chrono::Utc::now();
-            let stale_before = older_than.map(|days| now - chrono::Duration::days(days));
-            let mut todo: Vec<_> = jobs
-                .into_iter()
-                .filter(|j| match (stale_before, catalog.get(&j.uid)) {
-                    (Some(cut), Some(existing)) => chrono::DateTime::parse_from_rfc3339(&existing.sampled_at).map(|t| t < cut).unwrap_or(true),
-                    _ => true,
-                })
-                .collect();
-            todo.sort_by(|a, b| (a.datasource_uid.clone(), a.uid.clone()).cmp(&(b.datasource_uid.clone(), b.uid.clone())));
-            if dry_run {
-                for j in &todo {
-                    println!("-- {} ({}) on {} via {}\n{}\n{}\n", j.uid, j.name, j.table_uid, j.datasource_uid, j.distinct_sql, j.values_sql.clone().or(j.range_sql.clone()).unwrap_or_default());
+            if p.is_dir() {
+                stack.push(p);
+            } else if matches!(p.extension().and_then(|x| x.to_str()), Some("yml") | Some("yaml") | Some("gz")) {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    newest = Some(newest.map_or(m, |n: std::time::SystemTime| n.max(m)));
                 }
-                println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
-                return Ok(());
-            }
-            let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
-            let (mut done, mut failed) = (0, 0);
-            for j in &todo {
-                if !connections.contains_key(&j.datasource_uid) {
-                    let settings = zsql_warehouse::settings_for(&project, &j.datasource_uid)?;
-                    match zsql_warehouse::connect(&settings) {
-                        Ok(c) => {
-                            connections.insert(j.datasource_uid.clone(), c);
-                        }
-                        Err(e) => bail!("datasource {}: {e}", j.datasource_uid),
-                    }
-                }
-                let wh = connections.get_mut(&j.datasource_uid).unwrap();
-                let outcome = (|| -> Result<DimensionValues> {
-                    let distinct = wh.query(&j.distinct_sql)?.first().and_then(|r| r.first().cloned()).flatten().and_then(|n| n.parse::<i64>().ok());
-                    let mut entry = DimensionValues {
-                        uid: j.uid.clone(),
-                        name: j.name.clone(),
-                        table: j.table_uid.clone(),
-                        sampled_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        mode: j.mode,
-                        distinct,
-                        values: vec![],
-                        range: None,
-                    };
-                    if let Some(sql) = &j.values_sql {
-                        if j.cap.is_none() && distinct.map(|n| n > FULL_CEILING).unwrap_or(false) {
-                            bail!("{} has {} distinct values; a full sample is refused above {FULL_CEILING}. Use the default sample or raise value_list_size.", j.uid, distinct.unwrap());
-                        }
-                        entry.values = wh
-                            .query(sql)?
-                            .into_iter()
-                            .filter_map(|r| Some(ValueCount { v: r.first().cloned().flatten()?, n: r.get(1).cloned().flatten().and_then(|n| n.parse().ok()).unwrap_or(0) }))
-                            .collect();
-                    }
-                    if let Some(sql) = &j.range_sql {
-                        let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
-                        if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
-                            entry.range = Some(Range { min: lo, max: hi });
-                        }
-                    }
-                    Ok(entry)
-                })();
-                match outcome {
-                    Ok(entry) => {
-                        let what = match (&entry.range, entry.values.len()) {
-                            (Some(r), _) => format!("{} .. {}", r.min, r.max),
-                            (None, n) => format!("{n} values"),
-                        };
-                        println!("{:<40} {what}", j.uid);
-                        catalog.put(entry);
-                        done += 1;
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("{:<40} FAILED: {e}", j.uid);
-                    }
-                }
-            }
-            catalog.write(&project.join(FILE_NAME))?;
-            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), project.join(FILE_NAME).display());
-            if failed > 0 {
-                bail!("{failed} dimension(s) failed to sample");
             }
         }
     }
-    Ok(())
+    newest
 }
 
 /// The project as a tar.gz: YAML models, tests, security, datasources.yml
-/// with its secrets removed, and values.jsonl.gz. Never .strata, .git or
-/// data files.
-fn project_archive(project: &std::path::Path) -> Result<Vec<u8>> {
-    const SECRET_KEYS: [&str; 7] = ["password", "private_key", "personal_access_token", "secret_access_key", "access_key_id", "oauth_client_secret", "oauth_client_id"];
+/// with its secrets removed, and samples/values.jsonl.gz. Never .zsql,
+/// .strata, .git or data files.
+fn project_archive(project: &Path) -> Result<Vec<u8>> {
+    const SECRET_KEYS: [&str; 8] = ["password", "private_key", "personal_access_token", "secret_access_key", "access_key_id", "oauth_client_secret", "oauth_client_id", "api_key"];
     let mut buf = Vec::new();
     {
         let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -825,22 +512,22 @@ fn project_archive(project: &std::path::Path) -> Result<Vec<u8>> {
             }
         }
         if let Ok(text) = std::fs::read_to_string(project.join("datasources.yml")) {
-            let mut v: serde_yaml_value::Value = serde_yaml_value::from_str(&text)?;
+            let mut v: serde_yaml::Value = serde_yaml::from_str(&text)?;
             if let Some(map) = v.as_mapping_mut() {
                 for (_, ds) in map.iter_mut() {
                     if let Some(entry) = ds.as_mapping_mut() {
                         for k in SECRET_KEYS {
-                            entry.remove(serde_yaml_value::Value::String(k.into()));
+                            entry.remove(serde_yaml::Value::String(k.into()));
                         }
                     }
                 }
             }
-            add("datasources.yml", serde_yaml_value::to_string(&v)?.as_bytes())?;
+            add("datasources.yml", serde_yaml::to_string(&v)?.as_bytes())?;
         }
-        if let Ok(bytes) = std::fs::read(project.join(zsql_project::values::FILE_NAME)) {
-            add(zsql_project::values::FILE_NAME, &bytes)?;
+        if let Ok(bytes) = std::fs::read(project.join("samples").join("values.jsonl.gz")) {
+            add("samples/values.jsonl.gz", &bytes)?;
         }
-        for dir in ["models", "tests", "migrations"] {
+        for dir in ["models", "tests"] {
             let root = project.join(dir);
             if !root.is_dir() {
                 continue;
@@ -858,7 +545,7 @@ fn project_archive(project: &std::path::Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn walk_yaml(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_yaml(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -870,74 +557,274 @@ fn walk_yaml(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn remote_command(command: RemoteCommand) -> Result<()> {
-    let target_of = |t: &Target| -> Result<(remote::Client, String, String)> {
-        Ok((remote::Client::new(&t.server), remote::project_uid(t.uid.clone(), t.project.as_deref())?, t.branch.clone()))
-    };
-    match command {
-        RemoteCommand::Health { server } => {
-            let v = remote::Client::new(&server).get("/healthz")?;
-            println!("{}", v.as_str().unwrap_or("ok"));
+// ----------------------------------------------------------------- values
+
+fn values(what: ValuesCommand) -> Result<()> {
+    match what {
+        ValuesCommand::Show { at, dim } => {
+            let t = at.resolve()?;
+            remote::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, &dim)?);
+            Ok(())
         }
-        RemoteCommand::List { server } => {
-            let v = remote::Client::new(&server).get("/projects")?;
-            for d in v["deployments"].as_array().into_iter().flatten() {
-                println!("{:<32} {:<12} {} tables, {} fields, {} policies, {} values", d["project"].as_str().unwrap_or(""), d["branch"].as_str().unwrap_or(""), d["tables"], d["fields"], d["policies"], d["values"]);
-            }
-        }
-        RemoteCommand::Show { target } => {
-            let (client, uid, branch) = target_of(&target)?;
-            remote::print_json(&client.get(&format!("/projects/{uid}/branches/{branch}"))?)?;
-        }
-        RemoteCommand::Plan { target, spec, expr, context, json } => {
-            let (client, uid, branch) = target_of(&target)?;
-            let spec_value = match (spec, expr) {
-                (Some(path), _) => {
-                    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
-                    let value: serde_json::Value = serde_json::from_str(&text)?;
-                    value.get("spec").cloned().unwrap_or(value)
+        ValuesCommand::Sample { at, dims, full, older_than, dry_run, deploy: deploy_after } => {
+            let t = at.resolve()?;
+            let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
+            let plan = t.client.get(&format!("{}/sampling-plan?dims={}&full={full}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&dims.join(","))))?;
+            let jobs = plan["jobs"].as_array().cloned().unwrap_or_default();
+            let skipped = plan["skipped"].as_array().cloned().unwrap_or_default();
+            if !dims.is_empty() {
+                for s in &skipped {
+                    println!("skip {}: {}", s["uid"].as_str().unwrap_or(""), s["reason"].as_str().unwrap_or(""));
                 }
-                (None, Some(line)) => {
-                    let (spec, items) = exprs::parse_line(&line).map_err(|e| anyhow::anyhow!(e))?;
-                    for d in exprs::describe(&items) {
-                        eprintln!("{d}");
+            }
+            let now = chrono::Utc::now();
+            let cut = older_than.map(|days| now - chrono::Duration::days(days));
+            let todo: Vec<&Value> = jobs
+                .iter()
+                .filter(|j| match (cut, j["sampled_at"].as_str()) {
+                    (Some(cut), Some(at)) => chrono::DateTime::parse_from_rfc3339(at).map(|t| t < cut).unwrap_or(true),
+                    _ => true,
+                })
+                .collect();
+            if dry_run {
+                for j in &todo {
+                    println!("-- {} ({}) on {} via {}\n{}\n{}\n", j["uid"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or(""), j["table"].as_str().unwrap_or(""), j["datasource"].as_str().unwrap_or(""), j["distinct_sql"].as_str().unwrap_or(""), j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or(""));
+                }
+                println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
+                return Ok(());
+            }
+            let samples_dir = project.dir.join("samples");
+            std::fs::create_dir_all(&samples_dir)?;
+            let path = samples_dir.join("values.jsonl.gz");
+            let mut catalog = read_catalog(&path)?;
+            let ceiling = plan["full_ceiling"].as_i64().unwrap_or(100_000);
+            let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
+            let (mut done, mut failed) = (0, 0);
+            for j in &todo {
+                let ds = j["datasource"].as_str().unwrap_or("").to_string();
+                if !connections.contains_key(&ds) {
+                    let settings = zsql_warehouse::settings_for(&project.dir, &ds)?;
+                    match zsql_warehouse::connect(&settings) {
+                        Ok(c) => {
+                            connections.insert(ds.clone(), c);
+                        }
+                        Err(e) => bail!("datasource {ds}: {e}"),
                     }
-                    spec.to_value()
                 }
-                (None, None) => bail!("remote plan needs --spec or --expr"),
-            };
-            let context: Option<serde_json::Value> = match context {
-                Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| p.display().to_string())?)?),
-                None => None,
-            };
-            let v = remote::plan(&client, &uid, &branch, spec_value, context.as_ref(), json)?;
-            if json {
-                remote::print_json(&v)?;
-            } else {
-                println!("{}", v["sql"].as_str().unwrap_or(""));
+                let wh = connections.get_mut(&ds).unwrap();
+                let uid = j["uid"].as_str().unwrap_or("").to_string();
+                let outcome = (|| -> Result<Value> {
+                    let distinct = wh.query(j["distinct_sql"].as_str().unwrap_or(""))?.first().and_then(|r| r.first().cloned()).flatten().and_then(|n| n.parse::<i64>().ok());
+                    let mut entry = json!({
+                        "uid": uid, "name": j["name"], "table": j["table"],
+                        "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "mode": j["mode"], "distinct": distinct,
+                    });
+                    if let Some(sql) = j["values_sql"].as_str() {
+                        if j["cap"].is_null() && distinct.map(|n| n > ceiling).unwrap_or(false) {
+                            bail!("{uid} has {} distinct values; a full sample is refused above {ceiling}", distinct.unwrap());
+                        }
+                        let values: Vec<Value> = wh
+                            .query(sql)?
+                            .into_iter()
+                            .filter_map(|r| Some(json!({ "v": r.first().cloned().flatten()?, "n": r.get(1).cloned().flatten().and_then(|n| n.parse::<i64>().ok()).unwrap_or(0) })))
+                            .collect();
+                        entry["values"] = Value::Array(values);
+                    }
+                    if let Some(sql) = j["range_sql"].as_str() {
+                        let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
+                        if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
+                            entry["range"] = json!({ "min": lo, "max": hi });
+                        }
+                    }
+                    Ok(entry)
+                })();
+                match outcome {
+                    Ok(entry) => {
+                        let what = match (entry.get("range"), entry["values"].as_array().map(Vec::len)) {
+                            (Some(r), _) => format!("{} .. {}", r["min"].as_str().unwrap_or(""), r["max"].as_str().unwrap_or("")),
+                            (None, n) => format!("{} values", n.unwrap_or(0)),
+                        };
+                        println!("{:<40} {what}", uid);
+                        catalog.retain(|e| e["uid"] != uid);
+                        catalog.push(entry);
+                        done += 1;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{:<40} FAILED: {e}", uid);
+                    }
+                }
             }
+            catalog.sort_by(|a, b| a["uid"].as_str().cmp(&b["uid"].as_str()));
+            write_catalog(&path, &catalog)?;
+            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), path.display());
+            if failed > 0 {
+                bail!("{failed} dimension(s) failed to sample");
+            }
+            if deploy_after {
+                deploy(at, false, false)?;
+            }
+            Ok(())
         }
-        RemoteCommand::Fields { target, q, hidden } => {
-            let (client, uid, branch) = target_of(&target)?;
-            let q = q.unwrap_or_default();
-            remote::print_fields(&client.get(&format!("/projects/{uid}/branches/{branch}/fields?q={}&hidden={hidden}", q))?);
+    }
+}
+
+fn read_catalog(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            out.push(serde_json::from_str(&line)?);
         }
-        RemoteCommand::Tables { target } => {
-            let (client, uid, branch) = target_of(&target)?;
-            remote::print_tables(&client.get(&format!("/projects/{uid}/branches/{branch}/tables"))?);
+    }
+    Ok(out)
+}
+
+fn write_catalog(path: &Path, entries: &[Value]) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    for e in entries {
+        enc.write_all(serde_json::to_string(e)?.as_bytes())?;
+        enc.write_all(b"\n")?;
+    }
+    enc.finish()?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------- repl
+
+fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
+    let tty = std::io::stdout().is_terminal();
+    let dim = |s: &str| if tty { format!("\x1b[2m{s}\x1b[0m") } else { s.to_string() };
+    let bold = |s: &str| if tty { format!("\x1b[1m{s}\x1b[0m") } else { s.to_string() };
+    let mut field_names: Vec<String> = Vec::new();
+    let announce = |t: &Target, field_names: &mut Vec<String>| -> Result<()> {
+        let summary = t.client.get(&remote::branch_path(&t.uid, &t.branch))?;
+        println!("{}", dim(&format!("{}/{} on {}: {} tables, {} fields, {} joins, {} policies", t.uid, t.branch, t.client.server, summary["tables"], summary["fields"], summary["joins"], summary["policies"])));
+        *field_names = t
+            .client
+            .get(&format!("{}/fields?hidden=true", remote::branch_path(&t.uid, &t.branch)))?["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|f| [f["uid"].as_str().unwrap_or("").to_lowercase(), f["name"].as_str().unwrap_or("").to_lowercase()])
+            .collect();
+        Ok(())
+    };
+    announce(&t, &mut field_names)?;
+    println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
+
+    let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
+    let history = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zsql").join("history"));
+    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
+        let _ = std::fs::create_dir_all(h.parent().unwrap());
+        let _ = ed.load_history(h);
+    }
+    let stdin = std::io::stdin();
+    loop {
+        let line = match editor.as_mut() {
+            Some(ed) => match ed.readline("zsql> ") {
+                Ok(l) => {
+                    let _ = ed.add_history_entry(l.as_str());
+                    l
+                }
+                Err(rustyline::error::ReadlineError::Interrupted) => continue,
+                Err(_) => break,
+            },
+            None => {
+                print!("zsql> ");
+                std::io::stdout().flush()?;
+                let mut l = String::new();
+                if stdin.lock().read_line(&mut l)? == 0 {
+                    break;
+                }
+                l
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
-        RemoteCommand::Values { target, dim } => {
-            let (client, uid, branch) = target_of(&target)?;
-            remote::print_values(&remote::values_for(&client, &uid, &branch, &dim)?);
+        let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
+        let names_a_field = |w: &str| field_names.iter().any(|n| n == &w.to_lowercase());
+        let cmd = match word.strip_prefix('.') {
+            Some(c) => c,
+            None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
+            None => "",
+        };
+        if matches!(cmd, "quit" | "exit" | "q") {
+            break;
         }
-        RemoteCommand::Repl { target, context } => {
-            let (client, uid, branch) = target_of(&target)?;
-            let context: Option<serde_json::Value> = match context {
-                Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| p.display().to_string())?)?),
-                None => None,
-            };
-            remote::repl(&client, &uid, &branch, context)?;
+        let outcome: Result<()> = (|| {
+            match cmd {
+                "help" | "?" => println!("{}", exprs::HELP),
+                "tables" => remote::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?),
+                "fields" => remote::print_fields(&t.client.get(&format!("{}/fields?q={}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(rest)))?),
+                "values" => {
+                    if rest.is_empty() {
+                        println!("usage: .values <dimension>");
+                    } else {
+                        remote::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, rest)?);
+                    }
+                }
+                "branch" => {
+                    if rest.is_empty() {
+                        println!("{}", t.branch);
+                    } else {
+                        t.branch = rest.to_string();
+                        announce(&t, &mut field_names)?;
+                    }
+                }
+                "tojson" => match exprs::parse_line(rest) {
+                    Ok((spec, items)) => {
+                        for d in exprs::describe(&items) {
+                            println!("{}", dim(&d));
+                        }
+                        println!("{}", serde_json::to_string_pretty(&spec)?);
+                    }
+                    Err(e) => println!("error: {e}"),
+                },
+                "" | "json" => {
+                    let json_text = if cmd == "json" { Some(rest) } else if line.starts_with('{') { Some(line) } else { None };
+                    let spec: Result<Value, String> = match json_text {
+                        Some(text) => serde_json::from_str(text).map_err(|e| e.to_string()),
+                        None => exprs::parse_line(line).map(|(spec, items)| {
+                            for d in exprs::describe(&items) {
+                                println!("{}", dim(&d));
+                            }
+                            spec
+                        }),
+                    };
+                    match spec {
+                        Err(e) => println!("error: {e}"),
+                        Ok(spec) => {
+                            let t0 = Instant::now();
+                            match remote::plan(&t.client, &t.uid, &t.branch, spec, context.as_ref(), false) {
+                                Ok(v) => {
+                                    println!("{}", bold(v["sql"].as_str().unwrap_or("")));
+                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms (server lower {} us, plan {} us)", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3, v["timings_us"]["lower"], v["timings_us"]["plan"])));
+                                }
+                                Err(e) => println!("error: {e}"),
+                            }
+                        }
+                    }
+                }
+                other => println!("unknown command .{other}; .help lists them"),
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            println!("error: {e}");
         }
+    }
+    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
+        let _ = ed.save_history(h);
     }
     Ok(())
 }

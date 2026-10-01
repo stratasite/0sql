@@ -1,7 +1,7 @@
 //! Sampled dimension values: what a dimension's column actually holds, so a
 //! question like "shoes" can be matched to a value before any warehouse
-//! probe. Written by `zsql values sample` to `values.jsonl.gz` in the
-//! project directory, one line per dimension, and shipped with the model.
+//! probe. Written by `zsql values sample` to `samples/values.jsonl.gz` in
+//! the project directory, one line per dimension, and shipped with the model.
 //!
 //! The file is customer data: gitignored by default, regenerable, and
 //! only ever holds dimensions that are listable (not hidden, listing not

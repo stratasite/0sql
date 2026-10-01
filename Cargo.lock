@@ -2828,6 +2828,24 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+ "ureq",
+ "zsql-warehouse",
+]
+
+[[package]]
+name = "zsql-devtool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "flate2",
+ "libc",
  "regex",
  "rustyline",
  "serde_json",
@@ -2922,6 +2940,7 @@ dependencies = [
  "anyhow",
  "axum",
  "flate2",
+ "regex",
  "serde",
  "serde_json",
  "tar",

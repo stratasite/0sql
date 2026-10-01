@@ -1171,7 +1171,8 @@ impl<'d> Builder<'d> {
 
     fn finish(self) -> Loaded {
         let snapshot = self.snapshot();
-        let values = match values::ValueCatalog::read(&self.dir.join(values::FILE_NAME)) {
+        let values_path = [self.dir.join("samples").join(values::FILE_NAME), self.dir.join(values::FILE_NAME)].into_iter().find(|p| p.exists()).unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
+        let values = match values::ValueCatalog::read(&values_path) {
             Ok(v) => v,
             Err(e) => {
                 let mut warnings = self.warnings;

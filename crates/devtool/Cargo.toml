@@ -1,0 +1,31 @@
+[package]
+name = "zsql-devtool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zsql-dev: the engine on the command line for its developers: local planning, goldens, bench"
+
+[[bin]]
+name = "zsql-dev"
+path = "src/main.rs"
+
+[dependencies]
+zsql-semantic.workspace = true
+zsql-dialect.workspace = true
+zsql-spec.workspace = true
+zsql-planner.workspace = true
+zsql-golden.workspace = true
+zsql-formation.workspace = true
+zsql-project.workspace = true
+regex = "1"
+rustyline = "15"
+flate2.workspace = true
+zsql-warehouse.workspace = true
+chrono = "0.4"
+tar = "0.4"
+libc = "0.2"
+ureq = { version = "3", features = ["json"] }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true

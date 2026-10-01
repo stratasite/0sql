@@ -3,29 +3,22 @@ name = "zsql-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Command line front end: plan queries against a snapshot, score the goldens"
+description = "zsql: author a semantic model, deploy it, and query it through a zsqld server"
 
 [[bin]]
 name = "zsql"
 path = "src/main.rs"
 
 [dependencies]
-zsql-semantic.workspace = true
-zsql-dialect.workspace = true
-zsql-spec.workspace = true
-zsql-planner.workspace = true
-zsql-golden.workspace = true
-zsql-formation.workspace = true
-zsql-project.workspace = true
-regex = "1"
-rustyline = "15"
-flate2.workspace = true
 zsql-warehouse.workspace = true
-chrono = "0.4"
-tar = "0.4"
-libc = "0.2"
-ureq = { version = "3", features = ["json"] }
 clap.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+flate2.workspace = true
+tar = "0.4"
+ureq = { version = "3", features = ["json"] }
+rustyline = "15"
+chrono = "0.4"
+libc = "0.2"
