@@ -191,16 +191,17 @@
     const mine = (list.projects || []).find((x) => x.uid === uid) || {};
     const owner = mine.level === "owner";
     const deps = list.deployments.filter((x) => x.project === uid);
-    const depRows = deps.map((x) => h`<tr><td class="mono">${x.branch}</td><td>${x.tables} tables · ${x.fields} fields · ${x.joins} joins · ${x.policies} policies</td><td class="muted small">${x.deployed_at}</td></tr>`).join("");
+    const depRows = deps.map((x) => h`<tr><td class="mono">${x.branch}</td><td>${x.tables} tables · ${x.fields} fields · ${x.joins} joins · ${x.policies} policies</td><td class="muted small">${x.deployed_at}</td><td><a class="btn sm" href="/app/projects/${uid}/play?branch=${encodeURIComponent(x.branch)}" data-link>Playground</a></td></tr>`).join("");
     const accessRows = access.access.map((a) => h`<tr><td>${a.user.email}${a.user.name ? raw(` <span class="faint">${esc(a.user.name)}</span>`) : ""}</td><td>${pill(a.level)}</td>
       <td class="actions">${owner ? raw(h`<select class="sm" data-level="${a.user.email}" style="width:auto"><option ${a.level === "read" ? "selected" : ""}>read</option><option ${a.level === "write" ? "selected" : ""}>write</option><option ${a.level === "owner" ? "selected" : ""}>owner</option></select><button class="btn sm quiet danger" data-remove-access="${a.user.email}">Remove</button>`) : ""}</td></tr>`).join("");
     const keyRows = access.query_keys.map((k) => h`<tr><td>${k.key.name} <span class="faint mono">${k.key.prefix}…</span></td><td class="mono">${k.grant.branch === null ? p.production_branch + " (production)" : k.grant.branch === "*" ? "every branch" : k.grant.branch}</td>
       <td class="actions">${owner ? raw(h`<button class="btn sm quiet danger" data-revoke-grant="${k.key.id}">Revoke</button>`) : ""}</td></tr>`).join("");
     frame("/app/", h`
-      <div class="page-head"><div><div class="small"><a href="/app/" data-link>Projects</a> / ${p.uid}</div><h1>${p.name || p.uid}</h1></div>${pill(mine.level || "read")}</div>
+      <div class="page-head"><div><div class="small"><a href="/app/" data-link>Projects</a> / ${p.uid}</div><h1>${p.name || p.uid}</h1></div>
+        <div class="actions">${deps.length ? raw(h`<a class="btn primary" href="/app/projects/${uid}/play?branch=${encodeURIComponent(deps.some((x) => x.branch === p.production_branch) ? p.production_branch : deps[0].branch)}" data-link>Playground</a>`) : ""}${pill(mine.level || "read")}</div></div>
       <div class="grid two">
         <div class="card"><div class="card-head"><h2>Deployed branches</h2><span class="muted small">zsql deploy</span></div>
-          <div class="card-body flush">${raw(deps.length ? h`<table><thead><tr><th>branch</th><th>model</th><th>deployed</th></tr></thead><tbody>${raw(depRows)}</tbody></table>` : h`<div class="empty">Nothing deployed yet.</div>`)}</div></div>
+          <div class="card-body flush">${raw(deps.length ? h`<table><thead><tr><th>branch</th><th>model</th><th>deployed</th><th></th></tr></thead><tbody>${raw(depRows)}</tbody></table>` : h`<div class="empty">Nothing deployed yet.</div>`)}</div></div>
         <div class="card"><div class="card-head"><h2>Settings</h2>${owner ? "" : raw('<span class="muted small">owners edit</span>')}</div>
           <div class="card-body"><form id="settings">
             <div class="field"><label>Name</label><input name="name" value="${p.name}" ${owner ? "" : "disabled"}></div>
@@ -296,6 +297,165 @@
     root.querySelectorAll("[data-remove]").forEach((b) => b.onclick = async () => { if (!confirm(`Remove ${b.dataset.remove}? Their keys stop working.`)) return; try { await api("DELETE", `/account/members/${encodeURIComponent(b.dataset.remove)}`); viewMembers(); } catch (err) { toast(err.message); } });
   }
 
+  // ----------------------------------------------------------- playground
+  const CHEATSHEET = [
+    ["projection", "item category · month(date) · store net paid desc · yoy(revenue) · pct(revenue) · running_sum(revenue)"],
+    ["filter", "category = Books · net paid > 100 · date between 2024-01-01 and 2024-12-31 · category in (Books, Music) · name contains foo · category top 10 by revenue"],
+    ["calculation", "Share = sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m) · max([gross sales]@m) as Peak"],
+    ["fields", "names or uids, case ignored; [Name] or \"Name\" is always a field; @d / @m pick a dimension or measure"],
+  ];
+
+  async function viewPlayground(uid) {
+    const params = new URLSearchParams(location.search);
+    let list;
+    try { list = await api("GET", "/projects"); } catch (e) { return frame("/app/", h`<div class="alert error">${e.message}</div>`); }
+    const project = (list.projects || []).find((x) => x.uid === uid) || { uid, name: uid, production_branch: "main" };
+    const branches = list.deployments.filter((x) => x.project === uid).map((x) => x.branch).sort();
+    if (!branches.length) return frame("/app/", h`<div class="alert error">${uid} has no deployed branch to play on.</div>`);
+    let branch = params.get("branch");
+    if (!branches.includes(branch)) branch = branches.includes(project.production_branch) ? project.production_branch : branches[0];
+    const histKey = `zsql-play-${uid}`;
+    let recent = [];
+    try { recent = JSON.parse(localStorage.getItem(histKey) || "[]"); } catch (_) {}
+    let mode = "expr";
+    let lastQuery = recent[0] || "";
+
+    frame("/app/", h`
+      <div class="page-head"><div><div class="small"><a href="/app/" data-link>Projects</a> / <a href="/app/projects/${uid}" data-link>${uid}</a> / playground</div><h1>${project.name || uid}</h1></div>
+        <div class="actions"><label style="margin:0" for="branch">branch</label><select id="branch" class="mono" style="width:auto">${raw(branches.map((b) => h`<option ${b === branch ? "selected" : ""}>${b}</option>`).join(""))}</select></div></div>
+      <div class="play">
+        <div class="play-main">
+          <div class="card">
+            <div class="card-head"><div class="tabs"><button class="tab active" data-mode="expr">Expression</button><button class="tab" data-mode="spec">Spec JSON</button></div>
+              <button class="btn sm quiet" id="help-toggle">cheat sheet</button></div>
+            <div class="card-body">
+              <div id="help" class="cheat" hidden>${raw(CHEATSHEET.map(([k, v]) => h`<div><b>${k}</b><span>${v}</span></div>`).join(""))}</div>
+              <textarea id="query" class="mono" rows="3" spellcheck="false" placeholder="department, sales value, department = PRODUCE">${lastQuery}</textarea>
+              <details id="ctx-details" style="margin-top:8px"><summary class="small muted">Security context (JSON, for branches with policies)</summary>
+                <textarea id="context" class="mono" rows="3" spellcheck="false" placeholder='{"email": "ann@acme.com", "groups": [{"name": "EMEA", "tags": ["region:emea"]}]}'></textarea></details>
+              <div class="actions" style="margin-top:10px">
+                <button class="btn primary" id="run-sql">SQL <span class="kbd">⌘↵</span></button>
+                <button class="btn" id="run-explain">Explain</button>
+                <span class="inline-explore"><button class="btn" id="run-explore">Explore</button><input id="term" placeholder="filter term" style="width:140px"></span>
+                <span class="spacer"></span><span id="status" class="muted small"></span>
+              </div>
+              ${recent.length ? raw(h`<div class="chips" id="recent">${raw(recent.slice(0, 8).map((q) => h`<button class="chip" data-q="${q}" title="${q}">${q.length > 48 ? q.slice(0, 48) + "…" : q}</button>`).join(""))}</div>`) : ""}
+            </div>
+          </div>
+          <div id="out"></div>
+        </div>
+        <div class="play-side">
+          <div class="card"><div class="card-head"><h2>Fields</h2><span class="muted small">click to add</span></div>
+            <div class="card-body"><input id="field-q" placeholder="search fields"><div id="field-list" class="field-list"></div></div></div>
+        </div>
+      </div>`);
+
+    const $ = (id) => document.getElementById(id);
+    const out = $("out"), query = $("query"), status = $("status");
+    const branchOf = () => $("branch").value;
+    $("branch").onchange = () => { history.replaceState(null, "", `/app/projects/${uid}/play?branch=${encodeURIComponent(branchOf())}`); loadFields(); };
+    $("help-toggle").onclick = () => { $("help").hidden = !$("help").hidden; };
+    root.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
+      mode = t.dataset.mode;
+      root.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x === t));
+      query.rows = mode === "spec" ? 10 : 3;
+      query.placeholder = mode === "spec" ? '{"projections": [{"field": "department"}, {"field": "sales value"}], "filters": [{"field": "department", "predicate": "equals", "value": "PRODUCE"}]}' : "department, sales value, department = PRODUCE";
+    });
+    root.querySelectorAll(".chip").forEach((c) => c.onclick = () => { query.value = c.dataset.q; mode === "spec" && c.dataset.q.trim().startsWith("{") || (mode = "expr"); run("sql"); });
+
+    function remember(q) {
+      recent = [q, ...recent.filter((x) => x !== q)].slice(0, 20);
+      try { localStorage.setItem(histKey, JSON.stringify(recent)); } catch (_) {}
+    }
+
+    function body() {
+      const q = query.value.trim();
+      if (!q) throw new Error("type an expression or a spec first");
+      const b = {};
+      if (mode === "spec" || q.startsWith("{")) { try { b.spec = JSON.parse(q); } catch (e) { throw new Error("spec is not valid JSON: " + e.message); } }
+      else b.expr = q;
+      const ctx = $("context").value.trim();
+      if (ctx) { try { b.context = JSON.parse(ctx); } catch (e) { throw new Error("context is not valid JSON: " + e.message); } }
+      return b;
+    }
+
+    const sqlBlock = (r) => h`
+      <div class="card"><div class="card-head"><h2>SQL</h2><div class="actions"><span class="muted small">datasource ${r.datasource} · ${r.adapter}</span><button class="btn sm" data-copy="${r.sql}">Copy</button></div></div>
+        <div class="card-body">
+          ${raw((r.corrections || []).map((c) => h`<div class="note">${c.term} → <b>${c.field_name}</b> <span class="faint">~${c.score}</span></div>`).join(""))}
+          ${r.items && r.items.length ? raw(h`<div class="items">${raw(r.items.map((i) => h`<code>${i}</code>`).join(""))}</div>`) : ""}
+          <pre class="sql">${r.sql}</pre>
+          ${r.spec ? raw(h`<details class="small"><summary class="muted">spec this made</summary><pre class="sql">${JSON.stringify(r.spec, null, 2)}</pre></details>`) : ""}
+        </div></div>`;
+
+    function explainBlock(r) {
+      const byId = {}; for (const n of r.nodes) byId[n.id] = n;
+      const lines = [];
+      const walk = (n, depth, via) => {
+        const head = [via + n.kind, n.alias, n.table ? "on " + n.table + (n.datasource ? " (" + n.datasource + ")" : "") : "", n.join_type ? n.join_type + " join" : "", n.group_by ? "group by" : "", n.segment ? "[segment]" : "", n.transform ? "[" + n.transform + "]" : "", n.purpose ? "[" + n.purpose + "]" : ""].filter(Boolean).join(" ");
+        lines.push(h`<div class="tree-line" style="padding-left:${depth * 18}px"><b>${head}</b></div>`);
+        const sub = (label, arr) => { if (arr && arr.length) lines.push(h`<div class="tree-sub" style="padding-left:${depth * 18 + 14}px">${label}: ${arr.join(", ")}</div>`); };
+        sub("paths", n.paths); sub("projections", n.projections); sub("filters", n.filters); sub("security", n.security_filters); sub("masks", n.security_masks);
+        for (const st of n.strategies || []) if (byId[st.node]) walk(byId[st.node], depth + 1, st.kind + " ← ");
+        for (const id of n.inputs || []) if (byId[id]) walk(byId[id], depth + 1, "");
+      };
+      const rootNode = r.nodes.find((n) => n.root);
+      if (rootNode) walk(rootNode, 0, "");
+      return sqlBlock(r) + h`
+        <div class="card"><div class="card-head"><h2>Plan</h2><span class="muted small">${r.nodes.length} nodes · server ${r.timings.total_us} µs (parser ${r.timings.parser_us}, plan ${r.timings.plan_us})</span></div>
+          <div class="card-body"><div class="tree">${raw(lines.join(""))}</div>
+            <div class="phases">${raw(r.phases.map((p) => h`<span><b>${p.name}</b> ${p.us}</span>`).join(""))}</div></div></div>`;
+    }
+
+    const exploreBlock = (r) => {
+      const rows = (arr, kind) => arr.map((f) => h`<button class="row row-btn" data-add="${f.name}"><span class="grow"><span class="title">${f.name}</span> <span class="faint mono">${f.uid}</span>${f.score !== undefined && f.score < 1 ? raw(` <span class="faint">~${f.score}</span>`) : ""}</span><span class="pill ${kind}">${kind}</span><span class="meta">${(f.tables || []).join(", ")}</span></button>`).join("");
+      return h`<div class="card"><div class="card-head"><h2>Can add</h2><span class="muted small">${r.dimensions.length} dimensions · ${r.measures.length} measures · server ${r.total_us} µs</span></div>
+        <div class="card-body flush rows">${raw(rows(r.dimensions, "dim") + rows(r.measures, "msr") || h`<div class="empty">Nothing can be added to this query.</div>`)}</div></div>`;
+    };
+
+    async function run(kind) {
+      let b;
+      try { b = body(); } catch (e) { out.innerHTML = h`<div class="alert error">${e.message}</div>`; return; }
+      status.textContent = "…";
+      const path = `/projects/${encodeURIComponent(uid)}/branches/${encodeURIComponent(branchOf())}/${kind}`;
+      if (kind === "explore" && $("term").value.trim()) b.q = $("term").value.trim();
+      const t0 = performance.now();
+      try {
+        const r = await api("POST", path, b);
+        const ms = (performance.now() - t0).toFixed(1);
+        status.textContent = `${ms} ms round trip`;
+        remember(query.value.trim());
+        out.innerHTML = kind === "sql" ? sqlBlock(r) : kind === "explain" ? explainBlock(r) : exploreBlock(r);
+        out.querySelectorAll("[data-add]").forEach((btn) => btn.onclick = () => { if (mode === "expr") { query.value = query.value.trim().replace(/,\s*$/, "") + (query.value.trim() ? ", " : "") + btn.dataset.add; run("sql"); } });
+      } catch (e) {
+        status.textContent = "";
+        out.innerHTML = h`<div class="alert error">${e.message}</div>`;
+      }
+    }
+    $("run-sql").onclick = () => run("sql");
+    $("run-explain").onclick = () => run("explain");
+    $("run-explore").onclick = () => run("explore");
+    query.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); run("sql"); } });
+
+    let fieldTimer;
+    async function loadFields() {
+      const q = $("field-q").value.trim();
+      try {
+        const r = await api("GET", `/projects/${encodeURIComponent(uid)}/branches/${encodeURIComponent(branchOf())}/fields?q=${encodeURIComponent(q)}`);
+        const fields = r.fields.slice(0, 60);
+        $("field-list").innerHTML = fields.map((f) => h`<button class="field-item" data-add="${f.name}"><span class="pill ${f.kind === "dimension" ? "dim" : "msr"}">${f.kind === "dimension" ? "dim" : "msr"}</span><span class="grow">${f.name}</span>${f.score !== undefined && f.score < 1 ? raw(`<span class="faint">~${f.score}</span>`) : ""}</button>`).join("") || h`<div class="empty small">no fields match</div>`;
+        $("field-list").querySelectorAll("[data-add]").forEach((btn) => btn.onclick = () => {
+          if (mode !== "expr") return;
+          query.value = query.value.trim().replace(/,\s*$/, "") + (query.value.trim() ? ", " : "") + btn.dataset.add;
+          query.focus();
+        });
+      } catch (e) { $("field-list").innerHTML = h`<div class="alert error">${e.message}</div>`; }
+    }
+    $("field-q").oninput = () => { clearTimeout(fieldTimer); fieldTimer = setTimeout(loadFields, 150); };
+    loadFields();
+    if (lastQuery) run("sql");
+  }
+
   // ---------------------------------------------------------------- audit
   async function viewAudit() {
     const d = await api("GET", "/account/audit?limit=200");
@@ -325,6 +485,8 @@
       if (path === "/app/audit") return await viewAudit();
       const m = path.match(/^\/app\/projects\/([^/]+)$/);
       if (m) return await viewProject(decodeURIComponent(m[1]));
+      const pm = path.match(/^\/app\/projects\/([^/]+)\/play$/);
+      if (pm) return await viewPlayground(decodeURIComponent(pm[1]));
       go("/app/");
     } catch (e) {
       if (e.status === 401) { state.me = null; return viewLogin(); }

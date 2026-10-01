@@ -15,6 +15,7 @@ crates/project    a project directory (YAML models) loaded into a snapshot
 crates/golden     golden cases and the scoreboard
 crates/cli        zsql: init, deploy, and every server endpoint; no engine inside
 crates/devtool    zsql-dev: the engine on the command line (local plan, goldens, bench)
+crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
 crates/accounts   accounts, users, keys and project access (SQLite)
 crates/server     zsqld: deploy a project, plan specs
 crates/warehouse  duckdb and postgres drivers for value sampling
@@ -118,7 +119,7 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
 | `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
-| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
+| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` or `{expr, context?}` (a shorthand line; the answer then carries the `spec` it made and `items`) to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
 | `POST /projects/{uid}/branches/{branch}/explore` | `{spec, context?, q?}` to the visible dimensions and measures the query can add and still resolve, from a walk of the formed universes: `{dimensions: [{uid, name, data_type, tables, score?}], measures: [...], total_us}`; `q` keeps fields containing or near the term, best first |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |

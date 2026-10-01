@@ -3040,6 +3040,7 @@ dependencies = [
  "serde_yaml",
  "tar",
  "ureq",
+ "zsql-shorthand",
  "zsql-warehouse",
 ]
 
@@ -3158,7 +3159,15 @@ dependencies = [
  "zsql-planner",
  "zsql-project",
  "zsql-semantic",
+ "zsql-shorthand",
  "zsql-spec",
+]
+
+[[package]]
+name = "zsql-shorthand"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

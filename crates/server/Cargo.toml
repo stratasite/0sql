@@ -16,6 +16,7 @@ zsql-spec.workspace = true
 zsql-planner.workspace = true
 zsql-project.workspace = true
 zsql-accounts.workspace = true
+zsql-shorthand.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde.workspace = true

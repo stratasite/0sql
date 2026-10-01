@@ -390,9 +390,27 @@ fn write_gz(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[derive(Deserialize)]
 struct SqlRequest {
-    spec: Value,
+    /// A query spec, or instead `expr`, a line of the shorthand.
+    #[serde(default)]
+    spec: Option<Value>,
+    #[serde(default)]
+    expr: Option<String>,
     #[serde(default)]
     context: Option<SecurityContext>,
+}
+
+/// The spec a request names: given, or made from its shorthand line, in
+/// which case the item descriptions come back too.
+fn spec_of(spec: Option<Value>, expr: Option<&str>) -> Result<(Value, Option<Value>, Vec<String>), ApiError> {
+    match (spec, expr.map(str::trim).filter(|e| !e.is_empty())) {
+        (Some(s), _) => Ok((s, None, vec![])),
+        (None, Some(line)) => {
+            let (spec, items) = zsql_shorthand::parse_line(line).map_err(|m| ApiError(StatusCode::BAD_REQUEST, "Shorthand", m))?;
+            let described = zsql_shorthand::describe(&items);
+            Ok((spec.clone(), Some(spec), described))
+        }
+        (None, None) => Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", "give a spec or an expr".into())),
+    }
 }
 
 /// What a query needs to run: the statement and the datasource it is for.
@@ -405,6 +423,11 @@ struct SqlResponse {
     adapter: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     corrections: Vec<zsql_spec::fuzzy::Correction>,
+    /// The spec a shorthand `expr` made, and how each item was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    items: Vec<String>,
 }
 
 /// The statement, how long the server took to make it, each planning phase's
@@ -417,6 +440,10 @@ struct ExplainResponse {
     adapter: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     corrections: Vec<zsql_spec::fuzzy::Correction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    items: Vec<String>,
     timings: Timings,
     phases: Vec<zsql_planner::Phase>,
     nodes: Vec<zsql_planner::ExplainNode>,
@@ -431,33 +458,42 @@ struct Timings {
     total_us: u128,
 }
 
-fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Vec<zsql_spec::fuzzy::Correction>, Timings), ApiError> {
+struct Planned {
+    plan: zsql_planner::Plan,
+    corrections: Vec<zsql_spec::fuzzy::Correction>,
+    timings: Timings,
+    spec: Option<Value>,
+    items: Vec<String>,
+}
+
+fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<Planned, ApiError> {
     let t = gate(app, who, uid, branch, Verb::Read)?;
     let d = model(app, &t, uid, branch)?;
     if req.context.is_none() && !d.universe().policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
     }
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
+    let (spec_value, made_spec, items) = spec_of(req.spec, req.expr.as_deref())?;
     let t0 = Instant::now();
-    let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
+    let spec = zsql_spec::Spec::from_value(spec_value).map_err(spec_error)?;
     let mut query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let corrections = std::mem::take(&mut query.corrections);
     let t1 = Instant::now();
     let planner = d.planner();
     let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let t2 = Instant::now();
-    Ok((plan, corrections, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
+    Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items })
 }
 
 async fn sql(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
-    let (plan, corrections, _) = plan_request(&app, &who, &uid, &branch, req, false)?;
-    Ok(Json(SqlResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections }))
+    let p = plan_request(&app, &who, &uid, &branch, req, false)?;
+    Ok(Json(SqlResponse { sql: p.plan.sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items }))
 }
 
 async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
-    let (plan, corrections, timings) = plan_request(&app, &who, &uid, &branch, req, true)?;
-    let x = plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-    Ok(Json(ExplainResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
+    let p = plan_request(&app, &who, &uid, &branch, req, true)?;
+    let x = p.plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
+    Ok(Json(ExplainResponse { sql: p.plan.sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes }))
 }
 
 /// What a query can take on: the visible dimensions and measures the
@@ -465,7 +501,10 @@ async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
 /// universes, narrowed by a search term when one is given.
 #[derive(Deserialize)]
 struct ExploreRequest {
-    spec: Value,
+    #[serde(default)]
+    spec: Option<Value>,
+    #[serde(default)]
+    expr: Option<String>,
     /// Accepted for symmetry with sql and explain; exploring resolves
     /// universes only, so no policy applies yet.
     #[serde(default)]
@@ -488,8 +527,9 @@ async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
     let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
     let d = model(&app, &t, &uid, &branch)?;
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
+    let (spec_value, _, _) = spec_of(req.spec, req.expr.as_deref())?;
     let t0 = Instant::now();
-    let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
+    let spec = zsql_spec::Spec::from_value(spec_value).map_err(spec_error)?;
     let query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let planner = d.planner();
     let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;

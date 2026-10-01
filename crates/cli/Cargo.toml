@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zsql-warehouse.workspace = true
+zsql-shorthand.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -2,7 +2,7 @@
 //! here; every plan comes from a zsqld server.
 
 mod config;
-mod exprs;
+use zsql_shorthand as exprs;
 mod remote;
 mod templates;
 
