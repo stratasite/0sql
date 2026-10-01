@@ -71,3 +71,21 @@ so empty periods appear and windows are right); relative filters (measure
 against measure, against an aggregate, latest N periods with data); plans
 spanning datasources (one statement per datasource plus a merge
 specification the caller executes).
+
+## Field hit counts for ranking (parked)
+
+Count a field once per query that plans successfully through sql or
+explain (projections, filters, calculation references); explore, search
+and tests do not count. Key by project and field uid, keep a score and a
+last-seen time with exponential decay (half-life about thirty days), hold
+it in memory on the server and persist a small JSON file per project in
+the data directory, loaded at startup.
+
+Use: fields search orders containing matches by hits; explore orders each
+list by hits (match score first when a term is given); fuzzy resolution
+uses hits only to break ties inside the margin, when one candidate's
+share clearly dominates (about 3x), so popularity never overrides a better
+string match and the feedback loop stays open. Lowering takes an optional
+ranker (uid to score); without one behaviour is unchanged. A `hits` field
+on fields and explore entries, and a top-fields endpoint per project that
+doubles as a usage report.
