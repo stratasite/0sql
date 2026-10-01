@@ -210,6 +210,19 @@ CREATE TABLE IF NOT EXISTS audit (
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
 ";
 
+/// Records a key's use, at most once a minute: a key in steady use
+/// would otherwise commit a write on every request.
+fn touch(conn: &Connection, table: &str, id: i64, last: Option<&str>) -> rusqlite::Result<()> {
+    let now: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |r| r.get(0))?;
+    if let Some(last) = last {
+        if last.len() == now.len() && last[..16] == now[..16] {
+            return Ok(());
+        }
+    }
+    conn.execute(&format!("UPDATE {table} SET last_used_at = ?1 WHERE id = ?2"), params![now, id])?;
+    Ok(())
+}
+
 fn hash_password(password: &str) -> Result<String> {
     use argon2::password_hash::{rand_core::OsRng, SaltString};
     use argon2::PasswordHasher;
@@ -338,7 +351,10 @@ pub struct Signup {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        // WAL with synchronous=NORMAL: a commit does not fsync, the
+        // checkpoint does, so a power cut can lose the last moments of
+        // writes but never corrupts the file. Right for key metadata.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Store { conn: Mutex::new(conn) })
     }
@@ -419,7 +435,7 @@ impl Store {
                 )
                 .optional()?;
             let Some(key) = row else { return Ok(None) };
-            conn.execute("UPDATE user_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![key.id])?;
+            touch(&conn, "user_keys", key.id, key.last_used_at.as_deref())?;
             let user = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![key.user_id], user_row)?;
             // A user key answers for the user's account; several accounts
             // per user is a later feature, so the first membership wins.
@@ -442,7 +458,7 @@ impl Store {
                 )
                 .optional()?;
             let Some(key) = row else { return Ok(None) };
-            conn.execute("UPDATE query_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![key.id])?;
+            touch(&conn, "query_keys", key.id, key.last_used_at.as_deref())?;
             let account = conn.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![key.account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
             let grants = Self::grants_in(&conn, key.id)?;
             return Ok(Some(Principal::QueryKey { key, account, grants }));
