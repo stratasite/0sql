@@ -12,7 +12,7 @@ pub const MIN_LEN: usize = 4;
 /// The best match must score at least this...
 pub const FLOOR: f64 = 0.5;
 /// ...and lead the runner-up (on another field) by at least this to be taken.
-pub const MARGIN: f64 = 0.15;
+pub const MARGIN: f64 = 0.2;
 /// How many near misses an error or a listing names.
 pub const SUGGESTIONS: usize = 3;
 

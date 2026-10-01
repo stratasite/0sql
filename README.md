@@ -126,7 +126,7 @@ A branch with security policies refuses to plan without a context.
 
 A field reference resolves by uid, name or synonym, case ignored. One that
 matches nothing resolves to the nearest field by character trigram
-similarity when that field clearly leads (score 0.5 or more, 0.15 ahead of
+similarity when that field clearly leads (score 0.5 or more, 0.2 ahead of
 the next); the answer lists it under `corrections` and the CLI echoes
 `departmnt → Department (~0.8)`. Anything less clear fails with the closest
 fields named. References under four characters only resolve exactly.
