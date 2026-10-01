@@ -112,6 +112,9 @@ pub fn print_json(v: &Value) -> Result<()> {
 /// The explain answer as text: the SQL, the node graph from the root down,
 /// and what each phase cost.
 pub fn print_explain(v: &Value, style: &dyn Fn(&str) -> String) {
+    for c in corrections(v) {
+        println!("{}", style(&c));
+    }
     println!("{}", v["sql"].as_str().unwrap_or(""));
     let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
     if nodes.is_empty() {
@@ -181,8 +184,17 @@ pub fn print_fields(v: &Value) {
             Some("measure") => "msr",
             _ => "?",
         };
-        println!("{:<40} {} {}{}", f["uid"].as_str().unwrap_or(""), kind, f["name"].as_str().unwrap_or(""), if f["hidden"].as_bool().unwrap_or(false) { " (hidden)" } else { "" });
+        let near = match f["score"].as_f64() {
+            Some(s) if s < 1.0 => format!(" ~{s:.2}"),
+            _ => String::new(),
+        };
+        println!("{:<40} {} {}{}{near}", f["uid"].as_str().unwrap_or(""), kind, f["name"].as_str().unwrap_or(""), if f["hidden"].as_bool().unwrap_or(false) { " (hidden)" } else { "" });
     }
+}
+
+/// One line per reference the server resolved by near match.
+pub fn corrections(v: &Value) -> Vec<String> {
+    v["corrections"].as_array().into_iter().flatten().map(|c| format!("{} → {} (~{})", c["term"].as_str().unwrap_or(""), c["field_name"].as_str().unwrap_or(""), c["score"])).collect()
 }
 
 pub fn print_tables(v: &Value) {

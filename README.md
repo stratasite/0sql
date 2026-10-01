@@ -114,15 +114,22 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
 | `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
-| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, adapter}`, or `{error: {class, message}}` |
+| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
-| `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery (hidden fields excluded by default) |
+| `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery: containing matches, then near matches with a `score` (hidden fields excluded by default) |
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |
 | `GET /projects/{uid}/branches/{branch}/values/{dim}` | sampled values of a dimension |
 | `GET /projects`, `GET /healthz` | every deployment; liveness |
 
 A branch with security policies refuses to plan without a context.
+
+A field reference resolves by uid, name or synonym, case ignored. One that
+matches nothing resolves to the nearest field by character trigram
+similarity when that field clearly leads (score 0.5 or more, 0.15 ahead of
+the next); the answer lists it under `corrections` and the CLI echoes
+`departmnt → Department (~0.8)`. Anything less clear fails with the closest
+fields named. References under four characters only resolve exactly.
 
 The CLI covers every endpoint; see above.
 

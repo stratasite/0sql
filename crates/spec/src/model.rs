@@ -279,6 +279,9 @@ pub struct Query {
     pub projections: Vec<Projection>,
     pub filters: Vec<Filter>,
     pub segments: Vec<Segment>,
+    /// References that resolved to a field by near match rather than
+    /// exactly; see [`crate::fuzzy`].
+    pub corrections: Vec<crate::fuzzy::Correction>,
 }
 
 impl Query {
@@ -294,6 +297,7 @@ impl Query {
             projections: vec![],
             filters: vec![],
             segments: vec![],
+            corrections: vec![],
         }
     }
 }

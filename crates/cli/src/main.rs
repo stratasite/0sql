@@ -362,6 +362,9 @@ impl QueryArgs {
         } else if explain {
             remote::print_explain(&v, &|s| s.to_string());
         } else {
+            for c in remote::corrections(&v) {
+                eprintln!("{c}");
+            }
             println!("{}", v["sql"].as_str().unwrap_or(""));
         }
         Ok(())
@@ -837,6 +840,9 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                             match remote::sql(&t.client, &t.uid, &t.branch, spec, context.as_ref(), cmd == "explain") {
                                 Ok(v) if cmd == "explain" => remote::print_explain(&v, &dim),
                                 Ok(v) => {
+                                    for c in remote::corrections(&v) {
+                                        println!("{}", dim(&c));
+                                    }
                                     println!("{}", bold(v["sql"].as_str().unwrap_or("")));
                                     println!("{}", dim(&format!("-- {} · round trip {:.2} ms", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3)));
                                 }

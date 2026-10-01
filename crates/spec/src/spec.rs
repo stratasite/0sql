@@ -297,6 +297,15 @@ pub fn resolve_field<'u>(universe: &'u Universe, reference: &str, kind: Option<&
             .filter(|f| kinds.contains(&f.kind) && f.name.trim().to_lowercase() == wanted)
             .collect();
     }
+    // A synonym the modeler wrote resolves like the name itself.
+    if matches.is_empty() {
+        let wanted = base.trim().to_lowercase();
+        matches = universe
+            .fields()
+            .iter()
+            .filter(|f| kinds.contains(&f.kind) && f.synonyms.iter().any(|s| s.trim().to_lowercase() == wanted))
+            .collect();
+    }
     match matches.len() {
         0 => Err(SpecError::NotFound(format!("No field named '{base}' in this model."))),
         1 => Ok(matches[0]),
@@ -344,13 +353,45 @@ struct Cx<'u> {
     universe: &'u Universe,
     reserved: Vec<String>,
     aggregates: Vec<String>,
+    corrections: std::cell::RefCell<Vec<crate::fuzzy::Correction>>,
+}
+
+impl<'u> Cx<'u> {
+    /// [`resolve_field`], then the nearest field by trigram similarity when
+    /// nothing answers exactly. A near match is recorded as a correction;
+    /// an unclear one fails naming the closest fields.
+    fn resolve(&self, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
+        match resolve_field(self.universe, reference, kind) {
+            Err(SpecError::NotFound(msg)) => {
+                let (base, suffix) = reference.trim().split_once('@').map(|(b, s)| (b, Some(s))).unwrap_or((reference.trim(), None));
+                let kinds: Vec<FieldKind> = match kind_hint(kind).or_else(|| kind_hint(suffix)) {
+                    Some(k) => vec![k],
+                    None => vec![FieldKind::Dimension, FieldKind::Measure],
+                };
+                let ranked = crate::fuzzy::suggest(self.universe, base, &kinds);
+                match crate::fuzzy::pick(&ranked) {
+                    Some(best) => {
+                        self.corrections.borrow_mut().push(crate::fuzzy::Correction {
+                            term: base.trim().to_string(),
+                            field_uid: best.field.uid.clone(),
+                            field_name: best.field.name.clone(),
+                            score: (best.score * 100.0).round() / 100.0,
+                        });
+                        Ok(best.field)
+                    }
+                    None => Err(SpecError::NotFound(format!("{msg}{}", crate::fuzzy::did_you_mean(&ranked)))),
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Lowers a spec into the typed query the planner consumes. `dialect` is
 /// the base dialect (`Dialects::base`): its reserved keywords and aggregate
 /// functions parse each calculation's formula, as Rails' defaults do.
 pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Query> {
-    let cx = Cx { universe, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions() };
+    let cx = Cx { universe, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions(), corrections: Default::default() };
 
     // Projections in listed order, calculations in place, then the
     // separate calculations list; formulas resolve against every field
@@ -404,6 +445,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
     }
 
     Ok(Query {
+        corrections: cx.corrections.take(),
         population: false,
         name: spec.name.clone(),
         limit: Some(spec.limit.unwrap_or(5000)),
@@ -420,7 +462,7 @@ const AXES: [&str; 6] = ["row", "x", "y", "series", "tip", "pivot"];
 
 fn lower_field_projection(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i64) -> Result<Projection> {
     let source = p.field.as_ref().map(ref_text).transpose()?.ok_or_else(|| invalid(format!("projection {} needs a field", ordinal + 1)))?;
-    let field = resolve_field(cx.universe, &source, p.field_type.as_deref())?;
+    let field = cx.resolve(&source, p.field_type.as_deref())?;
     let axis = p.axis.clone().filter(|a| !a.is_empty()).unwrap_or_else(|| "row".into());
     if !AXES.contains(&axis.as_str()) {
         return Err(invalid(format!("'{axis}' is not a projection axis (row, x, y, series, tip, pivot)")));
@@ -493,14 +535,32 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     }
     let field_type = if parsed.has_aggregate_functions() { "measure" } else { "dimension" };
 
+    // `[Name]@m` and `[Name]@d` name fields; one that misses resolves by
+    // near match, and the formula is rewritten to the field's name since
+    // the planner substitutes references by name.
+    let mut sql = sql;
     let mut measure_refs = Vec::new();
     for name in &parsed.measure_refs {
-        let f = cx.universe.field_by_name(name, FieldKind::Measure).ok_or_else(|| record_invalid(format!("Measure refs could not find measure named: {name}")))?;
+        let f = match cx.universe.field_by_name(name, FieldKind::Measure) {
+            Some(f) => f,
+            None => {
+                let f = cx.resolve(name, Some("measure")).map_err(|e| record_invalid(format!("Measure refs could not find measure named: {name}.{}", did_you_mean_suffix(&e))))?;
+                sql = rename_ref(&sql, name, &f.name);
+                f
+            }
+        };
         measure_refs.push(f.uid.clone());
     }
     let mut dimension_refs = Vec::new();
     for name in &parsed.dimension_refs {
-        let f = cx.universe.field_by_name(name, FieldKind::Dimension).ok_or_else(|| record_invalid(format!("Dimension refs could not find dimension named: {name}")))?;
+        let f = match cx.universe.field_by_name(name, FieldKind::Dimension) {
+            Some(f) => f,
+            None => {
+                let f = cx.resolve(name, Some("dimension")).map_err(|e| record_invalid(format!("Dimension refs could not find dimension named: {name}.{}", did_you_mean_suffix(&e))))?;
+                sql = rename_ref(&sql, name, &f.name);
+                f
+            }
+        };
         dimension_refs.push(f.uid.clone());
     }
     let mut projection_refs = Vec::new();
@@ -773,7 +833,7 @@ fn scalar_text(v: Option<&Value>) -> Result<Option<String>> {
 
 fn lower_filter(cx: &Cx, leaf: &FilterLeafSpec, reference: String, ordinal: i64) -> Result<Filter> {
     let source = ref_text(&leaf.field)?;
-    let field = resolve_field(cx.universe, &source, leaf.field_type.as_deref())?;
+    let field = cx.resolve(&source, leaf.field_type.as_deref())?;
     let predicate: Predicate = serde_json::from_value(Value::String(leaf.predicate.trim().to_lowercase()))
         .map_err(|_| invalid(format!("'{}' is not a predicate (filter on {source})", leaf.predicate)))?;
     if !predicate_allowed(field, predicate) {
@@ -800,7 +860,7 @@ fn lower_filter(cx: &Cx, leaf: &FilterLeafSpec, reference: String, ordinal: i64)
         }
     }
     let top_n_measure = match top_n_measure {
-        Some(m) => Some(resolve_field(cx.universe, &m, Some("measure"))?.uid.clone()),
+        Some(m) => Some(cx.resolve(&m, Some("measure"))?.uid.clone()),
         None => None,
     };
 
@@ -883,8 +943,8 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     let mut projections = Vec::new();
     for k in &s.keys {
         let text = ref_text(k)?;
-        let f = resolve_field(cx.universe, &text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => resolve_field(cx.universe, &text, Some("dimension")),
+        let f = cx.resolve(&text, None).or_else(|e| match e {
+            SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Dimension {
@@ -895,8 +955,8 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     }
     for m in &s.measures {
         let text = ref_text(m)?;
-        let f = resolve_field(cx.universe, &text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => resolve_field(cx.universe, &text, Some("measure")),
+        let f = cx.resolve(&text, None).or_else(|e| match e {
+            SpecError::Ambiguous(_) => cx.resolve(&text, Some("measure")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Measure {
@@ -930,8 +990,8 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
         let key_name = cx.universe.field_by_uid(projections[0].field_uid.as_deref().unwrap_or(""), Some(FieldKind::Dimension)).map(|f| f.name.clone()).unwrap_or(first_key);
         for e in &s.expanding {
             let text = ref_text(&e.field)?;
-            let f = resolve_field(cx.universe, &text, None).or_else(|err| match err {
-                SpecError::Ambiguous(_) => resolve_field(cx.universe, &text, Some("dimension")),
+            let f = cx.resolve(&text, None).or_else(|err| match err {
+                SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
                 err => Err(err),
             })?;
             if f.kind != FieldKind::Dimension {
@@ -1011,6 +1071,20 @@ fn segment_projection(reference: String, f: &Field, ordinal: i64, kind: Projecti
         parent: None,
         is_static: false,
         source_ref: Some(source),
+    }
+}
+
+/// `[old]` becomes `[new]` wherever the formula writes it, in any case.
+fn rename_ref(sql: &str, old: &str, new: &str) -> String {
+    let re = Regex::new(&format!(r"(?i)\[\s*{}\s*\]", regex::escape(old.trim()))).expect("escaped reference");
+    re.replace_all(sql, format!("[{new}]").as_str()).into_owned()
+}
+
+/// The "Did you mean" tail of a not-found error, or empty.
+fn did_you_mean_suffix(e: &SpecError) -> String {
+    match e {
+        SpecError::NotFound(m) | SpecError::Ambiguous(m) => m.find(" Did you mean").map(|i| m[i..].to_string()).unwrap_or_default(),
+        _ => String::new(),
     }
 }
 

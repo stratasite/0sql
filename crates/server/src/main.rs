@@ -214,10 +214,13 @@ struct SqlRequest {
 }
 
 /// What a query needs to run: the statement and the datasource it is for.
+/// `corrections` lists references that resolved by near match.
 #[derive(Serialize)]
 struct SqlResponse {
     sql: String,
     adapter: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    corrections: Vec<zsql_spec::fuzzy::Correction>,
 }
 
 /// The statement, how long the server took to make it, each planning phase's
@@ -226,6 +229,8 @@ struct SqlResponse {
 struct ExplainResponse {
     sql: String,
     adapter: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    corrections: Vec<zsql_spec::fuzzy::Correction>,
     timings: Timings,
     phases: Vec<zsql_planner::Phase>,
     nodes: Vec<zsql_planner::ExplainNode>,
@@ -240,7 +245,7 @@ struct Timings {
     total_us: u128,
 }
 
-fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Timings), ApiError> {
+fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Vec<zsql_spec::fuzzy::Correction>, Timings), ApiError> {
     let d = model(app, uid, branch)?;
     if req.context.is_none() && !d.universe.policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
@@ -248,23 +253,24 @@ fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain:
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
     let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
-    let query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
+    let mut query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
+    let corrections = std::mem::take(&mut query.corrections);
     let t1 = Instant::now();
     let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
     let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let t2 = Instant::now();
-    Ok((plan, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
+    Ok((plan, corrections, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
 }
 
 async fn sql(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
-    let (plan, _) = plan_request(&app, &uid, &branch, req, false)?;
-    Ok(Json(SqlResponse { sql: plan.sql, adapter: plan.adapter }))
+    let (plan, corrections, _) = plan_request(&app, &uid, &branch, req, false)?;
+    Ok(Json(SqlResponse { sql: plan.sql, adapter: plan.adapter, corrections }))
 }
 
 async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
-    let (plan, timings) = plan_request(&app, &uid, &branch, req, true)?;
+    let (plan, corrections, timings) = plan_request(&app, &uid, &branch, req, true)?;
     let x = plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-    Ok(Json(ExplainResponse { sql: plan.sql, adapter: plan.adapter, timings, phases: x.phases, nodes: x.nodes }))
+    Ok(Json(ExplainResponse { sql: plan.sql, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
@@ -281,24 +287,46 @@ struct FieldsQuery {
     hidden: bool,
 }
 
+/// Field discovery. With `q`, fields containing the text come first in
+/// model order, then near matches by trigram similarity, each with its
+/// `score` (1 for a containing match).
 async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
     let d = model(&app, &uid, &branch)?;
-    let needle = q.q.to_lowercase();
-    let out: Vec<Value> = d
+    let needle = q.q.trim().to_lowercase();
+    let visible = |f: &&zsql_semantic::Field| q.hidden || !f.hidden;
+    let describe = |f: &zsql_semantic::Field, score: Option<f64>| {
+        let mut v = json!({
+            "uid": f.uid, "name": f.name,
+            "kind": match f.kind { FieldKind::Dimension => "dimension", FieldKind::Measure => "measure" },
+            "data_type": f.data_type, "description": f.description, "synonyms": f.synonyms, "tags": f.tags, "hidden": f.hidden,
+            "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
+        });
+        if let Some(s) = score {
+            v["score"] = json!((s * 100.0).round() / 100.0);
+        }
+        v
+    };
+    if needle.is_empty() {
+        return Ok(Json(json!({ "fields": d.universe.fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() })));
+    }
+    let mut out: Vec<Value> = d
         .universe
         .fields()
         .iter()
-        .filter(|f| q.hidden || !f.hidden)
-        .filter(|f| needle.is_empty() || f.uid.to_lowercase().contains(&needle) || f.name.to_lowercase().contains(&needle) || f.synonyms.iter().any(|s| s.to_lowercase().contains(&needle)))
-        .map(|f| {
-            json!({
-                "uid": f.uid, "name": f.name,
-                "kind": match f.kind { FieldKind::Dimension => "dimension", FieldKind::Measure => "measure" },
-                "data_type": f.data_type, "description": f.description, "synonyms": f.synonyms, "tags": f.tags, "hidden": f.hidden,
-                "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
-            })
-        })
+        .filter(visible)
+        .filter(|f| f.uid.to_lowercase().contains(&needle) || f.name.to_lowercase().contains(&needle) || f.synonyms.iter().any(|s| s.to_lowercase().contains(&needle)))
+        .map(|f| describe(f, Some(1.0)))
         .collect();
+    let seen: std::collections::HashSet<&str> = out.iter().filter_map(|v| v["uid"].as_str()).collect();
+    let seen: std::collections::HashSet<String> = seen.into_iter().map(str::to_string).collect();
+    for s in zsql_spec::fuzzy::suggest(&d.universe, &needle, &[FieldKind::Dimension, FieldKind::Measure]) {
+        if s.score < zsql_spec::fuzzy::FLOOR / 2.0 {
+            break;
+        }
+        if visible(&s.field) && !seen.contains(&s.field.uid) {
+            out.push(describe(s.field, Some(s.score)));
+        }
+    }
     Ok(Json(json!({ "fields": out })))
 }
 

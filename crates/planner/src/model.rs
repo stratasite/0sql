@@ -308,6 +308,7 @@ impl<'a> RSegment<'a> {
                 projections: vec![],
                 filters: vec![],
                 segments: vec![],
+                corrections: vec![],
             },
             projections: self.projections.clone(),
             filters: self.filters.clone(),

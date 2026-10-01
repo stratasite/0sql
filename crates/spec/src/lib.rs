@@ -39,6 +39,7 @@ pub struct Group {
 }
 
 pub mod expr;
+pub mod fuzzy;
 pub mod model;
 pub mod spec;
 pub use model::*;
