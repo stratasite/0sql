@@ -1,88 +1,91 @@
 # Accounts, users, keys and access
 
-Design notes, 2026-09-30. Not implemented yet.
+Decided 2026-10-01; implemented in `crates/accounts` and the server's
+accounts endpoints. The earlier draft (project-scoped keys, branch owners)
+is superseded.
 
-## Shape
+## The model
 
-One cluster serves many accounts. An account has users (the developers who
-build and maintain semantic layers), projects, and API keys. Rights flow
-down: account, then project, then branch.
+- An **account** is the tenant. It has users through memberships with a
+  role, `admin` or `developer`, and it owns projects. The first user of an
+  account is its admin, and an account always keeps at least one admin.
+- A **user** acts through **personal keys** (`zsk_...`), which do exactly
+  what the user may do; revoking the user revokes the keys. A user may
+  hold several, named, one per machine.
+- Every developer **reads every project** in the account, unless the
+  project is `restricted`, which shows it to granted users only. The
+  creator of a project **owns** it. Owners grant `read`, `write` or
+  `owner` to other members; a project always keeps at least one owner.
+  Admins own every project.
+- A **query key** (`zqk_...`) is a principal of its own, for applications.
+  It is read only, always. It carries **grants**, each naming a project and
+  a branch: the project's production branch by default, `*` for every
+  branch, or one named branch. Any developer can create a query key;
+  grants on a project are given by that project's owners (or an admin).
+  Rotation issues a new secret and keeps the grants; the old secret stops
+  at once.
+- A project's **protected production** flag makes deploys to its
+  production branch need an owner.
 
-- **Account owners** (one or more) administer every project in the account
-  and manage membership and keys. No other account-level role for now;
-  billing stays with owners until it needs splitting.
-- **Project grants** per user: `admin`, `write`, `read`.
-  - `read`: see the model, plan queries, run discovery, create a branch of
-    their own. No deploying to branches they do not own.
-  - `write`: deploy or update the model on unprotected branches, create
-    branches.
-  - `admin`: everything, including deploying to protected branches, managing
-    grants and keys, and deleting the project.
-- **Branches** have an owner (the creator) and a `protected` flag, on by
-  default for the production branch. A branch is deleted by its owner or a
-  project admin; a protected branch by a project admin only. Deploying to a
-  protected branch needs project admin or a deploy key granted that branch.
+| level  | can                                                                                  |
+|--------|--------------------------------------------------------------------------------------|
+| read   | sql, explain, explore, fields, tables, values, status                                 |
+| write  | read plus deploy, validate, test, remove a branch, upload samples                     |
+| owner  | write plus grant and revoke access, manage query key grants, settings, delete project |
+| admin  | owner on every project, plus members, roles, every key, the audit log                 |
 
-## Machines are the main callers
+Secrets are shown once and stored as SHA-256; a twelve-character prefix
+names a key in logs and listings. Every change writes an audit row with
+its actor: sign-up, members, keys, grants, access, deploys, removals.
 
-The plan endpoint is called by the customer's application at runtime, and
-deploys mostly come from CI. API keys are therefore first-class principals,
-not a convenience attached to a user:
+## Modes
 
-- a key belongs to a project (or, for account-wide tooling, the account);
-- it carries a scope: `plan` (plan and discovery, on one branch or all) or
-  `deploy` (write); a key never carries delete rights;
-- created and revoked by a project admin; optional expiry; last-used
-  timestamp; a visible prefix so logs can name a key without revealing it.
+`ZSQL_ACCOUNTS=on` turns tenancy on: `accounts.db` (SQLite) in the data
+directory, deployments under `data/<account>/<project>/<branch>`, every
+request authenticated. `ZSQL_SIGNUP=closed` stops new accounts. Off (the
+default), the server is single-tenant with no auth: the self-hosted mode,
+and the mode the CLI's tests run against.
 
-The customer's end users never appear. They exist only as the security
-context on plan requests, asserted by whoever holds the plan key: the key
-authorizes the application, the application vouches for the context. A
-leaked plan key can assert any context, including a bypass flag, so keys
-should be scoped to one project and one branch where possible. Signed
-contexts from the customer's identity provider are a later option.
+The CLI is unchanged: it sends whatever key `zsql auth` stored, and the
+server answers 401 without one, 403 when the key may not do the action.
 
-## From day one
+## Endpoints
 
-- Soft delete with a retention window for projects and branches.
-- An audit log of deploys, key creation and revocation, grants and deletes,
-  with the acting principal, user or key.
+```
+POST   /signup                                 {account, email, name?} → account, user, key, secret (once)
+GET    /me
+GET    /account/members                        POST {email, name?, role}  (admin; a member without a key also gets an invite token, once)
+DELETE /account/members/{email}                                           (admin)
+POST   /account/members/{email}/invite         a fresh invite token        (admin)
+POST   /invites/accept                         {token, name?, key_name?} → account, user, key, secret (no auth; the token is the credential)
+GET    /account/keys                           POST {name} → key, secret   (the caller's own)
+DELETE /account/keys/{id}
+GET    /account/query-keys                     POST {name} → key, secret
+DELETE /account/query-keys/{id}                                           (admin or creator)
+POST   /account/query-keys/{id}/rotate         → key, secret               (admin or creator)
+POST   /account/query-keys/{id}/grants         {project, branch?}          (project owner)
+DELETE /account/query-keys/{id}/grants/{project}                          (project owner)
+GET    /account/audit?limit=                                              (admin)
+GET    /projects                               deployments the caller may read, and the account's projects with the caller's level
+PATCH  /projects/{uid}                         {name?, production_branch?, visibility?, protected_production?} (owner)
+DELETE /projects/{uid}                         the record and every deployment (owner)
+GET    /projects/{uid}/access                  users and query keys on the project
+PUT    /projects/{uid}/access                  {email, level}              (owner)
+DELETE /projects/{uid}/access/{email}                                     (owner)
+```
 
-## Tables
+A user deploying to a project uid the account does not have yet creates
+the project and owns it; its name and production branch come from the
+archive's project.yml.
 
-`accounts`; `users` (identified by email, may belong to several accounts);
-`memberships` (account, user, `owner | member`); `projects` (account);
-`project_grants` (project, user, `admin | write | read`); `branches`
-(project, owner, `protected`); `deployments` (branch, version, compiled
-snapshot, created by, status); `api_keys` (project or account, scope, hashed
-secret, prefix, expiry, last used); `audit_events`.
+## Deferred
 
-Not yet: teams or groups within an account. Per-user grants are enough
-until an account has dozens of developers; groups can be layered on later
-to bulk-assign the same grants.
-
-## Service plan
-
-In order, each shippable on its own:
-
-1. A model handle that is safe to share: owns the snapshot, universe,
-   formed paths and planner indexes, `Send + Sync`, built once per deployed
-   branch and swapped atomically on redeploy.
-2. Deploy: `POST /projects/{uid}/branches/{branch}/deploy` with the project
-   archive; load, form, validate, store the compiled snapshot as a blob with
-   a head pointer per branch; return the loader's warnings and errors.
-3. Plan: `POST /projects/{uid}/branches/{branch}/plan` with the spec and the
-   security context; SQL, adapter and timings back; structured errors with
-   the existing class names; a context is required when the branch has
-   policies.
-4. Discovery: fields, tables, joins and policies per branch, hidden fields
-   excluded for callers asking as a user.
-5. Tenancy and tiers: API keys per project, and the entitlement that gates
-   row-level security (policies rejected at deploy, or planned without, on a
-   plan that lacks it).
-6. Operations: hot reload on deploy, structured logs with plan timings, a
-   health endpoint, bench numbers as a regression check.
-
-Open choices: web framework (axum is the obvious one) and synchronous
-deploys, which the current load time of a few milliseconds per project
-allows.
+- Sign-up, login and the key pages in a web app (`app.0sql.io`);
+  passwords or magic links. The `users.password_hash` column waits for it.
+- A user in several accounts: the schema allows it, the key answers for
+  the first membership for now.
+- Key expiry, a viewer role, teams, binding a query key to the security
+  context claims it may assert.
+- Multiple server instances: a storage trait with a Postgres and S3
+  backend behind the same endpoints (see the hosted-service notes in the
+  conversation of 2026-10-01: lazy load, LRU, version stamps).

@@ -1,6 +1,12 @@
 //! zsqld: a light service. Deploy a project directory (as a tar.gz), then
-//! plan specs against it. No accounts, users or keys yet; deployed models
-//! live in memory and under a data directory so a restart reloads them.
+//! plan specs against it. Deployed models live in memory and under a data
+//! directory so a restart reloads them.
+//!
+//! With `ZSQL_ACCOUNTS=on` the server is multi-tenant: every request
+//! carries a key (`Authorization: Bearer ...`) that names a user or a
+//! query key in an account, deployments are scoped to the account, and
+//! the accounts endpoints manage members, keys and project access. Off
+//! (the default, the self-hosted mode), there is one tenant and no auth.
 //!
 //! ```text
 //! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
@@ -18,7 +24,9 @@
 //! ```
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
+use zsql_accounts::{Level, Principal, Project, Role, Store, Verb};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
@@ -72,14 +80,100 @@ struct App {
     /// planner can borrow it for as long as its universe.
     dialects: &'static Dialects,
     data_dir: PathBuf,
+    /// Deployments by `[account/]project/branch`.
     models: RwLock<HashMap<String, Arc<Deployed>>>,
+    /// Accounts, users and keys; `None` in the single-tenant mode.
+    accounts: Option<Store>,
+    signup_open: bool,
+}
+
+// ---------------------------------------------------------------- tenancy
+
+/// The caller: a user or a query key when accounts are on, nothing when off.
+struct Auth(Option<Principal>);
+
+impl FromRequestParts<Shared> for Auth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, ApiError> {
+        let Some(store) = &app.accounts else { return Ok(Auth(None)) };
+        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let secret = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")).map(str::trim).unwrap_or("");
+        if secret.is_empty() {
+            return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()));
+        }
+        match store.authenticate(secret).map_err(internal)? {
+            Some(p) => Ok(Auth(Some(p))),
+            None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
+        }
+    }
+}
+
+/// Where a request's deployments live: the account's slice, or everything.
+struct Tenant {
+    scope: String,
+    project: Option<Project>,
+}
+
+impl Tenant {
+    fn key(&self, uid: &str, branch: &str) -> String {
+        format!("{}{uid}/{branch}", self.scope)
+    }
+    fn dir(&self, app: &App, uid: &str, branch: &str) -> PathBuf {
+        app.data_dir.join(&self.scope).join(uid).join(branch)
+    }
+}
+
+fn scope_of(who: &Option<Principal>) -> String {
+    who.as_ref().map(|p| format!("{}/", p.account().uid)).unwrap_or_default()
+}
+
+fn internal(e: zsql_accounts::Error) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", e.to_string())
+}
+
+fn accounts_error(e: zsql_accounts::Error) -> ApiError {
+    match e {
+        zsql_accounts::Error::NotFound(m) => ApiError(StatusCode::NOT_FOUND, "NotFound", m),
+        zsql_accounts::Error::Denied(m) => ApiError(StatusCode::FORBIDDEN, "Forbidden", m),
+        zsql_accounts::Error::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, "Invalid", m),
+        zsql_accounts::Error::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", e.to_string()),
+    }
+}
+
+/// Checks the caller may do `verb` on the project's branch and answers
+/// with the tenant to look deployments up in. In single-tenant mode
+/// everything is allowed.
+fn gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, verb: Verb) -> Result<Tenant, ApiError> {
+    let scope = scope_of(who);
+    let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
+    let project = store.project(p.account().id, uid).map_err(internal)?.ok_or_else(|| not_found(uid, branch))?;
+    store.authorize(p, &project, branch, verb).map_err(accounts_error)?;
+    Ok(Tenant { scope, project: Some(project) })
+}
+
+/// The user behind a request, for actions only people may take.
+fn user_of(who: &Option<Principal>) -> Result<(&zsql_accounts::User, &zsql_accounts::Account, Role), ApiError> {
+    match who {
+        Some(Principal::User { user, account, role, .. }) => Ok((user, account, *role)),
+        Some(Principal::QueryKey { .. }) => Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "a query key cannot do this; use your personal key".into())),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", "accounts are off on this server".into())),
+    }
+}
+
+fn store_of(app: &App) -> Result<&Store, ApiError> {
+    app.accounts.as_ref().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", "accounts are off on this server".into()))
+}
+
+fn admin_of(who: &Option<Principal>) -> Result<(&zsql_accounts::User, &zsql_accounts::Account), ApiError> {
+    let (user, account, role) = user_of(who)?;
+    if role != Role::Admin {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "this needs an account admin".into()));
+    }
+    Ok((user, account))
 }
 
 type Shared = Arc<App>;
-
-fn key(uid: &str, branch: &str) -> String {
-    format!("{uid}/{branch}")
-}
 
 /// An error as the API reports it: a status, a class the goldens would
 /// name, and a message.
@@ -95,8 +189,8 @@ fn not_found(uid: &str, branch: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid} branch {branch}"))
 }
 
-fn model(app: &App, uid: &str, branch: &str) -> Result<Arc<Deployed>, ApiError> {
-    app.models.read().unwrap().get(&key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
+fn model(app: &App, t: &Tenant, uid: &str, branch: &str) -> Result<Arc<Deployed>, ApiError> {
+    app.models.read().unwrap().get(&t.key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
 }
 
 fn summary(d: &Deployed) -> Value {
@@ -162,18 +256,42 @@ fn run_tests(app: &App, d: &Deployed) -> Value {
 
 // ------------------------------------------------------------------ deploy
 
-async fn deploy(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    deploy_or_validate(app, uid, branch, body, true)
+async fn deploy(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    deploy_or_validate(app, who, uid, branch, body, true)
 }
 
-async fn validate(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    deploy_or_validate(app, uid, branch, body, false)
+async fn validate(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    deploy_or_validate(app, who, uid, branch, body, false)
 }
 
-fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
+/// A user deploying to a project the account does not have yet creates
+/// it and owns it; validating needs no project. Query keys cannot deploy.
+fn deploy_gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, keep: bool, production_branch: &str, name: &str) -> Result<Tenant, ApiError> {
+    let scope = scope_of(who);
+    let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
+    match store.project(p.account().id, uid).map_err(internal)? {
+        Some(project) => {
+            store.authorize(p, &project, branch, Verb::Write).map_err(accounts_error)?;
+            Ok(Tenant { scope, project: Some(project) })
+        }
+        None => {
+            let (user, account, _) = user_of(who)?;
+            if !keep {
+                return Ok(Tenant { scope, project: None });
+            }
+            let project = store.create_project(account.id, user, uid, name, production_branch).map_err(accounts_error)?;
+            Ok(Tenant { scope, project: Some(project) })
+        }
+    }
+}
+
+fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
+    }
+    if matches!(who, Some(Principal::QueryKey { .. })) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "query keys are read only; deploy with your personal key".into()));
     }
     let work = std::env::temp_dir().join(format!("zsqld-deploy-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&work).map_err(|e| bad(e.to_string()))?;
@@ -183,6 +301,7 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
         archive.unpack(&work).map_err(|e| bad(format!("unpacking the archive: {e}")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_project::load(&root, app.dialects).map_err(|e| bad(e.to_string()))?;
+        let t = deploy_gate(&app, &who, &uid, &branch, keep, &loaded.snapshot.branch.uid, &loaded.snapshot.project.name)?;
         let universe = Universe::build(loaded.snapshot.clone()).map_err(|e| bad(e.to_string()))?;
         let mut warnings = loaded.warnings;
         warnings.extend(universe.warnings().iter().cloned());
@@ -193,7 +312,7 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
         out["validated_only"] = Value::Bool(!keep);
         if keep {
             // Keep the compiled model on disk so a restart reloads it.
-            let dir = app.data_dir.join(&uid).join(&branch);
+            let dir = t.dir(&app, &uid, &branch);
             std::fs::create_dir_all(&dir).map_err(|e| bad(e.to_string()))?;
             write_gz(&dir.join("snapshot.json.gz"), &serde_json::to_vec(&loaded.snapshot).map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
             match &deployed.values {
@@ -204,7 +323,10 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
             }
             let tests_json = serde_json::to_vec(&deployed.tests.iter().map(|t| json!({ "file": t.file.file_name().map(|f| f.to_string_lossy().to_string()), "name": t.name, "projections": t.projections, "assert_sql": t.assert_sql, "assert_regex": t.assert_regex })).collect::<Vec<_>>()).map_err(|e| bad(e.to_string()))?;
             std::fs::write(dir.join("tests.json"), tests_json).map_err(|e| bad(e.to_string()))?;
-            app.models.write().unwrap().insert(key(&uid, &branch), deployed);
+            app.models.write().unwrap().insert(t.key(&uid, &branch), deployed);
+            if let (Some(store), Some(p)) = (&app.accounts, &who) {
+                let _ = store.record(p.account().id, &p.describe(), "deploy", &format!("{uid}/{branch}"));
+            }
         }
         Ok(out)
     })();
@@ -275,8 +397,9 @@ struct Timings {
     total_us: u128,
 }
 
-fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Vec<zsql_spec::fuzzy::Correction>, Timings), ApiError> {
-    let d = model(app, uid, branch)?;
+fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Vec<zsql_spec::fuzzy::Correction>, Timings), ApiError> {
+    let t = gate(app, who, uid, branch, Verb::Read)?;
+    let d = model(app, &t, uid, branch)?;
     if req.context.is_none() && !d.universe().policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
     }
@@ -292,13 +415,13 @@ fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain:
     Ok((plan, corrections, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
 }
 
-async fn sql(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
-    let (plan, corrections, _) = plan_request(&app, &uid, &branch, req, false)?;
+async fn sql(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
+    let (plan, corrections, _) = plan_request(&app, &who, &uid, &branch, req, false)?;
     Ok(Json(SqlResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections }))
 }
 
-async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
-    let (plan, corrections, timings) = plan_request(&app, &uid, &branch, req, true)?;
+async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
+    let (plan, corrections, timings) = plan_request(&app, &who, &uid, &branch, req, true)?;
     let x = plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
     Ok(Json(ExplainResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
 }
@@ -327,8 +450,9 @@ struct ExploreResponse {
     total_us: u128,
 }
 
-async fn explore(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<ExploreRequest>) -> Result<Json<ExploreResponse>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<ExploreRequest>) -> Result<Json<ExploreResponse>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
+    let d = model(&app, &t, &uid, &branch)?;
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
     let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
@@ -390,8 +514,9 @@ struct FieldsQuery {
 /// Field discovery. With `q`, fields containing the text come first in
 /// model order, then near matches by trigram similarity, each with its
 /// `score` (1 for a containing match).
-async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
+    let d = model(&app, &t, &uid, &branch)?;
     let needle = q.q.trim().to_lowercase();
     let visible = |f: &&zsql_semantic::Field| q.hidden || !f.hidden;
     let describe = |f: &zsql_semantic::Field, score: Option<f64>| {
@@ -430,8 +555,9 @@ async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
     Ok(Json(json!({ "fields": out })))
 }
 
-async fn tables(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn tables(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
+    let d = model(&app, &t, &uid, &branch)?;
     let out: Vec<Value> = d
         .universe()
         .tables()
@@ -447,8 +573,9 @@ async fn tables(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
     Ok(Json(json!({ "tables": out })))
 }
 
-async fn values(State(app): State<Shared>, Path((uid, branch, dim)): Path<(String, String, String)>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn values(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch, dim)): Path<(String, String, String)>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
+    let d = model(&app, &t, &uid, &branch)?;
     let field = d.universe().field_by_uid(&dim, Some(FieldKind::Dimension)).or_else(|| d.universe().field_by_name(&dim, FieldKind::Dimension));
     let Some(field) = field else {
         return Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no dimension {dim}")));
@@ -460,13 +587,15 @@ async fn values(State(app): State<Shared>, Path((uid, branch, dim)): Path<(Strin
     }
 }
 
-async fn test(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn test(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
+    let d = model(&app, &t, &uid, &branch)?;
     Ok(Json(run_tests(&app, &d)))
 }
 
-async fn sampling_plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn sampling_plan(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
+    let d = model(&app, &t, &uid, &branch)?;
     let dims: Vec<String> = q.dims.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
         match app.dialects.get(adapter) {
@@ -497,26 +626,320 @@ struct SamplingQuery {
     full: bool,
 }
 
-async fn remove(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
-    let removed = app.models.write().unwrap().remove(&key(&uid, &branch)).is_some();
+async fn remove(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
+    let removed = app.models.write().unwrap().remove(&t.key(&uid, &branch)).is_some();
     if !removed {
         return Err(not_found(&uid, &branch));
     }
-    let _ = std::fs::remove_dir_all(app.data_dir.join(&uid).join(&branch));
-    Ok(Json(json!({ "removed": key(&uid, &branch) })))
+    let _ = std::fs::remove_dir_all(t.dir(&app, &uid, &branch));
+    if let (Some(store), Some(p)) = (&app.accounts, &who) {
+        let _ = store.record(p.account().id, &p.describe(), "branch_removed", &format!("{uid}/{branch}"));
+    }
+    Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
 }
 
-async fn branch_summary(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+async fn branch_summary(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
+    let d = model(&app, &t, &uid, &branch)?;
     Ok(Json(summary(&d)))
 }
 
-async fn projects(State(app): State<Shared>) -> Json<Value> {
-    let models = app.models.read().unwrap();
-    let mut out: Vec<Value> = models.values().map(|d| summary(d)).collect();
+/// Every deployment the caller may read; with accounts on, also the
+/// account's projects and the caller's level on each.
+async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    let mut out = Vec::new();
+    for d in app.models.read().unwrap().values() {
+        if gate(&app, &who, &d.uid, &d.branch, Verb::Read).is_ok() {
+            out.push(summary(d));
+        }
+    }
     out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
-    Json(json!({ "deployments": out }))
+    let mut answer = json!({ "deployments": out });
+    if let (Some(store), Some(p)) = (&app.accounts, &who) {
+        let mut projects = Vec::new();
+        for project in store.projects(p.account().id).map_err(internal)? {
+            let level = match p {
+                Principal::User { role: Role::Admin, .. } => Some(Level::Owner),
+                Principal::User { user, .. } => store.level_for(&project, user.id).map_err(internal)?,
+                Principal::QueryKey { grants, .. } => grants.iter().any(|g| g.project_id == project.id).then_some(Level::Read),
+            };
+            if level.is_some() {
+                projects.push(json!({ "uid": project.uid, "name": project.name, "production_branch": project.production_branch, "visibility": project.visibility, "protected_production": project.protected_production, "level": level }));
+            }
+        }
+        answer["projects"] = json!(projects);
+    }
+    Ok(Json(answer))
 }
+
+// ---------------------------------------------------------------- accounts
+
+#[derive(Deserialize)]
+struct SignupRequest {
+    account: String,
+    email: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// A new account with its first admin and key. The secret is shown once.
+async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    if !app.signup_open {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "sign-up is closed on this server".into()));
+    }
+    let su = store.signup(&req.account, &req.email, &req.name).map_err(accounts_error)?;
+    Ok(Json(json!({ "account": su.account, "user": su.user, "key": su.key, "secret": su.secret })))
+}
+
+async fn me(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    store_of(&app)?;
+    Ok(Json(match &who {
+        Some(Principal::User { user, account, role, key_id }) => json!({ "kind": "user", "user": user, "account": account, "role": role, "key_id": key_id }),
+        Some(Principal::QueryKey { key, account, grants }) => json!({ "kind": "query_key", "key": key, "account": account, "grants": grants }),
+        None => json!({}),
+    }))
+}
+
+async fn members(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (_, account, _) = user_of(&who)?;
+    Ok(Json(json!({ "members": store.members(account.id).map_err(accounts_error)? })))
+}
+
+#[derive(Deserialize)]
+struct MemberRequest {
+    email: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default = "developer")]
+    role: String,
+}
+
+fn developer() -> String {
+    "developer".into()
+}
+
+/// Adds or re-roles a member. A member with no personal key yet also gets
+/// an invite token, shown once, to redeem at `/invites/accept`.
+async fn add_member(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<MemberRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account) = admin_of(&who)?;
+    let role = zsql_accounts::parse_role(&req.role).map_err(accounts_error)?;
+    let m = store.add_member(account.id, &user.email, &req.email, &req.name, role).map_err(accounts_error)?;
+    let mut out = json!(m);
+    if store.user_keys(m.user.id).map_err(accounts_error)?.is_empty() {
+        out["invite"] = json!(store.create_invite(account.id, &user.email, &m.user.email).map_err(accounts_error)?);
+    }
+    Ok(Json(out))
+}
+
+/// A fresh invite token for a member, for when the first was lost.
+async fn invite(State(app): State<Shared>, Auth(who): Auth, Path(email): Path<String>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account) = admin_of(&who)?;
+    Ok(Json(json!({ "invite": store.create_invite(account.id, &user.email, &email).map_err(accounts_error)? })))
+}
+
+#[derive(Deserialize)]
+struct AcceptRequest {
+    token: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    key_name: String,
+}
+
+/// No auth: the token is the credential. Answers with the member's first
+/// personal key, shown once.
+async fn accept_invite(State(app): State<Shared>, Json(req): Json<AcceptRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (account, user, key, secret) = store.accept_invite(&req.token, &req.name, &req.key_name).map_err(accounts_error)?;
+    Ok(Json(json!({ "account": account, "user": user, "key": key, "secret": secret })))
+}
+
+async fn remove_member(State(app): State<Shared>, Auth(who): Auth, Path(email): Path<String>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account) = admin_of(&who)?;
+    store.remove_member(account.id, &user.email, &email).map_err(accounts_error)?;
+    Ok(Json(json!({ "removed": email })))
+}
+
+#[derive(Deserialize)]
+struct NameRequest {
+    name: String,
+}
+
+async fn user_keys(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, _, _) = user_of(&who)?;
+    Ok(Json(json!({ "keys": store.user_keys(user.id).map_err(accounts_error)? })))
+}
+
+async fn create_user_key(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<NameRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    let (key, secret) = store.create_user_key(account.id, user, &req.name).map_err(accounts_error)?;
+    Ok(Json(json!({ "key": key, "secret": secret })))
+}
+
+async fn revoke_user_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    store.revoke_user_key(account.id, user, id).map_err(accounts_error)?;
+    Ok(Json(json!({ "revoked": id })))
+}
+
+async fn query_keys(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (_, account, _) = user_of(&who)?;
+    let mut keys = Vec::new();
+    for k in store.query_keys(account.id).map_err(accounts_error)? {
+        let grants = store.grants(account.id, k.id).map_err(accounts_error)?;
+        keys.push(json!({ "key": k, "grants": grants }));
+    }
+    Ok(Json(json!({ "query_keys": keys })))
+}
+
+async fn create_query_key(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<NameRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    let (key, secret) = store.create_query_key(account.id, user, &req.name).map_err(accounts_error)?;
+    Ok(Json(json!({ "key": key, "secret": secret })))
+}
+
+/// Admins and the key's creator manage it.
+fn may_manage_key(store: &Store, who: &Option<Principal>, id: i64) -> Result<(zsql_accounts::User, zsql_accounts::Account, zsql_accounts::QueryKey), ApiError> {
+    let (user, account, role) = user_of(who)?;
+    let key = store.query_key(account.id, id).map_err(accounts_error)?;
+    if role != Role::Admin && key.created_by != Some(user.id) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "only an admin or the key's creator can manage it".into()));
+    }
+    Ok((user.clone(), account.clone(), key))
+}
+
+async fn rotate_query_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = may_manage_key(store, &who, id)?;
+    let (key, secret) = store.rotate_query_key(account.id, &user, id).map_err(accounts_error)?;
+    Ok(Json(json!({ "key": key, "secret": secret })))
+}
+
+async fn revoke_query_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = may_manage_key(store, &who, id)?;
+    store.revoke_query_key(account.id, &user, id).map_err(accounts_error)?;
+    Ok(Json(json!({ "revoked": id })))
+}
+
+#[derive(Deserialize)]
+struct GrantRequest {
+    project: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+/// Granting a key read on a project is the project owner's call (or an admin's).
+async fn grant(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>, Json(req): Json<GrantRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    let key = store.query_key(account.id, id).map_err(accounts_error)?;
+    let t = gate(&app, &who, &req.project, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    let g = store.grant(account.id, user, key.id, &project, req.branch.as_deref()).map_err(accounts_error)?;
+    Ok(Json(json!({ "key": key, "grant": g })))
+}
+
+async fn revoke_grant(State(app): State<Shared>, Auth(who): Auth, Path((id, project_uid)): Path<(i64, String)>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    let t = gate(&app, &who, &project_uid, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    store.revoke_grant(account.id, user, id, &project).map_err(accounts_error)?;
+    Ok(Json(json!({ "revoked": { "key": id, "project": project_uid } })))
+}
+
+async fn project_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let t = gate(&app, &who, &uid, "", Verb::Read)?;
+    let project = t.project.expect("accounts on");
+    let access: Vec<Value> = store.project_access(&project).map_err(accounts_error)?.into_iter().map(|(u, l)| json!({ "user": u, "level": l })).collect();
+    let keys: Vec<Value> = store.keys_granted_on(&project).map_err(accounts_error)?.into_iter().map(|(k, g)| json!({ "key": k, "grant": g })).collect();
+    Ok(Json(json!({ "project": project, "access": access, "query_keys": keys })))
+}
+
+#[derive(Deserialize)]
+struct AccessRequest {
+    email: String,
+    level: String,
+}
+
+async fn set_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>, Json(req): Json<AccessRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, _, _) = user_of(&who)?;
+    let t = gate(&app, &who, &uid, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    let level = zsql_accounts::parse_level(&req.level).map_err(accounts_error)?;
+    let (u, l) = store.set_access(user, &project, &req.email, level).map_err(accounts_error)?;
+    Ok(Json(json!({ "user": u, "level": l })))
+}
+
+async fn remove_access(State(app): State<Shared>, Auth(who): Auth, Path((uid, email)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, _, _) = user_of(&who)?;
+    let t = gate(&app, &who, &uid, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    store.remove_access(user, &project, &email).map_err(accounts_error)?;
+    Ok(Json(json!({ "removed": email })))
+}
+
+#[derive(Deserialize)]
+struct ProjectPatch {
+    name: Option<String>,
+    production_branch: Option<String>,
+    visibility: Option<String>,
+    protected_production: Option<bool>,
+}
+
+async fn update_project(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>, Json(req): Json<ProjectPatch>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, _, _) = user_of(&who)?;
+    let t = gate(&app, &who, &uid, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    let p = store.update_project(user, &project, req.name.as_deref(), req.production_branch.as_deref(), req.visibility.as_deref(), req.protected_production).map_err(accounts_error)?;
+    Ok(Json(json!(p)))
+}
+
+/// Deletes the project record and every deployment of it.
+async fn delete_project(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, _, _) = user_of(&who)?;
+    let t = gate(&app, &who, &uid, "", Verb::Owner)?;
+    let project = t.project.expect("accounts on");
+    let prefix = format!("{}{uid}/", t.scope);
+    app.models.write().unwrap().retain(|k, _| !k.starts_with(&prefix));
+    let _ = std::fs::remove_dir_all(app.data_dir.join(&t.scope).join(&uid));
+    store.delete_project(user, &project).map_err(accounts_error)?;
+    Ok(Json(json!({ "deleted": uid })))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default = "fifty")]
+    limit: usize,
+}
+
+fn fifty() -> usize {
+    50
+}
+
+async fn audit(State(app): State<Shared>, Auth(who): Auth, Query(q): Query<AuditQuery>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (_, account) = admin_of(&who)?;
+    Ok(Json(json!({ "events": store.audit_log(account.id, q.limit.min(1000)).map_err(accounts_error)? })))
+}
+
 
 async fn healthz() -> &'static str {
     "ok"
@@ -526,7 +949,15 @@ async fn healthz() -> &'static str {
 
 fn reload(app: &App) -> anyhow::Result<usize> {
     let mut n = 0;
-    let Ok(projects) = std::fs::read_dir(&app.data_dir) else { return Ok(0) };
+    // Single-tenant: data/<project>/<branch>; with accounts: data/<account>/<project>/<branch>.
+    let roots: Vec<(String, PathBuf)> = if app.accounts.is_some() {
+        let Ok(accounts) = std::fs::read_dir(&app.data_dir) else { return Ok(0) };
+        accounts.flatten().filter(|e| e.path().is_dir()).map(|e| (format!("{}/", e.file_name().to_string_lossy()), e.path())).collect()
+    } else {
+        vec![(String::new(), app.data_dir.clone())]
+    };
+    for (scope, root) in roots {
+    let Ok(projects) = std::fs::read_dir(&root) else { continue };
     for p in projects.flatten().filter(|e| e.path().is_dir()) {
         let uid = p.file_name().to_string_lossy().to_string();
         for b in std::fs::read_dir(p.path())?.flatten().filter(|e| e.path().is_dir()) {
@@ -553,9 +984,10 @@ fn reload(app: &App) -> anyhow::Result<usize> {
                 .collect();
             let deployed_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(|t| humantime(t)).unwrap_or_default();
             let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
-            app.models.write().unwrap().insert(key(&uid, &branch), Arc::new(Deployed { uid: uid.clone(), branch, engine, values, tests, warnings: vec![], deployed_at }));
+            app.models.write().unwrap().insert(format!("{scope}{uid}/{branch}"), Arc::new(Deployed { uid: uid.clone(), branch, engine, values, tests, warnings: vec![], deployed_at }));
             n += 1;
         }
+    }
     }
     Ok(n)
 }
@@ -579,9 +1011,12 @@ async fn main() -> anyhow::Result<()> {
     let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:3699".into());
     std::fs::create_dir_all(&data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()) });
+    let accounts_on = matches!(std::env::var("ZSQL_ACCOUNTS").as_deref(), Ok("on") | Ok("1") | Ok("true"));
+    let accounts = if accounts_on { Some(Store::open(&data_dir.join("accounts.db"))?) } else { None };
+    let signup_open = !matches!(std::env::var("ZSQL_SIGNUP").as_deref(), Ok("closed") | Ok("off") | Ok("0"));
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open });
     let n = reload(&app)?;
-    eprintln!("zsqld: {n} deployment(s) loaded from {}", app.data_dir.display());
+    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
 
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -598,6 +1033,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(values))
+        .route("/signup", post(signup))
+        .route("/me", get(me))
+        .route("/account/members", get(members).post(add_member))
+        .route("/account/members/{email}", delete(remove_member))
+        .route("/account/members/{email}/invite", post(invite))
+        .route("/invites/accept", post(accept_invite))
+        .route("/account/keys", get(user_keys).post(create_user_key))
+        .route("/account/keys/{id}", delete(revoke_user_key))
+        .route("/account/query-keys", get(query_keys).post(create_query_key))
+        .route("/account/query-keys/{id}", delete(revoke_query_key))
+        .route("/account/query-keys/{id}/rotate", post(rotate_query_key))
+        .route("/account/query-keys/{id}/grants", post(grant))
+        .route("/account/query-keys/{id}/grants/{project}", delete(revoke_grant))
+        .route("/account/audit", get(audit))
+        .route("/projects/{uid}", axum::routing::patch(update_project).delete(delete_project))
+        .route("/projects/{uid}/access", get(project_access).put(set_access))
+        .route("/projects/{uid}/access/{email}", delete(remove_access))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&bind).await?;

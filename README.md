@@ -15,6 +15,7 @@ crates/project    a project directory (YAML models) loaded into a snapshot
 crates/golden     golden cases and the scoreboard
 crates/cli        zsql: init, deploy, and every server endpoint; no engine inside
 crates/devtool    zsql-dev: the engine on the command line (local plan, goldens, bench)
+crates/accounts   accounts, users, keys and project access (SQLite)
 crates/server     zsqld: deploy a project, plan specs
 crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
@@ -127,6 +128,12 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `GET /projects`, `GET /healthz` | every deployment; liveness |
 
 A branch with security policies refuses to plan without a context.
+
+With `ZSQL_ACCOUNTS=on` the server is multi-tenant: accounts, users,
+personal keys and read-only query keys with per-project grants, in a
+SQLite file in the data directory; see `docs/accounts-and-access.md` for
+the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
+endpoints. Off, it is the single-tenant self-hosted mode with no auth.
 
 Each deployment keeps its planner, the per-root universe index, built
 once at deploy beside the universe; requests borrow it, so server time
