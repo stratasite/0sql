@@ -111,17 +111,24 @@ pub fn print_json(v: &Value) -> Result<()> {
 
 /// The explain answer as text: the SQL, the node graph from the root down,
 /// and what each phase cost.
+/// The line above every statement: which datasource runs it. A SQL
+/// comment, so the output stays pasteable into a client.
+pub fn datasource_line(v: &Value) -> String {
+    format!("-- datasource: {}", v["datasource"].as_str().unwrap_or("?"))
+}
+
 pub fn print_explain(v: &Value, style: &dyn Fn(&str) -> String) {
     for c in corrections(v) {
         println!("{}", style(&c));
     }
+    println!("{}", style(&datasource_line(v)));
     println!("{}", v["sql"].as_str().unwrap_or(""));
     let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
     if nodes.is_empty() {
         return;
     }
     println!();
-    println!("{}", style(&format!("-- {} · {} nodes", v["adapter"].as_str().unwrap_or(""), nodes.len())));
+    println!("{}", style(&format!("-- {} nodes", nodes.len())));
     fn walk(n: &Value, depth: usize, via: &str, nodes: &[Value], style: &dyn Fn(&str) -> String) {
         let by_id = |id: u64| nodes.iter().find(|n| n["id"].as_u64() == Some(id));
         let pad = "  ".repeat(depth);

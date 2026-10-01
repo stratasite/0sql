@@ -22,7 +22,9 @@ use zsql_semantic::Universe;
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub sql: String,
-    /// Adapter name of the datasource the plan executes in.
+    /// The datasource the plan executes in: its name, its uid and its adapter.
+    pub datasource: String,
+    pub datasource_uid: String,
     pub adapter: String,
     /// The plan explained: phase timings and the node graph. Asked for
     /// with [`Planner::plan_query_explained`].
@@ -240,7 +242,7 @@ fn run_plan<'a>(
     let sql = phase!("final_query", visitors::final_query::to_sql(&graph)?);
     let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
 
-    Ok(Plan { sql, adapter: graph.datasource.adapter.clone(), explain })
+    Ok(Plan { sql, datasource: graph.datasource.name.clone(), datasource_uid: graph.datasource.uid.clone(), adapter: graph.datasource.adapter.clone(), explain })
 }
 
 fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {

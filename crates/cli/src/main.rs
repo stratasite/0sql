@@ -365,6 +365,7 @@ impl QueryArgs {
             for c in remote::corrections(&v) {
                 eprintln!("{c}");
             }
+            println!("{}", remote::datasource_line(&v));
             println!("{}", v["sql"].as_str().unwrap_or(""));
         }
         Ok(())
@@ -843,8 +844,9 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                                     for c in remote::corrections(&v) {
                                         println!("{}", dim(&c));
                                     }
+                                    println!("{}", dim(&remote::datasource_line(&v)));
                                     println!("{}", bold(v["sql"].as_str().unwrap_or("")));
-                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3)));
+                                    println!("{}", dim(&format!("-- round trip {:.2} ms", t0.elapsed().as_secs_f64() * 1e3)));
                                 }
                                 Err(e) => println!("error: {e}"),
                             }

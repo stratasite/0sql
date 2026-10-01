@@ -218,6 +218,8 @@ struct SqlRequest {
 #[derive(Serialize)]
 struct SqlResponse {
     sql: String,
+    datasource: String,
+    datasource_uid: String,
     adapter: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     corrections: Vec<zsql_spec::fuzzy::Correction>,
@@ -228,6 +230,8 @@ struct SqlResponse {
 #[derive(Serialize)]
 struct ExplainResponse {
     sql: String,
+    datasource: String,
+    datasource_uid: String,
     adapter: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     corrections: Vec<zsql_spec::fuzzy::Correction>,
@@ -264,13 +268,13 @@ fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain:
 
 async fn sql(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
     let (plan, corrections, _) = plan_request(&app, &uid, &branch, req, false)?;
-    Ok(Json(SqlResponse { sql: plan.sql, adapter: plan.adapter, corrections }))
+    Ok(Json(SqlResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections }))
 }
 
 async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
     let (plan, corrections, timings) = plan_request(&app, &uid, &branch, req, true)?;
     let x = plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-    Ok(Json(ExplainResponse { sql: plan.sql, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
+    Ok(Json(ExplainResponse { sql: plan.sql, datasource: plan.datasource, datasource_uid: plan.datasource_uid, adapter: plan.adapter, corrections, timings, phases: x.phases, nodes: x.nodes }))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
