@@ -808,7 +808,7 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                             match remote::plan(&t.client, &t.uid, &t.branch, spec, context.as_ref(), false) {
                                 Ok(v) => {
                                     println!("{}", bold(v["sql"].as_str().unwrap_or("")));
-                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms (server lower {} us, plan {} us)", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3, v["timings_us"]["lower"], v["timings_us"]["plan"])));
+                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms (server {} us: parser {} us, plan {} us)", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3, v["timings"]["total_us"], v["timings"]["parser_us"], v["timings"]["plan_us"])));
                                 }
                                 Err(e) => println!("error: {e}"),
                             }

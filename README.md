@@ -113,7 +113,7 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
 | `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
-| `POST /projects/{uid}/branches/{branch}/plan` | `{spec, context?, explain?}` to `{sql, adapter, timings_us}`, or `{error: {class, message}}` |
+| `POST /projects/{uid}/branches/{branch}/plan` | `{spec, context?, explain?}` to `{sql, adapter, timings: {parser_us, plan_us, total_us}}`, or `{error: {class, message}}` |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
 | `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery (hidden fields excluded by default) |
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |

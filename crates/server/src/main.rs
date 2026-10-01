@@ -220,15 +220,18 @@ struct PlanRequest {
 struct PlanResponse {
     sql: String,
     adapter: String,
-    timings_us: Timings,
+    timings: Timings,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     identities: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
+/// Microseconds the server spent: parsing and resolving the spec,
+/// planning it, and both together.
 struct Timings {
-    lower: u128,
-    plan: u128,
+    parser_us: u128,
+    plan_us: u128,
+    total_us: u128,
 }
 
 async fn plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<PlanRequest>) -> Result<Json<PlanResponse>, ApiError> {
@@ -247,7 +250,7 @@ async fn plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, Stri
     Ok(Json(PlanResponse {
         sql: plan.sql,
         adapter: plan.adapter,
-        timings_us: Timings { lower: (t1 - t0).as_micros(), plan: (t2 - t1).as_micros() },
+        timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() },
         identities: plan.identities,
     }))
 }
