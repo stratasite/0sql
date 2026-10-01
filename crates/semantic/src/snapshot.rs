@@ -252,6 +252,10 @@ pub struct Field {
     #[serde(default)]
     pub disable_listing: bool,
     pub value_list_size: i64,
+    /// How `zsql values sample` treats the field: the top `value_list_size`
+    /// values by row count, every value, or none.
+    #[serde(default)]
+    pub value_sampling: ValueSampling,
     #[serde(default)]
     pub synonyms: Vec<String>,
     pub description: Option<String>,
@@ -269,6 +273,15 @@ impl Field {
     pub fn is_date(&self) -> bool {
         matches!(self.data_type, Some(DataType::Date) | Some(DataType::DateTime))
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueSampling {
+    #[default]
+    Sample,
+    Full,
+    None,
 }
 
 /// A measure exclusion rule: which tables, dimensions or universes the

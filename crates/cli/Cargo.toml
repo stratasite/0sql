@@ -6,7 +6,7 @@ license.workspace = true
 description = "Command line front end: plan queries against a snapshot, score the goldens"
 
 [[bin]]
-name = "0sql"
+name = "zsql"
 path = "src/main.rs"
 
 [dependencies]
@@ -20,6 +20,8 @@ zsql-project.workspace = true
 regex = "1"
 rustyline = "15"
 flate2.workspace = true
+zsql-warehouse.workspace = true
+chrono = "0.4"
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

@@ -27,6 +27,8 @@ use zsql_dialect::Dialects;
 use zsql_spec::expr::ParsedExpression;
 use zsql_semantic::*;
 
+pub mod values;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
     #[error("{0}: {1}")]
@@ -55,6 +57,8 @@ pub struct Loaded {
     pub snapshot: Snapshot,
     pub warnings: Vec<String>,
     pub tests: Vec<ProjectTest>,
+    /// Sampled dimension values (`values.jsonl.gz`), when the project has them.
+    pub values: Option<values::ValueCatalog>,
 }
 
 /// One `tests/*.yml` entry: fields to project by name and what the SQL
@@ -248,7 +252,7 @@ struct Builder<'d> {
 const TABLE_KEYS: &[&str] = &["datasource", "name", "physical_name", "cost", "description", "tags", "metadata", "snapshot", "snapshot_date", "partition", "partitions", "imports", "fields"];
 const FIELD_KEYS: &[&str] = &[
     "type", "name", "description", "hidden", "grains", "data_type", "display_type", "format", "secure", "disable_listing", "disable_value_listing", "value_list_size", "snapshot",
-    "exclusion_type", "exclusions", "inclusions", "extended_blend_group", "synonyms", "tags", "expression",
+    "exclusion_type", "exclusions", "inclusions", "extended_blend_group", "synonyms", "tags", "expression", "values",
 ];
 const EXPRESSION_KEYS: &[&str] = &["sql", "array", "lookup", "primary_key"];
 const JOIN_KEYS: &[&str] = &["left", "right", "sql", "cardinality", "join", "allow_measure_expansion", "description"];
@@ -610,6 +614,7 @@ impl<'d> Builder<'d> {
                     secure: false,
                     disable_listing: false,
                     value_list_size: 1000,
+                    value_sampling: ValueSampling::Sample,
                     synonyms: vec![],
                     description: None,
                     rank: 0,
@@ -637,6 +642,12 @@ impl<'d> Builder<'d> {
             f.secure = bool_of(fm, "secure").unwrap_or(false);
             f.disable_listing = bool_of(fm, "disable_listing").or_else(|| bool_of(fm, "disable_value_listing")).unwrap_or(false);
             f.value_list_size = int_of(fm, "value_list_size").unwrap_or(1000);
+            f.value_sampling = match str_of(fm, "values").map(|v| v.to_lowercase()).as_deref() {
+                None | Some("sample") => ValueSampling::Sample,
+                Some("full") => ValueSampling::Full,
+                Some("none") | Some("false") => ValueSampling::None,
+                Some(other) => return Err(invalid(file, format!("Field {name} errors: values '{other}' should be sample, full or none"))),
+            };
             f.synonyms = strs_of(fm, "synonyms");
             f.description = str_of(fm, "description");
         }
@@ -1160,7 +1171,15 @@ impl<'d> Builder<'d> {
 
     fn finish(self) -> Loaded {
         let snapshot = self.snapshot();
-        Loaded { snapshot, warnings: self.warnings, tests: self.tests }
+        let values = match values::ValueCatalog::read(&self.dir.join(values::FILE_NAME)) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut warnings = self.warnings;
+                warnings.push(format!("{}: {e}", values::FILE_NAME));
+                return Loaded { snapshot, warnings, tests: self.tests, values: None };
+            }
+        };
+        Loaded { snapshot, warnings: self.warnings, tests: self.tests, values }
     }
 }
 

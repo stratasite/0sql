@@ -431,7 +431,7 @@ Type a comma-separated line. Each item is read from its shape:
                a formula with a [Name]@m, [Name]@d or [Alias] reference; unnamed, the formula is its alias
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
 [Name] or \"Name\" is always a field, whatever the name says: [Tables], \"Sales in Store\" > 5.
-Commands start with a dot, as in sqlite: .fields [text], .tables, .json {...spec...}, .tojson <line>, .help, .quit\n.tojson prints a shorthand line as the JSON spec it stands for, without planning it";
+Commands start with a dot, as in sqlite: .fields [text], .tables, .values [text], .json {...spec...}, .tojson <line>, .help, .quit\n.tojson prints a shorthand line as the JSON spec it stands for, without planning it";
 
 #[cfg(test)]
 mod tests {

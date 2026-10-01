@@ -11,7 +11,7 @@ use zsql_semantic::{Snapshot, Universe};
 use zsql_spec::SecurityContext;
 
 #[derive(Parser)]
-#[command(name = "0sql", about = "0sql: semantic layer to SQL")]
+#[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,6 +36,7 @@ struct Model {
     snapshot: Snapshot,
     warnings: Vec<String>,
     tests: Vec<zsql_project::ProjectTest>,
+    values: Option<zsql_project::values::ValueCatalog>,
     dialects: Dialects,
 }
 
@@ -46,10 +47,10 @@ impl Source {
             None => Dialects::builtin(),
         };
         match (&self.snapshot, &self.project) {
-            (Some(path), _) => Ok(Model { snapshot: Snapshot::from_path(path).with_context(|| path.display().to_string())?, warnings: vec![], tests: vec![], dialects }),
+            (Some(path), _) => Ok(Model { snapshot: Snapshot::from_path(path).with_context(|| path.display().to_string())?, warnings: vec![], tests: vec![], values: None, dialects }),
             (None, Some(dir)) => {
                 let loaded = zsql_project::load(dir, &dialects)?;
-                Ok(Model { snapshot: loaded.snapshot, warnings: loaded.warnings, tests: loaded.tests, dialects })
+                Ok(Model { snapshot: loaded.snapshot, warnings: loaded.warnings, tests: loaded.tests, values: loaded.values, dialects })
             }
             (None, None) => bail!("give --snapshot <file> or --project <dir>"),
         }
@@ -149,6 +150,39 @@ enum Command {
     Form {
         #[command(flatten)]
         source: Source,
+    },
+    /// Sample dimension values from the project's warehouses into values.jsonl.gz, or show them.
+    Values {
+        #[command(subcommand)]
+        command: ValuesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ValuesCommand {
+    /// Sample the listable dimensions (top values by row count, or ranges for numbers and dates).
+    Sample {
+        #[arg(long)]
+        project: PathBuf,
+        /// Only these dimensions (uids or names); default: every listable one.
+        #[arg(long, value_delimiter = ',')]
+        dims: Vec<String>,
+        /// Take every distinct value, not the top `value_list_size` (refused above 100k).
+        #[arg(long)]
+        full: bool,
+        /// Resample only dimensions sampled more than this many days ago (or never).
+        #[arg(long)]
+        older_than: Option<i64>,
+        /// Print the SQL that would run and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show what values.jsonl.gz holds, for one dimension or all.
+    Show {
+        #[arg(long)]
+        project: PathBuf,
+        /// A dimension uid or name.
+        dim: Option<String>,
     },
 }
 
@@ -268,7 +302,7 @@ fn main() -> Result<()> {
             for w in &model.warnings {
                 eprintln!("warning: {w}");
             }
-            let universe = Universe::build(model.snapshot)?;
+            let universe = Universe::build(model.snapshot.clone())?;
             let context = read_context(context)?;
             let planner = zsql_planner::Planner::new(&universe, &model.dialects, None);
             let base = model.dialects.base()?;
@@ -279,14 +313,14 @@ fn main() -> Result<()> {
             println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
 
             let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
-            let history = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".0sql_history"));
+            let history = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zsql_history"));
             if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
                 let _ = ed.load_history(h);
             }
             let stdin = std::io::stdin();
             loop {
                 let line = match editor.as_mut() {
-                    Some(ed) => match ed.readline("0sql> ") {
+                    Some(ed) => match ed.readline("zsql> ") {
                         Ok(l) => {
                             let _ = ed.add_history_entry(l.as_str());
                             l
@@ -295,7 +329,7 @@ fn main() -> Result<()> {
                         Err(_) => break,
                     },
                     None => {
-                        print!("0sql> ");
+                        print!("zsql> ");
                         std::io::stdout().flush()?;
                         let mut l = String::new();
                         if stdin.lock().read_line(&mut l)? == 0 {
@@ -338,6 +372,15 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    "values" => match &model.values {
+                        None => println!("no values.jsonl.gz in the project; run `zsql values sample --project <dir>`"),
+                        Some(cat) => {
+                            let needle = rest.to_lowercase();
+                            for d in cat.dimensions.iter().filter(|d| needle.is_empty() || d.uid.to_lowercase().contains(&needle) || d.name.to_lowercase().contains(&needle)) {
+                                print_values(d, needle.is_empty());
+                            }
+                        }
+                    },
                     "tojson" => {
                         // The shorthand line as the JSON spec it lowers from, not planned.
                         match exprs::parse_line(rest) {
@@ -487,6 +530,7 @@ fn main() -> Result<()> {
                 println!("\n(set ZSQL_PROFILE=1 for per-phase planner timings)");
             }
         }
+        Command::Values { command } => values_command(command)?,
         Command::Form { source } => {
             let from_project = source.project.is_some();
             let model = source.load()?;
@@ -505,6 +549,144 @@ fn main() -> Result<()> {
             println!("{} warnings", formed.warnings.len() + model.warnings.len());
             for w in model.warnings.iter().chain(formed.warnings.iter()) {
                 println!("warning: {w}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_values(d: &zsql_project::values::DimensionValues, brief: bool) {
+    let when = d.sampled_at.get(..10).unwrap_or(&d.sampled_at);
+    match (&d.range, d.values.is_empty()) {
+        (Some(r), _) => println!("{:<40} {} .. {}  (distinct {}, {})", d.uid, r.min, r.max, d.distinct.map(|n| n.to_string()).unwrap_or_else(|| "?".into()), when),
+        (None, false) => {
+            println!("{:<40} {} of {} values, {:?}, {}", d.uid, d.values.len(), d.distinct.map(|n| n.to_string()).unwrap_or_else(|| "?".into()), d.mode, when);
+            let shown = if brief { 5 } else { d.values.len() };
+            for v in d.values.iter().take(shown) {
+                println!("    {:<60} {}", v.v, v.n);
+            }
+            if shown < d.values.len() {
+                println!("    ... {} more", d.values.len() - shown);
+            }
+        }
+        (None, true) => println!("{:<40} no values ({})", d.uid, when),
+    }
+}
+
+fn values_command(command: ValuesCommand) -> Result<()> {
+    use zsql_project::values::{DimensionValues, Range, ValueCatalog, ValueCount, FILE_NAME, FULL_CEILING};
+    match command {
+        ValuesCommand::Show { project, dim } => {
+            let catalog = ValueCatalog::read(&project.join(FILE_NAME))?;
+            let Some(catalog) = catalog else {
+                println!("no {FILE_NAME} in {}", project.display());
+                return Ok(());
+            };
+            let needle = dim.unwrap_or_default().to_lowercase();
+            for d in catalog.dimensions.iter().filter(|d| needle.is_empty() || d.uid.to_lowercase().contains(&needle) || d.name.to_lowercase().contains(&needle)) {
+                print_values(d, needle.is_empty());
+            }
+        }
+        ValuesCommand::Sample { project, dims, full, older_than, dry_run } => {
+            let dialects = Dialects::builtin();
+            let loaded = zsql_project::load(&project, &dialects)?;
+            for w in &loaded.warnings {
+                eprintln!("warning: {w}");
+            }
+            let universe = Universe::build(loaded.snapshot)?;
+            let mut catalog = loaded.values.unwrap_or_default();
+            let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
+                match dialects.get(adapter) {
+                    Ok(d) => zsql_planner::sql::expr::qualify(sql, columns, &d, alias),
+                    Err(_) => sql.to_string(),
+                }
+            };
+            let (jobs, skipped) = zsql_project::values::plan(&universe, &dims, full, &qualify);
+            for (uid, why) in &skipped {
+                if !dims.is_empty() {
+                    println!("skip {uid}: {why}");
+                }
+            }
+            let now = chrono::Utc::now();
+            let stale_before = older_than.map(|days| now - chrono::Duration::days(days));
+            let mut todo: Vec<_> = jobs
+                .into_iter()
+                .filter(|j| match (stale_before, catalog.get(&j.uid)) {
+                    (Some(cut), Some(existing)) => chrono::DateTime::parse_from_rfc3339(&existing.sampled_at).map(|t| t < cut).unwrap_or(true),
+                    _ => true,
+                })
+                .collect();
+            todo.sort_by(|a, b| (a.datasource_uid.clone(), a.uid.clone()).cmp(&(b.datasource_uid.clone(), b.uid.clone())));
+            if dry_run {
+                for j in &todo {
+                    println!("-- {} ({}) on {} via {}\n{}\n{}\n", j.uid, j.name, j.table_uid, j.datasource_uid, j.distinct_sql, j.values_sql.clone().or(j.range_sql.clone()).unwrap_or_default());
+                }
+                println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
+                return Ok(());
+            }
+            let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
+            let (mut done, mut failed) = (0, 0);
+            for j in &todo {
+                if !connections.contains_key(&j.datasource_uid) {
+                    let settings = zsql_warehouse::settings_for(&project, &j.datasource_uid)?;
+                    match zsql_warehouse::connect(&settings) {
+                        Ok(c) => {
+                            connections.insert(j.datasource_uid.clone(), c);
+                        }
+                        Err(e) => bail!("datasource {}: {e}", j.datasource_uid),
+                    }
+                }
+                let wh = connections.get_mut(&j.datasource_uid).unwrap();
+                let outcome = (|| -> Result<DimensionValues> {
+                    let distinct = wh.query(&j.distinct_sql)?.first().and_then(|r| r.first().cloned()).flatten().and_then(|n| n.parse::<i64>().ok());
+                    let mut entry = DimensionValues {
+                        uid: j.uid.clone(),
+                        name: j.name.clone(),
+                        table: j.table_uid.clone(),
+                        sampled_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        mode: j.mode,
+                        distinct,
+                        values: vec![],
+                        range: None,
+                    };
+                    if let Some(sql) = &j.values_sql {
+                        if j.cap.is_none() && distinct.map(|n| n > FULL_CEILING).unwrap_or(false) {
+                            bail!("{} has {} distinct values; a full sample is refused above {FULL_CEILING}. Use the default sample or raise value_list_size.", j.uid, distinct.unwrap());
+                        }
+                        entry.values = wh
+                            .query(sql)?
+                            .into_iter()
+                            .filter_map(|r| Some(ValueCount { v: r.first().cloned().flatten()?, n: r.get(1).cloned().flatten().and_then(|n| n.parse().ok()).unwrap_or(0) }))
+                            .collect();
+                    }
+                    if let Some(sql) = &j.range_sql {
+                        let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
+                        if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
+                            entry.range = Some(Range { min: lo, max: hi });
+                        }
+                    }
+                    Ok(entry)
+                })();
+                match outcome {
+                    Ok(entry) => {
+                        let what = match (&entry.range, entry.values.len()) {
+                            (Some(r), _) => format!("{} .. {}", r.min, r.max),
+                            (None, n) => format!("{n} values"),
+                        };
+                        println!("{:<40} {what}", j.uid);
+                        catalog.put(entry);
+                        done += 1;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{:<40} FAILED: {e}", j.uid);
+                    }
+                }
+            }
+            catalog.write(&project.join(FILE_NAME))?;
+            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), project.join(FILE_NAME).display());
+            if failed > 0 {
+                bail!("{failed} dimension(s) failed to sample");
             }
         }
     }

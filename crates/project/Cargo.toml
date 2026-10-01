@@ -10,7 +10,9 @@ zsql-semantic.workspace = true
 zsql-formation.workspace = true
 zsql-dialect.workspace = true
 zsql-spec.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+flate2.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 

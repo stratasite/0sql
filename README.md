@@ -13,7 +13,7 @@ crates/spec       the query spec, its lowering into the typed query, the formula
 crates/planner    resolution, visitors, SQL generation
 crates/project    a project directory (YAML models) loaded into a snapshot
 crates/golden     golden cases and the scoreboard
-crates/cli        0sql: check, plan, repl, test, export, golden, bench, form
+crates/cli        zsql: check, plan, repl, test, export, golden, bench, form
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
 harness/          import of goldens from a roundhouse/strata-rs capture
@@ -42,14 +42,16 @@ say `unresolved: allow` under `permission_resolution` to be skipped
 instead, which is what strata does. Bypass flags open the door explicitly.
 
 ```
-0sql check  --project ../myproject
-0sql plan   --project ../myproject --expr "item category, month(date), store net paid > 100"
-0sql plan   --project ../myproject --spec q.json --context user.json
-0sql repl   --project ../myproject
-0sql test   --project ../myproject
-0sql export --project ../myproject --out model.json.gz
-0sql golden                       # planner parity with the goldens
-0sql bench                        # phase timings (ZSQL_PROFILE=1 for detail)
+zsql check  --project ../myproject
+zsql plan   --project ../myproject --expr "item category, month(date), store net paid > 100"
+zsql plan   --project ../myproject --spec q.json --context user.json
+zsql repl   --project ../myproject
+zsql test   --project ../myproject
+zsql export --project ../myproject --out model.json.gz
+zsql values sample --project ../myproject          # dimension values into values.jsonl.gz
+zsql values show   --project ../myproject category
+zsql golden                       # planner parity with the goldens
+zsql bench                        # phase timings (ZSQL_PROFILE=1 for detail)
 ```
 
 The repl takes one comma-separated line and reads each item from its shape:
@@ -59,6 +61,21 @@ projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
 field. Commands start with a dot: `.fields`, `.tables`, `.json {...}`,
 `.tojson <line>`, `.help`, `.quit`.
+
+## Dimension values
+
+`zsql values sample` reads each listable dimension from the cheapest table
+that holds it and writes `values.jsonl.gz` in the project: for text, the
+top `value_list_size` values by row count (default 1000) with their counts,
+or every value with `values: full` on the field (refused above 100k
+distinct); for numbers and dates, the min and max. Hidden dimensions,
+listing-disabled ones, `values: none`, and any dimension a security policy
+names are never sampled. The file is customer data: gitignore it unless
+you want it reviewed. `--dims a,b` limits the run, `--older-than 7`
+resamples only stale entries, `--dry-run` prints the SQL. Connections come
+from `datasources.yml`, secrets from `.strata` in the project (the strata
+CLI's credential file) or `ZSQL_DS_<KEY>_PASSWORD`; duckdb and postgres
+are the drivers so far.
 
 ## Parity
 
