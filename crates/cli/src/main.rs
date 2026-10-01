@@ -137,6 +137,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The dimensions a query can take on: where it can drill to.
+    Drill {
+        #[command(flatten)]
+        query: QueryArgs,
+        /// Print the server's answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the query spec a shorthand line makes, without calling the server.
     Spec {
         /// The line: projections, filters and calculations, comma-separated.
@@ -304,6 +312,16 @@ fn main() -> Result<()> {
         }
         Command::Sql { query, explain, json } => query.run(explain, json),
         Command::Explain { query, json } => query.run(true, json),
+        Command::Drill { query, json } => {
+            let (t, spec_value, context) = query.resolve()?;
+            let v = remote::drill(&t.client, &t.uid, &t.branch, spec_value, context.as_ref())?;
+            if json {
+                remote::print_json(&v)?;
+            } else {
+                remote::print_drill(&v, &|s| s.to_string());
+            }
+            Ok(())
+        }
         Command::Repl { at, context } => repl(at.resolve()?, read_json(context)?),
         Command::Fields { at, q, hidden } => {
             let t = at.resolve()?;
@@ -363,7 +381,8 @@ struct QueryArgs {
 }
 
 impl QueryArgs {
-    fn run(self, explain: bool, json: bool) -> Result<()> {
+    /// The target, the spec and the context the arguments name.
+    fn resolve(self) -> Result<(Target, Value, Option<Value>)> {
         let t = self.at.resolve()?;
         let spec_value = match (self.spec, self.expr) {
             (Some(path), _) => {
@@ -381,6 +400,11 @@ impl QueryArgs {
             (None, None) => bail!("give the query as --spec FILE or --expr LINE"),
         };
         let context = read_json(self.context)?;
+        Ok((t, spec_value, context))
+    }
+
+    fn run(self, explain: bool, json: bool) -> Result<()> {
+        let (t, spec_value, context) = self.resolve()?;
         let v = remote::sql(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), explain)?;
         if json {
             remote::print_json(&v)?;
@@ -845,9 +869,9 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                     }
                     Err(e) => println!("error: {e}"),
                 },
-                "" | "json" | "explain" => {
+                "" | "json" | "explain" | "drill" => {
                     // A query: the shorthand, or a JSON spec after .json or
-                    // starting with a brace. .explain takes either.
+                    // starting with a brace. .explain and .drill take either.
                     let text = if cmd == "" { line } else { rest };
                     let spec: Result<Value, String> = if cmd == "json" || text.starts_with('{') {
                         serde_json::from_str(text).map_err(|e| e.to_string())
@@ -861,6 +885,10 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                     };
                     match spec {
                         Err(e) => println!("error: {e}"),
+                        Ok(spec) if cmd == "drill" => match remote::drill(&t.client, &t.uid, &t.branch, spec, context.as_ref()) {
+                            Ok(v) => remote::print_drill(&v, &dim),
+                            Err(e) => println!("error: {e}"),
+                        },
                         Ok(spec) => {
                             let t0 = Instant::now();
                             match remote::sql(&t.client, &t.uid, &t.branch, spec, context.as_ref(), cmd == "explain") {

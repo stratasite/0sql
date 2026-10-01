@@ -87,6 +87,24 @@ pub fn sql(client: &Client, uid: &str, branch: &str, spec: Value, context: Optio
     client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &body)
 }
 
+/// `/drill`: the dimensions the query can take on.
+pub fn drill(client: &Client, uid: &str, branch: &str, spec: Value, context: Option<&Value>) -> Result<Value> {
+    let mut body = json!({ "spec": spec });
+    if let Some(c) = context {
+        body["context"] = c.clone();
+    }
+    client.post(&format!("{}/drill", branch_path(uid, branch)), &body)
+}
+
+pub fn print_drill(v: &Value, style: &dyn Fn(&str) -> String) {
+    let dims = v["dimensions"].as_array().cloned().unwrap_or_default();
+    for f in &dims {
+        let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        println!("{:<40} {:<32} {}", f["uid"].as_str().unwrap_or(""), f["name"].as_str().unwrap_or(""), style(&tables.join(", ")));
+    }
+    println!("{}", style(&format!("-- {} dimensions can be added, {} cannot · server {} us", dims.len(), v["refused"], v["total_us"])));
+}
+
 /// A dimension's sampled values by uid or name, else by a unique substring
 /// match over the deployment's dimensions.
 pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result<Value> {

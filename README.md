@@ -62,6 +62,7 @@ zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's 
 zsql test                         # the deployed branch's tests/*.yml
 zsql sql --expr "department, sales value, department = PRODUCE" [--context user.json] [--explain] [--json]
 zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
+zsql drill --expr "department, sales value"   # the dimensions the query can take on
 zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes, locally
 zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
 zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
@@ -86,7 +87,7 @@ calculation (`Alias = formula` or `formula as Alias`), anything else is a
 projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
 field. Commands start with a dot: `.fields`, `.tables`, `.values`,
-`.json {...}`, `.spec <line>`, `.branch`, `.help`, `.quit`. Inside a project,
+`.drill <line>`, `.json {...}`, `.spec <line>`, `.branch`, `.help`, `.quit`. Inside a project,
 `zsql` with no command opens the repl.
 
 `zsql-dev` (the devtool crate) is the engine on the command line for its
@@ -118,6 +119,7 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
 | `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
+| `POST /projects/{uid}/branches/{branch}/drill` | the same request, answered with the visible dimensions the query can add and still plan: `{dimensions: [{uid, name, data_type, tables}], refused, total_us}` |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
 | `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery: containing matches, then near matches with a `score` (hidden fields excluded by default) |
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |
