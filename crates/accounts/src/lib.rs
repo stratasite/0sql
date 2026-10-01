@@ -199,11 +199,26 @@ CREATE TABLE IF NOT EXISTS invites (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), user_id INTEGER NOT NULL REFERENCES users(id),
   hash TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), accepted_at TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), account_id INTEGER NOT NULL REFERENCES accounts(id),
+  hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
 ";
+
+fn hash_password(password: &str) -> Result<String> {
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::PasswordHasher;
+    if password.chars().count() < 8 {
+        return Err(Error::Invalid("a password needs at least 8 characters".into()));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(argon2::Argon2::default().hash_password(password.as_bytes(), &salt).map_err(|e| Error::Invalid(e.to_string()))?.to_string())
+}
 
 fn hash(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
@@ -344,8 +359,9 @@ impl Store {
 
     /// A new account with its first admin and key. The account uid is the
     /// slug of its name, made unique with a suffix when taken.
-    pub fn signup(&self, account_name: &str, email: &str, user_name: &str) -> Result<Signup> {
+    pub fn signup(&self, account_name: &str, email: &str, user_name: &str, password: Option<&str>) -> Result<Signup> {
         let email = email_of(email)?;
+        let password_hash = password.map(hash_password).transpose()?;
         let name = account_name.trim();
         if name.is_empty() {
             return Err(Error::Invalid("an account name is required".into()));
@@ -363,9 +379,14 @@ impl Store {
         tx.execute("INSERT INTO accounts (uid, name) VALUES (?1, ?2)", params![uid, name])?;
         let account = Account { id: tx.last_insert_rowid(), uid, name: name.to_string() };
         let user = match tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()? {
-            Some(u) => u,
+            Some(u) => {
+                if let Some(h) = &password_hash {
+                    tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2 AND password_hash IS NULL", params![h, u.id])?;
+                }
+                u
+            }
             None => {
-                tx.execute("INSERT INTO users (email, name) VALUES (?1, ?2)", params![email, user_name.trim()])?;
+                tx.execute("INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)", params![email, user_name.trim(), password_hash])?;
                 User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string() }
             }
         };
@@ -571,7 +592,8 @@ impl Store {
 
     /// Redeems an invite: the member's name is set when given, and a
     /// first personal key is issued. The token stops working.
-    pub fn accept_invite(&self, token: &str, name: &str, key_name: &str) -> Result<(Account, User, UserKey, String)> {
+    pub fn accept_invite(&self, token: &str, name: &str, key_name: &str, password: Option<&str>) -> Result<(Account, User, UserKey, String)> {
+        let password_hash = password.map(hash_password).transpose()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (invite_id, account_id, user_id): (i64, i64, i64) = tx
@@ -581,6 +603,9 @@ impl Store {
         tx.execute("UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![invite_id])?;
         if !name.trim().is_empty() {
             tx.execute("UPDATE users SET name = ?1 WHERE id = ?2", params![name.trim(), user_id])?;
+        }
+        if let Some(h) = &password_hash {
+            tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user_id])?;
         }
         let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
         let account = tx.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
@@ -874,6 +899,80 @@ impl Store {
         conn.query_row("SELECT count(*) FROM project_access WHERE project_id = ?1 AND level = 'owner'", params![project_id], |r| r.get(0))
     }
 
+    // ----------------------------------------------------- passwords, sessions
+
+    pub fn set_password(&self, account_id: i64, user: &User, password: &str) -> Result<()> {
+        let h = hash_password(password)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user.id])?;
+        Self::audit(&conn, account_id, &user.email, "password_set", "")?;
+        Ok(())
+    }
+
+    /// The user when the email and password match; `None` otherwise,
+    /// including for users who never set a password.
+    pub fn verify_password(&self, email: &str, password: &str) -> Result<Option<User>> {
+        let Ok(email) = email_of(email) else { return Ok(None) };
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(User, Option<String>)> = conn
+            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get(3)?)))
+            .optional()?;
+        let Some((user, Some(h))) = row else { return Ok(None) };
+        use argon2::{PasswordHash, PasswordVerifier};
+        let parsed = PasswordHash::new(&h).map_err(|e| Error::Invalid(e.to_string()))?;
+        Ok(argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok().then_some(user))
+    }
+
+    /// A browser session for the user on an account; the token is the
+    /// cookie value, stored hashed, good for `days`.
+    pub fn create_session(&self, user: &User, days: i64) -> Result<(String, Account)> {
+        let conn = self.conn.lock().unwrap();
+        let account = conn
+            .query_row(
+                "SELECT a.id, a.uid, a.name FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 ORDER BY a.id LIMIT 1",
+                params![user.id],
+                |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Denied(format!("{} belongs to no account", user.email)))?;
+        let token = new_secret("zss");
+        conn.execute(
+            "INSERT INTO sessions (user_id, account_id, hash, expires_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now', ?4))",
+            params![user.id, account.id, hash(&token), format!("+{days} days")],
+        )?;
+        Self::audit(&conn, account.id, &user.email, "login", "")?;
+        Ok((token, account))
+    }
+
+    /// The principal a session cookie stands for, if it is live.
+    pub fn session(&self, token: &str) -> Result<Option<Principal>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT user_id, account_id FROM sessions WHERE hash = ?1 AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+                params![hash(token.trim())],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((user_id, account_id)) = row else { return Ok(None) };
+        let user = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
+        let membership = conn
+            .query_row(
+                "SELECT a.id, a.uid, a.name, m.role FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 AND m.account_id = ?2",
+                params![user_id, account_id],
+                |r| Ok((Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }, role_of(&r.get::<_, String>(3)?))),
+            )
+            .optional()?;
+        let Some((account, role)) = membership else { return Ok(None) };
+        Ok(Some(Principal::User { user, account, role, key_id: 0 }))
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sessions WHERE hash = ?1", params![hash(token.trim())])?;
+        Ok(())
+    }
+
     // --------------------------------------------------------------- audit
 
     pub fn record(&self, account_id: i64, actor: &str, action: &str, subject: &str) -> Result<()> {
@@ -902,21 +1001,21 @@ mod tests {
     #[test]
     fn signup_admin_developer_and_project_access() {
         let s = Store::in_memory().unwrap();
-        let su = s.signup("Acme Corp", "Ann@acme.com", "Ann").unwrap();
+        let su = s.signup("Acme Corp", "Ann@acme.com", "Ann", Some("hunter2hunter2")).unwrap();
         assert_eq!(su.account.uid, "acme-corp");
         assert!(su.secret.starts_with("zsk_"));
         let ann = principal(&s, &su.secret);
         assert!(matches!(ann, Principal::User { role: Role::Admin, .. }));
 
         // A second account with the same name gets a suffix.
-        assert_eq!(s.signup("Acme Corp", "other@x.com", "").unwrap().account.uid, "acme-corp-2");
+        assert_eq!(s.signup("Acme Corp", "other@x.com", "", None).unwrap().account.uid, "acme-corp-2");
 
         let bob = s.add_member(su.account.id, "ann@acme.com", "bob@acme.com", "", Role::Developer).unwrap();
         // Bob gets his first key by redeeming an invite; the token is one-time.
         let token = s.create_invite(su.account.id, "ann@acme.com", "bob@acme.com").unwrap();
-        let (_, bob_user, first, bob_secret) = s.accept_invite(&token, "Bob", "").unwrap();
+        let (_, bob_user, first, bob_secret) = s.accept_invite(&token, "Bob", "", Some("bobpassword")).unwrap();
         assert_eq!((bob_user.name.as_str(), first.name.as_str()), ("Bob", "default"));
-        assert!(matches!(s.accept_invite(&token, "", ""), Err(Error::NotFound(_))));
+        assert!(matches!(s.accept_invite(&token, "", "", None), Err(Error::NotFound(_))));
         let (bob_key, _) = s.create_user_key(su.account.id, &bob.user, "laptop").unwrap();
         assert_eq!(bob_key.name, "laptop");
         let bob_p = principal(&s, &bob_secret);
@@ -944,6 +1043,15 @@ mod tests {
         s.authorize(&ann, &bobs, "main", Verb::Owner).unwrap();
         // The last admin cannot leave.
         assert!(matches!(s.remove_member(su.account.id, "ann@acme.com", "ann@acme.com"), Err(Error::Invalid(_))));
+        // Passwords and sessions.
+        assert!(s.verify_password("ann@acme.com", "wrong").unwrap().is_none());
+        let ann_user = s.verify_password("ann@acme.com", "hunter2hunter2").unwrap().expect("ann's password");
+        let (cookie, acct) = s.create_session(&ann_user, 30).unwrap();
+        assert_eq!(acct.uid, "acme-corp");
+        assert!(matches!(s.session(&cookie).unwrap(), Some(Principal::User { role: Role::Admin, .. })));
+        s.delete_session(&cookie).unwrap();
+        assert!(s.session(&cookie).unwrap().is_none());
+        assert!(s.verify_password("bob@acme.com", "bobpassword").unwrap().is_some());
         // Removing Bob revokes his key.
         s.remove_member(su.account.id, "ann@acme.com", "bob@acme.com").unwrap();
         assert!(s.authenticate(&bob_secret).unwrap().is_none());
@@ -952,7 +1060,7 @@ mod tests {
     #[test]
     fn query_keys_read_granted_branches_only() {
         let s = Store::in_memory().unwrap();
-        let su = s.signup("Acme", "ann@acme.com", "Ann").unwrap();
+        let su = s.signup("Acme", "ann@acme.com", "Ann", None).unwrap();
         let sales = s.create_project(su.account.id, &su.user, "sales", "Sales", "main").unwrap();
         let hr = s.create_project(su.account.id, &su.user, "hr", "HR", "main").unwrap();
         let (qk, secret) = s.create_query_key(su.account.id, &su.user, "web app").unwrap();

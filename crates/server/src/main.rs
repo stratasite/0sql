@@ -85,6 +85,8 @@ struct App {
     /// Accounts, users and keys; `None` in the single-tenant mode.
     accounts: Option<Store>,
     signup_open: bool,
+    /// Session cookies marked Secure, for a server behind https.
+    secure_cookies: bool,
 }
 
 // ---------------------------------------------------------------- tenancy
@@ -99,14 +101,46 @@ impl FromRequestParts<Shared> for Auth {
         let Some(store) = &app.accounts else { return Ok(Auth(None)) };
         let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
         let secret = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")).map(str::trim).unwrap_or("");
-        if secret.is_empty() {
-            return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()));
+        if !secret.is_empty() {
+            return match store.authenticate(secret).map_err(internal)? {
+                Some(p) => Ok(Auth(Some(p))),
+                None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
+            };
         }
-        match store.authenticate(secret).map_err(internal)? {
-            Some(p) => Ok(Auth(Some(p))),
-            None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
+        // The web app: a session cookie. Anything but a read must also
+        // carry the header the app's own scripts send, which a cross-site
+        // form cannot, so a stolen navigation cannot act as the user.
+        if let Some(token) = cookie(parts, SESSION_COOKIE) {
+            let safe = matches!(parts.method.as_str(), "GET" | "HEAD" | "OPTIONS");
+            if !safe && parts.headers.get("x-requested-with").and_then(|v| v.to_str().ok()) != Some("zsql") {
+                return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "this request did not come from the app".into()));
+            }
+            if let Some(p) = store.session(&token).map_err(internal)? {
+                return Ok(Auth(Some(p)));
+            }
         }
+        Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()))
     }
+}
+
+const SESSION_COOKIE: &str = "zsql_session";
+const SESSION_DAYS: i64 = 30;
+
+fn cookie(parts: &Parts, name: &str) -> Option<String> {
+    let header = parts.headers.get("cookie")?.to_str().ok()?;
+    header.split(';').map(str::trim).find_map(|kv| kv.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')).map(str::to_string))
+}
+
+/// A response that sets (or clears) the session cookie.
+fn with_session_cookie(app: &App, body: Value, token: Option<&str>) -> Response {
+    let secure = if app.secure_cookies { "; Secure" } else { "" };
+    let value = match token {
+        Some(t) => format!("{SESSION_COOKIE}={t}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}", SESSION_DAYS * 86400),
+        None => format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"),
+    };
+    let mut r = Json(body).into_response();
+    r.headers_mut().insert("set-cookie", value.parse().expect("cookie header"));
+    r
 }
 
 /// Where a request's deployments live: the account's slice, or everything.
@@ -681,16 +715,63 @@ struct SignupRequest {
     email: String,
     #[serde(default)]
     name: String,
+    /// Optional: an account made from the CLI alone has no password until
+    /// someone sets one; the web app always sends one.
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// A new account with its first admin and key. The secret is shown once.
-async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Result<Json<Value>, ApiError> {
+/// With a password, the answer also opens a session.
+async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Result<Response, ApiError> {
     let store = store_of(&app)?;
     if !app.signup_open {
         return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "sign-up is closed on this server".into()));
     }
-    let su = store.signup(&req.account, &req.email, &req.name).map_err(accounts_error)?;
-    Ok(Json(json!({ "account": su.account, "user": su.user, "key": su.key, "secret": su.secret })))
+    let password = req.password.as_deref().filter(|p| !p.is_empty());
+    let su = store.signup(&req.account, &req.email, &req.name, password).map_err(accounts_error)?;
+    let body = json!({ "account": su.account, "user": su.user, "key": su.key, "secret": su.secret });
+    if password.is_some() {
+        let (token, _) = store.create_session(&su.user, SESSION_DAYS).map_err(accounts_error)?;
+        return Ok(with_session_cookie(&app, body, Some(&token)));
+    }
+    Ok(Json(body).into_response())
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> Result<Response, ApiError> {
+    let store = store_of(&app)?;
+    let user = store
+        .verify_password(&req.email, &req.password)
+        .map_err(accounts_error)?
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "wrong email or password".into()))?;
+    let (token, account) = store.create_session(&user, SESSION_DAYS).map_err(accounts_error)?;
+    Ok(with_session_cookie(&app, json!({ "user": user, "account": account }), Some(&token)))
+}
+
+async fn logout(State(app): State<Shared>, parts: axum::http::request::Parts) -> Result<Response, ApiError> {
+    let store = store_of(&app)?;
+    if let Some(token) = cookie(&parts, SESSION_COOKIE) {
+        store.delete_session(&token).map_err(accounts_error)?;
+    }
+    Ok(with_session_cookie(&app, json!({ "logged_out": true }), None))
+}
+
+#[derive(Deserialize)]
+struct PasswordRequest {
+    password: String,
+}
+
+async fn set_password(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<PasswordRequest>) -> Result<Json<Value>, ApiError> {
+    let store = store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    store.set_password(account.id, user, &req.password).map_err(accounts_error)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn me(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
@@ -749,14 +830,51 @@ struct AcceptRequest {
     name: String,
     #[serde(default)]
     key_name: String,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// No auth: the token is the credential. Answers with the member's first
-/// personal key, shown once.
-async fn accept_invite(State(app): State<Shared>, Json(req): Json<AcceptRequest>) -> Result<Json<Value>, ApiError> {
+/// personal key, shown once, and opens a session when a password was set.
+async fn accept_invite(State(app): State<Shared>, Json(req): Json<AcceptRequest>) -> Result<Response, ApiError> {
     let store = store_of(&app)?;
-    let (account, user, key, secret) = store.accept_invite(&req.token, &req.name, &req.key_name).map_err(accounts_error)?;
-    Ok(Json(json!({ "account": account, "user": user, "key": key, "secret": secret })))
+    let password = req.password.as_deref().filter(|p| !p.is_empty());
+    let (account, user, key, secret) = store.accept_invite(&req.token, &req.name, &req.key_name, password).map_err(accounts_error)?;
+    let body = json!({ "account": account, "user": user, "key": key, "secret": secret });
+    if password.is_some() {
+        let (token, _) = store.create_session(&user, SESSION_DAYS).map_err(accounts_error)?;
+        return Ok(with_session_cookie(&app, body, Some(&token)));
+    }
+    Ok(Json(body).into_response())
+}
+
+// ------------------------------------------------------------------ web app
+
+/// The app shell and its assets, embedded. Every `/app/...` path gets the
+/// shell; the script reads the path and renders the view.
+async fn ui(Path(rest): Path<String>) -> Response {
+    ui_file(&rest)
+}
+
+async fn ui_root() -> Response {
+    ui_file("")
+}
+
+fn ui_file(path: &str) -> Response {
+    let (body, mime): (&'static str, &str) = match path {
+        "app.css" => (include_str!("../ui/app.css"), "text/css; charset=utf-8"),
+        "app.js" => (include_str!("../ui/app.js"), "text/javascript; charset=utf-8"),
+        _ => (include_str!("../ui/app.html"), "text/html; charset=utf-8"),
+    };
+    ([("content-type", mime.to_string()), ("cache-control", "no-cache".to_string())], body).into_response()
+}
+
+async fn root(State(app): State<Shared>) -> Response {
+    if app.accounts.is_some() {
+        axum::response::Redirect::to("/app/").into_response()
+    } else {
+        "zsqld: accounts off; see /healthz".into_response()
+    }
 }
 
 async fn remove_member(State(app): State<Shared>, Auth(who): Auth, Path(email): Path<String>) -> Result<Json<Value>, ApiError> {
@@ -1000,9 +1118,23 @@ fn now() -> String {
     humantime(std::time::SystemTime::now())
 }
 
-/// Seconds since the epoch as text; good enough for a test server.
+/// UTC, to the minute: `2026-10-01 15:04`.
 fn humantime(t: std::time::SystemTime) -> String {
-    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default()
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // Civil-from-days (Howard Hinnant), so no date crate is needed here.
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
 }
 
 #[tokio::main]
@@ -1014,7 +1146,8 @@ async fn main() -> anyhow::Result<()> {
     let accounts_on = matches!(std::env::var("ZSQL_ACCOUNTS").as_deref(), Ok("on") | Ok("1") | Ok("true"));
     let accounts = if accounts_on { Some(Store::open(&data_dir.join("accounts.db"))?) } else { None };
     let signup_open = !matches!(std::env::var("ZSQL_SIGNUP").as_deref(), Ok("closed") | Ok("off") | Ok("0"));
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open });
+    let secure_cookies = std::env::var("ZSQL_PUBLIC_URL").map(|u| u.starts_with("https://")).unwrap_or(false);
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies });
     let n = reload(&app)?;
     eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
 
@@ -1033,7 +1166,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(values))
+        .route("/", get(root))
+        .route("/app", get(ui_root))
+        .route("/app/", get(ui_root))
+        .route("/app/{*rest}", get(ui))
         .route("/signup", post(signup))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/account/password", post(set_password))
         .route("/me", get(me))
         .route("/account/members", get(members).post(add_member))
         .route("/account/members/{email}", delete(remove_member))

@@ -78,10 +78,28 @@ A user deploying to a project uid the account does not have yet creates
 the project and owns it; its name and production branch come from the
 archive's project.yml.
 
+## The web app
+
+Served by zsqld itself at `/app/` (the root redirects there when accounts
+are on): sign-up, login, invite acceptance, projects with their deployed
+branches, settings and people, query keys with grants and rotation,
+personal keys and password, members with invites, and the audit log for
+admins. One HTML shell, one stylesheet and one script, embedded in the
+binary; views render from the JSON API. Black and white with rust for
+what matters, Inter and Space Grotesk, JetBrains Mono for keys; light and
+dark follow the system, with a toggle.
+
+Sessions are a cookie (`zsql_session`, HttpOnly, SameSite=Lax, Secure
+when `ZSQL_PUBLIC_URL` is https) backed by a hashed row with a 30-day
+expiry. Any state-changing call under a cookie must also carry the
+`x-requested-with: zsql` header the app's scripts send, which a
+cross-site form cannot. Passwords are argon2 hashes; sign-up and invite
+acceptance set them. `POST /login`, `POST /logout`,
+`POST /account/password`.
+
 ## Deferred
 
-- Sign-up, login and the key pages in a web app (`app.0sql.io`);
-  passwords or magic links. The `users.password_hash` column waits for it.
+- Magic links and password reset by email; SSO.
 - A user in several accounts: the schema allows it, the key answers for
   the first membership for now.
 - Key expiry, a viewer role, teams, binding a query key to the security

@@ -13,3 +13,4 @@ thiserror.workspace = true
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+argon2 = { version = "0.5", features = ["std"] }

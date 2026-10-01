@@ -133,7 +133,8 @@ With `ZSQL_ACCOUNTS=on` the server is multi-tenant: accounts, users,
 personal keys and read-only query keys with per-project grants, in a
 SQLite file in the data directory; see `docs/accounts-and-access.md` for
 the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
-endpoints. Off, it is the single-tenant self-hosted mode with no auth.
+endpoints, and the web app at `/app/` for sign-up, keys, members and
+project access. Off, it is the single-tenant self-hosted mode with no auth.
 
 Each deployment keeps its planner, the per-root universe index, built
 once at deploy beside the universe; requests borrow it, so server time
