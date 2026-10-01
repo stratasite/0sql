@@ -128,6 +128,10 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 
 A branch with security policies refuses to plan without a context.
 
+Each deployment keeps its planner, the per-root universe index, built
+once at deploy beside the universe; requests borrow it, so server time
+is lowering plus planning only.
+
 A field reference resolves by uid, name or synonym, case ignored. One that
 matches nothing resolves to the nearest field by character trigram
 similarity when that field clearly leads (score 0.5 or more, 0.2 ahead of

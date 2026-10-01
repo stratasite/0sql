@@ -34,18 +34,43 @@ use zsql_project::values::ValueCatalog;
 use zsql_semantic::{FieldKind, Snapshot, Universe};
 use zsql_spec::SecurityContext;
 
+// A deployed branch's universe and the planner index built over it, in
+// one cell: the planner borrows the universe, so the two must live and
+// die together, and the cell keeps the universe where the borrow expects
+// it. Built once per deploy; every request borrows it.
+self_cell::self_cell!(
+    struct Engine {
+        owner: Universe,
+        #[covariant]
+        dependent: Planner,
+    }
+);
+
+type Planner<'a> = zsql_planner::Planner<'a>;
+
 struct Deployed {
     uid: String,
     branch: String,
-    universe: Universe,
+    engine: Engine,
     values: Option<ValueCatalog>,
     tests: Vec<zsql_project::ProjectTest>,
     warnings: Vec<String>,
     deployed_at: String,
 }
 
+impl Deployed {
+    fn universe(&self) -> &Universe {
+        self.engine.borrow_owner()
+    }
+    fn planner(&self) -> &Planner<'_> {
+        self.engine.borrow_dependent()
+    }
+}
+
 struct App {
-    dialects: Dialects,
+    /// Shared by every deployment for the life of the process, so each
+    /// planner can borrow it for as long as its universe.
+    dialects: &'static Dialects,
     data_dir: PathBuf,
     models: RwLock<HashMap<String, Arc<Deployed>>>,
 }
@@ -75,7 +100,7 @@ fn model(app: &App, uid: &str, branch: &str) -> Result<Arc<Deployed>, ApiError> 
 }
 
 fn summary(d: &Deployed) -> Value {
-    let s = d.universe.snapshot();
+    let s = d.universe().snapshot();
     json!({
         "project": d.uid, "branch": d.branch, "deployed_at": d.deployed_at,
         "datasources": s.datasources.len(), "tables": s.tables.len(), "fields": s.fields.len(),
@@ -89,7 +114,7 @@ fn summary(d: &Deployed) -> Value {
 /// Runs the deployed project's tests/*.yml: each projects its fields and
 /// compares the SQL with the assertion.
 fn run_tests(app: &App, d: &Deployed) -> Value {
-    let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
+    let planner = d.planner();
     let base = match app.dialects.base() {
         Ok(b) => b,
         Err(e) => return json!({ "error": e.to_string() }),
@@ -102,7 +127,7 @@ fn run_tests(app: &App, d: &Deployed) -> Value {
             projections: t.projections.iter().map(|f| zsql_spec::spec::ProjectionSpec { field: Some(Value::String(f.clone())), ..Default::default() }).collect(),
             ..Default::default()
         };
-        let outcome = zsql_spec::lower(&spec, &d.universe, &base).map_err(|e| e.to_string()).and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
+        let outcome = zsql_spec::lower(&spec, d.universe(), &base).map_err(|e| e.to_string()).and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
         let (status, detail) = match (&outcome, &t.assert_sql, &t.assert_regex) {
             (Err(e), _, _) => ("error", json!({ "message": e })),
             (Ok(sql), Some(expected), _) => {
@@ -157,11 +182,12 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
         let mut archive = tar::Archive::new(decoder);
         archive.unpack(&work).map_err(|e| bad(format!("unpacking the archive: {e}")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
-        let loaded = zsql_project::load(&root, &app.dialects).map_err(|e| bad(e.to_string()))?;
+        let loaded = zsql_project::load(&root, app.dialects).map_err(|e| bad(e.to_string()))?;
         let universe = Universe::build(loaded.snapshot.clone()).map_err(|e| bad(e.to_string()))?;
         let mut warnings = loaded.warnings;
         warnings.extend(universe.warnings().iter().cloned());
-        let deployed = Arc::new(Deployed { uid: uid.clone(), branch: branch.clone(), universe, values: loaded.values, tests: loaded.tests, warnings, deployed_at: now() });
+        let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
+        let deployed = Arc::new(Deployed { uid: uid.clone(), branch: branch.clone(), engine, values: loaded.values, tests: loaded.tests, warnings, deployed_at: now() });
         let mut out = summary(&deployed);
         out["test_results"] = run_tests(&app, &deployed);
         out["validated_only"] = Value::Bool(!keep);
@@ -251,16 +277,16 @@ struct Timings {
 
 fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Vec<zsql_spec::fuzzy::Correction>, Timings), ApiError> {
     let d = model(app, uid, branch)?;
-    if req.context.is_none() && !d.universe.policies().is_empty() {
+    if req.context.is_none() && !d.universe().policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
     }
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
     let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
-    let mut query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
+    let mut query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let corrections = std::mem::take(&mut query.corrections);
     let t1 = Instant::now();
-    let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
+    let planner = d.planner();
     let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let t2 = Instant::now();
     Ok((plan, corrections, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
@@ -306,8 +332,8 @@ async fn explore(State(app): State<Shared>, Path((uid, branch)): Path<(String, S
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let t0 = Instant::now();
     let spec = zsql_spec::Spec::from_value(req.spec).map_err(spec_error)?;
-    let query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
-    let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
+    let query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
+    let planner = d.planner();
     let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let q = req.q.as_deref().map(zsql_spec::fuzzy::normalize).filter(|q| !q.is_empty());
     let wanted = |f: &zsql_semantic::Field| -> Option<f64> {
@@ -331,7 +357,7 @@ async fn explore(State(app): State<Shared>, Path((uid, branch)): Path<(String, S
                 let score = wanted(f)?;
                 let mut v = json!({
                     "uid": f.uid, "name": f.name, "data_type": f.data_type, "description": f.description,
-                    "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
+                    "tables": d.universe().snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe().table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
                 });
                 if q.is_some() {
                     v["score"] = json!((score * 100.0).round() / 100.0);
@@ -373,7 +399,7 @@ async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
             "uid": f.uid, "name": f.name,
             "kind": match f.kind { FieldKind::Dimension => "dimension", FieldKind::Measure => "measure" },
             "data_type": f.data_type, "description": f.description, "synonyms": f.synonyms, "tags": f.tags, "hidden": f.hidden,
-            "tables": d.universe.snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe.table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
+            "tables": d.universe().snapshot().expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| d.universe().table(e.table_id)).map(|t| t.uid.clone()).collect::<Vec<_>>(),
         });
         if let Some(s) = score {
             v["score"] = json!((s * 100.0).round() / 100.0);
@@ -381,10 +407,10 @@ async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
         v
     };
     if needle.is_empty() {
-        return Ok(Json(json!({ "fields": d.universe.fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() })));
+        return Ok(Json(json!({ "fields": d.universe().fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() })));
     }
     let mut out: Vec<Value> = d
-        .universe
+        .universe()
         .fields()
         .iter()
         .filter(visible)
@@ -393,7 +419,7 @@ async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
         .collect();
     let seen: std::collections::HashSet<&str> = out.iter().filter_map(|v| v["uid"].as_str()).collect();
     let seen: std::collections::HashSet<String> = seen.into_iter().map(str::to_string).collect();
-    for s in zsql_spec::fuzzy::suggest(&d.universe, &needle, &[FieldKind::Dimension, FieldKind::Measure]) {
+    for s in zsql_spec::fuzzy::suggest(d.universe(), &needle, &[FieldKind::Dimension, FieldKind::Measure]) {
         if s.score < zsql_spec::fuzzy::FLOOR / 2.0 {
             break;
         }
@@ -407,14 +433,14 @@ async fn fields(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
 async fn tables(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let d = model(&app, &uid, &branch)?;
     let out: Vec<Value> = d
-        .universe
+        .universe()
         .tables()
         .iter()
         .map(|t| {
             json!({
                 "uid": t.uid, "name": t.name, "physical_name": t.physical_name, "cost": t.cost,
-                "datasource": d.universe.datasource(t.datasource_id).map(|x| x.uid.clone()),
-                "fields": d.universe.expressions_of(t.id).filter_map(|e| d.universe.field(e.field_id)).map(|f| f.uid.clone()).collect::<Vec<_>>(),
+                "datasource": d.universe().datasource(t.datasource_id).map(|x| x.uid.clone()),
+                "fields": d.universe().expressions_of(t.id).filter_map(|e| d.universe().field(e.field_id)).map(|f| f.uid.clone()).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -423,7 +449,7 @@ async fn tables(State(app): State<Shared>, Path((uid, branch)): Path<(String, St
 
 async fn values(State(app): State<Shared>, Path((uid, branch, dim)): Path<(String, String, String)>) -> Result<Json<Value>, ApiError> {
     let d = model(&app, &uid, &branch)?;
-    let field = d.universe.field_by_uid(&dim, Some(FieldKind::Dimension)).or_else(|| d.universe.field_by_name(&dim, FieldKind::Dimension));
+    let field = d.universe().field_by_uid(&dim, Some(FieldKind::Dimension)).or_else(|| d.universe().field_by_name(&dim, FieldKind::Dimension));
     let Some(field) = field else {
         return Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no dimension {dim}")));
     };
@@ -448,7 +474,7 @@ async fn sampling_plan(State(app): State<Shared>, Path((uid, branch)): Path<(Str
             Err(_) => sql.to_string(),
         }
     };
-    let (jobs, skipped) = zsql_project::values::plan(&d.universe, &dims, q.full, &qualify);
+    let (jobs, skipped) = zsql_project::values::plan(d.universe(), &dims, q.full, &qualify);
     let jobs: Vec<Value> = jobs
         .iter()
         .map(|j| {
@@ -526,7 +552,8 @@ fn reload(app: &App) -> anyhow::Result<usize> {
                 })
                 .collect();
             let deployed_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(|t| humantime(t)).unwrap_or_default();
-            app.models.write().unwrap().insert(key(&uid, &branch), Arc::new(Deployed { uid: uid.clone(), branch, universe, values, tests, warnings: vec![], deployed_at }));
+            let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
+            app.models.write().unwrap().insert(key(&uid, &branch), Arc::new(Deployed { uid: uid.clone(), branch, engine, values, tests, warnings: vec![], deployed_at }));
             n += 1;
         }
     }
@@ -551,7 +578,8 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(std::env::var("ZSQL_DATA_DIR").unwrap_or_else(|_| "data".into()));
     let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:3699".into());
     std::fs::create_dir_all(&data_dir)?;
-    let app: Shared = Arc::new(App { dialects: Dialects::builtin(), data_dir, models: RwLock::new(HashMap::new()) });
+    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()) });
     let n = reload(&app)?;
     eprintln!("zsqld: {n} deployment(s) loaded from {}", app.data_dir.display());
 
