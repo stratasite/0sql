@@ -649,12 +649,37 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
             let path = samples_dir.join("values.jsonl.gz");
             let mut catalog = read_catalog(&path)?;
             let ceiling = plan["full_ceiling"].as_i64().unwrap_or(100_000);
+            let (done, failed) = sample_jobs(&project.dir, &todo, ceiling, now, &mut catalog)?;
+            catalog.sort_by(|a, b| a["uid"].as_str().cmp(&b["uid"].as_str()));
+            write_catalog(&path, &catalog)?;
+            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), path.display());
+            if failed > 0 {
+                bail!("{failed} dimension(s) failed to sample");
+            }
+            if deploy_after {
+                deploy(at, false, false)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Without the warehouse drivers, sampling can plan (`--dry-run`) but not run.
+#[cfg(not(feature = "warehouse"))]
+fn sample_jobs(_project_dir: &Path, _todo: &[&Value], _ceiling: i64, _now: chrono::DateTime<chrono::Utc>, _catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
+    bail!("this zsql build has no warehouse drivers; `zsql values sample --dry-run` shows the SQL, and the full build (cargo build --features warehouse) runs it")
+}
+
+/// Runs each sampling job against its datasource and folds the results
+/// into the catalog; answers with how many succeeded and failed.
+#[cfg(feature = "warehouse")]
+fn sample_jobs(project_dir: &Path, todo: &[&Value], ceiling: i64, now: chrono::DateTime<chrono::Utc>, catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
             let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
             let (mut done, mut failed) = (0, 0);
-            for j in &todo {
+            for j in todo {
                 let ds = j["datasource"].as_str().unwrap_or("").to_string();
                 if !connections.contains_key(&ds) {
-                    let settings = zsql_warehouse::settings_for(&project.dir, &ds)?;
+                    let settings = zsql_warehouse::settings_for(project_dir, &ds)?;
                     match zsql_warehouse::connect(&settings) {
                         Ok(c) => {
                             connections.insert(ds.clone(), c);
@@ -707,18 +732,7 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
                     }
                 }
             }
-            catalog.sort_by(|a, b| a["uid"].as_str().cmp(&b["uid"].as_str()));
-            write_catalog(&path, &catalog)?;
-            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), path.display());
-            if failed > 0 {
-                bail!("{failed} dimension(s) failed to sample");
-            }
-            if deploy_after {
-                deploy(at, false, false)?;
-            }
-            Ok(())
-        }
-    }
+            Ok((done, failed))
 }
 
 fn read_catalog(path: &Path) -> Result<Vec<Value>> {

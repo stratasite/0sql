@@ -9,8 +9,15 @@ description = "zsql: author a semantic model, deploy it, and query it through a 
 name = "zsql"
 path = "src/main.rs"
 
+[features]
+# The default build talks to the server only: no warehouse drivers, so
+# it builds everywhere in seconds and the binary stays small. The full
+# build adds `zsql values sample`, which runs the sampling SQL locally.
+default = []
+warehouse = ["dep:zsql-warehouse"]
+
 [dependencies]
-zsql-warehouse.workspace = true
+zsql-warehouse = { workspace = true, optional = true }
 zsql-shorthand.workspace = true
 clap.workspace = true
 anyhow.workspace = true

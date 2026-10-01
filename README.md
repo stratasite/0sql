@@ -68,9 +68,14 @@ zsql explore --expr "department, sales value" [-q customer]   # the dimensions a
 zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes, locally
 zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
 zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
-zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]
+zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]   # runs the SQL locally: needs the full build
 zsql remove --yes                 # drop the deployed branch
 ```
+
+The default build has no warehouse drivers: it talks to the server only,
+builds in seconds on every platform, and is what the installer ships.
+`cargo build -p zsql-cli --features warehouse` adds DuckDB and Postgres
+for `zsql values sample`.
 
 Every command takes `--project DIR`, `--branch NAME`, `--server URL` and
 `--uid UID`; without them the project is found from `project.yml` here or
