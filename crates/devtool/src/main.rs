@@ -323,9 +323,9 @@ fn main() -> Result<()> {
             let query = zsql_spec::lower(&spec, &universe, &base)?;
             let plan = zsql_planner::Planner::new(&universe, &model.dialects, None).plan_query_explained(query, context.as_ref(), identity)?;
             println!("{}", plan.sql);
-            if identity {
-                for (alias, id) in &plan.identities {
-                    println!("\n== {alias}\n{id}");
+            if let Some(x) = &plan.explain {
+                for n in &x.nodes {
+                    println!("\n== {}\n{}", n.alias, n.identity);
                 }
             }
         }

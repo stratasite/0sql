@@ -29,6 +29,13 @@ impl NodeKind {
             NodeKind::Merge => "Planner::Dag::Merge",
         }
     }
+    pub fn name(self) -> &'static str {
+        match self {
+            NodeKind::Query => "query",
+            NodeKind::Aggregation => "aggregation",
+            NodeKind::Merge => "merge",
+        }
+    }
     pub fn prefix(self) -> &'static str {
         match self {
             NodeKind::Query => "qr",
@@ -230,6 +237,17 @@ pub struct Owner {
     pub sid: usize,
     pub tree: crate::model::FilledTree,
     pub identity: String,
+}
+
+impl StrategyKind<'_> {
+    pub fn name(&self) -> &'static str {
+        match self {
+            StrategyKind::SegmentOnTable { .. } => "segment_on_table",
+            StrategyKind::SegmentByJoinKeys { .. } => "segment_by_join_keys",
+            StrategyKind::ExcludeByJoinKeys => "exclude_by_join_keys",
+            StrategyKind::ExpandByJoinKeys { .. } => "expand_by_join_keys",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

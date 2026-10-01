@@ -78,12 +78,13 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
-pub fn plan(client: &Client, uid: &str, branch: &str, spec: Value, context: Option<&Value>, explain: bool) -> Result<Value> {
-    let mut body = json!({ "spec": spec, "explain": explain });
+/// `/sql`: `{sql, adapter}`; `/explain`: that plus timings, phases and the node graph.
+pub fn sql(client: &Client, uid: &str, branch: &str, spec: Value, context: Option<&Value>, explain: bool) -> Result<Value> {
+    let mut body = json!({ "spec": spec });
     if let Some(c) = context {
         body["context"] = c.clone();
     }
-    client.post(&format!("{}/plan", branch_path(uid, branch)), &body)
+    client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &body)
 }
 
 /// A dimension's sampled values by uid or name, else by a unique substring
@@ -106,6 +107,71 @@ pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result
 pub fn print_json(v: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+/// The explain answer as text: the SQL, the node graph from the root down,
+/// and what each phase cost.
+pub fn print_explain(v: &Value, style: &dyn Fn(&str) -> String) {
+    println!("{}", v["sql"].as_str().unwrap_or(""));
+    let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
+    if nodes.is_empty() {
+        return;
+    }
+    println!();
+    println!("{}", style(&format!("-- {} · {} nodes", v["adapter"].as_str().unwrap_or(""), nodes.len())));
+    fn walk(n: &Value, depth: usize, via: &str, nodes: &[Value], style: &dyn Fn(&str) -> String) {
+        let by_id = |id: u64| nodes.iter().find(|n| n["id"].as_u64() == Some(id));
+        let pad = "  ".repeat(depth);
+        let mut head = format!("{pad}{via}{} {}", n["kind"].as_str().unwrap_or("?"), n["alias"].as_str().unwrap_or(""));
+        if let Some(t) = n["table"].as_str() {
+            head.push_str(&format!(" on {t}"));
+            if let Some(d) = n["datasource"].as_str() {
+                head.push_str(&format!(" ({d})"));
+            }
+        }
+        if let Some(j) = n["join_type"].as_str() {
+            head.push_str(&format!(" {j} join"));
+        }
+        if n["group_by"].as_bool() == Some(true) {
+            head.push_str(" group by");
+        }
+        if n["segment"].as_bool() == Some(true) {
+            head.push_str(" [segment]");
+        }
+        if let Some(t) = n["transform"].as_str() {
+            head.push_str(&format!(" [{t}]"));
+        }
+        if let Some(p) = n["purpose"].as_str() {
+            head.push_str(&format!(" [{p}]"));
+        }
+        println!("{head}");
+        let list = |label: &str, key: &str| {
+            let items: Vec<&str> = n[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if !items.is_empty() {
+                println!("{pad}    {}", style(&format!("{label}: {}", items.join(", "))));
+            }
+        };
+        list("paths", "paths");
+        list("projections", "projections");
+        list("filters", "filters");
+        list("security", "security_filters");
+        list("masks", "security_masks");
+        for s in n["strategies"].as_array().into_iter().flatten() {
+            if let Some(c) = s["node"].as_u64().and_then(by_id) {
+                walk(c, depth + 1, &format!("{} <- ", s["kind"].as_str().unwrap_or("strategy")), nodes, style);
+            }
+        }
+        for c in n["inputs"].as_array().into_iter().flatten().filter_map(Value::as_u64).filter_map(by_id) {
+            walk(c, depth + 1, "", nodes, style);
+        }
+    }
+    if let Some(root) = nodes.iter().find(|n| n["root"].as_bool() == Some(true)) {
+        walk(root, 0, "", &nodes, style);
+    }
+    let phases: Vec<String> = v["phases"].as_array().into_iter().flatten().map(|p| format!("{} {}", p["name"].as_str().unwrap_or(""), p["us"])).collect();
+    println!();
+    println!("{}", style(&format!("-- server {} us: parser {} us, plan {} us", v["timings"]["total_us"], v["timings"]["parser_us"], v["timings"]["plan_us"])));
+    println!("{}", style(&format!("-- phases (us): {}", phases.join(", "))));
 }
 
 pub fn print_fields(v: &Value) {

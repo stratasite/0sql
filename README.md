@@ -60,8 +60,9 @@ zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strat
 zsql check                        # validate on the server, keep nothing
 zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
 zsql test                         # the deployed branch's tests/*.yml
-zsql plan --expr "department, sales value, department = PRODUCE" [--context user.json] [--json]
-zsql repl [--context user.json]   # the shorthand, planned on the server; .branch switches branch
+zsql sql --expr "department, sales value, department = PRODUCE" [--context user.json] [--explain] [--json]
+zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
+zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
 zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
 zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]
 zsql remove --yes                 # drop the deployed branch
@@ -101,7 +102,7 @@ users or keys yet. Deployed models live in memory and under `ZSQL_DATA_DIR`
 ```
 cargo run --release -p zsql-server
 zsql deploy --project ../myproject --server http://127.0.0.1:3699
-curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
+curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
      -H 'content-type: application/json' \
      -d '{"spec": {"projections": [{"field": "department"}, {"field": "sales value"}]}, "context": {...}}'
 ```
@@ -113,7 +114,8 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/plan \
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
 | `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
-| `POST /projects/{uid}/branches/{branch}/plan` | `{spec, context?, explain?}` to `{sql, adapter, timings: {parser_us, plan_us, total_us}}`, or `{error: {class, message}}` |
+| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` to `{sql, adapter}`, or `{error: {class, message}}` |
+| `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
 | `GET /projects/{uid}/branches/{branch}` | summary and warnings |
 | `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery (hidden fields excluded by default) |
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |

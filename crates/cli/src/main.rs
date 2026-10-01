@@ -117,20 +117,22 @@ enum Command {
         #[command(flatten)]
         at: Where,
     },
-    /// Plan one query on the server and print the SQL.
-    Plan {
+    /// Generate one query's SQL on the server.
+    Sql {
         #[command(flatten)]
-        at: Where,
-        /// A JSON file holding a query spec.
-        #[arg(long, conflicts_with = "expr")]
-        spec: Option<PathBuf>,
-        /// A comma-separated line of projections, filters and calculations.
+        query: QueryArgs,
+        /// Explain the plan instead: node graph and timings, as `zsql explain`.
         #[arg(long)]
-        expr: Option<String>,
-        /// A JSON file holding the security context.
+        explain: bool,
+        /// Print the server's answer as JSON.
         #[arg(long)]
-        context: Option<PathBuf>,
-        /// Print the whole response, timings included.
+        json: bool,
+    },
+    /// Explain how the server plans a query: SQL, node graph and timings.
+    Explain {
+        #[command(flatten)]
+        query: QueryArgs,
+        /// Print the server's answer as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -275,32 +277,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Plan { at, spec, expr, context, json } => {
-            let t = at.resolve()?;
-            let spec_value = match (spec, expr) {
-                (Some(path), _) => {
-                    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
-                    let value: Value = serde_json::from_str(&text)?;
-                    value.get("spec").cloned().unwrap_or(value)
-                }
-                (None, Some(line)) => {
-                    let (spec, items) = exprs::parse_line(&line).map_err(|e| anyhow::anyhow!(e))?;
-                    for d in exprs::describe(&items) {
-                        eprintln!("{d}");
-                    }
-                    spec
-                }
-                (None, None) => bail!("plan needs --spec or --expr"),
-            };
-            let context = read_json(context)?;
-            let v = remote::plan(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), json)?;
-            if json {
-                remote::print_json(&v)?;
-            } else {
-                println!("{}", v["sql"].as_str().unwrap_or(""));
-            }
-            Ok(())
-        }
+        Command::Sql { query, explain, json } => query.run(explain, json),
+        Command::Explain { query, json } => query.run(true, json),
         Command::Repl { at, context } => repl(at.resolve()?, read_json(context)?),
         Command::Fields { at, q, hidden } => {
             let t = at.resolve()?;
@@ -339,6 +317,54 @@ fn main() -> Result<()> {
             println!("{} {}", server, v.as_str().unwrap_or("ok"));
             Ok(())
         }
+    }
+}
+
+/// What `zsql sql` and `zsql explain` take: the query, as a spec file or a
+/// shorthand line, and the security context.
+#[derive(clap::Args)]
+struct QueryArgs {
+    #[command(flatten)]
+    at: Where,
+    /// A JSON file holding a query spec.
+    #[arg(long, conflicts_with = "expr")]
+    spec: Option<PathBuf>,
+    /// A comma-separated line of projections, filters and calculations.
+    #[arg(long)]
+    expr: Option<String>,
+    /// A JSON file holding the security context.
+    #[arg(long)]
+    context: Option<PathBuf>,
+}
+
+impl QueryArgs {
+    fn run(self, explain: bool, json: bool) -> Result<()> {
+        let t = self.at.resolve()?;
+        let spec_value = match (self.spec, self.expr) {
+            (Some(path), _) => {
+                let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+                let value: Value = serde_json::from_str(&text)?;
+                value.get("spec").cloned().unwrap_or(value)
+            }
+            (None, Some(line)) => {
+                let (spec, items) = exprs::parse_line(&line).map_err(|e| anyhow::anyhow!(e))?;
+                for d in exprs::describe(&items) {
+                    eprintln!("{d}");
+                }
+                spec
+            }
+            (None, None) => bail!("give the query as --spec FILE or --expr LINE"),
+        };
+        let context = read_json(self.context)?;
+        let v = remote::sql(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), explain)?;
+        if json {
+            remote::print_json(&v)?;
+        } else if explain {
+            remote::print_explain(&v, &|s| s.to_string());
+        } else {
+            println!("{}", v["sql"].as_str().unwrap_or(""));
+        }
+        Ok(())
     }
 }
 
@@ -790,25 +816,29 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                     }
                     Err(e) => println!("error: {e}"),
                 },
-                "" | "json" => {
-                    let json_text = if cmd == "json" { Some(rest) } else if line.starts_with('{') { Some(line) } else { None };
-                    let spec: Result<Value, String> = match json_text {
-                        Some(text) => serde_json::from_str(text).map_err(|e| e.to_string()),
-                        None => exprs::parse_line(line).map(|(spec, items)| {
+                "" | "json" | "explain" => {
+                    // A query: the shorthand, or a JSON spec after .json or
+                    // starting with a brace. .explain takes either.
+                    let text = if cmd == "" { line } else { rest };
+                    let spec: Result<Value, String> = if cmd == "json" || text.starts_with('{') {
+                        serde_json::from_str(text).map_err(|e| e.to_string())
+                    } else {
+                        exprs::parse_line(text).map(|(spec, items)| {
                             for d in exprs::describe(&items) {
                                 println!("{}", dim(&d));
                             }
                             spec
-                        }),
+                        })
                     };
                     match spec {
                         Err(e) => println!("error: {e}"),
                         Ok(spec) => {
                             let t0 = Instant::now();
-                            match remote::plan(&t.client, &t.uid, &t.branch, spec, context.as_ref(), false) {
+                            match remote::sql(&t.client, &t.uid, &t.branch, spec, context.as_ref(), cmd == "explain") {
+                                Ok(v) if cmd == "explain" => remote::print_explain(&v, &dim),
                                 Ok(v) => {
                                     println!("{}", bold(v["sql"].as_str().unwrap_or("")));
-                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms (server {} us: parser {} us, plan {} us)", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3, v["timings"]["total_us"], v["timings"]["parser_us"], v["timings"]["plan_us"])));
+                                    println!("{}", dim(&format!("-- {} · round trip {:.2} ms", v["adapter"].as_str().unwrap_or(""), t0.elapsed().as_secs_f64() * 1e3)));
                                 }
                                 Err(e) => println!("error: {e}"),
                             }

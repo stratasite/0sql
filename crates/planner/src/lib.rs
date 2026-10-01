@@ -24,8 +24,71 @@ pub struct Plan {
     pub sql: String,
     /// Adapter name of the datasource the plan executes in.
     pub adapter: String,
-    /// Every node's alias and the identity string it was hashed from.
-    pub identities: Vec<(String, String)>,
+    /// The plan explained: phase timings and the node graph. Asked for
+    /// with [`Planner::plan_query_explained`].
+    pub explain: Option<Explain>,
+}
+
+/// How a plan came to be: what each planning phase cost and the DAG the
+/// visitors shaped, node by node.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Explain {
+    pub phases: Vec<Phase>,
+    /// Live nodes in build (post) order; the last one is the root.
+    pub nodes: Vec<ExplainNode>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Phase {
+    pub name: &'static str,
+    pub us: u128,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainNode {
+    pub id: usize,
+    /// The CTE name in the SQL.
+    pub alias: String,
+    /// `query`, `aggregation` or `merge`.
+    pub kind: &'static str,
+    pub root: bool,
+    /// The table the node reads, for query and aggregation nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datasource: Option<String>,
+    /// Join paths the node walks from its table.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<&'static str>,
+    /// The temporal transform a comparison node serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+    /// Imported from a segment's plan.
+    pub segment: bool,
+    pub projections: Vec<String>,
+    pub filters: Vec<String>,
+    /// Inputs read through the FROM clause.
+    pub inputs: Vec<usize>,
+    /// Inputs attached by a strategy (segments, exclusions, expansions).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub strategies: Vec<ExplainStrategy>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub join_type: String,
+    pub group_by: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub security_filters: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub security_masks: Vec<String>,
+    /// The string the alias hashes from.
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExplainStrategy {
+    pub node: usize,
+    pub kind: String,
 }
 
 impl Plan {
@@ -109,16 +172,16 @@ impl<'a> Planner<'a> {
         self.plan_query_explained(query, principal, false)
     }
 
-    /// As `plan_query`; with `with_identities` the plan also carries every
+    /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
-    pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, with_identities: bool) -> Result<Plan> {
+    pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
         let rquery = model::RQuery::resolve(self.universe, query)?;
         model::check_supported(&rquery, self.universe, principal)?;
-        match run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, vec![], with_identities) {
+        match run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, vec![], explain) {
             // A segment keyed in another datasource: resolve again with every key required.
             Err(PlanError::SegmentDatasource(_)) => {
                 let required = visitors::segmentation::all_key_dimensions(&rquery);
-                run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, required, with_identities)
+                run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, required, explain)
             }
             other => other,
         }
@@ -133,13 +196,22 @@ fn run_plan<'a>(
     rquery: &model::RQuery<'a>,
     principal: Option<&SecurityContext>,
     required_dims: Vec<&'a zsql_semantic::Field>,
-    with_identities: bool,
+    explain: bool,
 ) -> Result<Plan> {
     let opts = resolver::Options { required_dims, ..Default::default() };
-    let mut graph = {
-        let _t = profile::span("resolve");
-        resolver::resolve_with(universe, universes, dialects, rquery, &opts)?
-    };
+    let mut phases: Vec<Phase> = Vec::new();
+    macro_rules! phase {
+        ($name:literal, $e:expr) => {{
+            let _t = profile::span($name);
+            let start = explain.then(std::time::Instant::now);
+            let out = $e;
+            if let Some(start) = start {
+                phases.push(Phase { name: $name, us: start.elapsed().as_micros() });
+            }
+            out
+        }};
+    }
+    let mut graph = phase!("resolve", resolver::resolve_with(universe, universes, dialects, rquery, &opts)?);
 
     // A segment planned directly is a population preview: a criteria-only
     // segment resolves to a plain query node whose keys would repeat.
@@ -150,12 +222,6 @@ fn run_plan<'a>(
         }
     }
 
-    macro_rules! phase {
-        ($name:literal, $e:expr) => {{
-            let _t = profile::span($name);
-            $e
-        }};
-    }
     phase!("segment_fork", visitors::segment_fork::run(&mut graph, universe, universes, rquery)?);
     phase!("complex_measure", visitors::complex_measure::run(&mut graph, universe, universes, dialects, rquery)?);
     phase!("exclusion", visitors::exclusion::run(&mut graph, universe, rquery)?);
@@ -172,11 +238,46 @@ fn run_plan<'a>(
     phase!("alias", visitors::alias::run(&mut graph)?);
     phase!("sql", visitors::sql::run(&graph, universe, rquery)?);
     let sql = phase!("final_query", visitors::final_query::to_sql(&graph)?);
-    let identities = if with_identities {
-        phase!("identities", graph.live().map(|n| (n.alias(&graph), n.to_s(&graph))).collect())
-    } else {
-        vec![]
-    };
+    let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
 
-    Ok(Plan { sql, adapter: graph.datasource.adapter.clone(), identities })
+    Ok(Plan { sql, adapter: graph.datasource.adapter.clone(), explain })
+}
+
+fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
+    let order = graph.post_order();
+    order
+        .iter()
+        .map(|&id| {
+            let n = &graph.nodes[id];
+            let base = n.universe.as_ref();
+            ExplainNode {
+                id,
+                alias: n.alias(graph),
+                kind: n.kind.name(),
+                root: n.is_root(),
+                table: base.map(|b| b.root.name.clone()),
+                datasource: base.map(|b| b.datasource.uid.clone()),
+                paths: n.subtrees.iter().map(|t| universe::Model::to_s(t)).collect(),
+                purpose: n.purpose,
+                transform: n.transform.clone(),
+                segment: n.owner.is_some(),
+                projections: n.projections.iter().map(|p| format!("{} AS {}", p.to_s(), p.alias)).collect(),
+                filters: n.filters.iter().map(|f| f.to_s()).collect(),
+                inputs: n.plain_inputs(),
+                strategies: n.strategies.iter().map(|s| ExplainStrategy { node: s.node, kind: s.kind.name().to_string() }).collect(),
+                join_type: if n.is_merge() { n.join_type.clone() } else { String::new() },
+                group_by: n.should_group_by.unwrap_or(false),
+                security_filters: n.security_filters.iter().map(|(f, allowed)| security_to_s(f, allowed)).collect(),
+                security_masks: n.security_masks.iter().map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_to_s(f, allowed))).collect(),
+                identity: n.to_s(graph),
+            }
+        })
+        .collect()
+}
+
+fn security_to_s(f: &zsql_semantic::Field, allowed: &Option<Vec<String>>) -> String {
+    match allowed {
+        Some(v) => format!("[{}] in {v:?}", f.name),
+        None => format!("[{}] denied", f.name),
+    }
 }

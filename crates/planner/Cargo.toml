@@ -9,6 +9,7 @@ description = "Query planning: universe resolution, DAG visitors and SQL generat
 zsql-semantic.workspace = true
 zsql-dialect.workspace = true
 zsql-spec.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 md5 = "0.7"

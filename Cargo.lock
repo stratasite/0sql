@@ -2900,6 +2900,7 @@ dependencies = [
  "chrono",
  "md5",
  "regex",
+ "serde",
  "serde_json",
  "thiserror",
  "zsql-dialect",

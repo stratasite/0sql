@@ -204,25 +204,31 @@ fn write_gz(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------- plan
+// --------------------------------------------------------------- sql, explain
 
 #[derive(Deserialize)]
-struct PlanRequest {
+struct SqlRequest {
     spec: Value,
     #[serde(default)]
     context: Option<SecurityContext>,
-    /// Also return each node's identity string.
-    #[serde(default)]
-    explain: bool,
 }
 
+/// What a query needs to run: the statement and the datasource it is for.
 #[derive(Serialize)]
-struct PlanResponse {
+struct SqlResponse {
+    sql: String,
+    adapter: String,
+}
+
+/// The statement, how long the server took to make it, each planning phase's
+/// share, and the node graph the visitors shaped.
+#[derive(Serialize)]
+struct ExplainResponse {
     sql: String,
     adapter: String,
     timings: Timings,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    identities: Vec<(String, String)>,
+    phases: Vec<zsql_planner::Phase>,
+    nodes: Vec<zsql_planner::ExplainNode>,
 }
 
 #[derive(Serialize)]
@@ -234,8 +240,8 @@ struct Timings {
     total_us: u128,
 }
 
-async fn plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<PlanRequest>) -> Result<Json<PlanResponse>, ApiError> {
-    let d = model(&app, &uid, &branch)?;
+fn plan_request(app: &Shared, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<(zsql_planner::Plan, Timings), ApiError> {
+    let d = model(app, uid, branch)?;
     if req.context.is_none() && !d.universe.policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
     }
@@ -245,14 +251,20 @@ async fn plan(State(app): State<Shared>, Path((uid, branch)): Path<(String, Stri
     let query = zsql_spec::lower(&spec, &d.universe, &base).map_err(spec_error)?;
     let t1 = Instant::now();
     let planner = zsql_planner::Planner::new(&d.universe, &app.dialects, None);
-    let plan = planner.plan_query_explained(query, req.context.as_ref(), req.explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let t2 = Instant::now();
-    Ok(Json(PlanResponse {
-        sql: plan.sql,
-        adapter: plan.adapter,
-        timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() },
-        identities: plan.identities,
-    }))
+    Ok((plan, Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }))
+}
+
+async fn sql(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
+    let (plan, _) = plan_request(&app, &uid, &branch, req, false)?;
+    Ok(Json(SqlResponse { sql: plan.sql, adapter: plan.adapter }))
+}
+
+async fn explain(State(app): State<Shared>, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
+    let (plan, timings) = plan_request(&app, &uid, &branch, req, true)?;
+    let x = plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
+    Ok(Json(ExplainResponse { sql: plan.sql, adapter: plan.adapter, timings, phases: x.phases, nodes: x.nodes }))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
@@ -450,7 +462,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{uid}/branches/{branch}/test", post(test))
         .route("/projects/{uid}/branches/{branch}/sampling-plan", get(sampling_plan))
         .route("/projects/{uid}/branches/{branch}", delete(remove))
-        .route("/projects/{uid}/branches/{branch}/plan", post(plan))
+        .route("/projects/{uid}/branches/{branch}/sql", post(sql))
+        .route("/projects/{uid}/branches/{branch}/explain", post(explain))
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(values))
