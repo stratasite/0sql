@@ -21,6 +21,8 @@ struct Cli {
     /// Without a command, `zsql` inside a project opens the repl.
     #[command(subcommand)]
     command: Option<Command>,
+    #[command(flatten)]
+    at: Where,
 }
 
 /// Which project and branch a command works on, and which server.
@@ -94,13 +96,9 @@ enum Command {
         api_key: String,
         #[arg(long)]
         server: Option<String>,
-        #[command(flatten)]
-        at: Where,
     },
     /// Deploy the checked-out branch: the model files, tests and samples (never secrets).
     Deploy {
-        #[command(flatten)]
-        at: Where,
         /// Validate only; the server keeps nothing.
         #[arg(long)]
         dry_run: bool,
@@ -109,15 +107,9 @@ enum Command {
         watch: bool,
     },
     /// Validate the project on the server without deploying (deploy --dry-run).
-    Check {
-        #[command(flatten)]
-        at: Where,
-    },
+    Check,
     /// Run the deployed branch's tests/*.yml on the server.
-    Test {
-        #[command(flatten)]
-        at: Where,
-    },
+    Test,
     /// Generate one query's SQL on the server.
     Sql {
         #[command(flatten)]
@@ -153,51 +145,33 @@ enum Command {
     },
     /// Plan interactively against the server.
     Repl {
-        #[command(flatten)]
-        at: Where,
         #[arg(long)]
         context: Option<PathBuf>,
     },
     /// Fields of the deployed branch, filtered by text.
     Fields {
-        #[command(flatten)]
-        at: Where,
         q: Option<String>,
         #[arg(long)]
         hidden: bool,
     },
     /// Tables of the deployed branch.
-    Tables {
-        #[command(flatten)]
-        at: Where,
-    },
+    Tables,
     /// Sampled values of a dimension.
     Values {
         #[command(subcommand)]
         what: ValuesCommand,
     },
     /// Summary of the deployed branch.
-    Status {
-        #[command(flatten)]
-        at: Where,
-    },
+    Status,
     /// Every deployment on the server.
-    List {
-        #[command(flatten)]
-        at: Where,
-    },
+    List,
     /// Remove a deployed branch from the server.
     Remove {
-        #[command(flatten)]
-        at: Where,
         #[arg(long)]
         yes: bool,
     },
     /// Liveness of the server.
-    Health {
-        #[command(flatten)]
-        at: Where,
-    },
+    Health,
 }
 
 #[derive(Subcommand)]
@@ -235,15 +209,11 @@ enum NewCommand {
 enum ValuesCommand {
     /// Show a dimension's sampled values from the deployed branch.
     Show {
-        #[command(flatten)]
-        at: Where,
         dim: String,
     },
     /// Sample the listable dimensions from the project's warehouses into samples/values.jsonl.gz.
     /// The server says what to run (it knows the model); the SQL runs here, where the credentials are.
     Sample {
-        #[command(flatten)]
-        at: Where,
         /// Only these dimensions (uids or names).
         #[arg(long, value_delimiter = ',')]
         dims: Vec<String>,
@@ -267,9 +237,10 @@ fn main() -> Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let command = match Cli::parse().command {
+    let Cli { command, at } = Cli::parse();
+    let command = match command {
         Some(c) => c,
-        None if config::find_project(Path::new(".")).is_ok() => Command::Repl { at: Where::default(), context: None },
+        None if at.project.is_some() || at.uid.is_some() || config::find_project(Path::new(".")).is_ok() => Command::Repl { context: None },
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;
@@ -288,7 +259,7 @@ fn main() -> Result<()> {
         }
         Command::Init { dir, name, uid } => init(dir, name, uid),
         Command::New { what } => new_file(what),
-        Command::Auth { api_key, server, at } => {
+        Command::Auth { api_key, server } => {
             let project = match &at.project {
                 Some(d) => config::read_project(d)?,
                 None => config::find_project(Path::new("."))?,
@@ -300,9 +271,9 @@ fn main() -> Result<()> {
             println!("saved to {}", project.dir.join(config::LOCAL_FILE).display());
             Ok(())
         }
-        Command::Deploy { at, dry_run, watch } => deploy(at, dry_run, watch),
-        Command::Check { at } => deploy(at, true, false),
-        Command::Test { at } => {
+        Command::Deploy { dry_run, watch } => deploy(at, dry_run, watch),
+        Command::Check => deploy(at, true, false),
+        Command::Test => {
             let t = at.resolve()?;
             let v = t.client.post(&format!("{}/test", remote::branch_path(&t.uid, &t.branch)), &json!({}))?;
             if !remote::print_tests(&v) {
@@ -310,10 +281,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Sql { query, explain, json } => query.run(explain, json),
-        Command::Explain { query, json } => query.run(true, json),
+        Command::Sql { query, explain, json } => query.run(at, explain, json),
+        Command::Explain { query, json } => query.run(at, true, json),
         Command::Drill { query, json } => {
-            let (t, spec_value, context) = query.resolve()?;
+            let (t, spec_value, context) = query.resolve(at)?;
             let v = remote::drill(&t.client, &t.uid, &t.branch, spec_value, context.as_ref())?;
             if json {
                 remote::print_json(&v)?;
@@ -322,23 +293,23 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Repl { at, context } => repl(at.resolve()?, read_json(context)?),
-        Command::Fields { at, q, hidden } => {
+        Command::Repl { context } => repl(at.resolve()?, read_json(context)?),
+        Command::Fields { q, hidden } => {
             let t = at.resolve()?;
             remote::print_fields(&t.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&q.unwrap_or_default())))?);
             Ok(())
         }
-        Command::Tables { at } => {
+        Command::Tables => {
             let t = at.resolve()?;
             remote::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?);
             Ok(())
         }
-        Command::Values { what } => values(what),
-        Command::Status { at } => {
+        Command::Values { what } => values(at, what),
+        Command::Status => {
             let t = at.resolve()?;
             remote::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::List { at } => {
+        Command::List => {
             let server = config::server(at.server.as_deref(), at.resolve().ok().and_then(|t| t.project).as_ref());
             let client = Client::new(&server, config::api_key(None));
             let v = client.get("/projects")?;
@@ -347,14 +318,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Remove { at, yes } => {
+        Command::Remove { yes } => {
             let t = at.resolve()?;
             if !yes {
                 bail!("this removes {}/{} from {}; add --yes to confirm", t.uid, t.branch, t.client.server);
             }
             remote::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::Health { at } => {
+        Command::Health => {
             let server = config::server(at.server.as_deref(), config::find_project(Path::new(".")).ok().as_ref());
             let v = Client::new(&server, None).get("/healthz")?;
             println!("{} {}", server, v.as_str().unwrap_or("ok"));
@@ -367,8 +338,6 @@ fn main() -> Result<()> {
 /// shorthand line, and the security context.
 #[derive(clap::Args)]
 struct QueryArgs {
-    #[command(flatten)]
-    at: Where,
     /// A JSON file holding a query spec.
     #[arg(long, conflicts_with = "expr")]
     spec: Option<PathBuf>,
@@ -382,8 +351,8 @@ struct QueryArgs {
 
 impl QueryArgs {
     /// The target, the spec and the context the arguments name.
-    fn resolve(self) -> Result<(Target, Value, Option<Value>)> {
-        let t = self.at.resolve()?;
+    fn resolve(self, at: Where) -> Result<(Target, Value, Option<Value>)> {
+        let t = at.resolve()?;
         let spec_value = match (self.spec, self.expr) {
             (Some(path), _) => {
                 let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
@@ -403,8 +372,8 @@ impl QueryArgs {
         Ok((t, spec_value, context))
     }
 
-    fn run(self, explain: bool, json: bool) -> Result<()> {
-        let (t, spec_value, context) = self.resolve()?;
+    fn run(self, at: Where, explain: bool, json: bool) -> Result<()> {
+        let (t, spec_value, context) = self.resolve(at)?;
         let v = remote::sql(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), explain)?;
         if json {
             remote::print_json(&v)?;
@@ -638,14 +607,14 @@ fn walk_yaml(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 // ----------------------------------------------------------------- values
 
-fn values(what: ValuesCommand) -> Result<()> {
+fn values(at: Where, what: ValuesCommand) -> Result<()> {
     match what {
-        ValuesCommand::Show { at, dim } => {
+        ValuesCommand::Show { dim } => {
             let t = at.resolve()?;
             remote::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, &dim)?);
             Ok(())
         }
-        ValuesCommand::Sample { at, dims, full, older_than, dry_run, deploy: deploy_after } => {
+        ValuesCommand::Sample { dims, full, older_than, dry_run, deploy: deploy_after } => {
             let t = at.resolve()?;
             let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
             let plan = t.client.get(&format!("{}/sampling-plan?dims={}&full={full}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&dims.join(","))))?;
