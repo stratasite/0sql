@@ -62,6 +62,7 @@ zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's 
 zsql test                         # the deployed branch's tests/*.yml
 zsql sql --expr "department, sales value, department = PRODUCE" [--context user.json] [--explain] [--json]
 zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
+zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes, locally
 zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
 zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
 zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]
@@ -85,7 +86,8 @@ calculation (`Alias = formula` or `formula as Alias`), anything else is a
 projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
 field. Commands start with a dot: `.fields`, `.tables`, `.values`,
-`.json {...}`, `.tojson <line>`, `.branch`, `.help`, `.quit`.
+`.json {...}`, `.spec <line>`, `.branch`, `.help`, `.quit`. Inside a project,
+`zsql` with no command opens the repl.
 
 `zsql-dev` (the devtool crate) is the engine on the command line for its
 own developers: local planning over a snapshot or project directory, the

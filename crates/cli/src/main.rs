@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)", version)]
 struct Cli {
+    /// Without a command, `zsql` inside a project opens the repl.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Which project and branch a command works on, and which server.
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Default)]
 struct Where {
     /// Project directory; defaults to the one holding project.yml here or above.
     #[arg(long, global = true)]
@@ -135,6 +136,12 @@ enum Command {
         /// Print the server's answer as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Print the query spec a shorthand line makes, without calling the server.
+    Spec {
+        /// The line: projections, filters and calculations, comma-separated.
+        #[arg(trailing_var_arg = true, required = true)]
+        line: Vec<String>,
     },
     /// Plan interactively against the server.
     Repl {
@@ -252,7 +259,25 @@ fn main() -> Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    match Cli::parse().command {
+    let command = match Cli::parse().command {
+        Some(c) => c,
+        None if config::find_project(Path::new(".")).is_ok() => Command::Repl { at: Where::default(), context: None },
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!("\nInside a project, `zsql` alone opens the repl.");
+            return Ok(());
+        }
+    };
+    match command {
+        Command::Spec { line } => {
+            let (spec, items) = exprs::parse_line(&line.join(" ")).map_err(|e| anyhow::anyhow!(e))?;
+            for d in exprs::describe(&items) {
+                eprintln!("{d}");
+            }
+            println!("{}", serde_json::to_string_pretty(&spec)?);
+            Ok(())
+        }
         Command::Init { dir, name, uid } => init(dir, name, uid),
         Command::New { what } => new_file(what),
         Command::Auth { api_key, server, at } => {
@@ -811,7 +836,7 @@ fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
                         announce(&t, &mut field_names)?;
                     }
                 }
-                "tojson" => match exprs::parse_line(rest) {
+                "spec" => match exprs::parse_line(rest) {
                     Ok((spec, items)) => {
                         for d in exprs::describe(&items) {
                             println!("{}", dim(&d));

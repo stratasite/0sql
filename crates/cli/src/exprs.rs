@@ -417,7 +417,7 @@ Type a comma-separated line. Each item is read from its shape:
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
 [Name] or \"Name\" is always a field, whatever the name says: [Tables], \"Sales in Store\" > 5.
 Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .fields [text], .tables, .values <dim>,
-.json {...spec...}, .tojson <line>, .branch [name], .help, .quit";
+.json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
 
 #[cfg(test)]
 mod tests {
