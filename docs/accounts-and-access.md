@@ -112,7 +112,18 @@ acceptance set them. `POST /login`, `POST /logout`,
 
 ## Deferred
 
-- Magic links and password reset by email; SSO.
+See `docs/running-it.md` for the state of the running service and the
+operational side of this list.
+
+- Magic links and password reset by email; SSO. Both matter more now
+  that the service is public and sign-up is open: without reset a user
+  who forgets a password has no way back without someone editing the
+  database, and without verification an account can be made with an
+  address its owner does not control.
+- A cap on how many branches an account may deploy. Models are held in
+  memory for the life of the process and nothing evicts them, so an
+  account can deploy its way through the machine; `running-it.md` has
+  the measurements and the restart behaviour that makes it bite.
 - A user in several accounts: the schema allows it, the key answers for
   the first membership for now.
 - Key expiry, a viewer role, teams, binding a query key to the security
