@@ -142,6 +142,9 @@ the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
 endpoints, and the web app at `/app/` for sign-up, keys, members and
 project access. Off, it is the single-tenant self-hosted mode with no auth.
 
+`docs/running-it.md` is where the service actually runs, how a release
+reaches it, how the backups work and what is still open.
+
 Requests are rate limited and admitted by cost class: planning, exploring,
 deploying, account changes and the password routes each have their own
 per-account allowance and their own cap on how many may run at once, and
