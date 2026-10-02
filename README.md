@@ -142,6 +142,15 @@ the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
 endpoints, and the web app at `/app/` for sign-up, keys, members and
 project access. Off, it is the single-tenant self-hosted mode with no auth.
 
+Requests are rate limited and admitted by cost class: planning, exploring,
+deploying, account changes and the password routes each have their own
+per-account allowance and their own cap on how many may run at once, and
+deploys and password hashing run off the request threads. Bodies and
+query specs are bounded too. With accounts off only the admission caps
+and those bounds apply. `docs/rate-limiting.md` has the design, the
+settings and the measurements; `429` and `503` both say when to come
+back, and the CLI waits and asks again.
+
 Each deployment keeps its planner, the per-root universe index, built
 once at deploy beside the universe; requests borrow it, so server time
 is lowering plus planning only.
@@ -197,3 +206,9 @@ A `Planner` is built once per loaded model and reused for every request;
 the index build is the only per-model cost. Planning a golden case takes
 about 70 microseconds in release builds, about a third of it in resolution
 and the rest in SQL generation.
+
+End to end over HTTP, on a twelve-thread laptop against the TPC-DS sample,
+the `sql` endpoint answers about 42,000 requests a second with accounts on
+and about 39,000 with the rate limits enforcing. Authentication is cached
+in memory for a minute and emptied by every change, which is what moved
+that from 13,000; see `docs/rate-limiting.md`.
