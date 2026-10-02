@@ -155,25 +155,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "CLI ${GITHUB_REF_NAME#cli-}" dist/*
 
-      # The repository is private, so a public installer cannot read its
-      # releases. When a public bucket is configured the same files go
-      # there too, under the version and under `latest`, which is what
-      # 0sql.io/install.sh downloads. Without the secrets this does
-      # nothing and the release is still made.
-      - name: Publish for the installer
+      # This repository is private, and release assets inherit that, so
+      # nothing here can be downloaded without a token. The same files
+      # go to stratasite/0sql-cli, which is public and holds releases
+      # and nothing else. That is what 0sql.io/install.sh reads, through
+      # the permanent /releases/latest/download/ redirect.
+      #
+      # It needs a token because a workflow's own token only reaches the
+      # repository it runs in. Without the secret this does nothing and
+      # the private release is still made.
+      - name: Publish where the installer can reach it
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.DOWNLOADS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.DOWNLOADS_SECRET }}
-          AWS_ENDPOINT_URL: ${{ secrets.DOWNLOADS_ENDPOINT }}
-          AWS_DEFAULT_REGION: ${{ secrets.DOWNLOADS_REGION }}
-          BUCKET: ${{ secrets.DOWNLOADS_BUCKET }}
+          GH_TOKEN: ${{ secrets.CLI_RELEASES_TOKEN }}
+          PUBLIC_REPO: stratasite/0sql-cli
         run: |
-          if [ -z "$BUCKET" ]; then
-            echo "no downloads bucket configured; the release is on GitHub only"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "no CLI_RELEASES_TOKEN set; this release is on the private repository only,"
+            echo "so the installer has nothing to download. Add the secret and re-run."
             exit 0
           fi
-          version="${GITHUB_REF_NAME#cli-v}"
-          aws s3 cp dist "s3://$BUCKET/cli/$version/" --recursive --only-show-errors
-          aws s3 cp dist "s3://$BUCKET/cli/latest/" --recursive --only-show-errors
-          echo "$version" | aws s3 cp - "s3://$BUCKET/cli/latest/VERSION" --only-show-errors
-          echo "published to s3://$BUCKET/cli/$version/ and cli/latest/"
+          version="${GITHUB_REF_NAME#cli-}"
+          # Notes are written rather than generated: --generate-notes
+          # would read the public repository's history, which is empty.
+          gh release create "$version" --repo "$PUBLIC_REPO" \
+            --title "zsql $version" \
+            --notes "The 0sql command line tool, $version.
+
+          Install:
+
+              curl -fsSL https://0sql.io/install.sh | sh
+
+          Or take the build for your platform below and check it against \`SHA256SUMS\`." \
+            dist/*
+          echo "published https://github.com/$PUBLIC_REPO/releases/tag/$version"
