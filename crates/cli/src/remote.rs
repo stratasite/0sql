@@ -28,24 +28,63 @@ impl Client {
         }
     }
 
+    /// Sends, and waits the server out if it says it has not started
+    /// the request yet. The waiting is announced on stderr so it never
+    /// lands in `--json` output.
+    fn send(&self, what: &str, attempt: impl Fn() -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value> {
+        let mut waited = 0;
+        loop {
+            let r = attempt().with_context(|| what.to_string())?;
+            match retry_after(&r) {
+                Some(secs) if waited < RETRIES => {
+                    waited += 1;
+                    eprintln!("{what}: the server is at its limit, waiting {secs}s ({waited} of {RETRIES})");
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
+                _ => return read(r),
+            }
+        }
+    }
+
     pub fn get(&self, path: &str) -> Result<Value> {
-        let r = self.auth(self.agent().get(self.url(path))).call().with_context(|| format!("GET {}", self.url(path)))?;
-        read(r)
+        let url = self.url(path);
+        self.send(&format!("GET {url}"), || self.auth(self.agent().get(&url)).call())
     }
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        let r = self.auth(self.agent().post(self.url(path))).send_json(body).with_context(|| format!("POST {}", self.url(path)))?;
-        read(r)
+        let url = self.url(path);
+        self.send(&format!("POST {url}"), || self.auth(self.agent().post(&url)).send_json(body))
     }
 
     pub fn post_bytes(&self, path: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
-        let r = self.auth(self.agent().post(self.url(path))).header("content-type", content_type).send(bytes).with_context(|| format!("POST {}", self.url(path)))?;
-        read(r)
+        let url = self.url(path);
+        self.send(&format!("POST {url}"), || self.auth(self.agent().post(&url)).header("content-type", content_type).send(bytes))
     }
 
     pub fn delete(&self, path: &str) -> Result<Value> {
-        let r = self.auth(self.agent().delete(self.url(path))).call().with_context(|| format!("DELETE {}", self.url(path)))?;
-        read(r)
+        let url = self.url(path);
+        self.send(&format!("DELETE {url}"), || self.auth(self.agent().delete(&url)).call())
+    }
+}
+
+/// How many times a refusal is worth waiting out, and the longest the
+/// CLI will sit on one wait.
+const RETRIES: u32 = 3;
+const LONGEST_WAIT: u64 = 30;
+
+/// Whether to wait and ask again, and for how long.
+///
+/// A `429`, and a `503` that names a delay, are the server saying it
+/// refused the request before running any of it: asking again is safe
+/// whatever the request was, including a deploy. A `503` with no delay
+/// is a deadline that passed inside the handler, which may have done
+/// part of the work, so that one is reported rather than repeated.
+fn retry_after(r: &ureq::http::Response<ureq::Body>) -> Option<u64> {
+    let named = r.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
+    match (r.status().as_u16(), named) {
+        (429, secs) => Some(secs.unwrap_or(1).clamp(1, LONGEST_WAIT)),
+        (503, Some(secs)) => Some(secs.clamp(1, LONGEST_WAIT)),
+        _ => None,
     }
 }
 

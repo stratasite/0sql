@@ -23,8 +23,10 @@
 //! GET  /healthz
 //! ```
 
+mod limits;
+
 use axum::body::Bytes;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use zsql_accounts::{Level, Principal, Project, Role, Store, Verb};
 use axum::http::StatusCode;
@@ -33,10 +35,12 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use limits::{Admission, Class, Limiter};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zsql_dialect::Dialects;
 use zsql_project::values::ValueCatalog;
 use zsql_semantic::{FieldKind, Snapshot, Universe};
@@ -87,6 +91,10 @@ struct App {
     signup_open: bool,
     /// Session cookies marked Secure, for a server behind https.
     secure_cookies: bool,
+    /// What each caller may ask for, and how fast.
+    limits: Limiter,
+    /// How much of each kind of work may be in the server at once.
+    admission: Admission,
 }
 
 // ---------------------------------------------------------------- tenancy
@@ -94,32 +102,204 @@ struct App {
 /// The caller: a user or a query key when accounts are on, nothing when off.
 struct Auth(Option<Principal>);
 
+/// What the guard worked out about the caller, carried on the request so
+/// that authentication happens once however many extractors ask for it.
+#[derive(Clone)]
+struct Caller(Option<Principal>);
+
+/// Who is calling: the key in the Authorization header, else the session
+/// cookie the web app holds.
+fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError> {
+    let Some(store) = &app.accounts else { return Ok(None) };
+    let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let secret = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")).map(str::trim).unwrap_or("");
+    if !secret.is_empty() {
+        return match store.authenticate(secret).map_err(internal)? {
+            Some(p) => Ok(Some(p)),
+            None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
+        };
+    }
+    // The web app: a session cookie. Anything but a read must also
+    // carry the header the app's own scripts send, which a cross-site
+    // form cannot, so a stolen navigation cannot act as the user.
+    if let Some(token) = cookie(parts, SESSION_COOKIE) {
+        let safe = matches!(parts.method.as_str(), "GET" | "HEAD" | "OPTIONS");
+        if !safe && parts.headers.get("x-requested-with").and_then(|v| v.to_str().ok()) != Some("zsql") {
+            return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "this request did not come from the app".into()));
+        }
+        if let Some(p) = store.session(&token).map_err(internal)? {
+            return Ok(Some(p));
+        }
+    }
+    Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()))
+}
+
 impl FromRequestParts<Shared> for Auth {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, ApiError> {
-        let Some(store) = &app.accounts else { return Ok(Auth(None)) };
-        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-        let secret = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")).map(str::trim).unwrap_or("");
-        if !secret.is_empty() {
-            return match store.authenticate(secret).map_err(internal)? {
-                Some(p) => Ok(Auth(Some(p))),
-                None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
-            };
+        // The guard in front of every route has already decided; this
+        // reads that back. The fallback keeps the extractor correct on
+        // its own, for a route reached without the guard.
+        if let Some(Caller(who)) = parts.extensions.get::<Caller>() {
+            return Ok(Auth(who.clone()));
         }
-        // The web app: a session cookie. Anything but a read must also
-        // carry the header the app's own scripts send, which a cross-site
-        // form cannot, so a stolen navigation cannot act as the user.
-        if let Some(token) = cookie(parts, SESSION_COOKIE) {
-            let safe = matches!(parts.method.as_str(), "GET" | "HEAD" | "OPTIONS");
-            if !safe && parts.headers.get("x-requested-with").and_then(|v| v.to_str().ok()) != Some("zsql") {
-                return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "this request did not come from the app".into()));
-            }
-            if let Some(p) = store.session(&token).map_err(internal)? {
-                return Ok(Auth(Some(p)));
+        authenticate(app, parts).map(Auth)
+    }
+}
+
+// ------------------------------------------------------------- the guard
+
+/// Everything a request meets before its handler: the limit on what its
+/// caller may ask for, the cap on how much of its kind of work may run
+/// at once, and a deadline. Authentication happens here, once, and
+/// travels on the request. See `docs/rate-limiting.md`.
+async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let class = limits::classify(req.method().as_str(), req.uri().path());
+    if class == Class::Exempt {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let addr = client_addr(&app, &parts, peer);
+
+    // The routes that cost before anyone is identified are counted
+    // against the address they came from.
+    if let Some(gate) = address_gate(&parts) {
+        let d = app.limits.address(addr, gate);
+        if app.limits.enforced(&d, &format!("{addr} on {}", gate_name(gate))) {
+            return too_many(&d);
+        }
+    }
+
+    let mut who = None;
+    if limits::authenticates(parts.uri.path()) {
+        match authenticate(&app, &parts) {
+            Ok(p) => who = p,
+            Err(e) => {
+                // Answering a key that is not valid is cheap but not
+                // free, and a stream of them is someone guessing.
+                if e.0 == StatusCode::UNAUTHORIZED {
+                    let d = app.limits.address(addr, limits::Gate::BadKey);
+                    if app.limits.enforced(&d, &format!("{addr} sending keys that are not valid")) {
+                        return too_many(&d);
+                    }
+                }
+                return e.into_response();
             }
         }
-        Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()))
+    }
+    parts.extensions.insert(Caller(who.clone()));
+
+    let allowance = who.as_ref().map(|p| {
+        let key_id = match p {
+            Principal::QueryKey { key, .. } => Some(key.id),
+            Principal::User { .. } => None,
+        };
+        app.limits.principal(p.account().id, key_id, class)
+    });
+    if let (Some(d), Some(p)) = (&allowance, &who) {
+        if app.limits.enforced(d, &format!("{} on {}", p.describe(), class.name())) {
+            return too_many(d);
+        }
+    }
+
+    // Room to run, or come back later. The permit is held until the
+    // handler has finished with it.
+    let permit = match app.admission.admit(class).await {
+        Ok(p) => p,
+        Err(secs) => return busy(secs, class),
+    };
+    let req = axum::extract::Request::from_parts(parts, body);
+    let mut response = match tokio::time::timeout(limits::deadline(class), next.run(req)).await {
+        Ok(r) => r,
+        Err(_) => retry_later(StatusCode::SERVICE_UNAVAILABLE, "Timeout", format!("this request passed its {}s deadline", limits::deadline(class).as_secs()), 0),
+    };
+    drop(permit);
+    if let Some(d) = allowance {
+        rate_headers(&mut response, &d);
+    }
+    response
+}
+
+fn gate_name(gate: limits::Gate) -> &'static str {
+    match gate {
+        limits::Gate::Login => "signing in",
+        limits::Gate::Signup => "signing up",
+        limits::Gate::Invite => "accepting an invite",
+        limits::Gate::BadKey => "keys that are not valid",
+    }
+}
+
+/// The three routes that spend an argon2 hash before anyone is known.
+fn address_gate(parts: &Parts) -> Option<limits::Gate> {
+    if parts.method != axum::http::Method::POST {
+        return None;
+    }
+    match parts.uri.path().trim_end_matches('/') {
+        "/login" => Some(limits::Gate::Login),
+        "/signup" => Some(limits::Gate::Signup),
+        "/invites/accept" => Some(limits::Gate::Invite),
+        _ => None,
+    }
+}
+
+/// The address a per-address limit counts against: the socket peer, or
+/// the last hop of `X-Forwarded-For` when the server has been told it is
+/// behind a proxy. Reading that header uninvited would let every caller
+/// pick their own bucket, so it is only read when `ZSQL_TRUSTED_PROXY`
+/// says a proxy is really there.
+fn client_addr(app: &App, parts: &Parts, peer: SocketAddr) -> IpAddr {
+    if app.limits.cfg.trusted_proxy {
+        if let Some(hops) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(ip) = hops.split(',').map(str::trim).rfind(|h| !h.is_empty()).and_then(|h| h.parse().ok()) {
+                return ip;
+            }
+        }
+    }
+    peer.ip()
+}
+
+/// An answer that says when to come back.
+fn retry_later(status: StatusCode, class: &'static str, message: String, secs: u64) -> Response {
+    let mut res = ApiError(status, class, message).into_response();
+    if secs > 0 {
+        if let Ok(v) = secs.to_string().parse() {
+            res.headers_mut().insert("retry-after", v);
+        }
+    }
+    res
+}
+
+/// What is left of an allowance, so a client can pace itself before it
+/// is refused rather than after.
+fn rate_headers(res: &mut Response, d: &limits::Decision) {
+    if d.limit == 0.0 || !d.limit.is_finite() {
+        return;
+    }
+    for (name, value) in [("ratelimit-limit", d.limit as u64), ("ratelimit-remaining", d.remaining as u64), ("ratelimit-reset", d.reset)] {
+        if let Ok(v) = value.to_string().parse() {
+            res.headers_mut().insert(name, v);
+        }
+    }
+}
+
+fn too_many(d: &limits::Decision) -> Response {
+    let mut res = retry_later(StatusCode::TOO_MANY_REQUESTS, "RateLimited", format!("too many requests: retry in {}s", d.retry_after), d.retry_after);
+    rate_headers(&mut res, d);
+    res
+}
+
+fn busy(secs: u64, class: Class) -> Response {
+    retry_later(StatusCode::SERVICE_UNAVAILABLE, "Busy", format!("the server is full of {} work: retry in {secs}s", class.name()), secs)
+}
+
+/// Runs work that would hold a runtime thread for seconds on a blocking
+/// thread instead, so a deploy or a password hash never stalls the
+/// planning the rest of the server is doing.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("this request did not finish: {e}"))),
     }
 }
 
@@ -291,11 +471,11 @@ fn run_tests(app: &App, d: &Deployed) -> Value {
 // ------------------------------------------------------------------ deploy
 
 async fn deploy(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    deploy_or_validate(app, who, uid, branch, body, true)
+    blocking(move || deploy_or_validate(app, who, uid, branch, body, true)).await
 }
 
 async fn validate(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    deploy_or_validate(app, who, uid, branch, body, false)
+    blocking(move || deploy_or_validate(app, who, uid, branch, body, false)).await
 }
 
 /// A user deploying to a project the account does not have yet creates
@@ -399,13 +579,114 @@ struct SqlRequest {
     context: Option<SecurityContext>,
 }
 
+/// What one request may ask for. A spec is JSON the caller wrote and
+/// the cost of planning grows with it, so its shape is bounded before
+/// any work starts: generous beside any real query, a wall in front of
+/// a generated one. See `docs/rate-limiting.md`.
+mod shape {
+    pub const EXPR: usize = 8 * 1024;
+    pub const PROJECTIONS: usize = 100;
+    pub const CALCULATIONS: usize = 50;
+    pub const SEGMENTS: usize = 50;
+    pub const FILTERS: usize = 200;
+    pub const FILTER_DEPTH: usize = 8;
+    pub const VALUES: usize = 20_000;
+    pub const DEPTH: usize = 32;
+    pub const TEXT: usize = 64 * 1024;
+    pub const SEARCH_TERM: usize = 200;
+}
+
+fn too_big(what: &str, n: usize, limit: usize) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "TooLarge", format!("this request has {n} {what}; the limit is {limit}"))
+}
+
+/// Counts a spec's parts and refuses one built to be expensive.
+fn check_shape(spec: &Value) -> Result<(), ApiError> {
+    for (part, limit) in [("projections", shape::PROJECTIONS), ("calculations", shape::CALCULATIONS), ("segments", shape::SEGMENTS)] {
+        let n = spec.get(part).and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+        if n > limit {
+            return Err(too_big(part, n, limit));
+        }
+    }
+    // Filters are a flat list or an and/or tree; resolution walks it, so
+    // bound both how many there are and how deeply they nest.
+    fn walk(v: &Value, depth: usize, n: &mut usize) -> Result<(), ApiError> {
+        if depth > shape::FILTER_DEPTH {
+            return Err(too_big("levels of nested filters", depth, shape::FILTER_DEPTH));
+        }
+        match v {
+            // The list inside an `and` or an `or` is part of that level,
+            // not another one, so the count means what it says.
+            Value::Array(items) => {
+                for i in items {
+                    walk(i, depth, n)?;
+                }
+            }
+            Value::Object(o) => match o.get("and").or_else(|| o.get("or")) {
+                Some(inner) => walk(inner, depth + 1, n)?,
+                None => *n += 1,
+            },
+            _ => *n += 1,
+        }
+        Ok(())
+    }
+    if let Some(filters) = spec.get("filters") {
+        let mut n = 0;
+        walk(filters, 0, &mut n)?;
+        if n > shape::FILTERS {
+            return Err(too_big("filters", n, shape::FILTERS));
+        }
+    }
+    // Whatever else the document carries, bound the document.
+    fn measure(v: &Value, depth: usize, n: &mut usize) -> Result<(), ApiError> {
+        *n += 1;
+        if *n > shape::VALUES {
+            return Err(too_big("values in this spec", *n, shape::VALUES));
+        }
+        if depth > shape::DEPTH {
+            return Err(too_big("levels of nesting", depth, shape::DEPTH));
+        }
+        match v {
+            Value::Array(items) => {
+                for i in items {
+                    measure(i, depth + 1, n)?;
+                }
+            }
+            Value::Object(o) => {
+                for (_, i) in o {
+                    measure(i, depth + 1, n)?;
+                }
+            }
+            Value::String(text) if text.len() > shape::TEXT => return Err(too_big("characters in one value", text.len(), shape::TEXT)),
+            _ => {}
+        }
+        Ok(())
+    }
+    measure(spec, 0, &mut 0)
+}
+
+/// A search term long enough to be slow to score against every field.
+fn check_term(term: &str) -> Result<(), ApiError> {
+    if term.len() > shape::SEARCH_TERM {
+        return Err(too_big("characters in this search term", term.len(), shape::SEARCH_TERM));
+    }
+    Ok(())
+}
+
 /// The spec a request names: given, or made from its shorthand line, in
 /// which case the item descriptions come back too.
 fn spec_of(spec: Option<Value>, expr: Option<&str>) -> Result<(Value, Option<Value>, Vec<String>), ApiError> {
     match (spec, expr.map(str::trim).filter(|e| !e.is_empty())) {
-        (Some(s), _) => Ok((s, None, vec![])),
+        (Some(s), _) => {
+            check_shape(&s)?;
+            Ok((s, None, vec![]))
+        }
         (None, Some(line)) => {
+            if line.len() > shape::EXPR {
+                return Err(too_big("characters in this expression", line.len(), shape::EXPR));
+            }
             let (spec, items) = zsql_shorthand::parse_line(line).map_err(|m| ApiError(StatusCode::BAD_REQUEST, "Shorthand", m))?;
+            check_shape(&spec)?;
             let described = zsql_shorthand::describe(&items);
             Ok((spec.clone(), Some(spec), described))
         }
@@ -533,6 +814,9 @@ async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
     let query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let planner = d.planner();
     let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    if let Some(term) = &req.q {
+        check_term(term)?;
+    }
     let q = req.q.as_deref().map(zsql_spec::fuzzy::normalize).filter(|q| !q.is_empty());
     let wanted = |f: &zsql_semantic::Field| -> Option<f64> {
         let Some(q) = &q else { return Some(1.0) };
@@ -591,6 +875,7 @@ struct FieldsQuery {
 async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
     let d = model(&app, &t, &uid, &branch)?;
+    check_term(&q.q)?;
     let needle = q.q.trim().to_lowercase();
     let visible = |f: &&zsql_semantic::Field| q.hidden || !f.hidden;
     let describe = |f: &zsql_semantic::Field, score: Option<f64>| {
@@ -664,7 +949,7 @@ async fn values(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch, d
 async fn test(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let d = model(&app, &t, &uid, &branch)?;
-    Ok(Json(run_tests(&app, &d)))
+    blocking(move || Ok(Json(run_tests(&app, &d)))).await
 }
 
 async fn sampling_plan(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
@@ -764,12 +1049,16 @@ struct SignupRequest {
 /// A new account with its first admin and key. The secret is shown once.
 /// With a password, the answer also opens a session.
 async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Result<Response, ApiError> {
-    let store = store_of(&app)?;
+    store_of(&app)?;
     if !app.signup_open {
         return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "sign-up is closed on this server".into()));
     }
-    let password = req.password.as_deref().filter(|p| !p.is_empty());
-    let su = store.signup(&req.account, &req.email, &req.name, password).map_err(accounts_error)?;
+    let password = req.password.filter(|p| !p.is_empty());
+    let su = {
+        let (app, account, email, name, password) = (app.clone(), req.account, req.email, req.name, password.clone());
+        blocking(move || store_of(&app)?.signup(&account, &email, &name, password.as_deref()).map_err(accounts_error)).await?
+    };
+    let store = store_of(&app)?;
     let body = json!({ "account": su.account, "user": su.user, "key": su.key, "secret": su.secret });
     if password.is_some() {
         let (token, _) = store.create_session(&su.user, SESSION_DAYS).map_err(accounts_error)?;
@@ -785,11 +1074,23 @@ struct LoginRequest {
 }
 
 async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> Result<Response, ApiError> {
+    store_of(&app)?;
+    // Enough wrong passwords for one email and it is refused for a
+    // while, whichever address they come from: that is what someone
+    // working through a password list looks like.
+    if let Some(secs) = app.limits.login_blocked(&req.email) {
+        return Ok(retry_later(StatusCode::TOO_MANY_REQUESTS, "RateLimited", format!("too many failed sign-ins for this email: retry in {secs}s"), secs));
+    }
+    let found = {
+        let (app, email, password) = (app.clone(), req.email.clone(), req.password);
+        blocking(move || store_of(&app)?.verify_password(&email, &password).map_err(accounts_error)).await?
+    };
+    let Some(user) = found else {
+        app.limits.login_failed(&req.email);
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "wrong email or password".into()));
+    };
+    app.limits.login_ok(&req.email);
     let store = store_of(&app)?;
-    let user = store
-        .verify_password(&req.email, &req.password)
-        .map_err(accounts_error)?
-        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "wrong email or password".into()))?;
     let (token, account) = store.create_session(&user, SESSION_DAYS).map_err(accounts_error)?;
     Ok(with_session_cookie(&app, json!({ "user": user, "account": account }), Some(&token)))
 }
@@ -808,10 +1109,15 @@ struct PasswordRequest {
 }
 
 async fn set_password(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<PasswordRequest>) -> Result<Json<Value>, ApiError> {
-    let store = store_of(&app)?;
+    store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
-    store.set_password(account.id, user, &req.password).map_err(accounts_error)?;
-    Ok(Json(json!({ "ok": true })))
+    let (user, account_id, password) = (user.clone(), account.id, req.password);
+    let app = app.clone();
+    blocking(move || {
+        store_of(&app)?.set_password(account_id, &user, &password).map_err(accounts_error)?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
 }
 
 async fn me(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
@@ -877,9 +1183,13 @@ struct AcceptRequest {
 /// No auth: the token is the credential. Answers with the member's first
 /// personal key, shown once, and opens a session when a password was set.
 async fn accept_invite(State(app): State<Shared>, Json(req): Json<AcceptRequest>) -> Result<Response, ApiError> {
+    store_of(&app)?;
+    let password = req.password.filter(|p| !p.is_empty());
+    let (account, user, key, secret) = {
+        let (app, token, name, key_name, password) = (app.clone(), req.token, req.name, req.key_name, password.clone());
+        blocking(move || store_of(&app)?.accept_invite(&token, &name, &key_name, password.as_deref()).map_err(accounts_error)).await?
+    };
     let store = store_of(&app)?;
-    let password = req.password.as_deref().filter(|p| !p.is_empty());
-    let (account, user, key, secret) = store.accept_invite(&req.token, &req.name, &req.key_name, password).map_err(accounts_error)?;
     let body = json!({ "account": account, "user": user, "key": key, "secret": secret });
     if password.is_some() {
         let (token, _) = store.create_session(&user, SESSION_DAYS).map_err(accounts_error)?;
@@ -900,13 +1210,43 @@ async fn ui_root() -> Response {
     ui_file("")
 }
 
+/// The files browsers and manifests expect at the site root: favicons,
+/// the touch icon, the Android icons and the manifest that names them.
+const SITE_FILES: &[&str] = &["favicon.ico", "favicon.svg", "apple-touch-icon.png", "site.webmanifest", "icon-192.png", "icon-512.png", "icon-maskable-192.png", "icon-maskable-512.png"];
+
+async fn site_file(uri: axum::http::Uri) -> Response {
+    ui_file(uri.path().trim_start_matches('/'))
+}
+
+/// An embedded asset: its bytes, media type, and whether browsers may keep
+/// it for a day (the brand files never change under one build; the shell,
+/// stylesheet and script are revalidated every time).
+fn asset(path: &str) -> Option<(&'static [u8], &'static str, bool)> {
+    Some(match path {
+        "app.css" => (include_bytes!("../ui/app.css"), "text/css; charset=utf-8", false),
+        "app.js" => (include_bytes!("../ui/app.js"), "text/javascript; charset=utf-8", false),
+        "brand/wordmark-light.svg" => (include_bytes!("../ui/brand/wordmark-light.svg"), "image/svg+xml", true),
+        "brand/wordmark-dark.svg" => (include_bytes!("../ui/brand/wordmark-dark.svg"), "image/svg+xml", true),
+        "brand/icon-light.svg" => (include_bytes!("../ui/brand/icon-light.svg"), "image/svg+xml", true),
+        "brand/icon-dark.svg" => (include_bytes!("../ui/brand/icon-dark.svg"), "image/svg+xml", true),
+        "favicon.svg" => (include_bytes!("../ui/brand/favicon.svg"), "image/svg+xml", true),
+        "favicon.ico" => (include_bytes!("../ui/brand/favicon.ico"), "image/x-icon", true),
+        "apple-touch-icon.png" => (include_bytes!("../ui/brand/apple-touch-icon.png"), "image/png", true),
+        "icon-192.png" => (include_bytes!("../ui/brand/icon-192.png"), "image/png", true),
+        "icon-512.png" => (include_bytes!("../ui/brand/icon-512.png"), "image/png", true),
+        "icon-maskable-192.png" => (include_bytes!("../ui/brand/icon-maskable-192.png"), "image/png", true),
+        "icon-maskable-512.png" => (include_bytes!("../ui/brand/icon-maskable-512.png"), "image/png", true),
+        "site.webmanifest" => (include_bytes!("../ui/brand/site.webmanifest"), "application/manifest+json", true),
+        _ => return None,
+    })
+}
+
 fn ui_file(path: &str) -> Response {
-    let (body, mime): (&'static str, &str) = match path {
-        "app.css" => (include_str!("../ui/app.css"), "text/css; charset=utf-8"),
-        "app.js" => (include_str!("../ui/app.js"), "text/javascript; charset=utf-8"),
-        _ => (include_str!("../ui/app.html"), "text/html; charset=utf-8"),
+    let (body, mime, cache): (&'static [u8], &str, &str) = match asset(path) {
+        Some((body, mime, stable)) => (body, mime, if stable { "public, max-age=86400" } else { "no-cache" }),
+        None => (include_bytes!("../ui/app.html"), "text/html; charset=utf-8", "no-cache"),
     };
-    ([("content-type", mime.to_string()), ("cache-control", "no-cache".to_string())], body).into_response()
+    ([("content-type", mime.to_string()), ("cache-control", cache.to_string())], body).into_response()
 }
 
 async fn root(State(app): State<Shared>) -> Response {
@@ -1187,16 +1527,19 @@ async fn main() -> anyhow::Result<()> {
     let accounts = if accounts_on { Some(Store::open(&data_dir.join("accounts.db"))?) } else { None };
     let signup_open = !matches!(std::env::var("ZSQL_SIGNUP").as_deref(), Ok("closed") | Ok("off") | Ok("0"));
     let secure_cookies = std::env::var("ZSQL_PUBLIC_URL").map(|u| u.starts_with("https://")).unwrap_or(false);
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies });
+    let limits = Limiter::new(limits::Config::from_env(accounts_on).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission });
     let n = reload(&app)?;
-    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/projects", get(projects))
         .route("/projects/{uid}/branches/{branch}", get(branch_summary))
-        .route("/projects/{uid}/branches/{branch}/deploy", post(deploy))
-        .route("/projects/{uid}/branches/{branch}/validate", post(validate))
+        .route("/projects/{uid}/branches/{branch}/deploy", post(deploy).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
+        .route("/projects/{uid}/branches/{branch}/validate", post(validate).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
         .route("/projects/{uid}/branches/{branch}/test", post(test))
         .route("/projects/{uid}/branches/{branch}/sampling-plan", get(sampling_plan))
         .route("/projects/{uid}/branches/{branch}", delete(remove))
@@ -1229,11 +1572,38 @@ async fn main() -> anyhow::Result<()> {
         .route("/account/audit", get(audit))
         .route("/projects/{uid}", axum::routing::patch(update_project).delete(delete_project))
         .route("/projects/{uid}/access", get(project_access).put(set_access))
-        .route("/projects/{uid}/access/{email}", delete(remove_access))
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
-        .with_state(app);
+        .route("/projects/{uid}/access/{email}", delete(remove_access));
+    for name in SITE_FILES {
+        router = router.route(&format!("/{name}"), get(site_file));
+    }
+    let router = router
+        .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
+        // Every route but a deploy takes a small JSON body; the archive
+        // routes raise their own limit above.
+        .layer(axum::extract::DefaultBodyLimit::max(JSON_LIMIT))
+        .with_state(app.clone());
+
+    // Buckets for callers that have gone quiet, and failure windows that
+    // have passed, are dropped now and then so an idle server does not
+    // hold a row per address it has ever seen.
+    let sweeper = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            sweeper.limits.sweep();
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("zsqld: listening on http://{bind}");
-    axum::serve(listener, router).await?;
+    // Connect info: the per-address limits need the peer's address.
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
+
+/// A project archive. The TPC-DS sample is ten kilobytes and a large
+/// model is single-digit megabytes, so this is roomy; the point is that
+/// it no longer applies to every other route.
+const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
+const JSON_LIMIT: usize = 1024 * 1024;

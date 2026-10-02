@@ -19,8 +19,11 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -153,8 +156,42 @@ impl Principal {
     }
 }
 
+/// Decisions worth not making twice. Every request with a key asks the
+/// same three questions (who is this, what project, what level), and the
+/// answers change only when someone changes them, which is rare. Holding
+/// them for a moment takes the store's lock off the hot path.
+///
+/// Correctness rests on two things: every change calls [`Store::bump`],
+/// which empties this and moves the generation on; and a read that
+/// raced a change notices the generation moved and does not cache what
+/// it saw. The TTL is only a backstop for a change that somehow does
+/// neither.
+#[derive(Default)]
+struct Cache {
+    /// secret hash -> who it is
+    principals: HashMap<String, (Principal, Instant)>,
+    /// session token hash -> whose session
+    sessions: HashMap<String, (Principal, Instant)>,
+    projects: HashMap<(i64, String), (Project, Instant)>,
+    /// (project, user) -> the user's level on it
+    levels: HashMap<(i64, i64), (Option<Level>, Instant)>,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
+    cache: RwLock<Cache>,
+    /// Moved on by every change, so a read that overlapped one throws
+    /// its answer away rather than caching it.
+    generation: AtomicU64,
+    ttl: Duration,
+}
+
+/// How long an authentication decision may be reused. Long enough to
+/// take the store off the hot path, short enough that a change which
+/// somehow skipped invalidation is forgotten quickly. `0` turns the
+/// cache off, which is also how to prove a bug is not the cache's.
+fn ttl_from_env() -> Duration {
+    Duration::from_secs(std::env::var("ZSQL_AUTH_CACHE_TTL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60))
 }
 
 const SCHEMA: &str = "
@@ -356,18 +393,64 @@ impl Store {
         // writes but never corrupts the file. Right for key metadata.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Store { conn: Mutex::new(conn) })
+        Ok(Store::over(conn))
     }
 
     pub fn in_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Store { conn: Mutex::new(conn) })
+        Ok(Store::over(conn))
     }
 
-    fn audit(conn: &Connection, account_id: i64, actor: &str, action: &str, subject: &str) -> rusqlite::Result<()> {
+    fn over(conn: Connection) -> Store {
+        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl: ttl_from_env() }
+    }
+
+    // --------------------------------------------------------- the cache
+
+    /// A cached answer, if one is there and still fresh.
+    fn hit<T>(&self, pick: impl FnOnce(&Cache) -> Option<(T, Instant)>) -> Option<T> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let (value, at) = pick(&self.cache.read().unwrap())?;
+        (at.elapsed() < self.ttl).then_some(value)
+    }
+
+    /// Caches an answer, unless a change landed while it was being read.
+    fn store_if_current(&self, generation: u64, put: impl FnOnce(&mut Cache)) {
+        if self.ttl.is_zero() || self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        put(&mut self.cache.write().unwrap());
+    }
+
+    /// Throws every cached decision away. Called by the audit row that
+    /// every change writes, so a new kind of change cannot forget to,
+    /// and by the two changes that write no audit row.
+    ///
+    /// Emptying all of it rather than the entries that changed is what
+    /// keeps "the old secret stops at once" true without tracking which
+    /// decision depended on what. Changes are rare; a burst of misses
+    /// after one costs nothing.
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        let mut c = self.cache.write().unwrap();
+        c.principals.clear();
+        c.sessions.clear();
+        c.projects.clear();
+        c.levels.clear();
+    }
+
+    /// Writes the audit row for a change, and marks the cache stale.
+    /// The two belong together: everything that changes an account
+    /// writes one, so this is the one place invalidation cannot be
+    /// forgotten. Called while the connection is held, so a read that
+    /// overlapped it sees the generation move.
+    fn audit(&self, conn: &Connection, account_id: i64, actor: &str, action: &str, subject: &str) -> rusqlite::Result<()> {
         conn.execute("INSERT INTO audit (account_id, actor, action, subject) VALUES (?1, ?2, ?3, ?4)", params![account_id, actor, action, subject])?;
+        self.bump();
         Ok(())
     }
 
@@ -413,7 +496,7 @@ impl Store {
             params![user.id, prefix_of(&secret), hash(&secret)],
         )?;
         let key_id = tx.last_insert_rowid();
-        Self::audit(&tx, account.id, &user.email, "signup", &account.uid)?;
+        self.audit(&tx, account.id, &user.email, "signup", &account.uid)?;
         let key = Self::user_key_in(&tx, key_id)?;
         tx.commit()?;
         Ok(Signup { account, user, key, secret })
@@ -422,10 +505,33 @@ impl Store {
     // ------------------------------------------------------ authentication
 
     /// The principal a secret stands for, or none. Touches last-used.
+    ///
+    /// A hit answers without taking the store's lock at all, which is
+    /// what keeps authentication off the hot path. Only a hit answers
+    /// from memory: a secret that matches nothing is never cached, so a
+    /// stream of made-up keys cannot fill it.
     pub fn authenticate(&self, secret: &str) -> Result<Option<Principal>> {
         let secret = secret.trim();
         let h = hash(secret);
+        if let Some(p) = self.hit(|c| c.principals.get(&h).cloned()) {
+            return Ok(Some(p));
+        }
+        let (found, generation) = self.authenticate_uncached(secret, &h)?;
+        if let Some(p) = found.clone() {
+            self.store_if_current(generation, move |c| {
+                c.principals.insert(h, (p, Instant::now()));
+            });
+        }
+        Ok(found)
+    }
+
+    /// The read behind [`Store::authenticate`], with the generation it
+    /// read at: the caller caches only if that has not moved since.
+    /// Also records the key's use, at most once a minute, which now
+    /// happens on a cache miss rather than on every request.
+    fn authenticate_uncached(&self, secret: &str, h: &str) -> Result<(Option<Principal>, u64)> {
         let conn = self.conn.lock().unwrap();
+        let generation = self.generation.load(Ordering::Acquire);
         if secret.starts_with("zsk_") {
             let row = conn
                 .query_row(
@@ -434,7 +540,7 @@ impl Store {
                     |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_at: r.get(4)?, last_used_at: r.get(5)? }),
                 )
                 .optional()?;
-            let Some(key) = row else { return Ok(None) };
+            let Some(key) = row else { return Ok((None, generation)) };
             touch(&conn, "user_keys", key.id, key.last_used_at.as_deref())?;
             let user = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![key.user_id], user_row)?;
             // A user key answers for the user's account; several accounts
@@ -446,8 +552,8 @@ impl Store {
                     |r| Ok((Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }, role_of(&r.get::<_, String>(3)?))),
                 )
                 .optional()?;
-            let Some((account, role)) = membership else { return Ok(None) };
-            return Ok(Some(Principal::User { user, account, role, key_id: key.id }));
+            let Some((account, role)) = membership else { return Ok((None, generation)) };
+            return Ok((Some(Principal::User { user, account, role, key_id: key.id }), generation));
         }
         if secret.starts_with("zqk_") {
             let row = conn
@@ -457,13 +563,13 @@ impl Store {
                     |r| Ok(QueryKey { id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_by: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }),
                 )
                 .optional()?;
-            let Some(key) = row else { return Ok(None) };
+            let Some(key) = row else { return Ok((None, generation)) };
             touch(&conn, "query_keys", key.id, key.last_used_at.as_deref())?;
             let account = conn.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![key.account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
             let grants = Self::grants_in(&conn, key.id)?;
-            return Ok(Some(Principal::QueryKey { key, account, grants }));
+            return Ok((Some(Principal::QueryKey { key, account, grants }), generation));
         }
-        Ok(None)
+        Ok((None, generation))
     }
 
     // -------------------------------------------------------- authorization
@@ -517,15 +623,27 @@ impl Store {
     /// The user's level on a project: granted, else read when the project
     /// is visible to the account.
     pub fn level_for(&self, project: &Project, user_id: i64) -> Result<Option<Level>> {
-        let conn = self.conn.lock().unwrap();
-        let granted: Option<String> = conn
-            .query_row("SELECT level FROM project_access WHERE project_id = ?1 AND user_id = ?2", params![project.id, user_id], |r| r.get(0))
-            .optional()?;
-        Ok(match granted {
+        let key = (project.id, user_id);
+        if let Some(l) = self.hit(|c| c.levels.get(&key).copied()) {
+            return Ok(l);
+        }
+        let (granted, generation) = {
+            let conn = self.conn.lock().unwrap();
+            let generation = self.generation.load(Ordering::Acquire);
+            let granted: Option<String> = conn
+                .query_row("SELECT level FROM project_access WHERE project_id = ?1 AND user_id = ?2", params![project.id, user_id], |r| r.get(0))
+                .optional()?;
+            (granted, generation)
+        };
+        let level = match granted {
             Some(l) => Some(level_of(&l)),
             None if project.visibility == "account" => Some(Level::Read),
             None => None,
-        })
+        };
+        self.store_if_current(generation, |c| {
+            c.levels.insert(key, (level, Instant::now()));
+        });
+        Ok(level)
     }
 
     // ------------------------------------------------------------ members
@@ -558,7 +676,7 @@ impl Store {
         if Self::admin_count(&tx, account_id)? == 0 {
             return Err(Error::Invalid("an account needs at least one admin".into()));
         }
-        Self::audit(&tx, account_id, actor, "member", &format!("{} {role_s}", user.email))?;
+        self.audit(&tx, account_id, actor, "member", &format!("{} {role_s}", user.email))?;
         tx.commit()?;
         Ok(Membership { user, role })
     }
@@ -582,7 +700,7 @@ impl Store {
         // owned alone fall to the admins, who own everything anyway.
         tx.execute("UPDATE user_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id = ?1 AND revoked_at IS NULL", params![user.id])?;
         tx.execute("DELETE FROM project_access WHERE user_id = ?1 AND project_id IN (SELECT id FROM projects WHERE account_id = ?2)", params![user.id, account_id])?;
-        Self::audit(&tx, account_id, actor, "member_removed", &user.email)?;
+        self.audit(&tx, account_id, actor, "member_removed", &user.email)?;
         tx.commit()?;
         Ok(())
     }
@@ -602,7 +720,7 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("{email} is not a member")))?;
         let token = new_secret("zin");
         conn.execute("INSERT INTO invites (account_id, user_id, hash, created_by) VALUES (?1, ?2, ?3, ?4)", params![account_id, user.id, hash(&token), actor])?;
-        Self::audit(&conn, account_id, actor, "invite", &user.email)?;
+        self.audit(&conn, account_id, actor, "invite", &user.email)?;
         Ok(token)
     }
 
@@ -629,7 +747,7 @@ impl Store {
         let secret = new_secret("zsk");
         tx.execute("INSERT INTO user_keys (user_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4)", params![user.id, key_name, prefix_of(&secret), hash(&secret)])?;
         let key = Self::user_key_in(&tx, tx.last_insert_rowid())?;
-        Self::audit(&tx, account.id, &user.email, "invite_accepted", &account.uid)?;
+        self.audit(&tx, account.id, &user.email, "invite_accepted", &account.uid)?;
         tx.commit()?;
         Ok((account, user, key, secret))
     }
@@ -670,7 +788,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute("INSERT INTO user_keys (user_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4)", params![user.id, name, prefix_of(&secret), hash(&secret)])?;
         let id = conn.last_insert_rowid();
-        Self::audit(&conn, account_id, &user.email, "user_key_created", &format!("{name} {}", prefix_of(&secret)))?;
+        self.audit(&conn, account_id, &user.email, "user_key_created", &format!("{name} {}", prefix_of(&secret)))?;
         Ok((Self::user_key_in(&conn, id)?, secret))
     }
 
@@ -683,7 +801,7 @@ impl Store {
         if n == 0 {
             return Err(Error::NotFound(format!("no active key {key_id} for {}", user.email)));
         }
-        Self::audit(&conn, account_id, &user.email, "user_key_revoked", &key_id.to_string())?;
+        self.audit(&conn, account_id, &user.email, "user_key_revoked", &key_id.to_string())?;
         Ok(())
     }
 
@@ -724,7 +842,7 @@ impl Store {
             params![account_id, name, prefix_of(&secret), hash(&secret), actor.id],
         )?;
         let id = conn.last_insert_rowid();
-        Self::audit(&conn, account_id, &actor.email, "query_key_created", &format!("{name} {}", prefix_of(&secret)))?;
+        self.audit(&conn, account_id, &actor.email, "query_key_created", &format!("{name} {}", prefix_of(&secret)))?;
         Ok((Self::query_key_in(&conn, account_id, id)?, secret))
     }
 
@@ -734,7 +852,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let key = Self::query_key_in(&conn, account_id, id)?;
         conn.execute("UPDATE query_keys SET prefix = ?1, hash = ?2 WHERE id = ?3", params![prefix_of(&secret), hash(&secret), key.id])?;
-        Self::audit(&conn, account_id, &actor.email, "query_key_rotated", &format!("{} {}", key.name, prefix_of(&secret)))?;
+        self.audit(&conn, account_id, &actor.email, "query_key_rotated", &format!("{} {}", key.name, prefix_of(&secret)))?;
         Ok((Self::query_key_in(&conn, account_id, id)?, secret))
     }
 
@@ -742,7 +860,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let key = Self::query_key_in(&conn, account_id, id)?;
         conn.execute("UPDATE query_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![key.id])?;
-        Self::audit(&conn, account_id, &actor.email, "query_key_revoked", &key.name)?;
+        self.audit(&conn, account_id, &actor.email, "query_key_revoked", &key.name)?;
         Ok(())
     }
 
@@ -768,7 +886,7 @@ impl Store {
             "INSERT INTO query_key_grants (query_key_id, project_id, branch) VALUES (?1, ?2, ?3) ON CONFLICT (query_key_id, project_id) DO UPDATE SET branch = excluded.branch",
             params![key.id, project.id, branch],
         )?;
-        Self::audit(&conn, account_id, &actor.email, "grant", &format!("{} on {}/{}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)))?;
+        self.audit(&conn, account_id, &actor.email, "grant", &format!("{} on {}/{}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)))?;
         Ok(Grant { project_id: project.id, project_uid: project.uid.clone(), branch })
     }
 
@@ -779,7 +897,7 @@ impl Store {
         if n == 0 {
             return Err(Error::NotFound(format!("{} is not granted {}", key.name, project.uid)));
         }
-        Self::audit(&conn, account_id, &actor.email, "grant_revoked", &format!("{} on {}", key.name, project.uid))?;
+        self.audit(&conn, account_id, &actor.email, "grant_revoked", &format!("{} on {}", key.name, project.uid))?;
         Ok(())
     }
 
@@ -801,10 +919,27 @@ impl Store {
     // ------------------------------------------------------------ projects
 
     pub fn project(&self, account_id: i64, uid: &str) -> Result<Option<Project>> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE account_id = ?1 AND uid = ?2"), params![account_id, uid.trim().to_lowercase()], project_row)
-            .optional()?)
+        let uid = uid.trim().to_lowercase();
+        let key = (account_id, uid);
+        if let Some(p) = self.hit(|c| c.projects.get(&key).cloned()) {
+            return Ok(Some(p));
+        }
+        let (found, generation) = {
+            let conn = self.conn.lock().unwrap();
+            let generation = self.generation.load(Ordering::Acquire);
+            let found = conn
+                .query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE account_id = ?1 AND uid = ?2"), params![key.0, key.1], project_row)
+                .optional()?;
+            (found, generation)
+        };
+        // A uid that names nothing is not cached: the caller chooses it,
+        // so caching misses would let one fill the map with nonsense.
+        if let Some(p) = found.clone() {
+            self.store_if_current(generation, move |c| {
+                c.projects.insert(key, (p, Instant::now()));
+            });
+        }
+        Ok(found)
     }
 
     pub fn projects(&self, account_id: i64) -> Result<Vec<Project>> {
@@ -830,7 +965,7 @@ impl Store {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("INSERT INTO project_access (project_id, user_id, level) VALUES (?1, ?2, 'owner')", params![id, creator.id])?;
-        Self::audit(&tx, account_id, &creator.email, "project_created", &uid)?;
+        self.audit(&tx, account_id, &creator.email, "project_created", &uid)?;
         let p = tx.query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"), params![id], project_row)?;
         tx.commit()?;
         Ok(p)
@@ -847,7 +982,7 @@ impl Store {
             "UPDATE projects SET name = coalesce(?1, name), production_branch = coalesce(?2, production_branch), visibility = coalesce(?3, visibility), protected_production = coalesce(?4, protected_production) WHERE id = ?5",
             params![name.map(str::trim), production_branch.map(str::trim).filter(|b| !b.is_empty()), visibility, protected_production.map(|b| b as i64), project.id],
         )?;
-        Self::audit(&conn, project.account_id, &actor.email, "project_updated", &project.uid)?;
+        self.audit(&conn, project.account_id, &actor.email, "project_updated", &project.uid)?;
         Ok(conn.query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"), params![project.id], project_row)?)
     }
 
@@ -857,7 +992,7 @@ impl Store {
         tx.execute("DELETE FROM query_key_grants WHERE project_id = ?1", params![project.id])?;
         tx.execute("DELETE FROM project_access WHERE project_id = ?1", params![project.id])?;
         tx.execute("DELETE FROM projects WHERE id = ?1", params![project.id])?;
-        Self::audit(&tx, project.account_id, &actor.email, "project_deleted", &project.uid)?;
+        self.audit(&tx, project.account_id, &actor.email, "project_deleted", &project.uid)?;
         tx.commit()?;
         Ok(())
     }
@@ -890,7 +1025,7 @@ impl Store {
         if Self::owner_count(&tx, project.id)? == 0 {
             return Err(Error::Invalid(format!("{} needs at least one owner", project.uid)));
         }
-        Self::audit(&tx, project.account_id, &actor.email, "access", &format!("{} {} on {}", user.email, level_name(level), project.uid))?;
+        self.audit(&tx, project.account_id, &actor.email, "access", &format!("{} {} on {}", user.email, level_name(level), project.uid))?;
         tx.commit()?;
         Ok((user, level))
     }
@@ -906,7 +1041,7 @@ impl Store {
         if Self::owner_count(&tx, project.id)? == 0 {
             return Err(Error::Invalid(format!("{} needs at least one owner", project.uid)));
         }
-        Self::audit(&tx, project.account_id, &actor.email, "access_removed", &format!("{email} on {}", project.uid))?;
+        self.audit(&tx, project.account_id, &actor.email, "access_removed", &format!("{email} on {}", project.uid))?;
         tx.commit()?;
         Ok(())
     }
@@ -921,7 +1056,7 @@ impl Store {
         let h = hash_password(password)?;
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user.id])?;
-        Self::audit(&conn, account_id, &user.email, "password_set", "")?;
+        self.audit(&conn, account_id, &user.email, "password_set", "")?;
         Ok(())
     }
 
@@ -956,21 +1091,37 @@ impl Store {
             "INSERT INTO sessions (user_id, account_id, hash, expires_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now', ?4))",
             params![user.id, account.id, hash(&token), format!("+{days} days")],
         )?;
-        Self::audit(&conn, account.id, &user.email, "login", "")?;
+        self.audit(&conn, account.id, &user.email, "login", "")?;
         Ok((token, account))
     }
 
-    /// The principal a session cookie stands for, if it is live.
+    /// The principal a session cookie stands for, if it is live. Cached
+    /// like a key, and dropped by logout and by every change.
     pub fn session(&self, token: &str) -> Result<Option<Principal>> {
+        let h = hash(token.trim());
+        if let Some(p) = self.hit(|c| c.sessions.get(&h).cloned()) {
+            return Ok(Some(p));
+        }
+        let (found, generation) = self.session_uncached(&h)?;
+        if let Some(p) = found.clone() {
+            self.store_if_current(generation, move |c| {
+                c.sessions.insert(h, (p, Instant::now()));
+            });
+        }
+        Ok(found)
+    }
+
+    fn session_uncached(&self, h: &str) -> Result<(Option<Principal>, u64)> {
         let conn = self.conn.lock().unwrap();
+        let generation = self.generation.load(Ordering::Acquire);
         let row: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT user_id, account_id FROM sessions WHERE hash = ?1 AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-                params![hash(token.trim())],
+                params![h],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some((user_id, account_id)) = row else { return Ok(None) };
+        let Some((user_id, account_id)) = row else { return Ok((None, generation)) };
         let user = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
         let membership = conn
             .query_row(
@@ -979,13 +1130,14 @@ impl Store {
                 |r| Ok((Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }, role_of(&r.get::<_, String>(3)?))),
             )
             .optional()?;
-        let Some((account, role)) = membership else { return Ok(None) };
-        Ok(Some(Principal::User { user, account, role, key_id: 0 }))
+        let Some((account, role)) = membership else { return Ok((None, generation)) };
+        Ok((Some(Principal::User { user, account, role, key_id: 0 }), generation))
     }
 
     pub fn delete_session(&self, token: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE hash = ?1", params![hash(token.trim())])?;
+        self.bump();
         Ok(())
     }
 
@@ -993,7 +1145,7 @@ impl Store {
 
     pub fn record(&self, account_id: i64, actor: &str, action: &str, subject: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        Ok(Self::audit(&conn, account_id, actor, action, subject)?)
+        Ok(self.audit(&conn, account_id, actor, action, subject)?)
     }
 
     pub fn audit_log(&self, account_id: i64, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -1012,6 +1164,85 @@ mod tests {
 
     fn principal(store: &Store, secret: &str) -> Principal {
         store.authenticate(secret).unwrap().expect("a live key")
+    }
+
+    /// Authentication is cached, so every change that could make a
+    /// cached answer wrong has to be felt at once. Each step here would
+    /// pass trivially with the cache off; with it on, each one is a
+    /// check that the change invalidated.
+    #[test]
+    fn a_change_is_felt_at_once_through_the_cache() {
+        let s = Store::in_memory().unwrap();
+        assert!(!s.ttl.is_zero(), "this test is only meaningful with the cache on");
+        let su = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let ann = su.user.clone();
+        let bob = s.add_member(su.account.id, &ann.email, "bob@acme.test", "Bob", Role::Developer).unwrap();
+        let (bob_key, bob_secret) = s.create_user_key(su.account.id, &bob.user, "laptop").unwrap();
+
+        // Warm the cache, and check it is really holding the answer.
+        assert!(s.authenticate(&bob_secret).unwrap().is_some());
+        assert_eq!(s.cache.read().unwrap().principals.len(), 1, "the decision is cached");
+        assert!(s.authenticate(&bob_secret).unwrap().is_some(), "a second ask is served from memory");
+
+        // Revoking the key stops it on the next request, not in a minute.
+        s.revoke_user_key(su.account.id, &bob.user, bob_key.id).unwrap();
+        assert!(s.authenticate(&bob_secret).unwrap().is_none(), "a revoked key stops at once");
+
+        // A query key: rotation keeps the grants and kills the old secret.
+        let project = s.create_project(su.account.id, &ann, "sales", "Sales", "main").unwrap();
+        let (qk, old_secret) = s.create_query_key(su.account.id, &ann, "web app").unwrap();
+        s.grant(su.account.id, &ann, qk.id, &project, None).unwrap();
+        let before = principal(&s, &old_secret);
+        s.authorize(&before, &project, "main", Verb::Read).unwrap();
+        let (_, new_secret) = s.rotate_query_key(su.account.id, &ann, qk.id).unwrap();
+        assert!(s.authenticate(&old_secret).unwrap().is_none(), "the rotated-away secret stops at once");
+        let after = principal(&s, &new_secret);
+        s.authorize(&after, &project, "main", Verb::Read).unwrap();
+
+        // Revoking the grant is felt by the next principal read.
+        s.revoke_grant(su.account.id, &ann, qk.id, &project).unwrap();
+        let after = principal(&s, &new_secret);
+        assert!(matches!(s.authorize(&after, &project, "main", Verb::Read), Err(Error::Denied(_))));
+
+        // Levels and visibility are cached beside the principal.
+        let (_, bob_secret) = s.create_user_key(su.account.id, &bob.user, "desk").unwrap();
+        let bob_p = principal(&s, &bob_secret);
+        assert_eq!(s.level_for(&project, bob.user.id).unwrap(), Some(Level::Read), "visible to the account");
+        s.set_access(&ann, &project, "bob@acme.test", Level::Write).unwrap();
+        assert_eq!(s.level_for(&project, bob.user.id).unwrap(), Some(Level::Write), "a new level is felt at once");
+        let project = s.update_project(&ann, &project, None, None, Some("restricted"), None).unwrap();
+        s.remove_access(&ann, &project, "bob@acme.test").unwrap();
+        assert_eq!(s.level_for(&project, bob.user.id).unwrap(), None, "restricted and ungranted");
+        assert!(matches!(s.authorize(&bob_p, &project, "main", Verb::Read), Err(Error::Denied(_))));
+
+        // The project lookup is cached too, and a rename is felt.
+        assert_eq!(s.project(su.account.id, "sales").unwrap().unwrap().name, "Sales");
+        s.update_project(&ann, &project, Some("Revenue"), None, None, None).unwrap();
+        assert_eq!(s.project(su.account.id, "sales").unwrap().unwrap().name, "Revenue");
+
+        // Sessions: logging out ends the session now.
+        let (cookie, _) = s.create_session(&ann, 30).unwrap();
+        assert!(s.session(&cookie).unwrap().is_some());
+        assert_eq!(s.cache.read().unwrap().sessions.len(), 1);
+        s.delete_session(&cookie).unwrap();
+        assert!(s.session(&cookie).unwrap().is_none(), "logout ends it at once");
+
+        // Removing a member stops the keys they still hold.
+        let (_, bob_secret) = s.create_user_key(su.account.id, &bob.user, "third").unwrap();
+        assert!(s.authenticate(&bob_secret).unwrap().is_some());
+        s.remove_member(su.account.id, &ann.email, "bob@acme.test").unwrap();
+        assert!(s.authenticate(&bob_secret).unwrap().is_none(), "a removed member's key stops at once");
+    }
+
+    /// A secret that matches nothing must not be kept: the caller picks
+    /// it, so caching misses would be a way to fill memory.
+    #[test]
+    fn unknown_secrets_are_not_cached() {
+        let s = Store::in_memory().unwrap();
+        for i in 0..50 {
+            assert!(s.authenticate(&format!("zsk_nonsense{i}")).unwrap().is_none());
+        }
+        assert!(s.cache.read().unwrap().principals.is_empty());
     }
 
     #[test]

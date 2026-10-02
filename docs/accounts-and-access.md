@@ -88,9 +88,19 @@ admins, and a playground per deployed branch: a shorthand line or a spec,
 an optional security context, and the SQL, the explain tree or the
 explore lists back, with a field search beside it and recent lines kept
 in the browser. One HTML shell, one stylesheet and one script, embedded in the
-binary; views render from the JSON API. Black and white with rust for
-what matters, Inter and Space Grotesk, JetBrains Mono for keys; light and
-dark follow the system, with a toggle.
+binary; views render from the JSON API. The styling follows the 0sql brand
+package (the marketing repo's `brand/`): monochrome with the one rust
+accent on the logo badge, links, the primary action, and active and focus
+states; Inter for the UI, mono for titles, keys and code; the outlined
+wordmark and site icons from the package live under `crates/server/ui/brand`
+and are served at `/app/brand/...` and the site root. Interface icons are
+Lucide, inlined. Light and dark follow the system, with a toggle.
+
+Authentication is cached in memory for a minute (`ZSQL_AUTH_CACHE_TTL`)
+so a key in steady use does not take the store's lock on every request.
+Every change empties that cache, through the audit row each one writes,
+so a revoked or rotated key, a changed role, level or grant, and a logout
+are all felt by the next request. See `docs/rate-limiting.md`.
 
 Sessions are a cookie (`zsql_session`, HttpOnly, SameSite=Lax, Secure
 when `ZSQL_PUBLIC_URL` is https) backed by a hashed row with a 30-day
