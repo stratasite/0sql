@@ -19,15 +19,37 @@ production_branch: main\n\
 
 pub const DATASOURCES_YML: &str = "\
 # The warehouses this project's tables live in. One entry per datasource,\n\
-# keyed by a short id that table files refer to. Connection details that\n\
-# are secrets (password, tokens, keys) go in .zsql under the same key, or\n\
-# in ZSQL_DS_<KEY>_PASSWORD; they are never deployed.\n\
+# keyed by a short id that table files refer to.\n\
+#\n\
+# 0sql never connects to your warehouse. zsqld has no database driver in\n\
+# it at all: it takes a query spec and gives back SQL text. Running that\n\
+# SQL against your data stays inside your network, with your credentials,\n\
+# and nothing about the rows ever reaches the service.\n\
+#\n\
+# So the settings below are two different things.\n\
+#\n\
+# The model needs `adapter` and `tier`, and those are the only keys the\n\
+# planner reads. The adapter picks the SQL dialect to generate; the tier\n\
+# ranks datasources when more than one could answer a query. They are\n\
+# compiled into the deployed model.\n\
+#\n\
+# This machine needs the rest: host, port, database, username, schema,\n\
+# file. They are here so `zsql values sample` can connect from here and\n\
+# collect the dimension values that make authoring easier. Nothing on the\n\
+# server reads them. A deploy does upload this file, with the secrets\n\
+# taken out, but every one of these keys is ignored and none of them is\n\
+# kept: the deployed model holds the adapter, the tier and the name.\n\
+#\n\
+# Secrets never leave this machine. Passwords, tokens and keys go in\n\
+# .zsql under the same datasource key, or in ZSQL_DS_<KEY>_PASSWORD;\n\
+# `zsql deploy` strips them from what it sends, and .zsql is gitignored\n\
+# and never deployed.\n\
 #\n\
 # warehouse:\n\
 #   name: Warehouse\n\
-#   adapter: postgres            # duckdb | postgres | snowflake | bigquery | databricks | trino | mysql | sqlserver | ...\n\
+#   adapter: postgres            # the dialect to generate; duckdb | postgres | snowflake | bigquery | databricks | trino | mysql | sqlserver | ...\n\
 #   tier: hot                    # hot | warm | cold; the planner prefers hotter tiers\n\
-#   host: localhost\n\
+#   host: localhost              # from here down: so this machine can sample; the server ignores it\n\
 #   port: 5432\n\
 #   database: analytics\n\
 #   username: analyst\n\
