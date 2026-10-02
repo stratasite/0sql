@@ -114,10 +114,17 @@ so a deploy or an argon2 hash never holds a runtime worker. Measured: 508
 deploys running flat out during a load test cost plan throughput 20% and
 left its p99 at 5.7 ms. Before, deploys stalled the runtime.
 
-Requests also carry a deadline: 180 s for heavy, 30 s for everything
+Requests also carry a deadline: 90 s for heavy, 30 s for everything
 else. A deadline that passes answers `503 Timeout` **without**
 `Retry-After`, because unlike the other two refusals it happened after
 the handler started.
+
+Ninety rather than the couple of minutes a large deploy might want,
+because Cloudflare gives an origin a hundred seconds and then answers
+`524` itself. A 524 carries no retry hint, so the CLI cannot act on it
+and the caller is left guessing about a deploy that may well have
+landed. The server should always get to give its own answer first. On a
+deployment without that ceiling in front, this is the number to raise.
 
 ### 2. Fairness: token buckets per principal
 
@@ -162,9 +169,24 @@ It is the classic account-lockout trade, taken deliberately, and
 else. Worth revisiting if anyone is annoyed by it.
 
 The address is the socket peer. Behind a proxy that is wrong for every
-client, so `ZSQL_TRUSTED_PROXY=1` makes the server read the last hop of
-`X-Forwarded-For` instead. The header is never read uninvited; that is
-how per-address limits get bypassed.
+client, so `ZSQL_TRUSTED_PROXY=1` makes the server read two headers
+instead, in order of how far they can be trusted.
+
+`CF-Connecting-IP` first: Cloudflare sets it to the single address that
+reached its edge, and being one value it cannot be padded into a list to
+hide behind. Failing that, the **rightmost** hop of `X-Forwarded-For`.
+
+That is the opposite of the usual advice and deliberately so. Every
+proxy appends, so the leftmost entry is whatever the caller sent and is
+forgeable, while the rightmost is the one the nearest proxy wrote
+itself. Cloudflare's edge appends the connecting address to any header
+already there, and `cloudflared` appends the visitor again on the way to
+the origin, so the rightmost is the real visitor there too. The
+Cloudflare header is preferred anyway, because that ordering is the
+subject of an open issue asking for it to be reversed.
+
+Neither header is read uninvited. That is how per-address limits get
+bypassed.
 
 ### 4. Shape limits: bound the cost of one request
 
