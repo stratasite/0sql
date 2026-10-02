@@ -160,7 +160,7 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();
-    let addr = client_addr(&app, &parts, peer);
+    let addr = client_addr(app.limits.cfg.trusted_proxy, &parts.headers, peer.ip());
 
     // The routes that cost before anyone is identified are counted
     // against the address they came from.
@@ -243,20 +243,36 @@ fn address_gate(parts: &Parts) -> Option<limits::Gate> {
     }
 }
 
-/// The address a per-address limit counts against: the socket peer, or
-/// the last hop of `X-Forwarded-For` when the server has been told it is
-/// behind a proxy. Reading that header uninvited would let every caller
-/// pick their own bucket, so it is only read when `ZSQL_TRUSTED_PROXY`
-/// says a proxy is really there.
-fn client_addr(app: &App, parts: &Parts, peer: SocketAddr) -> IpAddr {
-    if app.limits.cfg.trusted_proxy {
-        if let Some(hops) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+/// The address a per-address limit counts against.
+///
+/// The socket peer, unless the server has been told a proxy is in front
+/// of it, and then two headers in order of how much they can be
+/// trusted. `CF-Connecting-IP` first: Cloudflare sets it to the single
+/// address that reached its edge, and being one value it cannot be
+/// turned into a list to hide behind.
+///
+/// Failing that, the **rightmost** hop of `X-Forwarded-For`. That is
+/// the opposite of the usual advice, and deliberately so. Every proxy
+/// appends, so the leftmost entry is whatever the caller sent and is
+/// forgeable; the rightmost is the one the nearest proxy wrote itself.
+/// Cloudflare's edge and `cloudflared` both append, so the rightmost is
+/// the real visitor there too.
+///
+/// Neither header is read unless `ZSQL_TRUSTED_PROXY` says a proxy is
+/// really there. Reading them uninvited would let every caller choose
+/// its own bucket, which is how per-address limits get bypassed.
+fn client_addr(trusted_proxy: bool, headers: &axum::http::HeaderMap, peer: IpAddr) -> IpAddr {
+    if trusted_proxy {
+        if let Some(ip) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()) {
+            return ip;
+        }
+        if let Some(hops) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(ip) = hops.split(',').map(str::trim).rfind(|h| !h.is_empty()).and_then(|h| h.parse().ok()) {
                 return ip;
             }
         }
     }
-    peer.ip()
+    peer
 }
 
 /// An answer that says when to come back.
@@ -1607,3 +1623,59 @@ async fn main() -> anyhow::Result<()> {
 /// it no longer applies to every other route.
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(k.parse::<HeaderName>().unwrap(), v.parse().unwrap());
+        }
+        h
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Which address a request is counted against decides whether the
+    /// login and sign-up limits mean anything, so each way of getting
+    /// it wrong is worth a line here.
+    #[test]
+    fn the_address_a_request_is_counted_against() {
+        let peer = ip("10.0.0.1");
+        let visitor = ip("203.0.113.9");
+
+        // No proxy in front: headers are not read at all, however
+        // confidently they are sent.
+        let forged = headers(&[("x-forwarded-for", "1.2.3.4"), ("cf-connecting-ip", "5.6.7.8")]);
+        assert_eq!(client_addr(false, &forged, peer), peer);
+
+        // Behind a proxy, Cloudflare's single-value header wins.
+        let both = headers(&[("x-forwarded-for", "1.2.3.4, 203.0.113.9"), ("cf-connecting-ip", "198.51.100.2")]);
+        assert_eq!(client_addr(true, &both, peer), ip("198.51.100.2"));
+
+        // Without it, the rightmost hop: the one the nearest proxy
+        // wrote. The leftmost is whatever the caller sent.
+        let appended = headers(&[("x-forwarded-for", "1.2.3.4, 203.0.113.9")]);
+        assert_eq!(client_addr(true, &appended, peer), visitor);
+
+        // A caller stuffing the header cannot reach past the entry the
+        // proxy appends after it.
+        let stuffed = headers(&[("x-forwarded-for", "9.9.9.9, 9.9.9.9, 9.9.9.9, 203.0.113.9")]);
+        assert_eq!(client_addr(true, &stuffed, peer), visitor);
+
+        // Nonsense in the header falls back rather than failing.
+        assert_eq!(client_addr(true, &headers(&[("x-forwarded-for", "not-an-ip")]), peer), peer);
+        assert_eq!(client_addr(true, &headers(&[("x-forwarded-for", "")]), peer), peer);
+        assert_eq!(client_addr(true, &headers(&[("cf-connecting-ip", "nope")]), peer), peer);
+        assert_eq!(client_addr(true, &HeaderMap::new(), peer), peer);
+
+        // Spacing and IPv6 are both ordinary.
+        assert_eq!(client_addr(true, &headers(&[("x-forwarded-for", " 1.2.3.4 ,  203.0.113.9 ")]), peer), visitor);
+        assert_eq!(client_addr(true, &headers(&[("cf-connecting-ip", "2001:db8::1")]), peer), ip("2001:db8::1"));
+    }
+}

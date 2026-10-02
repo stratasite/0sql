@@ -513,9 +513,16 @@ fn patience(class: Class) -> Duration {
 }
 
 /// How long a request may run before it is abandoned.
+///
+/// Heavy work gets ninety seconds rather than the couple of minutes a
+/// deploy might want, because Cloudflare gives an origin a hundred
+/// seconds and then answers 524 itself. A 524 carries no retry hint, so
+/// the CLI cannot act on it and the caller is left guessing about a
+/// deploy that may well have landed. Better that the server always gets
+/// to give its own answer first.
 pub fn deadline(class: Class) -> Duration {
     match class {
-        Class::Heavy => Duration::from_secs(180),
+        Class::Heavy => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
