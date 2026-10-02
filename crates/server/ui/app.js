@@ -240,13 +240,21 @@
   async function viewQueryKeys(reveal) {
     const [d, list] = await Promise.all([api("GET", "/account/query-keys"), api("GET", "/projects")]);
     const projects = (list.projects || []).filter((p) => p.level === "owner");
-    const options = projects.map((p) => h`<option value="${p.uid}">${p.name || p.uid}</option>`).join("");
+    const options = projects.map((p) => h`<option value="${p.uid}">${p.name && p.name !== p.uid ? p.name + " · " + p.uid : p.uid}</option>`).join("");
+    // The branch is one the server serves: the project's production branch
+    // (the default), every branch, or a deployed one by name.
+    const branchOptions = (uid) => {
+      const p = projects.find((x) => x.uid === uid) || {};
+      const deployed = list.deployments.filter((d) => d.project === uid).map((d) => d.branch).sort();
+      return h`<option value="">production (${p.production_branch || "main"})</option><option value="*">every branch</option>` +
+        deployed.filter((b) => b !== p.production_branch).map((b) => h`<option value="${b}">${b}</option>`).join("");
+    };
     const cards = d.query_keys.map(({ key, grants }) => h`
       <div class="card"><div class="card-head"><h2>${key.name} <span class="faint mono" style="font-weight:400">${key.prefix}…</span></h2>
         <div class="actions"><span class="muted small">${key.last_used_at ? "used " + when(key.last_used_at) : "never used"}</span><button class="btn sm" data-rotate="${key.id}">Rotate</button><button class="btn sm quiet danger" data-revoke-key="${key.id}">Revoke</button></div></div>
         <div class="card-body flush">
           ${raw(grants.length ? h`<table><thead><tr><th>project</th><th>branch</th><th></th></tr></thead><tbody>${raw(grants.map((g) => h`<tr><td><a href="/app/projects/${g.project_uid}" data-link>${g.project_uid}</a></td><td class="mono">${g.branch === null ? "production" : g.branch === "*" ? "every branch" : g.branch}</td><td class="actions"><button class="btn sm quiet danger" data-revoke-grant="${key.id}" data-project="${g.project_uid}">Revoke</button></td></tr>`).join(""))}</tbody></table>` : h`<div class="empty">Reads nothing yet. Grant it a project below.</div>`)}
-          ${projects.length ? raw(h`<form class="inline" data-grant="${key.id}" style="padding:12px 16px;border-top:1px solid var(--line)"><div class="field"><label>Project you own</label><select name="project">${raw(options)}</select></div><div class="field narrow"><label>Branch</label><input name="branch" class="mono" placeholder="production"></div><button class="btn" type="submit">Grant read</button></form>`) : ""}
+          ${projects.length ? raw(h`<form class="inline" data-grant="${key.id}" style="padding:12px 16px;border-top:1px solid var(--line)"><div class="field"><label>Project you own</label><select name="project">${raw(options)}</select></div><div class="field narrow"><label>Branch</label><select name="branch" class="mono">${raw(branchOptions(projects[0].uid))}</select></div><button class="btn" type="submit">Grant read</button></form>`) : ""}
         </div></div>`).join("");
     frame("/app/query-keys", h`
       <div class="page-head"><div><h1>Query keys</h1><div class="sub">What your applications send. Read only, on the projects and branches they are granted. <code>*</code> means every branch.</div></div></div>
@@ -255,7 +263,10 @@
       <div class="grid">${raw(cards || h`<div class="empty">No query keys yet.</div>`)}</div>`);
     const nk = document.getElementById("new-key");
     nk.onsubmit = async (e) => { e.preventDefault(); try { const r = await api("POST", "/account/query-keys", Object.fromEntries(new FormData(nk).entries())); viewQueryKeys({ name: r.key.name, secret: r.secret }); } catch (err) { toast(err.message); } };
-    root.querySelectorAll("[data-grant]").forEach((f) => f.onsubmit = async (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(f).entries()); if (!d.branch) delete d.branch; try { await api("POST", `/account/query-keys/${f.dataset.grant}/grants`, d); viewQueryKeys(); } catch (err) { toast(err.message); } });
+    root.querySelectorAll("[data-grant]").forEach((f) => {
+      f.project.onchange = () => { f.branch.innerHTML = branchOptions(f.project.value); };
+      f.onsubmit = async (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(f).entries()); if (!d.branch) delete d.branch; try { await api("POST", `/account/query-keys/${f.dataset.grant}/grants`, d); viewQueryKeys(); } catch (err) { toast(err.message); } };
+    });
     root.querySelectorAll("[data-revoke-grant]").forEach((b) => b.onclick = async () => { try { await api("DELETE", `/account/query-keys/${b.dataset.revokeGrant}/grants/${encodeURIComponent(b.dataset.project)}`); viewQueryKeys(); } catch (err) { toast(err.message); } });
     root.querySelectorAll("[data-rotate]").forEach((b) => b.onclick = async () => { if (!confirm("Rotate this key? The current secret stops working at once.")) return; try { const r = await api("POST", `/account/query-keys/${b.dataset.rotate}/rotate`); viewQueryKeys({ name: r.key.name + " (rotated)", secret: r.secret }); } catch (err) { toast(err.message); } });
     root.querySelectorAll("[data-revoke-key]").forEach((b) => b.onclick = async () => { if (!confirm("Revoke this key? Apps using it stop working.")) return; try { await api("DELETE", `/account/query-keys/${b.dataset.revokeKey}`); viewQueryKeys(); } catch (err) { toast(err.message); } });
