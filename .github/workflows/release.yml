@@ -1,0 +1,98 @@
+# Builds the server and attaches it to a release. Only on a version tag,
+# or by hand from the Actions tab; nothing is built on an ordinary push.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The result is one statically linked binary. Everything the server
+# serves is compiled into it: the web app, the brand assets and the
+# dialect files. Deploying is copying that file and restarting the unit.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Build without cutting a release, to try the pipeline or grab a
+  # binary from a branch. The result lands in the run's artifacts.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # musl rather than glibc, for two reasons. A glibc binary built on
+      # a modern runner needs that glibc or newer on the server, which
+      # no stable distribution has; and glibc's static mode cannot
+      # resolve names, so it crashes outright if ZSQL_BIND is ever given
+      # a hostname. musl links statically, resolves names, and will
+      # still be right when the server has to reach a Postgres or an S3
+      # by name.
+      - name: Toolchain
+        # The version and the musl target both come from
+        # rust-toolchain.toml, so there is one place to bump.
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+          rustc --version
+
+      # rusqlite bundles SQLite, which is C, so the target needs a C
+      # compiler of its own.
+      - name: musl C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # A tag says what version it is; the manifest has to agree.
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          test "$manifest" = "$tag" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          }
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zsql-server
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          install -m755 target/x86_64-unknown-linux-musl/release/zsqld dist/zsqld-x86_64-linux
+          ( cd dist && sha256sum zsqld-x86_64-linux > zsqld-x86_64-linux.sha256 )
+          ls -l dist
+
+      # The point of the whole exercise, so it is worth asserting rather
+      # than assuming.
+      - name: It is really static
+        run: |
+          file dist/zsqld-x86_64-linux
+          file dist/zsqld-x86_64-linux | grep -qE 'static(ally linked|-pie linked)'
+          ! ldd dist/zsqld-x86_64-linux 2>/dev/null | grep -q '=>'
+
+      # Job control is off in this shell, so the pid is kept by hand.
+      - name: It really starts
+        run: |
+          ZSQL_DATA_DIR=$(mktemp -d) ZSQL_BIND=127.0.0.1:3699 ./dist/zsqld-x86_64-linux &
+          pid=$!
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:3699/healthz >/dev/null 2>&1 && break || sleep 0.5; done
+          curl -fsS http://127.0.0.1:3699/healthz
+          kill "$pid"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zsqld-x86_64-linux
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes dist/zsqld-x86_64-linux dist/zsqld-x86_64-linux.sha256

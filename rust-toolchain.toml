@@ -1,0 +1,10 @@
+# The toolchain a release is built with. rustup reads this on its own,
+# so CI needs no version of its own and a local rustup would match it.
+# Bump it deliberately: the released binary is whatever this says.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+# The release target. Statically linked, and unlike glibc's static mode
+# it can still resolve names. See .github/workflows/release.yml.
+targets = ["x86_64-unknown-linux-musl"]
