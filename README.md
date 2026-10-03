@@ -170,6 +170,15 @@ Each deployment keeps its planner, the per-root universe index, built
 once at deploy beside the universe; requests borrow it, so server time
 is lowering plus planning only.
 
+`[Name]` inside a formula names a field in a model expression, and a
+projection of the same query (then a field) in a calculation; `@d` and
+`@m` pick the dimension or the measure, and in a calculation they also
+say you mean the field rather than a projection that shares the name. A
+name belongs to at most one dimension and at most one measure, so a bare
+reference is ambiguous only when both exist, which is when the suffix is
+required. Square brackets always name a field: a warehouse column goes
+in bare or in double quotes, whatever its warehouse uses for quoting.
+
 A field reference resolves by uid, name or synonym, case ignored. One that
 matches nothing resolves to the nearest field by character trigram
 similarity when that field clearly leads (score 0.5 or more, 0.2 ahead of

@@ -210,6 +210,9 @@ struct PendingExpression {
     field_name: String,
     measure_refs: Vec<String>,
     dimension_refs: Vec<String>,
+    /// `[Name]` with no `@d`/`@m`. Resolved against both kinds once every
+    /// file is loaded, since the field it names may live in another one.
+    bare_refs: Vec<String>,
 }
 
 struct PendingTable {
@@ -693,13 +696,14 @@ impl<'d> Builder<'d> {
             dimension_ref_ids: vec![],
             measure_ref_ids: vec![],
         });
-        if !parsed.measure_refs.is_empty() || !parsed.dimension_refs.is_empty() {
+        if !parsed.measure_refs.is_empty() || !parsed.dimension_refs.is_empty() || !parsed.field_refs.is_empty() {
             self.pending_expressions.push(PendingExpression {
                 expression_index: self.expressions.len() - 1,
                 file: file.to_path_buf(),
                 field_name: name,
                 measure_refs: parsed.measure_refs,
                 dimension_refs: parsed.dimension_refs,
+                bare_refs: parsed.field_refs,
             });
         }
         Ok(())
@@ -919,6 +923,9 @@ impl<'d> Builder<'d> {
         // Expression references (`Expression::References#compute_and_validate_references`)
         // and their integrity across universes.
         let pending = std::mem::take(&mut self.pending_expressions);
+        // Which file each referencing expression came from, kept for the
+        // cycle check below, which runs once every reference is resolved.
+        let mut ref_files: HashMap<Id, PathBuf> = HashMap::new();
         for pe in pending {
             let mut measure_ids = Vec::new();
             for m in &pe.measure_refs {
@@ -929,6 +936,37 @@ impl<'d> Builder<'d> {
             for d in &pe.dimension_refs {
                 let i = self.field_by_name(FieldKind::Dimension, d).ok_or_else(|| invalid(&pe.file, format!("[{}]: could not find dimension named: {d}", pe.field_name)))?;
                 dimension_ids.push(self.fields[i].id);
+            }
+            // `[Name]` with no suffix. A name belongs to at most one
+            // dimension and at most one measure, so it is only ambiguous
+            // when both exist; that is the one case the suffix is for.
+            // Before this, a bare reference was parsed and then dropped,
+            // so it reached the warehouse as literal `[Name]` text.
+            for b in &pe.bare_refs {
+                let dim = self.field_by_name(FieldKind::Dimension, b);
+                let msr = self.field_by_name(FieldKind::Measure, b);
+                match (dim, msr) {
+                    (Some(d), Some(_)) => {
+                        // The parser lower-cases the formula, so the name
+                        // is echoed back from the field, not from `b`.
+                        let n = &self.fields[d].name;
+                        return Err(invalid(
+                            &pe.file,
+                            format!("[{}]: [{n}] is both a dimension and a measure. Write [{n}]@d or [{n}]@m to say which.", pe.field_name),
+                        ));
+                    }
+                    (Some(i), None) => dimension_ids.push(self.fields[i].id),
+                    (None, Some(i)) => measure_ids.push(self.fields[i].id),
+                    (None, None) => {
+                        return Err(invalid(
+                            &pe.file,
+                            format!(
+                                "[{}]: could not find a field named: {b}. Square brackets name a field; for a warehouse column write it bare or in double quotes.",
+                                pe.field_name
+                            ),
+                        ))
+                    }
+                }
             }
             let e = &self.expressions[pe.expression_index];
             let own = e.field_id;
@@ -956,10 +994,12 @@ impl<'d> Builder<'d> {
                     return Err(invalid(&pe.file, format!("[{}] on {table_name}: Sql Mixed measure and dimension references must all be reachable from one universe.", pe.field_name)));
                 }
             }
+            ref_files.entry(own).or_insert_with(|| pe.file.clone());
             let e = &mut self.expressions[pe.expression_index];
             e.measure_ref_ids = measure_ids;
             e.dimension_ref_ids = dimension_ids;
         }
+        self.reject_reference_cycles(&ref_files)?;
 
         // Exclusion and inclusion rules resolve their entities to dimensions.
         let rules = std::mem::take(&mut self.pending_rules);
@@ -1036,6 +1076,80 @@ impl<'d> Builder<'d> {
 
     fn field_kind(&self, id: Id) -> Option<FieldKind> {
         self.fields.iter().find(|f| f.id == id).map(|f| f.kind)
+    }
+
+    /// A field whose expression reaches itself through other fields.
+    ///
+    /// The planner builds a reference per referenced field and recurses,
+    /// so a cycle does not fail: it overflows the stack and takes the
+    /// process down with it, from one query. Caught here, where the
+    /// modeller can still read the names.
+    fn reject_reference_cycles(&self, files: &HashMap<Id, PathBuf>) -> Result<()> {
+        // Field -> the fields its expressions name. A field may be
+        // expressed on several tables, and any one of them can close a
+        // cycle, so every expression counts.
+        let mut edges: HashMap<Id, Vec<Id>> = HashMap::new();
+        for e in &self.expressions {
+            let to = edges.entry(e.field_id).or_default();
+            for r in e.dimension_ref_ids.iter().chain(e.measure_ref_ids.iter()) {
+                if !to.contains(r) {
+                    to.push(*r);
+                }
+            }
+        }
+        let name_of = |id: Id| self.fields.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_else(|| id.to_string());
+
+        // Iterative depth-first search, since recursing to find a stack
+        // overflow would be its own joke.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Open,
+            Done,
+        }
+        let mut mark: HashMap<Id, Mark> = HashMap::new();
+        for start in edges.keys().copied() {
+            if mark.contains_key(&start) {
+                continue;
+            }
+            let mut path: Vec<Id> = Vec::new();
+            let mut stack: Vec<(Id, usize)> = vec![(start, 0)];
+            mark.insert(start, Mark::Open);
+            path.push(start);
+            while let Some((node, next)) = stack.pop() {
+                let kids = edges.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+                if next >= kids.len() {
+                    mark.insert(node, Mark::Done);
+                    path.pop();
+                    continue;
+                }
+                stack.push((node, next + 1));
+                let kid = kids[next];
+                match mark.get(&kid) {
+                    Some(Mark::Done) => {}
+                    Some(Mark::Open) => {
+                        // `path` from the first sighting of `kid` is the cycle.
+                        let at = path.iter().position(|p| *p == kid).unwrap_or(0);
+                        let mut names: Vec<String> = path[at..].iter().map(|i| name_of(*i)).collect();
+                        names.push(name_of(kid));
+                        let file = files.get(&node).cloned().unwrap_or_default();
+                        return Err(invalid(
+                            &file,
+                            if names.len() == 2 {
+                                format!("[{}]: its expression references itself.", names[0])
+                            } else {
+                                format!("[{}]: its expression references itself through {}.", names[0], names[1..].join(" -> "))
+                            },
+                        ));
+                    }
+                    None => {
+                        mark.insert(kid, Mark::Open);
+                        path.push(kid);
+                        stack.push((kid, 0));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn field_by_name(&self, kind: FieldKind, name: &str) -> Option<usize> {
