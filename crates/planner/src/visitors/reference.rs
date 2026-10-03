@@ -69,6 +69,34 @@ fn only_carried(graph: &Graph, id: NodeId, field: &Field) -> bool {
 /// Rails `create_reference`: the field's expression on the cheapest path
 /// of the subtree holding it, adding the path to the node when none does.
 pub fn create_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, field: &'a Field) -> Result<Reference<'a>> {
+    create_reference_within(graph, id, universe, field, &mut Vec::new())
+}
+
+/// `visiting` is the chain of fields whose expressions are being built,
+/// outermost first. A field expression may name other fields, and those
+/// may name more, so this descends; if it ever arrives back at a field
+/// already in the chain the model has a cycle, and without this it
+/// would descend until the stack ran out and the process aborted.
+///
+/// The loader refuses to build a cyclic model, so this catches only what
+/// is already on disk from before it did, and answers with a planning
+/// error rather than taking the server down with it.
+fn create_reference_within<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    field: &'a Field,
+    visiting: &mut Vec<zsql_semantic::Id>,
+) -> Result<Reference<'a>> {
+    if visiting.contains(&field.id) {
+        let mut chain: Vec<String> = visiting.iter().filter_map(|i| universe.field(*i)).map(|f| f.name.clone()).collect();
+        chain.push(field.name.clone());
+        return Err(PlanError::Resolution(format!(
+            "The expression for {} references itself: {}. Fix the model; this field cannot be planned.",
+            crate::model::field_to_s(field),
+            chain.join(" -> ")
+        )));
+    }
     let path = {
         let node = &graph.nodes[id];
         match node.subtrees.iter().find(|t| t.paths.iter().any(|p| p.field_id == field.id)) {
@@ -97,7 +125,7 @@ pub fn create_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Uni
     })?;
     let table = universe.table(exp.table_id).expect("expression table");
     if !exp.dimension_ref_ids.is_empty() || !exp.measure_ref_ids.is_empty() {
-        create_local_multi_reference(graph, id, universe, field, exp)
+        create_local_multi_reference(graph, id, universe, field, exp, visiting)
     } else {
         Ok(Reference::Table { entity: Entity::Field(field), expression: exp, table, greedy: vec![] })
     }
@@ -170,16 +198,32 @@ fn build_out_multi_source_reference<'a>(graph: &mut Graph<'a>, id: NodeId, unive
 
 /// A compound expression: its own columns on the local table plus a
 /// reference per field it names.
-fn create_local_multi_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, field: &'a Field, exp: &'a Expression) -> Result<Reference<'a>> {
+fn create_local_multi_reference<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    field: &'a Field,
+    exp: &'a Expression,
+    visiting: &mut Vec<zsql_semantic::Id>,
+) -> Result<Reference<'a>> {
     let mut sources = Vec::new();
     if !exp.column_refs.is_empty() {
         let table = universe.table(exp.table_id).expect("expression table");
         sources.push(Reference::Table { entity: Entity::Field(field), expression: exp, table, greedy: vec![] });
     }
+    visiting.push(field.id);
     for rid in exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()) {
         let rf = universe.field(*rid).ok_or_else(|| PlanError::Resolution(format!("referenced field {rid} not found")))?;
-        sources.push(create_reference(graph, id, universe, rf)?);
+        let r = create_reference_within(graph, id, universe, rf, visiting);
+        match r {
+            Ok(r) => sources.push(r),
+            Err(e) => {
+                visiting.pop();
+                return Err(e);
+            }
+        }
     }
+    visiting.pop();
     Ok(Reference::Multi { entity: Entity::Field(field), expression: Some(MultiExpr::Semantic(exp)), sources })
 }
 

@@ -563,15 +563,44 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
         };
         dimension_refs.push(f.uid.clone());
     }
+    // `[Name]` with no suffix: another projection of this query first,
+    // then a field. An alias wins because it is the nearer thing and the
+    // one the author just wrote; `@d`/`@m` is how to insist on the field
+    // when a projection happens to share its name.
     let mut projection_refs = Vec::new();
     for name in &parsed.field_refs {
-        if !peers.iter().any(|q| alias_matches(cx, q, name)) {
-            return Err(record_invalid(format!(
-                "Sql could not find a projection with alias {name}. If you meant to references a measure or dimension used @m or @d to clarify: [My Measure]@m"
-            )));
+        if peers.iter().any(|q| alias_matches(cx, q, name)) {
+            // The parser lower-cases the formula, so the reference is lower-case.
+            projection_refs.push(name.clone());
+            continue;
         }
-        // The parser lower-cases the formula, so the reference is lower-case.
-        projection_refs.push(name.clone());
+        let dim = cx.universe.field_by_name(name, FieldKind::Dimension);
+        let msr = cx.universe.field_by_name(name, FieldKind::Measure);
+        // A name belongs to at most one dimension and at most one
+        // measure, so the only ambiguity is a name that is both.
+        match (dim, msr) {
+            (Some(d), Some(_)) => {
+                // The parser lower-cases the formula, so the name is
+                // echoed back from the field, not from the reference.
+                let n = &d.name;
+                return Err(record_invalid(format!(
+                    "Sql [{n}] is both a dimension and a measure. Write [{n}]@d or [{n}]@m to say which."
+                )));
+            }
+            (Some(f), None) => {
+                sql = rename_ref(&sql, name, &f.name);
+                dimension_refs.push(f.uid.clone());
+            }
+            (None, Some(f)) => {
+                sql = rename_ref(&sql, name, &f.name);
+                measure_refs.push(f.uid.clone());
+            }
+            (None, None) => {
+                return Err(record_invalid(format!(
+                    "Sql could not find a projection or a field named {name}. If you meant a measure or a dimension you can say so with @m or @d: [My Measure]@m"
+                )))
+            }
+        }
     }
 
     let mut decorators = Vec::new();
