@@ -36,7 +36,8 @@ pub enum Class {
     Heavy,
     /// the account endpoints: cheap, but not for applications to hammer.
     Manage,
-    /// one argon2 hash each, spent before anyone is identified.
+    /// The credential routes: an argon2 hash or a mail send each, most
+    /// of them spent before anyone is identified.
     Password,
     /// static assets and liveness: no limit, no admission.
     Exempt,
@@ -66,6 +67,7 @@ pub fn classify(method: &str, path: &str) -> Class {
         (_, []) | (_, ["healthz"]) | (_, ["app", ..]) => Class::Exempt,
         (_, [one]) if SITE_FILES.contains(one) => Class::Exempt,
         ("POST", ["login"]) | ("POST", ["signup"]) | ("POST", ["invites", "accept"]) | ("POST", ["account", "password"]) => Class::Password,
+        ("POST", ["password-reset"]) | ("POST", ["password-reset", "accept"]) | ("POST", ["verify-email"]) | ("POST", ["account", "verify-email"]) => Class::Password,
         (_, ["projects", _, "branches", _, verb]) => match *verb {
             "deploy" | "validate" | "test" | "sampling-plan" => Class::Heavy,
             "sql" | "explain" => Class::Plan,
@@ -80,11 +82,18 @@ pub fn classify(method: &str, path: &str) -> Class {
 }
 
 /// Whether the route authenticates. The rest either have no caller yet
-/// (login, sign-up, invite acceptance), read the cookie themselves
-/// (logout), or are public (assets, liveness).
+/// (login, sign-up, invite acceptance, and the reset and verification
+/// links, where the token in the body is the credential), read the
+/// cookie themselves (logout), or are public (assets, liveness).
+///
+/// `/account/verify-email` is not in this list: it sends the caller
+/// their own link, so it needs to know who the caller is.
 pub fn authenticates(path: &str) -> bool {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    !matches!(p.as_slice(), [] | ["healthz"] | ["app", ..] | ["login"] | ["signup"] | ["logout"] | ["invites", "accept"]) && !matches!(p.as_slice(), [one] if SITE_FILES.contains(one))
+    !matches!(
+        p.as_slice(),
+        [] | ["healthz"] | ["app", ..] | ["login"] | ["signup"] | ["logout"] | ["invites", "accept"] | ["password-reset"] | ["password-reset", "accept"] | ["verify-email"]
+    ) && !matches!(p.as_slice(), [one] if SITE_FILES.contains(one))
 }
 
 // ------------------------------------------------------------- token bucket
@@ -166,7 +175,15 @@ impl Decision {
 pub enum Gate {
     Login,
     Signup,
+    /// Redeeming a one-time link: an invite, a reset, a verification.
+    /// The tokens are unguessable, so this is about the cost of being
+    /// asked, not about the guess succeeding.
     Invite,
+    /// Asking for a password reset link. Its own low rate because it is
+    /// the one unauthenticated route that makes the server send mail,
+    /// and a sender's daily allowance is a finite thing someone else
+    /// can spend.
+    Reset,
     /// Keys that are not valid: cheap to answer, but not free, and a
     /// stream of them is someone guessing.
     BadKey,
@@ -228,6 +245,7 @@ pub struct Config {
     pub login: Rate,
     pub signup: Rate,
     pub invite: Rate,
+    pub reset: Rate,
     pub bad_key: Rate,
     /// Failed logins for one email before it is refused for a while,
     /// whichever address they came from, which is what working through
@@ -254,6 +272,7 @@ impl Default for Config {
             login: Rate { per_sec: 10.0 / 60.0, burst: 10.0 },
             signup: Rate { per_sec: 5.0 / 3600.0, burst: 5.0 },
             invite: Rate { per_sec: 10.0 / 60.0, burst: 10.0 },
+            reset: Rate { per_sec: 10.0 / 3600.0, burst: 5.0 },
             bad_key: Rate { per_sec: 1.0, burst: 60.0 },
             email_failures: 5,
             email_window: Duration::from_secs(15 * 60),
@@ -287,6 +306,7 @@ impl Config {
         env_rate("ZSQL_LIMIT_LOGIN", &mut c.login)?;
         env_rate("ZSQL_LIMIT_SIGNUP", &mut c.signup)?;
         env_rate("ZSQL_LIMIT_INVITE", &mut c.invite)?;
+        env_rate("ZSQL_LIMIT_RESET", &mut c.reset)?;
         env_rate("ZSQL_LIMIT_BAD_KEY", &mut c.bad_key)?;
         if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_FAILURES") {
             c.email_failures = if v.trim().eq_ignore_ascii_case("off") { 0 } else { v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))? };
@@ -403,6 +423,7 @@ impl Limiter {
             Gate::Login => self.cfg.login,
             Gate::Signup => self.cfg.signup,
             Gate::Invite => self.cfg.invite,
+            Gate::Reset => self.cfg.reset,
             Gate::BadKey => self.cfg.bad_key,
         };
         self.take(BKey::Addr(addr, gate), rate, 1.0, Instant::now())

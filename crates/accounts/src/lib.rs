@@ -54,6 +54,50 @@ pub enum Level {
     Owner,
 }
 
+/// The two kinds of emailed link. Both are one-time, both are stored
+/// hashed like every other secret here, and both are bound to the
+/// address they were sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// Proves the address is read by its owner.
+    Verify,
+    /// Sets a new password without knowing the old one.
+    Reset,
+}
+
+impl TokenKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Verify => "verify",
+            TokenKind::Reset => "reset",
+        }
+    }
+
+    /// The prefix of the secret, so a token is recognisable in a log
+    /// line and cannot be redeemed at the wrong endpoint.
+    fn secret_kind(self) -> &'static str {
+        match self {
+            TokenKind::Verify => "zvf",
+            TokenKind::Reset => "zrs",
+        }
+    }
+
+    /// How long the link works. A reset is short because it is a
+    /// password in waiting; a verification is long because it is often
+    /// read the next morning.
+    fn minutes(self) -> i64 {
+        match self {
+            TokenKind::Verify => 24 * 60,
+            TokenKind::Reset => 60,
+        }
+    }
+}
+
+/// How long after issuing one link the same user is refused another.
+/// The per-address rate limit stops someone asking for many resets; this
+/// stops them mailbombing one victim from many addresses.
+const TOKEN_COOLDOWN_SECONDS: i64 = 60;
+
 /// What an action needs on a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -77,6 +121,11 @@ pub struct User {
     pub id: i64,
     pub email: String,
     pub name: String,
+    /// Whether the address has been proven: a verification link was
+    /// followed, or a password was reset through one. Nothing is denied
+    /// for want of it; it says whether the address can be trusted for
+    /// support and billing.
+    pub email_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,7 +249,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
-  password_hash TEXT,
+  password_hash TEXT, email_verified_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
 CREATE TABLE IF NOT EXISTS memberships (
   account_id INTEGER NOT NULL REFERENCES accounts(id), user_id INTEGER NOT NULL REFERENCES users(id),
@@ -241,11 +290,36 @@ CREATE TABLE IF NOT EXISTS sessions (
   hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS email_tokens (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  kind TEXT NOT NULL CHECK (kind IN ('verify','reset')),
+  hash TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  expires_at TEXT NOT NULL, used_at TEXT);
+CREATE INDEX IF NOT EXISTS email_tokens_user ON email_tokens (user_id, kind);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
 ";
+
+/// Columns added after a database was first made. `SCHEMA` only creates
+/// tables that are absent, so a file from an earlier version keeps its
+/// old shape and needs each new column added here. Adding one that is
+/// already there is not an error worth failing a start-up over.
+fn migrate(conn: &Connection) -> Result<()> {
+    for ddl in ["ALTER TABLE users ADD COLUMN email_verified_at TEXT"] {
+        match conn.execute(ddl, []) {
+            Ok(_) => {}
+            // The only expected failure: the column is already present.
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref m))) if m.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
 
 /// Records a key's use, at most once a minute: a key in steady use
 /// would otherwise commit a write on every request.
@@ -352,14 +426,21 @@ fn email_of(s: &str) -> Result<String> {
     if !e.contains('@') || e.len() < 3 {
         return Err(Error::Invalid(format!("'{s}' is not an email address")));
     }
+    // Addresses end up in mail headers, where a control character or a
+    // space would let the rest of a header be written by whoever typed
+    // the address. Trimming is not enough: the break can be in the
+    // middle. Refused here, at the one door every address comes through.
+    if e.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(Error::Invalid(format!("'{s}' is not an email address")));
+    }
     Ok(e)
 }
 
-const USER_COLS: &str = "id, email, name";
+const USER_COLS: &str = "id, email, name, email_verified_at";
 const PROJECT_COLS: &str = "id, account_id, uid, name, production_branch, visibility, protected_production, created_by";
 
 fn user_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
-    Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)? })
+    Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)?, email_verified: r.get::<_, Option<String>>(3)?.is_some() })
 }
 
 fn project_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
@@ -383,6 +464,11 @@ pub struct Signup {
     pub user: User,
     pub key: UserKey,
     pub secret: String,
+    /// The verification link's token, for the caller to mail. Never
+    /// serialized: it is a credential for the address, and the sign-up
+    /// response goes to whoever typed the address, who may not own it.
+    #[serde(skip)]
+    pub verify_token: Option<String>,
 }
 
 impl Store {
@@ -393,6 +479,7 @@ impl Store {
         // writes but never corrupts the file. Right for key metadata.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store::over(conn))
     }
 
@@ -400,6 +487,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store::over(conn))
     }
 
@@ -486,7 +574,7 @@ impl Store {
             }
             None => {
                 tx.execute("INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)", params![email, user_name.trim(), password_hash])?;
-                User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string() }
+                User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string(), email_verified: false }
             }
         };
         tx.execute("INSERT INTO memberships (account_id, user_id, role) VALUES (?1, ?2, 'admin')", params![account.id, user.id])?;
@@ -498,8 +586,12 @@ impl Store {
         let key_id = tx.last_insert_rowid();
         self.audit(&tx, account.id, &user.email, "signup", &account.uid)?;
         let key = Self::user_key_in(&tx, key_id)?;
+        // A new account's address is unproven until someone follows the
+        // link; an address already verified through another account
+        // needs no second proof.
+        let verify_token = if user.email_verified { None } else { self.issue_token(&tx, &user, account.id, TokenKind::Verify)? };
         tx.commit()?;
-        Ok(Signup { account, user, key, secret })
+        Ok(Signup { account, user, key, secret, verify_token })
     }
 
     // ------------------------------------------------------ authentication
@@ -650,8 +742,8 @@ impl Store {
 
     pub fn members(&self, account_id: i64) -> Result<Vec<Membership>> {
         let conn = self.conn.lock().unwrap();
-        let mut st = conn.prepare(&format!("SELECT u.id, u.email, u.name, m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = ?1 ORDER BY u.email"))?;
-        let rows = st.query_map(params![account_id], |r| Ok(Membership { user: User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)? }, role: role_of(&r.get::<_, String>(3)?) }))?;
+        let mut st = conn.prepare("SELECT u.id, u.email, u.name, u.email_verified_at, m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = ?1 ORDER BY u.email")?;
+        let rows = st.query_map(params![account_id], |r| Ok(Membership { user: user_row(r)?, role: role_of(&r.get::<_, String>(4)?) }))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -665,7 +757,7 @@ impl Store {
             Some(u) => u,
             None => {
                 tx.execute("INSERT INTO users (email, name) VALUES (?1, ?2)", params![email, name.trim()])?;
-                User { id: tx.last_insert_rowid(), email: email.clone(), name: name.trim().to_string() }
+                User { id: tx.last_insert_rowid(), email: email.clone(), name: name.trim().to_string(), email_verified: false }
             }
         };
         let role_s = if role == Role::Admin { "admin" } else { "developer" };
@@ -999,8 +1091,8 @@ impl Store {
 
     pub fn project_access(&self, project: &Project) -> Result<Vec<(User, Level)>> {
         let conn = self.conn.lock().unwrap();
-        let mut st = conn.prepare("SELECT u.id, u.email, u.name, a.level FROM project_access a JOIN users u ON u.id = a.user_id WHERE a.project_id = ?1 ORDER BY u.email")?;
-        let rows = st.query_map(params![project.id], |r| Ok((User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)? }, level_of(&r.get::<_, String>(3)?))))?;
+        let mut st = conn.prepare("SELECT u.id, u.email, u.name, u.email_verified_at, a.level FROM project_access a JOIN users u ON u.id = a.user_id WHERE a.project_id = ?1 ORDER BY u.email")?;
+        let rows = st.query_map(params![project.id], |r| Ok((user_row(r)?, level_of(&r.get::<_, String>(4)?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1066,7 +1158,7 @@ impl Store {
         let Ok(email) = email_of(email) else { return Ok(None) };
         let conn = self.conn.lock().unwrap();
         let row: Option<(User, Option<String>)> = conn
-            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get(3)?)))
+            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get(4)?)))
             .optional()?;
         let Some((user, Some(h))) = row else { return Ok(None) };
         use argon2::{PasswordHash, PasswordVerifier};
@@ -1139,6 +1231,151 @@ impl Store {
         conn.execute("DELETE FROM sessions WHERE hash = ?1", params![hash(token.trim())])?;
         self.bump();
         Ok(())
+    }
+
+    // ------------------------------------------- verification and reset
+
+    /// The account a user acts in: the first membership, as elsewhere
+    /// here while a user belongs to one account at a time.
+    fn first_account(conn: &Connection, user_id: i64) -> Result<Account> {
+        conn.query_row(
+            "SELECT a.id, a.uid, a.name FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 ORDER BY a.id LIMIT 1",
+            params![user_id],
+            |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Denied("this user belongs to no account".into()))
+    }
+
+    /// A fresh link token, or `None` when one was issued moments ago.
+    ///
+    /// Issuing invalidates every unused token of the same kind for that
+    /// user, so the newest link is always the only one that works: a
+    /// second request does not leave the first link live.
+    fn issue_token(&self, conn: &Connection, user: &User, account_id: i64, kind: TokenKind) -> Result<Option<String>> {
+        // Expired rows are of no use to anyone; clearing them here keeps
+        // the table the size of the links actually in flight.
+        conn.execute("DELETE FROM email_tokens WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now') OR used_at IS NOT NULL", [])?;
+        let recent: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM email_tokens WHERE user_id = ?1 AND kind = ?2
+                   AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now', ?3) LIMIT 1",
+                params![user.id, kind.as_str(), format!("-{TOKEN_COOLDOWN_SECONDS} seconds")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if recent.is_some() {
+            return Ok(None);
+        }
+        conn.execute("DELETE FROM email_tokens WHERE user_id = ?1 AND kind = ?2", params![user.id, kind.as_str()])?;
+        let token = new_secret(kind.secret_kind());
+        conn.execute(
+            "INSERT INTO email_tokens (user_id, account_id, kind, hash, email, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ','now', ?6))",
+            params![user.id, account_id, kind.as_str(), hash(&token), user.email, format!("+{} minutes", kind.minutes())],
+        )?;
+        Ok(Some(token))
+    }
+
+    /// Redeems a link: its row, if the token is of that kind, unused,
+    /// unexpired, and still names the user's current address. Marks it
+    /// used, so a link works exactly once.
+    fn take_token(tx: &Connection, kind: TokenKind, token: &str) -> Result<(i64, i64, String)> {
+        let stale = || Error::NotFound("this link is not valid, was already used, or has expired".into());
+        let (id, user_id, account_id, email): (i64, i64, i64, String) = tx
+            .query_row(
+                "SELECT id, user_id, account_id, email FROM email_tokens
+                  WHERE hash = ?1 AND kind = ?2 AND used_at IS NULL
+                    AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+                params![hash(token.trim()), kind.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(stale)?;
+        // The link is for the address it was sent to. If the account's
+        // address has changed since, the old mailbox no longer speaks
+        // for it.
+        let current: String = tx.query_row("SELECT email FROM users WHERE id = ?1", params![user_id], |r| r.get(0))?;
+        if current != email {
+            return Err(stale());
+        }
+        tx.execute("UPDATE email_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![id])?;
+        Ok((user_id, account_id, email))
+    }
+
+    /// A verification link for a user's own address: `None` when it is
+    /// already verified, or when one was issued moments ago.
+    pub fn start_verification(&self, account_id: i64, user: &User) -> Result<Option<String>> {
+        if user.email_verified {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        let token = self.issue_token(&conn, user, account_id, TokenKind::Verify)?;
+        if token.is_some() {
+            self.audit(&conn, account_id, &user.email, "verification_sent", &user.email)?;
+        }
+        Ok(token)
+    }
+
+    /// Marks the address proven. The link stops working.
+    pub fn verify_email(&self, token: &str) -> Result<(Account, User)> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (user_id, account_id, _) = Self::take_token(&tx, TokenKind::Verify, token)?;
+        tx.execute("UPDATE users SET email_verified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1 AND email_verified_at IS NULL", params![user_id])?;
+        let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
+        let account = Self::first_account(&tx, user_id)?;
+        self.audit(&tx, account_id, &user.email, "email_verified", &user.email)?;
+        tx.commit()?;
+        Ok((account, user))
+    }
+
+    /// A reset link for an address, or `None` when no user has it, when
+    /// they belong to no account, or when one was issued moments ago.
+    ///
+    /// The three cases are deliberately one answer: the endpoint says the
+    /// same thing either way, so nobody can ask this which addresses have
+    /// accounts.
+    pub fn start_reset(&self, email: &str) -> Result<Option<(Account, User, String)>> {
+        let Ok(email) = email_of(email) else { return Ok(None) };
+        let conn = self.conn.lock().unwrap();
+        let Some(user) = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()? else {
+            return Ok(None);
+        };
+        let Ok(account) = Self::first_account(&conn, user.id) else { return Ok(None) };
+        let Some(token) = self.issue_token(&conn, &user, account.id, TokenKind::Reset)? else {
+            return Ok(None);
+        };
+        self.audit(&conn, account.id, &user.email, "reset_requested", &user.email)?;
+        Ok(Some((account, user, token)))
+    }
+
+    /// Sets a password from a reset link.
+    ///
+    /// Three things happen besides the password. The link stops working,
+    /// so it cannot be replayed from a mailbox later. Every session of
+    /// that user is dropped, since whoever knew the old password may be
+    /// signed in. And the address counts as verified, because following
+    /// a link sent to it is the same proof verification asks for.
+    ///
+    /// Personal keys are left alone: a forgotten password is not a
+    /// reason to break the user's machines, and the keys are revoked
+    /// from the account pages when it is.
+    pub fn reset_password(&self, token: &str, password: &str) -> Result<(Account, User)> {
+        let password_hash = hash_password(password)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (user_id, account_id, _) = Self::take_token(&tx, TokenKind::Reset, token)?;
+        tx.execute(
+            "UPDATE users SET password_hash = ?1, email_verified_at = coalesce(email_verified_at, strftime('%Y-%m-%dT%H:%M:%SZ','now')) WHERE id = ?2",
+            params![password_hash, user_id],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
+        let account = Self::first_account(&tx, user_id)?;
+        self.audit(&tx, account_id, &user.email, "password_reset", &user.email)?;
+        tx.commit()?;
+        Ok((account, user))
     }
 
     // --------------------------------------------------------------- audit
@@ -1332,5 +1569,161 @@ mod tests {
         s.revoke_query_key(su.account.id, &su.user, qk.id).unwrap();
         assert!(s.authenticate(&secret2).unwrap().is_none());
         assert!(s.audit_log(su.account.id, 50).unwrap().len() >= 6);
+    }
+
+    /// A reset link is a password in waiting, so each of its edges is
+    /// worth a line: it works once, it drops the sessions someone else
+    /// may be holding, and following it proves the address.
+    #[test]
+    fn a_reset_link_sets_a_password_once_and_proves_the_address() {
+        let s = Store::in_memory().unwrap();
+        let su = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        assert!(!su.user.email_verified, "a new address is unproven");
+        assert!(su.verify_token.is_some(), "signing up issues a verification link");
+
+        // A session from before the reset, which the reset must drop.
+        let (session, _) = s.create_session(&su.user, 30).unwrap();
+        assert!(s.session(&session).unwrap().is_some());
+
+        let (_, user, token) = s.start_reset("ann@acme.test").unwrap().expect("a link for a known address");
+        assert!(token.starts_with("zrs_"), "{token}");
+        assert_eq!(user.email, "ann@acme.test");
+
+        let (_, after) = s.reset_password(&token, "correcthorse").unwrap();
+        assert!(after.email_verified, "following a link to the address proves it");
+        assert!(s.verify_password("ann@acme.test", "correcthorse").unwrap().is_some(), "the new password works");
+        assert!(s.verify_password("ann@acme.test", "hunter2hunter2").unwrap().is_none(), "the old one does not");
+        assert!(s.session(&session).unwrap().is_none(), "every session of that user is dropped");
+
+        // Replay, from a mailbox read later, does nothing.
+        assert!(matches!(s.reset_password(&token, "another1234"), Err(Error::NotFound(_))), "a link works once");
+        assert!(s.verify_password("ann@acme.test", "correcthorse").unwrap().is_some(), "and the password it set stands");
+
+        // The keys the user's machines hold are untouched: a forgotten
+        // password is not a reason to break their CLI.
+        assert!(s.authenticate(&su.secret).unwrap().is_some(), "personal keys survive a reset");
+    }
+
+    /// Asking for a reset must not say whether an address is registered,
+    /// and must not be a way to mailbomb someone who is.
+    #[test]
+    fn asking_for_a_reset_reveals_nothing_and_is_not_repeatable() {
+        let s = Store::in_memory().unwrap();
+        s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+
+        // Unknown, and malformed, are the same answer as a success:
+        // nothing the caller can tell apart.
+        assert!(s.start_reset("nobody@acme.test").unwrap().is_none());
+        assert!(s.start_reset("not-an-address").unwrap().is_none());
+
+        // A first ask works; a second inside the cooldown does not, so
+        // nobody can pump one mailbox from many addresses.
+        let first = s.start_reset("ann@acme.test").unwrap().expect("the first link");
+        assert!(s.start_reset("ann@acme.test").unwrap().is_none(), "a second ask inside the cooldown is refused");
+        // The first link is still the live one, and still works.
+        assert!(s.reset_password(&first.2, "correcthorse").is_ok());
+    }
+
+    /// Verification and reset are different doors, and a token for one
+    /// must not open the other: a verification link is long-lived and
+    /// sent on sign-up, so redeeming it as a reset would be a way in.
+    #[test]
+    fn a_link_only_opens_the_door_it_was_made_for() {
+        let s = Store::in_memory().unwrap();
+        let su = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let verify = su.verify_token.clone().expect("a verification link");
+        assert!(verify.starts_with("zvf_"), "{verify}");
+
+        assert!(matches!(s.reset_password(&verify, "correcthorse"), Err(Error::NotFound(_))), "a verification link is not a reset");
+        assert!(s.verify_password("ann@acme.test", "hunter2hunter2").unwrap().is_some(), "the password is untouched");
+
+        let (_, user) = s.verify_email(&verify).unwrap();
+        assert!(user.email_verified);
+        assert!(matches!(s.verify_email(&verify), Err(Error::NotFound(_))), "and it works once");
+
+        // Nothing left to prove, so no second verification link.
+        assert!(s.start_verification(su.account.id, &user).unwrap().is_none(), "an address already proven needs no link");
+    }
+
+    /// Issuing a link invalidates the one before it, so a mailbox never
+    /// holds two live links and the newest is always the one that works.
+    #[test]
+    fn a_new_link_replaces_the_one_before_it() {
+        let s = Store::in_memory().unwrap();
+        let su = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let first = su.verify_token.clone().expect("a verification link");
+
+        // Past the cooldown, so the second ask is allowed. Reaching into
+        // the row is the only way to age it without sleeping a minute.
+        s.conn.lock().unwrap().execute("UPDATE email_tokens SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-5 minutes')", []).unwrap();
+        let second = s.start_verification(su.account.id, &su.user).unwrap().expect("a fresh link");
+        assert_ne!(first, second);
+
+        assert!(matches!(s.verify_email(&first), Err(Error::NotFound(_))), "the earlier link is dead");
+        assert!(s.verify_email(&second).is_ok(), "the newest one works");
+    }
+
+    /// An expired link is refused rather than quietly honoured.
+    #[test]
+    fn an_expired_link_is_refused() {
+        let s = Store::in_memory().unwrap();
+        s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let (_, _, token) = s.start_reset("ann@acme.test").unwrap().expect("a link");
+        s.conn.lock().unwrap().execute("UPDATE email_tokens SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 minute')", []).unwrap();
+        assert!(matches!(s.reset_password(&token, "correcthorse"), Err(Error::NotFound(_))));
+    }
+
+    /// An address that would break out of a mail header is not an
+    /// address. Refused where addresses enter, not where they are sent.
+    #[test]
+    fn an_address_cannot_carry_a_mail_header() {
+        let s = Store::in_memory().unwrap();
+        for bad in ["ann@acme.test\nBcc: everyone@acme.test", "ann@acme.test\r\nBcc: v@x.test", "ann @acme.test"] {
+            assert!(matches!(s.signup("Acme", bad, "Ann", None), Err(Error::Invalid(_))), "{bad:?} was accepted");
+        }
+    }
+
+    /// The live service has an `accounts.db` made before any of this
+    /// existed, and `SCHEMA` only creates tables that are absent, so
+    /// that file keeps its old `users` table. This is the check that
+    /// opening it adds the column rather than failing every query that
+    /// mentions it, and that opening it twice is still fine.
+    #[test]
+    fn a_database_from_before_this_gains_the_new_column() {
+        let dir = std::env::temp_dir().join(format!("zsql-accounts-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.db");
+        let _ = std::fs::remove_file(&path);
+
+        // The `users` table as it was, with a row in it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                   id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
+                   password_hash TEXT,
+                   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+                 INSERT INTO users (email, name) VALUES ('old@acme.test', 'Old');",
+            )
+            .unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+        // The column is there, and the existing user counts as unproven
+        // rather than as an error or as verified.
+        let user: User = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params!["old@acme.test"], user_row)
+            .unwrap();
+        assert!(!user.email_verified, "an address from before verification existed is unproven, not proven");
+
+        // Opening again must not trip over the column it added.
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.start_reset("old@acme.test").unwrap().is_none(), "the old user belongs to no account, so no link");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

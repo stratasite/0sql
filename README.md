@@ -142,6 +142,18 @@ the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
 endpoints, and the web app at `/app/` for sign-up, keys, members and
 project access. Off, it is the single-tenant self-hosted mode with no auth.
 
+An account may keep 5 deployed branches per project and 20 in all
+(`ZSQL_MAX_BRANCHES_PER_PROJECT`, `ZSQL_MAX_BRANCHES_PER_ACCOUNT`, `off`
+for neither), since a deployed model stays in memory for the life of the
+process. Going over answers `409 OverLimit` and names what to remove.
+
+Password reset and email verification are emailed links. The server has
+no SMTP client: it writes the message to `ZSQL_MAIL_COMMAND` on stdin
+(`msmtp -t`, `sendmail -t`, a script), with `ZSQL_MAIL_FROM` as the
+sender and `ZSQL_PUBLIC_URL` as the base of the link. With no command
+configured the links go to the journal instead, never into a response,
+so a self-hosted server works without mail.
+
 `docs/running-it.md` is where the service actually runs, how a release
 reaches it, how the backups work and what is still open.
 
