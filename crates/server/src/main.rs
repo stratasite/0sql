@@ -24,6 +24,7 @@
 //! ```
 
 mod limits;
+mod mail;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
@@ -95,6 +96,39 @@ struct App {
     limits: Limiter,
     /// How much of each kind of work may be in the server at once.
     admission: Admission,
+    /// How many branches an account may keep deployed.
+    caps: Caps,
+    /// How the verification and reset links get out.
+    mailer: mail::Mailer,
+}
+
+/// How many deployed branches are allowed.
+///
+/// This is a memory limit wearing a product's clothes: a deployed model
+/// is held for the life of the process and nothing evicts it, so the
+/// number of them is the number the machine can hold. Both counts are
+/// needed: per project is the one a person feels and reasons about, and
+/// per account is the one that actually bounds the process, since an
+/// account may make as many projects as it likes.
+///
+/// Only with accounts on. A single-tenant server is one operator on
+/// their own machine, who does not need protecting from themselves.
+struct Caps {
+    per_project: usize,
+    per_account: usize,
+}
+
+impl Caps {
+    fn from_env() -> Result<Caps, String> {
+        fn count(name: &str, default: usize) -> Result<usize, String> {
+            match std::env::var(name) {
+                Ok(v) if v.trim().eq_ignore_ascii_case("off") => Ok(usize::MAX),
+                Ok(v) => v.trim().parse().map_err(|_| format!("{name}: {v:?} is not a number")),
+                Err(_) => Ok(default),
+            }
+        }
+        Ok(Caps { per_project: count("ZSQL_MAX_BRANCHES_PER_PROJECT", 5)?, per_account: count("ZSQL_MAX_BRANCHES_PER_ACCOUNT", 20)? })
+    }
 }
 
 // ---------------------------------------------------------------- tenancy
@@ -225,7 +259,8 @@ fn gate_name(gate: limits::Gate) -> &'static str {
     match gate {
         limits::Gate::Login => "signing in",
         limits::Gate::Signup => "signing up",
-        limits::Gate::Invite => "accepting an invite",
+        limits::Gate::Invite => "redeeming a link",
+        limits::Gate::Reset => "asking for a password reset",
         limits::Gate::BadKey => "keys that are not valid",
     }
 }
@@ -238,7 +273,8 @@ fn address_gate(parts: &Parts) -> Option<limits::Gate> {
     match parts.uri.path().trim_end_matches('/') {
         "/login" => Some(limits::Gate::Login),
         "/signup" => Some(limits::Gate::Signup),
-        "/invites/accept" => Some(limits::Gate::Invite),
+        "/invites/accept" | "/password-reset/accept" | "/verify-email" => Some(limits::Gate::Invite),
+        "/password-reset" => Some(limits::Gate::Reset),
         _ => None,
     }
 }
@@ -494,6 +530,71 @@ async fn validate(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)
     blocking(move || deploy_or_validate(app, who, uid, branch, body, false)).await
 }
 
+/// Refuses a deploy that would put an account over its branch caps.
+///
+/// Checked before the archive is unpacked, so going over costs the
+/// caller nothing and the server nothing. Redeploying a branch that is
+/// already there is not a new branch and is always allowed, which is
+/// what keeps an account at its cap from being locked out of its own
+/// models.
+///
+/// Counted from the models actually in memory rather than from the
+/// project records, because memory is what is being protected: a branch
+/// that is not loaded is not holding anything.
+fn check_caps(app: &App, who: &Option<Principal>, uid: &str, branch: &str) -> Result<(), ApiError> {
+    let models = app.models.read().unwrap();
+    caps_allow(app, &models, &scope_of(who), uid, branch)
+}
+
+/// The cap check itself, over a models map the caller already holds.
+/// Taken twice: once before the work, and once more under the write lock
+/// that inserts, because two deploys can pass the first check at the
+/// same moment and only the second one is exact.
+fn caps_allow(app: &App, models: &HashMap<String, Arc<Deployed>>, scope: &str, uid: &str, branch: &str) -> Result<(), ApiError> {
+    if app.accounts.is_none() {
+        return Ok(());
+    }
+    let (key, project_prefix) = (format!("{scope}{uid}/{branch}"), format!("{scope}{uid}/"));
+    if models.contains_key(&key) {
+        return Ok(());
+    }
+    let (in_project, in_account) = branch_counts(models.keys().map(|k| k.as_str()), scope, &project_prefix);
+    let over = |what: String, n: usize, cap: usize| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "OverLimit",
+            format!(
+                "{what} already has {n} deployed branch{} of the {cap} allowed. Remove one before deploying another: `zsql remove --branch <branch> --yes`, or delete it in the web app under the project.",
+                if n == 1 { "" } else { "es" }
+            ),
+        )
+    };
+    if in_project >= app.caps.per_project {
+        return Err(over(uid.to_string(), in_project, app.caps.per_project));
+    }
+    if in_account >= app.caps.per_account {
+        return Err(over("this account".into(), in_account, app.caps.per_account));
+    }
+    Ok(())
+}
+
+/// Deployed branches in this project, and in the whole account, counted
+/// from the keys of the models map (`[account/]project/branch`).
+///
+/// The trailing slash both prefixes carry is load-bearing: without it
+/// the account `acme` would count `acme-2`'s branches against itself,
+/// and the project `sales` would count `sales-eu`'s.
+fn branch_counts<'a>(keys: impl Iterator<Item = &'a str>, scope: &str, project_prefix: &str) -> (usize, usize) {
+    let (mut in_project, mut in_account) = (0usize, 0usize);
+    for k in keys.filter(|k| k.starts_with(scope)) {
+        in_account += 1;
+        if k.starts_with(project_prefix) {
+            in_project += 1;
+        }
+    }
+    (in_project, in_account)
+}
+
 /// A user deploying to a project the account does not have yet creates
 /// it and owns it; validating needs no project. Query keys cannot deploy.
 fn deploy_gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, keep: bool, production_branch: &str, name: &str) -> Result<Tenant, ApiError> {
@@ -522,6 +623,10 @@ fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: 
     }
     if matches!(who, Some(Principal::QueryKey { .. })) {
         return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "query keys are read only; deploy with your personal key".into()));
+    }
+    // A validate keeps nothing, so it is not held to the caps.
+    if keep {
+        check_caps(&app, &who, &uid, &branch)?;
     }
     let work = std::env::temp_dir().join(format!("zsqld-deploy-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&work).map_err(|e| bad(e.to_string()))?;
@@ -553,7 +658,10 @@ fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: 
             }
             let tests_json = serde_json::to_vec(&deployed.tests.iter().map(|t| json!({ "file": t.file.file_name().map(|f| f.to_string_lossy().to_string()), "name": t.name, "projections": t.projections, "assert_sql": t.assert_sql, "assert_regex": t.assert_regex })).collect::<Vec<_>>()).map_err(|e| bad(e.to_string()))?;
             std::fs::write(dir.join("tests.json"), tests_json).map_err(|e| bad(e.to_string()))?;
-            app.models.write().unwrap().insert(t.key(&uid, &branch), deployed);
+            let mut models = app.models.write().unwrap();
+            caps_allow(&app, &models, &t.scope, &uid, &branch)?;
+            models.insert(t.key(&uid, &branch), deployed);
+            drop(models);
             if let (Some(store), Some(p)) = (&app.accounts, &who) {
                 let _ = store.record(p.account().id, &p.describe(), "deploy", &format!("{uid}/{branch}"));
             }
@@ -1072,7 +1180,16 @@ async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Re
     let password = req.password.filter(|p| !p.is_empty());
     let su = {
         let (app, account, email, name, password) = (app.clone(), req.account, req.email, req.name, password.clone());
-        blocking(move || store_of(&app)?.signup(&account, &email, &name, password.as_deref()).map_err(accounts_error)).await?
+        blocking(move || {
+            let su = store_of(&app)?.signup(&account, &email, &name, password.as_deref()).map_err(accounts_error)?;
+            if let Some(token) = &su.verify_token {
+                let link = app.mailer.link("verify", token);
+                let (subject, body) = mail::verification(&link);
+                deliver(&app, &su.user.email, &subject, &body, &link, "verification");
+            }
+            Ok(su)
+        })
+        .await?
     };
     let store = store_of(&app)?;
     let body = json!({ "account": su.account, "user": su.user, "key": su.key, "secret": su.secret });
@@ -1132,6 +1249,120 @@ async fn set_password(State(app): State<Shared>, Auth(who): Auth, Json(req): Jso
     blocking(move || {
         store_of(&app)?.set_password(account_id, &user, &password).map_err(accounts_error)?;
         Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Hands one message to the mailer. Answers whether it went.
+///
+/// With nothing configured the link is written to the journal instead,
+/// which is what makes a self-hosted or development server usable
+/// without mail. It is never put in a response: a reset is asked for by
+/// whoever typed the address, who may not be its owner.
+///
+/// A send that fails is logged and nothing else. The alternative is a
+/// 500 that tells the caller their address exists and that the operator
+/// has a broken relay, which helps an attacker and not the user.
+fn deliver(app: &App, to: &str, subject: &str, body: &str, link: &str, what: &str) -> bool {
+    match app.mailer.send(to, subject, body) {
+        Ok(mail::Sent::Delivered) => true,
+        Ok(mail::Sent::NotConfigured) => {
+            eprintln!("zsqld: no ZSQL_MAIL_COMMAND is set, so the {what} link for {to} was not sent: {link}");
+            false
+        }
+        Err(e) => {
+            eprintln!("zsqld: sending the {what} link to {to} failed: {e}");
+            false
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EmailRequest {
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct ResetRequest {
+    token: String,
+    password: String,
+}
+
+/// Asks for a password reset link. No auth: forgetting a password is the
+/// whole reason to be here.
+///
+/// Always answers the same, whether the address has an account, belongs
+/// to no account, or asked moments ago. Saying which would turn this
+/// into a way to test whether an address is registered, and the answer
+/// would be worth having for whoever asked.
+async fn request_reset(State(app): State<Shared>, Json(req): Json<EmailRequest>) -> Result<Json<Value>, ApiError> {
+    store_of(&app)?;
+    let (app, email) = (app.clone(), req.email);
+    blocking(move || {
+        if let Some((_, user, token)) = store_of(&app)?.start_reset(&email).map_err(accounts_error)? {
+            let link = app.mailer.link("reset", &token);
+            let (subject, body) = mail::reset(&user.email, &link);
+            deliver(&app, &user.email, &subject, &body, &link, "reset");
+        }
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Sets a new password from a reset link and signs the user in, so the
+/// one thing they came to do is not followed by a login form.
+///
+/// No auth: the token is the credential. It stops working here, and
+/// every other session of that user is dropped.
+async fn accept_reset(State(app): State<Shared>, Json(req): Json<ResetRequest>) -> Result<Response, ApiError> {
+    store_of(&app)?;
+    let (account, user) = {
+        let (app, token, password) = (app.clone(), req.token, req.password);
+        blocking(move || store_of(&app)?.reset_password(&token, &password).map_err(accounts_error)).await?
+    };
+    let store = store_of(&app)?;
+    let (token, _) = store.create_session(&user, SESSION_DAYS).map_err(accounts_error)?;
+    Ok(with_session_cookie(&app, json!({ "user": user, "account": account }), Some(&token)))
+}
+
+/// Confirms an address from a verification link. No auth: the token is
+/// the credential, and the link is often opened in another browser than
+/// the one that signed up.
+async fn verify_email(State(app): State<Shared>, Json(req): Json<TokenRequest>) -> Result<Json<Value>, ApiError> {
+    store_of(&app)?;
+    let (app, token) = (app.clone(), req.token);
+    blocking(move || {
+        let (account, user) = store_of(&app)?.verify_email(&token).map_err(accounts_error)?;
+        Ok(Json(json!({ "verified": true, "user": user, "account": account })))
+    })
+    .await
+}
+
+/// Sends the caller a fresh verification link for their own address.
+/// `sent` is false when mail is not configured or a link went out
+/// moments ago, so the app can say which.
+async fn resend_verification(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    store_of(&app)?;
+    let (user, account, _) = user_of(&who)?;
+    if user.email_verified {
+        return Ok(Json(json!({ "verified": true, "sent": false })));
+    }
+    let (app, user, account_id) = (app.clone(), user.clone(), account.id);
+    blocking(move || {
+        let Some(token) = store_of(&app)?.start_verification(account_id, &user).map_err(accounts_error)? else {
+            // One went out in the last minute. Sending another would
+            // only invalidate the link already in their inbox.
+            return Ok(Json(json!({ "verified": false, "sent": false, "waiting": true })));
+        };
+        let link = app.mailer.link("verify", &token);
+        let (subject, body) = mail::verification(&link);
+        let sent = deliver(&app, &user.email, &subject, &body, &link, "verification");
+        Ok(Json(json!({ "verified": false, "sent": sent })))
     })
     .await
 }
@@ -1545,10 +1776,18 @@ async fn main() -> anyhow::Result<()> {
     let secure_cookies = std::env::var("ZSQL_PUBLIC_URL").map(|u| u.starts_with("https://")).unwrap_or(false);
     let limits = Limiter::new(limits::Config::from_env(accounts_on).map_err(|e| anyhow::anyhow!("{e}"))?);
     let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+    let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
     let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission });
+    let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
     let n = reload(&app)?;
-    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    if accounts_on {
+        let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
+        eprintln!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
+    }
 
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -1573,6 +1812,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/account/password", post(set_password))
+        .route("/password-reset", post(request_reset))
+        .route("/password-reset/accept", post(accept_reset))
+        .route("/verify-email", post(verify_email))
+        .route("/account/verify-email", post(resend_verification))
         .route("/me", get(me))
         .route("/account/members", get(members).post(add_member))
         .route("/account/members/{email}", delete(remove_member))
@@ -1639,6 +1882,42 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// The caps are counted by string prefix over the deployment keys,
+    /// and a prefix is an easy thing to get subtly wrong: the account
+    /// `acme` must not be charged for `acme-2`, and the project `sales`
+    /// must not be charged for `sales-eu`. Both of those would show up
+    /// as an account mysteriously unable to deploy.
+    #[test]
+    fn branches_are_counted_against_the_right_project_and_account() {
+        let keys = [
+            "acme/sales/main",
+            "acme/sales/feature-x",
+            "acme/sales-eu/main",
+            "acme/web/main",
+            "acme-2/sales/main",
+            "acme-2/sales/staging",
+        ];
+        let it = || keys.iter().copied();
+
+        // Four branches in acme, two of them in acme/sales.
+        assert_eq!(branch_counts(it(), "acme/", "acme/sales/"), (2, 4));
+
+        // `sales-eu` is its own project, with its own count.
+        assert_eq!(branch_counts(it(), "acme/", "acme/sales-eu/"), (1, 4));
+
+        // The other account is counted separately, and is not reached
+        // by a prefix of its name.
+        assert_eq!(branch_counts(it(), "acme-2/", "acme-2/sales/"), (2, 2));
+
+        // A project with nothing deployed yet starts at zero.
+        assert_eq!(branch_counts(it(), "acme/", "acme/new/"), (0, 4));
+
+        // Single-tenant: no scope at all, so everything is in scope and
+        // the account count is simply the total.
+        let flat = ["sales/main", "sales/dev", "web/main"];
+        assert_eq!(branch_counts(flat.iter().copied(), "", "sales/"), (2, 3));
     }
 
     /// Which address a request is counted against decides whether the

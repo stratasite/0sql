@@ -16,7 +16,8 @@ release build, against the TPC-DS sample:
 | plan (`sql`, `explain`) | ~70 µs | `plan_request` |
 | explore, fields search | a walk or a trigram scoring pass over every visible field; milliseconds, grows with the model | `explore`, `fields` |
 | deploy, validate, test | untar, load YAML, build the universe and the per-root index, run the tests; seconds for a real model | `deploy_or_validate` |
-| login, sign-up, invite accept, set password | one argon2 hash each, tens to hundreds of ms, before any identity is known | `login`, `signup`, `accept_invite`, `set_password` |
+| login, sign-up, invite accept, set password, accept a reset | one argon2 hash each, tens to hundreds of ms, before any identity is known | `login`, `signup`, `accept_invite`, `set_password`, `accept_reset` |
+| ask for a reset, resend a verification | a subprocess that talks to a mail relay, and a message against a finite daily allowance | `request_reset`, `resend_verification` |
 | any authenticated request | SHA-256 of the key plus two or three SQLite lookups under one store mutex | the `Auth` extractor, `gate` |
 | any body | the 256 MB limit was on the whole router, not just deploy | `main` |
 
@@ -104,7 +105,7 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 | class | routes | permits | wait before 503 |
 |---|---|---|---|
 | heavy | deploy, validate, test, sampling-plan | 2 | 5 s |
-| password | login, signup, invites/accept, account/password | 2 | 2 s |
+| password | login, signup, invites/accept, account/password, the reset and verification routes | 2 | 2 s |
 | explore | explore, fields | cores | 1 s |
 | plan | sql, explain, tables, values, branch summary, projects | cores × 4 | 1 s |
 | manage | the account endpoints | cores × 2 | 1 s |
@@ -154,8 +155,18 @@ next store mutex. Idle buckets are swept every five minutes.
 |---|---|
 | `POST /login` | 10/min |
 | `POST /signup` | 5/hour |
-| `POST /invites/accept` | 10/min |
+| `POST /invites/accept`, `/password-reset/accept`, `/verify-email` | 10/min |
+| `POST /password-reset` | 10/hour, burst 5 |
 | any 401 answer | 60/min |
+
+Asking for a reset gets its own low rate because it is the one
+unauthenticated route that makes the server send mail, and a sender's
+daily allowance is a finite thing a stranger can spend. It is paired
+with a rule in the store rather than here: one link per user per minute,
+whichever address asked, so the address limit stops one person asking
+for many and the cooldown stops many addresses mailbombing one victim.
+Redeeming a link is grouped with accepting an invite: the tokens are
+unguessable, so that limit is about the cost of being asked.
 
 Plus a counter per email: five failed sign-ins and that email is refused
 for fifteen minutes whichever address they came from, which is what

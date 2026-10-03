@@ -26,6 +26,14 @@ is superseded.
   at once.
 - A project's **protected production** flag makes deploys to its
   production branch need an owner.
+- An account may keep **5 deployed branches per project and 20 in all**
+  (`ZSQL_MAX_BRANCHES_PER_PROJECT`, `ZSQL_MAX_BRANCHES_PER_ACCOUNT`;
+  `off` for no limit). Going over answers `409 OverLimit` and names what
+  to remove. Redeploying a branch that is already deployed is not a new
+  branch, so an account at its cap can still ship to what it has, and
+  `validate` is not held to the caps since it keeps nothing. Counted
+  from the models in memory, not the project records, because memory is
+  what they protect: see `running-it.md`.
 
 | level  | can                                                                                  |
 |--------|--------------------------------------------------------------------------------------|
@@ -36,7 +44,8 @@ is superseded.
 
 Secrets are shown once and stored as SHA-256; a twelve-character prefix
 names a key in logs and listings. Every change writes an audit row with
-its actor: sign-up, members, keys, grants, access, deploys, removals.
+its actor: sign-up, members, keys, grants, access, deploys, removals,
+and the verification and reset links as they are asked for and used.
 
 ## Modes
 
@@ -58,6 +67,10 @@ GET    /account/members                        POST {email, name?, role}  (admin
 DELETE /account/members/{email}                                           (admin)
 POST   /account/members/{email}/invite         a fresh invite token        (admin)
 POST   /invites/accept                         {token, name?, key_name?} → account, user, key, secret (no auth; the token is the credential)
+POST   /password-reset                         {email} → {ok} always              (no auth)
+POST   /password-reset/accept                  {token, password} → user, account  (no auth; opens a session)
+POST   /verify-email                           {token} → {verified, user, account} (no auth)
+POST   /account/verify-email                   a fresh verification link to the caller's own address
 GET    /account/keys                           POST {name} → key, secret   (the caller's own)
 DELETE /account/keys/{id}
 GET    /account/query-keys                     POST {name} → key, secret
@@ -110,20 +123,55 @@ cross-site form cannot. Passwords are argon2 hashes; sign-up and invite
 acceptance set them. `POST /login`, `POST /logout`,
 `POST /account/password`.
 
+## Verification and password reset
+
+Two emailed links, both `zvf_`/`zrs_` secrets stored as SHA-256 like
+every other secret here, both one-time, and both bound to the address
+they were sent to: changing the address kills the links to the old one.
+Issuing a link invalidates any unused one of the same kind, so a mailbox
+never holds two live links and the newest is always the one that works.
+A link of one kind cannot be redeemed at the other's endpoint.
+
+**Verification** is issued at sign-up and expires in 24 hours. Nothing
+is denied for want of it: blocking an unverified account would lock out
+everyone who signed up before this existed, and the point is to know
+whether the address can be trusted for support and billing, not to gate
+the product. The web app carries a line at the top of every page until
+it is done, with a button that sends a fresh link. Invite acceptance
+does not verify: the invite token is relayed by an admin, so following
+it proves nothing about the address.
+
+**Reset** expires in an hour. `POST /password-reset` answers `{ok: true}`
+whether or not the address has an account, whether or not it belongs to
+one, and whether or not a link went out moments ago — otherwise it would
+be a way to ask the server which addresses are registered. Redeeming it
+sets the password, drops **every session** of that user, marks the
+address verified (following a link to it is the proof verification asks
+for), and opens a new session so the user lands signed in. Personal keys
+are left alone: a forgotten password is not a reason to break the user's
+machines.
+
+One link per user per minute, whichever address asked. The per-address
+rate limit stops one person asking for many; this stops many addresses
+mailbombing one victim. See `docs/rate-limiting.md` for the `reset` gate.
+
+Delivery is a command, not an SMTP client: the message goes to
+`ZSQL_MAIL_COMMAND` on stdin, the way `sendmail` has always been fed.
+With none configured the links are written to the journal and never put
+in a response — a reset is asked for by whoever typed the address, who
+may not own it. `docs/running-it.md` has the live configuration.
+
 ## Deferred
 
 See `docs/running-it.md` for the state of the running service and the
 operational side of this list.
 
-- Magic links and password reset by email; SSO. Both matter more now
-  that the service is public and sign-up is open: without reset a user
-  who forgets a password has no way back without someone editing the
-  database, and without verification an account can be made with an
-  address its owner does not control.
-- A cap on how many branches an account may deploy. Models are held in
-  memory for the life of the process and nothing evicts them, so an
-  account can deploy its way through the machine; `running-it.md` has
-  the measurements and the restart behaviour that makes it bite.
+- Magic links, and SSO. Password reset and verification are done; see
+  above.
+- What startup should do when it cannot load every deployment. The caps
+  bound one account, not the machine across many, and a process that
+  runs out of memory still restarts into the same reload. `running-it.md`
+  keeps this open.
 - A user in several accounts: the schema allows it, the key answers for
   the first membership for now.
 - Key expiry, a viewer role, teams, binding a query key to the security

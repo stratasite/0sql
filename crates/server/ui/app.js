@@ -189,11 +189,30 @@
           </div>
         </div>
       </div>
-      <div class="main">${raw(body)}</div>`;
+      <div class="main">${raw(unverifiedBanner())}${raw(body)}</div>`;
     root.classList.toggle("tall", !!tall);
     document.getElementById("logout").onclick = async () => { await api("POST", "/logout"); state.me = null; go("/app/login"); };
     document.getElementById("theme").onclick = () => theme();
+    const resend = document.getElementById("resend-verify");
+    if (resend) resend.onclick = async () => {
+      resend.disabled = true;
+      try {
+        const r = await api("POST", "/account/verify-email");
+        toast(r.sent ? "link sent" : r.waiting ? "a link was sent moments ago; check your inbox" : "mail is not configured on this server; ask your operator", r.sent);
+      } catch (err) { toast(err.message); }
+      resend.disabled = false;
+    };
     whoMenu();
+  }
+
+  // Nothing is withheld for an unconfirmed address; it is the address
+  // support and billing would use, so it is worth saying once per page
+  // and not worth blocking anyone over.
+  function unverifiedBanner() {
+    const me = state.me;
+    if (!me || !me.user || me.user.email_verified) return "";
+    return h`<div class="alert">${icon("mail")}<div>Confirm <b>${me.user.email}</b> so it can be used for support and recovery.</div>
+      <button class="btn sm" id="resend-verify" style="margin-left:auto;flex:none">Send the link</button></div>`;
   }
 
   // The account menu: who you are, and the one thing you do to that.
@@ -255,8 +274,74 @@
         <div class="field"><label>Password</label><input name="password" type="password" required></div>
         <button class="btn primary" type="submit" style="width:100%;justify-content:center">Sign in</button>
       </form>
-      <div class="alt">New here? <a href="/app/signup" data-link>Create an account</a></div>`);
+      <div class="alt">New here? <a href="/app/signup" data-link>Create an account</a></div>
+      <div class="alt"><a href="/app/forgot" data-link>Forgot your password?</a></div>`);
     form(root, async (d) => { await api("POST", "/login", d); await loadMe(); go("/app/"); });
+  }
+
+  // Asking for a reset link. The answer is the same whether or not the
+  // address has an account, so the view says what was done rather than
+  // what was found: anything else would make this a way to test which
+  // addresses are registered.
+  function viewForgot() {
+    authFrame(h`
+      <h1 style="margin-bottom:4px">Reset your password</h1>
+      <p class="muted" style="margin-bottom:16px">We will send a link to your address. It works once and expires in an hour.</p>
+      <form>
+        <div class="field"><label>Email</label><input name="email" type="email" required autofocus></div>
+        <button class="btn primary" type="submit" style="width:100%;justify-content:center">Send the link</button>
+      </form>
+      <div class="alt"><a href="/app/login" data-link>Back to sign in</a></div>`);
+    form(root, async (d) => {
+      await api("POST", "/password-reset", d);
+      authFrame(h`
+        <h1 style="margin-bottom:4px">Check your email</h1>
+        <p class="muted">If <b>${d.email}</b> has an account, a link is on its way. It works once and expires in an hour.</p>
+        <p class="muted" style="margin-bottom:16px">Nothing has changed yet, and your current password still works until you use the link.</p>
+        <a class="btn primary" href="/app/login" data-link>Back to sign in${icon("arrow-right")}</a>`);
+    });
+  }
+
+  // Setting a password from a link. Succeeding signs the user in, since
+  // the one thing they came to do should not be followed by a login form.
+  function viewReset() {
+    const token = new URLSearchParams(location.search).get("token") || "";
+    authFrame(h`
+      <h1 style="margin-bottom:4px">Set a new password</h1>
+      <p class="muted" style="margin-bottom:16px">This signs you in, and signs out anything else that was.</p>
+      <form>
+        ${raw(token ? "" : h`<div class="field"><label>Reset token</label><input name="token" class="mono" required placeholder="zrs_..."></div>`)}
+        <div class="field"><label>New password</label><input name="password" type="password" required minlength="8" autofocus></div>
+        <button class="btn primary" type="submit" style="width:100%;justify-content:center">Set password and sign in</button>
+      </form>
+      <div class="alt"><a href="/app/forgot" data-link>Ask for a new link</a></div>`);
+    form(root, async (d) => {
+      await api("POST", "/password-reset/accept", { token: d.token || token, password: d.password });
+      await loadMe();
+      go("/app/");
+    });
+  }
+
+  // Confirming an address. The link is usually opened in a different
+  // browser than the one that signed up, so this works signed out and
+  // only offers the way on when there is a session to use it with.
+  async function viewVerify() {
+    const token = new URLSearchParams(location.search).get("token") || "";
+    authFrame(h`<h1>Confirming your address…</h1>`);
+    try {
+      const r = await api("POST", "/verify-email", { token });
+      await loadMe();
+      authFrame(h`
+        <h1 style="display:flex;align-items:center;gap:8px;margin-bottom:4px">${icon("circle-check")}Address confirmed</h1>
+        <p class="muted" style="margin-bottom:16px"><b>${r.user.email}</b> is confirmed for <b>${r.account.name}</b>.</p>
+        ${raw(state.me ? h`<a class="btn primary" href="/app/" data-link>Go to projects${icon("arrow-right")}</a>` : h`<a class="btn primary" href="/app/login" data-link>Sign in${icon("arrow-right")}</a>`)}`);
+    } catch (e) {
+      authFrame(h`
+        <h1 style="margin-bottom:12px">That link did not work</h1>
+        ${raw(alertBox(e.message))}
+        <p class="muted" style="margin-bottom:16px">Links work once and expire. Sign in and ask for a new one from the banner at the top of any page.</p>
+        <a class="btn" href="/app/login" data-link>Sign in${icon("arrow-right")}</a>`);
+    }
   }
 
   function viewSignup() {
@@ -643,6 +728,9 @@
     if (path === "/app/signup") return viewSignup();
     if (path === "/app/invite") return viewInvite();
     if (path === "/app/login") return viewLogin();
+    if (path === "/app/forgot") return viewForgot();
+    if (path === "/app/reset") return viewReset();
+    if (path === "/app/verify") return await viewVerify();
     if (!state.me) await loadMe();
     if (!state.me) return viewLogin();
     try {

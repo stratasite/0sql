@@ -121,48 +121,123 @@ The archive holds a single `zsqld/` directory, so it unpacks over
 directory, starting a server on it, signing in with the original
 password, and planning a query against the restored model.
 
-## Open
+## Done since it went up
 
 ### A cap on deployed branches per account
 
-The one with teeth. Deployed models are held in memory for the life of
-the process and nothing ever evicts them: they are inserted on deploy
-and at startup, and removed only when someone deletes a branch or a
-project. Nothing caps how many branches an account may deploy.
+Deployed models are held in memory for the life of the process and
+nothing ever evicts them: they are inserted on deploy and at startup,
+and removed only when someone deletes a branch or a project.
 
 Measured: about 5 MB per model of the TPC-DS sample's size, 4.2 MB idle,
 against roughly 11 GB free on buzz. The deploy allowance is 10 a minute,
-so one account can add around 600 models an hour, near 3 GB an hour.
+so one account could add around 600 models an hour, near 3 GB an hour.
 
-What makes it more than a slow leak is the restart behaviour. Startup
-reloads every deployment from disk, so once memory is exhausted the
-service is killed, restarts, reloads the same models and is killed
-again. After five attempts in ten seconds systemd gives up and leaves it
-failed, with the thing that brought it down still on disk waiting to be
-reloaded. `MemoryMax` is unset.
+**The cap.** An account may keep 5 deployed branches per project and 20
+in all. Going over answers `409 OverLimit` naming what to remove.
+Checked before the archive is unpacked, so refusing costs nothing;
+counted from the models in memory rather than the project records,
+because memory is the thing being protected. Redeploying a branch that
+is already deployed is not a new branch, so an account at its cap can
+still ship to what it has, and `validate` is exempt since it keeps
+nothing. `ZSQL_MAX_BRANCHES_PER_PROJECT` and
+`ZSQL_MAX_BRANCHES_PER_ACCOUNT` change them, `off` removes them, and
+both are logged at startup. Off entirely when accounts are off: a
+single-tenant server is one operator on their own machine.
 
-So two decisions, not one: a limit on branches per account, and what the
-server should do when it cannot load everything at startup. Lazy loading
-with an LRU, which `accounts-and-access.md` already parks for the
-multi-instance work, would answer the second.
-
-This is reachable by any single account, so it is not an argument about
-sign-up.
+It bounds one account, not the machine across many; what startup should
+do when it cannot load everything is still open, below.
 
 ### Password reset, and email verification
 
-Already parked in `accounts-and-access.md`. Both matter more now the
-service is public and anyone can sign up.
+Both are live; `accounts-and-access.md` has the model, the token
+lifetimes and why a reset answers the same whatever it finds. The
+operational half is here.
 
-Without reset, a user who forgets their password has no path back
-without someone editing SQLite by hand. Without verification, an account
-can be made with an address its owner does not control, so the email
-cannot be trusted for support or billing.
+**Delivery is a command, not an SMTP client.** zsqld writes the message
+to `ZSQL_MAIL_COMMAND` on stdin, the way `sendmail` has always been fed.
+Nothing about a provider is compiled in: no TLS stack in a binary built
+static against musl, no credential in this process's environment, and
+changing provider is a config file rather than a release.
 
-Neither is a reason to close sign-up: closing it helps nobody who is
-already locked out, it only limits how many people meet the gap.
-Sign-up being open is a deliberate choice, since self-serve is the
-point of a multi-tenant service.
+On buzz that command is msmtp against the Workspace account on
+`strata.do`:
+
+```
+# /etc/zsqld.env
+ZSQL_MAIL_COMMAND=msmtp -t
+ZSQL_MAIL_FROM=0sql support <0sql-support@strata.do>
+ZSQL_PUBLIC_URL=https://app.0sql.io
+```
+
+```
+# /etc/msmtprc, mode 0600, owned by the user zsqld runs as
+defaults
+tls on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+account gmail
+host smtp.gmail.com
+port 587
+auth on
+user <the workspace user>@strata.do
+passwordeval cat /etc/zsqld/app-password
+from 0sql-support@strata.do
+account default : gmail
+```
+
+Four things about that account, each of which will bite if missed:
+
+- **An App Password authenticates as a user, never as an alias.** If
+  `0sql-support@strata.do` is an alias on an existing user, `user` is
+  that user's own address and `from` is the alias; Gmail allows a From
+  that is a verified alias of the authenticated account and silently
+  rewrites it to the authenticated address if it is not. A real user of
+  its own, with its own App Password, costs a seat and needs no alias.
+- **App Passwords need 2FA on that user, and a Workspace admin can
+  disable them for the whole organisation.** Check both before blaming
+  the config.
+- **DKIM is not on by default.** Generate the key under Admin → Apps →
+  Google Workspace → Gmail → Authenticate email and publish the TXT
+  record, or mail is not signed as `strata.do` and the alignment that
+  makes this better than a personal Gmail is not there. SPF should
+  include `_spf.google.com`.
+- **The quota is about 2,000 messages a day**, and a reset endpoint is
+  a mail-sending primitive anyone can reach. The `reset` gate (five per
+  address, ten an hour) and the one-link-per-user-per-minute rule are
+  what stand between a stranger and that allowance.
+
+Mail arrives from `strata.do` while the product is `0sql.com`. Fine for
+deliverability, since alignment is with the sending domain; a `0sql.io`
+sender later is DNS and `msmtprc`, not a release.
+
+**With no command configured** the links are written to the journal
+instead, which is how a self-hosted or development server is used
+without mail. They are never put in a response: a reset is asked for by
+whoever typed the address, who may not own it. `zsqld` says which mode
+it is in on the first line it logs.
+
+**Nothing watches whether mail is actually going out.** A failed send is
+one journal line, next to the backup failures that are also unwatched.
+
+## Open
+
+### Startup when it cannot load everything
+
+Startup reloads every deployment from disk, so a process that runs out
+of memory is killed, restarts, reloads the same models and is killed
+again; after five attempts in ten seconds systemd gives up and leaves it
+failed, with the thing that brought it down still on disk waiting to be
+reloaded. `MemoryMax` is unset.
+
+The branch caps bound one account, not the machine across many: twenty
+models is about 100 MB, so a hundred accounts is 10 GB, which is the
+whole box. The caps buy room, they do not remove the ceiling, and they
+do nothing about this failure mode.
+
+Two candidates, unchanged. Skip what will not load and come up degraded,
+which is small and removes the restart loop. Or lazy loading with an
+LRU, which `accounts-and-access.md` already parks for the multi-instance
+work and which answers it properly.
 
 ### Smaller
 
