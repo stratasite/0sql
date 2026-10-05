@@ -71,10 +71,10 @@ not trigger it and a `v*` tag does not trigger the CLI's.
    against. The whole workspace shares it, so a server-only change still
    moves the number the CLI carries.
 
-2. **Refresh `Cargo.lock` and commit it with the bump.** The workspace
-   crates are in the lock file with their versions — fifteen lines at the
-   time of writing — and the build runs `cargo build --locked`, which
-   fails rather than updating it. `cargo check -p zsql-server` is enough
+2. **Refresh `Cargo.lock` and commit it with the bump.** Every workspace
+   crate appears in the lock file with its version, one line each, and
+   the build runs `cargo build --locked`, which fails rather than
+   updating it. `cargo check -p zsql-server` is enough
    to rewrite it. This is the step that is easy to miss, because nothing
    locally complains until CI does.
 
