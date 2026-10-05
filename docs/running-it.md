@@ -59,12 +59,91 @@ hostname, and a statically linked glibc cannot, because it loads its
 name service modules at runtime and dumps core without them. That was
 observed, not assumed.
 
-Deploying a new server build is three steps: tag, take the binary from
-the release, `install -m755` it over `/usr/local/bin/zsqld` and
-`systemctl restart zsqld`. Keep the previous binary beside it to roll
-back. A restart reloads deployments from disk in well under a second,
-sessions survive because they are in SQLite, and the in-memory rate
-limit buckets reset.
+### Releasing the server, in order
+
+`.github/workflows/release.yml` builds on a `v*` tag. It is not the CLI's
+workflow and does not share a step with it: no public repository, no
+`CLI_RELEASES_TOKEN`, one binary rather than four. A `cli-v*` tag does
+not trigger it and a `v*` tag does not trigger the CLI's.
+
+1. **Bump the version in `Cargo.toml`.** `[workspace.package]`, which is
+   the first `^version` line in the file and the one CI compares a tag
+   against. The whole workspace shares it, so a server-only change still
+   moves the number the CLI carries.
+
+2. **Refresh `Cargo.lock` and commit it with the bump.** The workspace
+   crates are in the lock file with their versions — fifteen lines at the
+   time of writing — and the build runs `cargo build --locked`, which
+   fails rather than updating it. `cargo check -p zsql-server` is enough
+   to rewrite it. This is the step that is easy to miss, because nothing
+   locally complains until CI does.
+
+3. **Run the tests.** CI does not; that is deliberate, and it means
+   nothing stands between a broken commit and a tag except this step.
+   `cargo test` for the workspace.
+
+4. **Tag and push the tag.** `git tag v0.2.2 && git push origin v0.2.2`.
+   Pushing the branch does not build anything; only the tag does. The
+   workflow checks the tag against the manifest and stops if they
+   disagree, so a forgotten step 1 costs a tag rather than a bad release.
+
+5. **Let the workflow prove the binary before trusting it.** It asserts
+   the result is really static, with no dynamic dependencies, then starts
+   it and waits for `/healthz`. If either fails there is no release, by
+   design. It publishes `zsqld-x86_64-linux` and a `.sha256` beside it on
+   a release of that tag, with generated notes. The repository is
+   private, so the assets are too.
+
+6. **Install it on buzz, keeping the one it replaces.**
+
+   ```
+   gh release download v0.2.2 -p 'zsqld-x86_64-linux*'
+   sha256sum -c zsqld-x86_64-linux.sha256
+   ssh root@buzz 'cp /usr/local/bin/zsqld /usr/local/bin/zsqld.prev'
+   scp zsqld-x86_64-linux root@buzz:/tmp/zsqld
+   ssh root@buzz 'install -m755 /tmp/zsqld /usr/local/bin/zsqld && systemctl restart zsqld'
+   ```
+
+7. **Read the first lines it logs.** `journalctl -u zsqld -n 10`. The
+   startup line says how many deployments loaded, whether accounts and
+   sign-up are on, the rate limit mode and whether mail is configured —
+   and, when there is one, the line naming deployments that could not be
+   loaded and are not being served. That line is the point of reading
+   the journal rather than only checking that the unit is active.
+
+   Rolling back is `install -m755 /usr/local/bin/zsqld.prev` over it and
+   another restart.
+
+A restart reloads deployments from disk in well under a second, sessions
+survive because they are in SQLite, and the in-memory rate limit buckets
+reset.
+
+**A schema change makes the order matter.** The binary brings the
+migration steps with it, so the database is upgraded by the restart in
+step 6, by whichever binary starts first. Take a backup before that
+restart rather than relying on the six-hourly one
+(`/usr/local/bin/zsqld-backup` writes a restore point on demand), and
+read step 7's output before walking away. A step that fails leaves the
+file on the version before it, and the unit dead rather than serving
+something half-changed.
+
+### Building without releasing
+
+`release.yml` also has `workflow_dispatch`, which builds and attaches
+the binary to the run's artifacts without cutting a release or needing a
+tag — so it skips the version check too. That is the way to get a binary
+from a branch, or to try the pipeline after changing it:
+
+```
+gh workflow run release.yml --ref <branch>
+gh run watch
+gh run download <run-id>
+```
+
+Useful, and worth being careful with: a binary from a branch carries
+whatever version the manifest said, so two different builds can call
+themselves the same thing. Fine for trying something on buzz, wrong for
+leaving installed there.
 
 ### The CLI's public half
 
