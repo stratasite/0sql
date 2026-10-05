@@ -861,6 +861,7 @@ impl<'d> Builder<'d> {
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
+            version: zsql_semantic::snapshot::FORMAT,
             project: self.project.clone().unwrap_or(ProjectRef { uid: "project".into(), name: "project".into() }),
             branch: BranchRef { id: 1, uid: self.production_branch.clone(), production: true },
             datasources: self.datasources.clone(),

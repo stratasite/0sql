@@ -243,19 +243,38 @@ fn ttl_from_env() -> Duration {
     Duration::from_secs(std::env::var("ZSQL_AUTH_CACHE_TTL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60))
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS accounts (
+/// The schema as numbered steps, oldest first. `PRAGMA user_version`
+/// holds how many of them a file has seen, so the length of this list is
+/// the current schema version. A fresh database and an upgraded one end
+/// up identical because both ran this same list, not because anyone
+/// remembered to describe a change in two places.
+///
+/// Append only. A step that has shipped is never edited: a database that
+/// already applied it will not apply it again, so editing one changes
+/// what new files get and nothing else, which is the divergence the
+/// version exists to prevent. Correcting a shipped step means adding
+/// another step.
+///
+/// Plain `CREATE TABLE`, not `CREATE TABLE IF NOT EXISTS`. A table that
+/// unexpectedly exists means the file is not the shape its version
+/// claims, which is worth failing loudly over rather than skipping.
+const MIGRATIONS: &[&str] = &[
+    // 1: the schema as the service first shipped, through 0.2.1. The
+    // `email_verified_at` column is inline here; the database on the
+    // live service gained it from an `ALTER` that this list replaces.
+    "
+CREATE TABLE accounts (
   id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE users (
   id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
   password_hash TEXT, email_verified_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
-CREATE TABLE IF NOT EXISTS memberships (
+CREATE TABLE memberships (
   account_id INTEGER NOT NULL REFERENCES accounts(id), user_id INTEGER NOT NULL REFERENCES users(id),
   role TEXT NOT NULL CHECK (role IN ('admin','developer')),
   PRIMARY KEY (account_id, user_id));
-CREATE TABLE IF NOT EXISTS projects (
+CREATE TABLE projects (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id),
   uid TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', production_branch TEXT NOT NULL DEFAULT 'main',
   visibility TEXT NOT NULL DEFAULT 'account' CHECK (visibility IN ('account','restricted')),
@@ -263,34 +282,34 @@ CREATE TABLE IF NOT EXISTS projects (
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   UNIQUE (account_id, uid));
-CREATE TABLE IF NOT EXISTS project_access (
+CREATE TABLE project_access (
   project_id INTEGER NOT NULL REFERENCES projects(id), user_id INTEGER NOT NULL REFERENCES users(id),
   level TEXT NOT NULL CHECK (level IN ('read','write','owner')),
   PRIMARY KEY (project_id, user_id));
-CREATE TABLE IF NOT EXISTS user_keys (
+CREATE TABLE user_keys (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL,
   prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   last_used_at TEXT, revoked_at TEXT);
-CREATE TABLE IF NOT EXISTS query_keys (
+CREATE TABLE query_keys (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), name TEXT NOT NULL,
   prefix TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   last_used_at TEXT, revoked_at TEXT);
-CREATE TABLE IF NOT EXISTS query_key_grants (
+CREATE TABLE query_key_grants (
   query_key_id INTEGER NOT NULL REFERENCES query_keys(id), project_id INTEGER NOT NULL REFERENCES projects(id),
   branch TEXT,
   PRIMARY KEY (query_key_id, project_id));
-CREATE TABLE IF NOT EXISTS invites (
+CREATE TABLE invites (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), user_id INTEGER NOT NULL REFERENCES users(id),
   hash TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), accepted_at TEXT);
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE TABLE sessions (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), account_id INTEGER NOT NULL REFERENCES accounts(id),
   hash TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   expires_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS email_tokens (
+CREATE TABLE email_tokens (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
   account_id INTEGER NOT NULL REFERENCES accounts(id),
   kind TEXT NOT NULL CHECK (kind IN ('verify','reset')),
@@ -298,27 +317,61 @@ CREATE TABLE IF NOT EXISTS email_tokens (
   email TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   expires_at TEXT NOT NULL, used_at TEXT);
-CREATE INDEX IF NOT EXISTS email_tokens_user ON email_tokens (user_id, kind);
-CREATE TABLE IF NOT EXISTS audit (
+CREATE INDEX email_tokens_user ON email_tokens (user_id, kind);
+CREATE TABLE audit (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
-  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
-";
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));",
+];
 
-/// Columns added after a database was first made. `SCHEMA` only creates
-/// tables that are absent, so a file from an earlier version keeps its
-/// old shape and needs each new column added here. Adding one that is
-/// already there is not an error worth failing a start-up over.
+/// Brings a database up to the last step in [`MIGRATIONS`], applying
+/// only the steps it has not seen.
+///
+/// Each step commits together with the version it reaches, so an
+/// interrupted upgrade leaves the file on the step before it rather than
+/// half-changed, and running again carries on from there. `user_version`
+/// lives in the file header and is journalled with everything else,
+/// which is what lets the two share a transaction.
+///
+/// A later step that has to rebuild a table — SQLite cannot alter a
+/// CHECK constraint, so changing one means create, copy, drop, rename —
+/// will need `foreign_keys` off while it runs. That pragma is a no-op
+/// inside a transaction, so it has to be turned off around this call
+/// rather than within a step.
 fn migrate(conn: &Connection) -> Result<()> {
-    for ddl in ["ALTER TABLE users ADD COLUMN email_verified_at TEXT"] {
-        match conn.execute(ddl, []) {
-            Ok(_) => {}
-            // The only expected failure: the column is already present.
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref m))) if m.contains("duplicate column name") => {}
-            Err(e) => return Err(e.into()),
-        }
+    let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let have = have.max(0) as usize;
+    let want = MIGRATIONS.len();
+    if have > want {
+        return Err(Error::Invalid(format!(
+            "this accounts database is at schema version {have}, newer than the {want} this build knows. \
+             Run the build it came from, or restore a backup."
+        )));
+    }
+    if have == 0 && !is_empty(conn)? {
+        return Err(Error::Invalid(
+            "this accounts database holds tables but no schema version, so it predates versioning. \
+             Set `PRAGMA user_version = 1` on a file that already has every table of version 1, or start a new one."
+                .into(),
+        ));
+    }
+    for (i, step) in MIGRATIONS.iter().enumerate().skip(have) {
+        let version = i + 1;
+        conn.execute_batch(&format!("BEGIN; {step} PRAGMA user_version = {version}; COMMIT;"))
+            .map_err(|e| Error::Invalid(format!("applying schema version {version}: {e}")))?;
     }
     Ok(())
+}
+
+/// Whether a database holds nothing of ours. Step 1 creates every table
+/// the service started with, so it can only run on an empty file.
+fn is_empty(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n == 0)
 }
 
 /// Records a key's use, at most once a minute: a key in steady use
@@ -478,7 +531,6 @@ impl Store {
         // checkpoint does, so a power cut can lose the last moments of
         // writes but never corrupts the file. Right for key metadata.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Store::over(conn))
     }
@@ -486,7 +538,6 @@ impl Store {
     pub fn in_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Store::over(conn))
     }
@@ -1683,46 +1734,97 @@ mod tests {
         }
     }
 
-    /// The live service has an `accounts.db` made before any of this
-    /// existed, and `SCHEMA` only creates tables that are absent, so
-    /// that file keeps its old `users` table. This is the check that
-    /// opening it adds the column rather than failing every query that
-    /// mentions it, and that opening it twice is still fine.
-    #[test]
-    fn a_database_from_before_this_gains_the_new_column() {
-        let dir = std::env::temp_dir().join(format!("zsql-accounts-migrate-{}", std::process::id()));
+    /// A temporary directory of our own, removed by the caller.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zsql-accounts-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("accounts.db");
-        let _ = std::fs::remove_file(&path);
+        dir
+    }
 
-        // The `users` table as it was, with a row in it.
+    fn version_of(path: &std::path::Path) -> i64 {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    /// The whole point of the version: a new file ends up on the last
+    /// step, and opening it again applies nothing and changes nothing.
+    #[test]
+    fn a_new_database_lands_on_the_last_step_and_stays_there() {
+        let dir = scratch("fresh");
+        let path = dir.join("accounts.db");
+
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version_of(&path), MIGRATIONS.len() as i64, "a new file is at the current version");
+        s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        drop(s);
+
+        let before = schema_of(&path);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(version_of(&path), MIGRATIONS.len() as i64, "opening again does not move the version");
+        assert_eq!(schema_of(&path), before, "opening again does not change the schema");
+        assert!(s.start_reset("ann@acme.test").unwrap().is_some(), "and the account that was there still is");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every table and index in the file, as SQLite stores the
+    /// statement that made it. A change to the schema has to change this
+    /// too, which is the point: it makes the shape of the database
+    /// something a reviewer sees rather than something they infer.
+    fn schema_of(path: &std::path::Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// A file written before versioning existed cannot be told apart
+    /// from one halfway through step 1, so it is refused with something
+    /// to do about it rather than guessed at. Replacing the old
+    /// `ALTER`-on-every-open means this is the one case that regressed,
+    /// so it is the one worth a test.
+    #[test]
+    fn a_database_from_before_versioning_is_refused_not_guessed() {
+        let dir = scratch("unversioned");
+        let path = dir.join("accounts.db");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE users (
                    id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
                    password_hash TEXT,
-                   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
-                 INSERT INTO users (email, name) VALUES ('old@acme.test', 'Old');",
+                   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));",
             )
             .unwrap();
         }
 
-        let s = Store::open(&path).unwrap();
-        // The column is there, and the existing user counts as unproven
-        // rather than as an error or as verified.
-        let user: User = s
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params!["old@acme.test"], user_row)
-            .unwrap();
-        assert!(!user.email_verified, "an address from before verification existed is unproven, not proven");
+        let Err(err) = Store::open(&path) else { panic!("tables with no version must not be taken for an empty file") };
+        let said = err.to_string();
+        assert!(said.contains("predates versioning"), "the error should say what is wrong: {said}");
+        assert!(said.contains("user_version = 1"), "and what to do about it: {said}");
 
-        // Opening again must not trip over the column it added.
-        drop(s);
-        let s = Store::open(&path).unwrap();
-        assert!(s.start_reset("old@acme.test").unwrap().is_none(), "the old user belongs to no account, so no link");
+        // Stamping it, which is what step 4 of the plan does on the live
+        // service, is enough to make it open.
+        Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
+        assert!(Store::open(&path).is_ok(), "a stamped file opens");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file from a newer build is not downgraded by running an older
+    /// one against it, because this build has no idea what the newer one
+    /// did.
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let dir = scratch("newer");
+        let path = dir.join("accounts.db");
+        Store::open(&path).unwrap();
+        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() + 1)).unwrap();
+
+        let Err(err) = Store::open(&path) else { panic!("a newer file must not be opened blindly") };
+        assert!(err.to_string().contains("newer than"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

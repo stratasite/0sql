@@ -3,6 +3,19 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::Path as FsPath;
 
+/// The snapshot shape this build writes, and the newest it can read.
+///
+/// Raise it in the same change that makes a snapshot a reader of the
+/// previous number could not understand: a field added without a serde
+/// default, or one renamed or removed, since every struct here is
+/// `deny_unknown_fields`. Adding a field that defaults is not such a
+/// change, and does not need a new number.
+pub const FORMAT: u32 = 1;
+
+fn first_format() -> u32 {
+    1
+}
+
 /// Row id as assigned by the strata database. Kept verbatim so a branch and
 /// its clone stay distinguishable and so paths can reference joins and tables.
 pub type Id = i64;
@@ -10,6 +23,12 @@ pub type Id = i64;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    /// The shape this snapshot was written in, so a build that cannot
+    /// read one can say so instead of reporting a missing field.
+    /// Snapshots written before the field existed have no `version` key
+    /// and are version 1, which is what the default is for.
+    #[serde(default = "first_format")]
+    pub version: u32,
     pub project: ProjectRef,
     pub branch: BranchRef,
     pub datasources: Vec<Datasource>,
@@ -424,6 +443,8 @@ pub enum LoadError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("this snapshot is in format {found}, and this build reads up to {FORMAT}; deploy it again from its project")]
+    Newer { found: u32 },
 }
 
 impl Snapshot {
@@ -437,10 +458,31 @@ impl Snapshot {
         } else {
             std::io::BufReader::new(file).read_to_string(&mut text)?;
         }
-        Ok(serde_json::from_str(&text)?)
+        Self::from_str(&text)
     }
 
     pub fn from_str(text: &str) -> Result<Self, LoadError> {
-        Ok(serde_json::from_str(text)?)
+        match serde_json::from_str(text) {
+            Ok(s) => Ok(s),
+            // A snapshot this build is too old for fails on whatever
+            // field moved, which says nothing useful. Its `version` is
+            // readable on its own, so ask that first and report the
+            // real reason when it is the reason.
+            Err(e) => match Self::format_of(text) {
+                Some(found) if found > FORMAT => Err(LoadError::Newer { found }),
+                _ => Err(e.into()),
+            },
+        }
+    }
+
+    /// The `version` of a snapshot, read without parsing the rest, so a
+    /// snapshot that cannot be loaded can still be identified.
+    fn format_of(text: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct JustTheVersion {
+            #[serde(default = "first_format")]
+            version: u32,
+        }
+        serde_json::from_str::<JustTheVersion>(text).ok().map(|v| v.version)
     }
 }
