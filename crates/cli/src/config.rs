@@ -131,13 +131,65 @@ pub fn write_secret(project_dir: &Path, key: &str, value: &str) -> Result<()> {
 
 /// The checked-out git branch of the project, which is what deploys go to.
 pub fn git_branch(dir: &Path) -> Result<String> {
-    let out = std::process::Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(dir).output().context("running git; is it installed?")?;
-    if !out.status.success() {
+    let git = |args: &[&str]| -> Result<(bool, String)> {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().context("running git; is it installed?")?;
+        Ok((out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string()))
+    };
+    if !git(&["rev-parse", "--git-dir"])?.0 {
         anyhow::bail!("{} is not a git repository; zsql deploys the checked-out branch, so run `git init` and commit first", dir.display());
     }
-    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // An unborn HEAD is a repository all the same: it names its branch
+    // symbolically, it just has no commit for `--abbrev-ref` to resolve.
+    if !git(&["rev-parse", "--verify", "--quiet", "HEAD"])?.0 {
+        let unborn = git(&["symbolic-ref", "--short", "--quiet", "HEAD"])?.1;
+        let on = if unborn.is_empty() { String::new() } else { format!(" on `{unborn}`") };
+        anyhow::bail!("{} is a git repository with no commits; zsql deploys the checked-out branch, so commit{on} first", dir.display());
+    }
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?.1;
     if branch == "HEAD" {
         anyhow::bail!("detached HEAD; check out a branch to deploy");
     }
     Ok(branch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The four HEAD states are four different complaints. A project inside
+    /// a fresh `git init` used to be told it was not a repository and to run
+    /// `git init`, the one step that could not have helped.
+    #[test]
+    fn git_branch_tells_no_repository_from_no_commits() {
+        let root = std::env::temp_dir().join(format!("zsql-git-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let project = repo.join("semantic");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+
+        let err = git_branch(&root.join("plain")).unwrap_err().to_string();
+        assert!(err.contains("is not a git repository"), "{err}");
+
+        run_git(&repo, &["init", "-q", "-b", "main", "."]);
+        let err = git_branch(&project).unwrap_err().to_string();
+        assert!(err.contains("is a git repository with no commits"), "{err}");
+        assert!(err.contains("commit on `main` first"), "{err}");
+
+        std::fs::write(repo.join("f"), "x").unwrap();
+        run_git(&repo, &["add", "f"]);
+        run_git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "c"]);
+        assert_eq!(git_branch(&project).unwrap(), "main");
+
+        run_git(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+        let err = git_branch(&project).unwrap_err().to_string();
+        assert!(err.contains("detached HEAD"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
