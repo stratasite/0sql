@@ -649,6 +649,16 @@ const GRAINS: [&str; 10] = ["raw", "millisecond", "second", "minute", "hour", "d
 const EXTRACTS: [&str; 12] = ["minute", "hour", "day_of_month", "day_of_week", "day_of_year", "week_of_year", "month", "quarter", "year", "day_name", "month_name", "year_month"];
 const WINDOW_FUNCTIONS: [&str; 15] = ["avg", "sum", "min", "max", "count", "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value", "last_value"];
 const TRANSFORMS: [&str; 5] = ["year_over_year", "quarter_over_quarter", "month_over_month", "week_over_week", "day_over_day"];
+/// `["a", "b", "c"]` read out as `a, b or c`: what an unknown enum value's
+/// message offers in place of the value it got.
+fn one_of(allowed: &[&str]) -> String {
+    match allowed.split_last() {
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// Bookkeeping columns Rails' serializer emits on a decorator.
 const DECORATOR_NOISE: [&str; 8] = ["id", "projection_id", "prompt", "share_full_result_set_with_ai", "created_at", "updated_at", "created_by_id", "updated_by_id"];
 
@@ -724,11 +734,13 @@ fn lower_decorator(d: &DecoratorSpec, field: Option<&Field>, owner: &str) -> Res
         attrs.insert(k.clone(), v.clone());
     }
     let label = d.kind.as_str();
-    let choice = |key: &str, allowed: &[&str], msg: &str| -> Result<Option<String>> {
+    // Absent is the caller's `ok_or_else`; set but not in `allowed` is this
+    // error, which names the value it got and every value that would do.
+    let choice = |key: &str, allowed: &[&str]| -> Result<Option<String>> {
         match attrs.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(s)) if allowed.contains(&s.to_lowercase().as_str()) => Ok(Some(s.to_lowercase())),
-            Some(other) => Err(record_invalid(format!("{msg} ({label} on {owner}: {key} = {other})"))),
+            Some(other) => Err(record_invalid(format!("unknown {key} {other}; use {} ({label} on {owner})", one_of(allowed)))),
         }
     };
     if let Some(f) = field {
@@ -748,16 +760,16 @@ fn lower_decorator(d: &DecoratorSpec, field: Option<&Field>, owner: &str) -> Res
     }
     match kind {
         DecoratorKind::Truncate => {
-            let grain = choice("grain", &GRAINS, "Grain must be set")?.ok_or_else(|| record_invalid(format!("Grain must be set ({owner})")))?;
+            let grain = choice("grain", &GRAINS)?.ok_or_else(|| record_invalid(format!("Grain must be set ({owner})")))?;
             attrs.insert("grain".into(), json!(grain));
         }
         DecoratorKind::Extract => {
-            let e = choice("extract", &EXTRACTS, "Extract must be set")?.ok_or_else(|| record_invalid(format!("Extract must be set ({owner})")))?;
+            let e = choice("extract", &EXTRACTS)?.ok_or_else(|| record_invalid(format!("Extract must be set ({owner})")))?;
             attrs.insert("extract".into(), json!(e));
         }
         DecoratorKind::Window => {
-            let mode = choice("mode", &["moving", "running"], "Mode must be moving or running")?.ok_or_else(|| record_invalid(format!("Mode must be moving or running ({owner})")))?;
-            let func = choice("function", &WINDOW_FUNCTIONS, "Function must be a valid window function")?.ok_or_else(|| record_invalid(format!("Function must be a valid window function ({owner})")))?;
+            let mode = choice("mode", &["moving", "running"])?.ok_or_else(|| record_invalid(format!("Mode must be moving or running ({owner})")))?;
+            let func = choice("function", &WINDOW_FUNCTIONS)?.ok_or_else(|| record_invalid(format!("Function must be a valid window function ({owner})")))?;
             attrs.insert("mode".into(), json!(mode));
             attrs.insert("function".into(), json!(func));
             for (key, needed) in [("size", mode == "moving"), ("offset", matches!(func.as_str(), "lag" | "lead")), ("buckets", func == "ntile")] {
@@ -768,7 +780,7 @@ fn lower_decorator(d: &DecoratorSpec, field: Option<&Field>, owner: &str) -> Res
             }
         }
         DecoratorKind::Temporalize => {
-            let t = choice("transform", &TRANSFORMS, "Transform invalid transform type")?.ok_or_else(|| record_invalid(format!("Transform invalid transform type ({owner})")))?;
+            let t = choice("transform", &TRANSFORMS)?.ok_or_else(|| record_invalid(format!("Transform invalid transform type ({owner})")))?;
             attrs.insert("transform".into(), json!(t));
         }
         // Not in Rails' spec vocabulary (its DECORATOR_MAP has no customize
@@ -1363,5 +1375,33 @@ mod tests {
         assert!(matches!(tree, FilterNodeSpec::Group(ref op, ref kids) if op == "or" && kids.len() == 2));
         assert!(parse_filters(&json!([{ "and": [] }])).is_err());
         assert!(parse_filters(&json!({ "xor": [] })).is_err());
+    }
+
+    /// A decorator attribute that is set but not one of the choices is a
+    /// different failure from one that is missing, and says so.
+    #[test]
+    fn unknown_enum_value_is_not_reported_as_missing() {
+        let dec = |kind: &str, key: &str, value: Value| {
+            let mut attrs = Attrs::new();
+            attrs.insert(key.into(), value);
+            lower_decorator(&DecoratorSpec { kind: kind.into(), attrs }, None, "Contact Date").unwrap_err().to_string()
+        };
+        assert_eq!(
+            dec("truncate", "grain", json!("fortnight")),
+            "Validation failed: unknown grain \"fortnight\"; use raw, millisecond, second, minute, hour, day, week, month, quarter or year (truncate on Contact Date)"
+        );
+        assert_eq!(
+            dec("extract", "extract", json!("fortnight")),
+            "Validation failed: unknown extract \"fortnight\"; use minute, hour, day_of_month, day_of_week, day_of_year, week_of_year, month, quarter, year, day_name, month_name or year_month (extract on Contact Date)"
+        );
+        assert_eq!(dec("window", "mode", json!("sliding")), "Validation failed: unknown mode \"sliding\"; use moving or running (window on Contact Date)");
+        assert_eq!(
+            dec("temporalize", "transform", json!("decade_over_decade")),
+            "Validation failed: unknown transform \"decade_over_decade\"; use year_over_year, quarter_over_quarter, month_over_month, week_over_week or day_over_day (temporalize on Contact Date)"
+        );
+        // Absent keeps the wording Rails' own validations use.
+        assert_eq!(dec("truncate", "grain", Value::Null), "Validation failed: Grain must be set (Contact Date)");
+        assert_eq!(dec("extract", "extract", Value::Null), "Validation failed: Extract must be set (Contact Date)");
+        assert_eq!(dec("window", "mode", Value::Null), "Validation failed: Mode must be moving or running (Contact Date)");
     }
 }
