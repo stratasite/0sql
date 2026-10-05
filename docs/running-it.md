@@ -123,6 +123,99 @@ password, and planning a query against the restored model.
 
 ## Done since it went up
 
+### Schema changes, and the version that records them
+
+Two things on disk change shape as the service does: `accounts.db`, and
+the compiled model under each branch. Both now say which shape they are
+in, which they did not before.
+
+**`accounts.db`.** `MIGRATIONS` in `crates/accounts/src/lib.rs` is a list
+of numbered steps and `PRAGMA user_version` holds how many of them a file
+has run, so the length of the list is the schema version. Opening a
+database applies the steps it has not seen, each committing together with
+the version it reaches, so an interrupted upgrade leaves the file on the
+step before rather than halfway through one.
+
+The list is append-only. A step that has shipped is never edited: a
+database that already ran it will not run it again, so editing one
+changes what new files get and nothing else — which is the divergence the
+version is there to prevent. Correcting a shipped step means adding
+another one.
+
+This replaced a schema replayed with `CREATE TABLE IF NOT EXISTS` on
+every open plus a separate list of `ALTER`s for files that predated a
+column. That arrangement needed every change written in two places and
+had no way to say what shape a file was in; a fresh database and an
+upgraded one agreed only as long as both were remembered. They now agree
+because both ran the same list.
+
+Two refusals rather than guesses: a file whose version is higher than
+this build knows, and a file with tables but no version, which cannot be
+told from one halfway through step 1.
+
+The second is what every database from before this change looks like,
+including the live one. Its only difference from what step 1 builds is
+that `users` gained `email_verified_at` from an `ALTER`, so the column
+sits at the end rather than inline — harmless, because every read names
+its columns, but it leaves one file that does not match the steps said to
+have built it. Bringing it onto the lineage is a rebuild of that one
+table and a stamp, with zsqld stopped and after a backup. Every row is
+kept, hashes and sessions included, so nobody signs in again:
+
+```
+PRAGMA foreign_keys = OFF;
+BEGIN;
+CREATE TABLE users_new (
+  id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT, email_verified_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+INSERT INTO users_new (id, email, name, password_hash, email_verified_at, created_at)
+  SELECT id, email, name, password_hash, email_verified_at, created_at FROM users;
+DROP TABLE users;
+ALTER TABLE users_new RENAME TO users;
+PRAGMA user_version = 1;
+COMMIT;
+```
+
+Then `PRAGMA integrity_check` and `PRAGMA foreign_key_check` before
+starting it again. A `VACUUM INTO` copy taken while it was stopped is
+what to put back if either complains.
+
+A later step that has to rebuild a table — SQLite cannot alter a CHECK
+constraint, so changing `role IN (...)` or a `level` means create, copy,
+drop, rename — needs `foreign_keys` off while it runs, and that pragma
+does nothing inside a transaction. It has to be set around the call, not
+within a step.
+
+**The compiled model.** `snapshot.json.gz` now carries a `version`, and
+`zsql_semantic::snapshot::FORMAT` is the newest this build writes and
+reads. Raise it in the same change that makes a snapshot unreadable to
+the number before it: a field added without a serde default, or one
+renamed or removed, since every struct in that file is
+`deny_unknown_fields`. Adding a field that defaults is not such a change.
+
+Nothing migrates a snapshot, and nothing needs to. It is compiled from a
+project archive that lives in somebody's repository, so the fix for one
+this build cannot read is to deploy that branch again. What changed is
+that startup says so instead of refusing to run: see below.
+
+### Startup comes up without what it cannot load
+
+`reload` used to stop at the first branch that would not load, and the
+error reached `main`, so one unreadable file meant the service did not
+start at all — five restarts in ten seconds and then systemd leaving it
+failed. A release that changed the snapshot format without raising
+`FORMAT` would have done exactly that, on a machine that was healthy a
+moment earlier.
+
+Each branch now loads on its own. One that fails is logged by name with
+its reason, left out, and counted in a line after the startup summary
+saying what is not being served. Everything else comes up.
+
+This is the first of the two candidates the open item below used to list,
+and it only answers the format half. A process that runs out of memory
+still restarts into the same reload; that is still open.
+
 ### A cap on deployed branches per account
 
 Deployed models are held in memory for the life of the process and
@@ -221,23 +314,22 @@ one journal line, next to the backup failures that are also unwatched.
 
 ## Open
 
-### Startup when it cannot load everything
+### Startup when it cannot fit everything
 
-Startup reloads every deployment from disk, so a process that runs out
-of memory is killed, restarts, reloads the same models and is killed
-again; after five attempts in ten seconds systemd gives up and leaves it
-failed, with the thing that brought it down still on disk waiting to be
-reloaded. `MemoryMax` is unset.
+Skipping what will not load, above, removed the restart loop for a model
+that cannot be *read*. It does nothing for one that does not *fit*: a
+process killed for memory is killed while loading, not handed an error it
+can skip, so it restarts, reloads the same models and is killed again.
+After five attempts in ten seconds systemd gives up. `MemoryMax` is
+unset.
 
 The branch caps bound one account, not the machine across many: twenty
 models is about 100 MB, so a hundred accounts is 10 GB, which is the
 whole box. The caps buy room, they do not remove the ceiling, and they
 do nothing about this failure mode.
 
-Two candidates, unchanged. Skip what will not load and come up degraded,
-which is small and removes the restart loop. Or lazy loading with an
-LRU, which `accounts-and-access.md` already parks for the multi-instance
-work and which answers it properly.
+What is left of the answer is lazy loading with an LRU, which
+`accounts-and-access.md` already parks for the multi-instance work.
 
 ### Smaller
 

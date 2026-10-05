@@ -1692,11 +1692,12 @@ async fn healthz() -> &'static str {
 
 // ----------------------------------------------------------------- startup
 
-fn reload(app: &App) -> anyhow::Result<usize> {
+fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
     let mut n = 0;
+    let mut skipped: Vec<String> = Vec::new();
     // Single-tenant: data/<project>/<branch>; with accounts: data/<account>/<project>/<branch>.
     let roots: Vec<(String, PathBuf)> = if app.accounts.is_some() {
-        let Ok(accounts) = std::fs::read_dir(&app.data_dir) else { return Ok(0) };
+        let Ok(accounts) = std::fs::read_dir(&app.data_dir) else { return Ok((0, skipped)) };
         accounts.flatten().filter(|e| e.path().is_dir()).map(|e| (format!("{}/", e.file_name().to_string_lossy()), e.path())).collect()
     } else {
         vec![(String::new(), app.data_dir.clone())]
@@ -1711,30 +1712,46 @@ fn reload(app: &App) -> anyhow::Result<usize> {
             if !snap_path.exists() {
                 continue;
             }
-            let snapshot = Snapshot::from_path(&snap_path)?;
-            let universe = Universe::build(snapshot)?;
-            let values = ValueCatalog::read(&b.path().join(zsql_project::values::FILE_NAME))?;
-            let tests: Vec<zsql_project::ProjectTest> = std::fs::read_to_string(b.path().join("tests.json"))
-                .ok()
-                .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|v| zsql_project::ProjectTest {
-                    file: PathBuf::from(v["file"].as_str().unwrap_or("")),
-                    name: v["name"].as_str().unwrap_or("").to_string(),
-                    projections: v["projections"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect(),
-                    assert_sql: v["assert_sql"].as_str().map(str::to_string),
-                    assert_regex: v["assert_regex"].as_str().map(str::to_string),
-                })
-                .collect();
-            let deployed_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(|t| humantime(t)).unwrap_or_default();
-            let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
-            app.models.write().unwrap().insert(format!("{scope}{uid}/{branch}"), Arc::new(Deployed { uid: uid.clone(), branch, engine, values, tests, warnings: vec![], deployed_at }));
-            n += 1;
+            // One unreadable branch is not a reason to refuse to
+            // start. A model that will not load is almost always a
+            // format this build is too old or too new for, and the
+            // archive it was compiled from lives in someone's
+            // repository, so the fix is a redeploy of that one branch.
+            // Coming up without it, and saying which, beats a restart
+            // loop that systemd gives up on after five tries.
+            let key = format!("{scope}{uid}/{branch}");
+            match (|| -> anyhow::Result<()> {
+                let snapshot = Snapshot::from_path(&snap_path)?;
+                let universe = Universe::build(snapshot)?;
+                let values = ValueCatalog::read(&b.path().join(zsql_project::values::FILE_NAME))?;
+                let tests: Vec<zsql_project::ProjectTest> = std::fs::read_to_string(b.path().join("tests.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|v| zsql_project::ProjectTest {
+                        file: PathBuf::from(v["file"].as_str().unwrap_or("")),
+                        name: v["name"].as_str().unwrap_or("").to_string(),
+                        projections: v["projections"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect(),
+                        assert_sql: v["assert_sql"].as_str().map(str::to_string),
+                        assert_regex: v["assert_regex"].as_str().map(str::to_string),
+                    })
+                    .collect();
+                let deployed_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(|t| humantime(t)).unwrap_or_default();
+                let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
+                app.models.write().unwrap().insert(key.clone(), Arc::new(Deployed { uid: uid.clone(), branch: branch.clone(), engine, values, tests, warnings: vec![], deployed_at }));
+                Ok(())
+            })() {
+                Ok(()) => n += 1,
+                Err(e) => {
+                    eprintln!("zsqld: {key} was not loaded: {e}");
+                    skipped.push(key);
+                }
+            }
         }
     }
     }
-    Ok(n)
+    Ok((n, skipped))
 }
 
 fn nanos() -> u128 {
@@ -1782,8 +1799,13 @@ async fn main() -> anyhow::Result<()> {
     let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
     let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
     let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
-    let n = reload(&app)?;
+    let (n, skipped) = reload(&app)?;
     eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    if !skipped.is_empty() {
+        // Said again, together, after the per-branch lines above: the
+        // one line someone watching a restart will actually read.
+        eprintln!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
+    }
     if accounts_on {
         let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
         eprintln!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
