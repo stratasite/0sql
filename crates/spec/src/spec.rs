@@ -35,19 +35,25 @@ pub enum SpecError {
     /// A malformed spec: bad shape, unknown type, an unresolvable target.
     #[error("{0}")]
     Invalid(String),
-    /// A component Rails' model validations would refuse (a blank alias, a
-    /// decorator on the wrong kind of field, a non-numeric top-n value).
+    /// A well-formed spec holding a value that is not legal there: a blank
+    /// alias, a decorator on the wrong kind of field, a non-numeric top-n.
+    /// (The wording of these messages is still Rails'; see NOTES.md.)
     #[error("Validation failed: {0}")]
     RecordInvalid(String),
 }
 
 impl SpecError {
-    pub fn rails_class(&self) -> &'static str {
+    /// The `class` an API error carries. Flat and 0sql's own, like the
+    /// envelope classes beside it (`Unauthorized`, `ContextRequired`): what
+    /// a caller switches on should not name the framework that happened to
+    /// raise it first. `FieldNotFound` also stops reading like the 404
+    /// `NotFound`, which is a different failure entirely.
+    pub fn error_class(&self) -> &'static str {
         match self {
-            SpecError::NotFound(_) => "Semantic::NotFound",
-            SpecError::Ambiguous(_) => "Semantic::Ambiguous",
-            SpecError::Invalid(_) => "Query::Spec::InvalidSpecError",
-            SpecError::RecordInvalid(_) => "ActiveRecord::RecordInvalid",
+            SpecError::NotFound(_) => "FieldNotFound",
+            SpecError::Ambiguous(_) => "FieldAmbiguous",
+            SpecError::Invalid(_) => "InvalidSpec",
+            SpecError::RecordInvalid(_) => "InvalidValue",
         }
     }
 }
@@ -1373,6 +1379,21 @@ mod tests {
         assert!(matches!(tree, FilterNodeSpec::Group(ref op, ref kids) if op == "or" && kids.len() == 2));
         assert!(parse_filters(&json!([{ "and": [] }])).is_err());
         assert!(parse_filters(&json!({ "xor": [] })).is_err());
+    }
+
+    /// The `class` on an error is a contract: callers switch on it, the
+    /// OpenAPI publishes it, and `zsql` prints it. Pin the set so a rename
+    /// is a deliberate act with a failing test, not a silent break.
+    #[test]
+    fn error_classes_are_0sqls_own() {
+        assert_eq!(SpecError::NotFound(String::new()).error_class(), "FieldNotFound");
+        assert_eq!(SpecError::Ambiguous(String::new()).error_class(), "FieldAmbiguous");
+        assert_eq!(SpecError::Invalid(String::new()).error_class(), "InvalidSpec");
+        assert_eq!(SpecError::RecordInvalid(String::new()).error_class(), "InvalidValue");
+        // Nothing here may name a framework we are not.
+        for class in ["FieldNotFound", "FieldAmbiguous", "InvalidSpec", "InvalidValue"] {
+            assert!(!class.contains("ActiveRecord") && !class.contains("::"), "{class}");
+        }
     }
 
     /// A decorator attribute that is set but not one of the choices is a

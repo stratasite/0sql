@@ -89,3 +89,47 @@ string match and the feedback loop stays open. Lowering takes an optional
 ranker (uid to score); without one behaviour is unchanged. A `hits` field
 on fields and explore entries, and a top-fields endpoint per project that
 doubles as a usage report.
+
+## Error messages still written in Rails' voice
+
+Parked 2026-10-05, when the error *classes* were renamed to 0sql's own
+(`FieldNotFound`, `FieldAmbiguous`, `InvalidSpec`, `InvalidValue`,
+`Unresolvable`, `SegmentDatasource`, `SecurityPolicy`). The messages behind
+them were left alone and are still ActiveRecord validation strings, carried
+over so the port read the same as Rails: attribute name first, framework
+grammar, and a `Validation failed: ` prefix from `SpecError::RecordInvalid`.
+
+About 28 of them, all in `crates/spec/src/spec.rs`:
+
+    Alias can't be blank
+    Sql can't be blank (calculation '{alias}')
+    Calculation data type is not included in the list ('{data_type}')
+    Axis the tooltip holds measures only
+    Transform invalid transform type ({owner})
+    Filter value is not a number ({source})
+    Filter value values must be numeric ({source})
+    Predicate {} predicate is not supported for {}.
+    Measure refs could not find measure named: {name}.
+    …
+
+Three of them read as broken English (`Transform invalid transform type`,
+`Axis the tooltip holds measures only`, `Filter value values must be
+numeric`) because ActiveRecord prepends the attribute name to a message
+written to follow it.
+
+What a rewrite should do: say what was wrong with the request and what would
+be right, in 0sql's voice, and drop the `Validation failed: ` prefix with
+them. The unknown-enum messages fixed on 2026-10-05 are the model —
+`unknown grain "fortnight"; use raw, millisecond, … or year (truncate on
+Contact Date)`.
+
+Parked because it is a wide, shallow change that touches a published
+surface: `src/content/docs/query/errors.mdx` in 0sql-marketing quotes many of
+these verbatim, so the docs move with it. Nothing blocks it technically —
+the goldens compare the error *class* only, never the message
+(`crates/golden/src/lib.rs`), so Rails and 0sql may word things differently
+without breaking parity.
+
+Worth doing in one pass rather than drifting message by message, so the
+surface stays consistent.
+

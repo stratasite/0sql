@@ -26,7 +26,7 @@ fn specs_serialize_back_and_lower_to_the_same_plan() {
             let b = planner.plan_query(again, case.context.as_ref());
             match (a, b) {
                 (Ok(a), Ok(b)) => assert_eq!(a.sql, b.sql, "{}: spec -> query -> spec changes the plan", case.id),
-                (Err(a), Err(b)) => assert_eq!(a.rails_class(), b.rails_class(), "{}", case.id),
+                (Err(a), Err(b)) => assert_eq!(a.error_class(), b.error_class(), "{}", case.id),
                 (a, b) => panic!("{}: outcomes differ: {:?} vs {:?}", case.id, a.map(|p| p.sql), b.map(|p| p.sql)),
             }
             checked += 1;
