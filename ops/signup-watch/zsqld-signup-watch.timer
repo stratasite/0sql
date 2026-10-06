@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for new 0sql sign-ups every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

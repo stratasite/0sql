@@ -1,0 +1,78 @@
+#!/bin/sh
+# zsqld-signup-watch: mail a list of new sign-ups since the last run.
+#
+# Runs from a systemd timer with /etc/zsqld.env loaded, so it sends
+# through the same ZSQL_MAIL_COMMAND and ZSQL_MAIL_FROM the service
+# uses. Reads the accounts database read-only; the server keeps it in
+# WAL mode, so a concurrent read is safe. Remembers the highest user
+# and account id it has reported, and says nothing when nothing is new.
+# The first run only records where it started, so the people already
+# here are not announced.
+set -eu
+
+DB="${ZSQL_SIGNUP_WATCH_DB:-/var/lib/zsqld/accounts.db}"
+STATE_DIR="${ZSQL_SIGNUP_WATCH_STATE:-/var/lib/zsqld-signup-watch}"
+TO="${ZSQL_SIGNUP_WATCH_TO:-ajo@strata.do}"
+STATE="$STATE_DIR/last"
+
+: "${ZSQL_MAIL_COMMAND:?ZSQL_MAIL_COMMAND is not set; load /etc/zsqld.env}"
+: "${ZSQL_MAIL_FROM:?ZSQL_MAIL_FROM is not set; load /etc/zsqld.env}"
+command -v sqlite3 >/dev/null || { echo "sqlite3 is not installed" >&2; exit 1; }
+[ -r "$DB" ] || { echo "cannot read $DB" >&2; exit 1; }
+
+q() { sqlite3 -batch -noheader "file:$DB?mode=ro" "$1"; }
+
+mkdir -p "$STATE_DIR"
+max_user=$(q "SELECT coalesce(max(id), 0) FROM users")
+max_account=$(q "SELECT coalesce(max(id), 0) FROM accounts")
+
+if [ ! -f "$STATE" ]; then
+    printf '%s %s\n' "$max_user" "$max_account" > "$STATE"
+    echo "first run: starting after user $max_user, account $max_account; nothing sent"
+    exit 0
+fi
+read -r last_user last_account < "$STATE"
+
+if [ "$max_user" -le "$last_user" ] && [ "$max_account" -le "$last_account" ]; then
+    exit 0
+fi
+
+# New people, with every account they belong to.
+users=$(q "SELECT '  ' || u.email || '  (' || coalesce(nullif(u.name,''),'no name') || ')  ' || u.created_at
+             || '  verified: ' || CASE WHEN u.email_verified_at IS NULL THEN 'no' ELSE 'yes' END
+             || '  accounts: ' || coalesce((SELECT group_concat(a.uid || ':' || m.role, ', ')
+                                             FROM memberships m JOIN accounts a ON a.id = m.account_id
+                                             WHERE m.user_id = u.id), 'none')
+           FROM users u WHERE u.id > $last_user ORDER BY u.id")
+# New accounts, including ones opened by someone already here.
+accounts=$(q "SELECT '  ' || a.uid || '  (' || a.name || ')  admins: '
+             || coalesce((SELECT group_concat(u.email, ', ') FROM memberships m JOIN users u ON u.id = m.user_id
+                          WHERE m.account_id = a.id AND m.role = 'admin'), 'none')
+           FROM accounts a WHERE a.id > $last_account ORDER BY a.id")
+n_users=$(q "SELECT count(*) FROM users WHERE id > $last_user")
+n_accounts=$(q "SELECT count(*) FROM accounts WHERE id > $last_account")
+total_users=$(q "SELECT count(*) FROM users")
+total_accounts=$(q "SELECT count(*) FROM accounts")
+
+subject="0sql: $n_users new sign-up(s), $n_accounts new account(s)"
+body="New since the last check on $(hostname):
+
+Users ($n_users):
+${users:-  none}
+
+Accounts ($n_accounts):
+${accounts:-  none}
+
+Now $total_users user(s) in $total_accounts account(s).
+"
+
+message=$(printf 'Date: %s\r\nFrom: %s\r\nTo: %s\r\nSubject: %s\r\nMessage-ID: <signup-watch-%s@zsqld>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nAuto-Submitted: auto-generated\r\n\r\n%s' \
+    "$(date -R)" "$ZSQL_MAIL_FROM" "$TO" "$subject" "$(date +%s)-$$" "$(printf '%s' "$body" | sed 's/$/\r/')")
+
+if printf '%s\r\n' "$message" | sh -c "$ZSQL_MAIL_COMMAND"; then
+    printf '%s %s\n' "$max_user" "$max_account" > "$STATE"
+    echo "sent: $subject"
+else
+    echo "the mail command failed; will retry next run" >&2
+    exit 1
+fi

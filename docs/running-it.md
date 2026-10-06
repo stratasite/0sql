@@ -127,6 +127,22 @@ read step 7's output before walking away. A step that fails leaves the
 file on the version before it, and the unit dead rather than serving
 something half-changed.
 
+### Sign-up notifications
+
+`ops/signup-watch/` holds a script, a service and an hourly timer that
+are installed on buzz (`/usr/local/bin/zsqld-signup-watch`, units in
+`/etc/systemd/system/`). Each hour the script opens the accounts
+database read-only, compares the highest user and account ids with
+what it reported last time (`/var/lib/zsqld-signup-watch/last`), and
+when either has moved mails the new rows to `ajo@strata.do` through
+the same `ZSQL_MAIL_COMMAND` the service uses, loaded from
+`/etc/zsqld.env`. A quiet hour sends nothing; a failed send leaves the
+watermark alone so the next hour retries. The first run only records
+where it started. Installed 2026-10-06; `journalctl -u
+zsqld-signup-watch` shows each run, and `echo "0 0" >
+/var/lib/zsqld-signup-watch/last` followed by `systemctl start
+zsqld-signup-watch.service` forces a full report as a test.
+
 ### Building without releasing
 
 `release.yml` also has `workflow_dispatch`, which builds and attaches
