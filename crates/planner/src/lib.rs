@@ -101,6 +101,9 @@ pub struct ExplainStrategy {
 }
 
 impl Plan {
+    /// The statement with the caller's row limit appended, or untouched when
+    /// they did not ask for one. `sql` itself never carries it: a plan is the
+    /// shape of the question, and how many rows you want back is yours.
     pub fn sql_with_limit(&self, limit: Option<u64>) -> String {
         match limit {
             Some(n) => format!("{}\nLIMIT {n}", self.sql),
