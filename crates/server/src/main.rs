@@ -891,7 +891,7 @@ fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, 
     let limit = query.limit.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0);
     let t1 = Instant::now();
     let planner = d.planner();
-    let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.error_class(), e.to_string()))?;
     let t2 = Instant::now();
     Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items, limit })
 }
@@ -945,7 +945,7 @@ async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
     let spec = zsql_spec::Spec::from_value(spec_value).map_err(spec_error)?;
     let query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let planner = d.planner();
-    let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
+    let x = planner.explore(query).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.error_class(), e.to_string()))?;
     if let Some(term) = &req.q {
         check_term(term)?;
     }
@@ -988,7 +988,7 @@ async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
-    ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string())
+    ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.error_class(), e.to_string())
 }
 
 // --------------------------------------------------------------- discovery

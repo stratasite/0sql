@@ -396,8 +396,8 @@ pub fn plan_case(planner: &Planner<'_>, dialects: &Dialects, case: &Case) -> std
     let base = dialects.base().map_err(|e| ("Unimplemented".to_string(), e.to_string()))?;
     zsql_spec::Spec::from_value(case.spec.clone())
         .and_then(|spec| zsql_spec::lower(&spec, universe, &base))
-        .map_err(|e| (e.rails_class().to_string(), e.to_string()))
-        .and_then(|query| planner.plan_query(query, case.context.as_ref()).map_err(|e| (e.rails_class().to_string(), e.to_string())))
+        .map_err(|e| (e.error_class().to_string(), e.to_string()))
+        .and_then(|query| planner.plan_query(query, case.context.as_ref()).map_err(|e| (e.error_class().to_string(), e.to_string())))
 }
 
 pub fn run_case(fixtures: &Fixtures, case: &Case, source: PathSource) -> Result<Outcome> {
@@ -407,6 +407,29 @@ pub fn run_case(fixtures: &Fixtures, case: &Case, source: PathSource) -> Result<
 }
 
 /// Scores one case on a planner already built for its universe.
+/// The Rails class each 0sql error class was captured under. The goldens
+/// record what Rails answered, down to the exception name, and are not
+/// rewritten when we rename ours — parity is about which failure happens,
+/// not about what the two codebases call it. A name we do not translate
+/// has to match outright.
+fn rails_name(class: &str) -> &str {
+    match class {
+        "FieldNotFound" => "Semantic::NotFound",
+        "FieldAmbiguous" => "Semantic::Ambiguous",
+        "InvalidSpec" => "Query::Spec::InvalidSpecError",
+        "InvalidValue" => "ActiveRecord::RecordInvalid",
+        "Unresolvable" => "Planner::ResolutionError",
+        "SegmentDatasource" => "Planner::SegmentDatasourceError",
+        "SecurityPolicy" => "Planner::SecurityPolicyError",
+        other => other,
+    }
+}
+
+/// True when our class and the golden's name the same failure.
+fn same_failure(ours: &str, golden: &str) -> bool {
+    ours == golden || rails_name(ours) == golden
+}
+
 pub fn run_case_on(planner: &Planner<'_>, dialects: &Dialects, case: &Case) -> Result<Outcome> {
     Ok(match (&case.expected, plan_case(planner, dialects, case)) {
         (_, Err((class, msg))) if class == "Unimplemented" => Outcome::Unimplemented(msg),
@@ -423,7 +446,7 @@ pub fn run_case_on(planner: &Planner<'_>, dialects: &Dialects, case: &Case) -> R
         }
         (Expected::Sql { .. }, Err((class, msg))) => Outcome::WrongError { got: format!("{class}: {msg}") },
         (Expected::Error { error }, Err((class, msg))) => {
-            if class == error.class {
+            if same_failure(&class, &error.class) {
                 Outcome::Pass
             } else {
                 Outcome::WrongError { got: format!("{class}: {msg}") }

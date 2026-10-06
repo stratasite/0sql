@@ -508,7 +508,7 @@ fn main() -> Result<()> {
                         };
                         let lowered = parsed.and_then(|spec| zsql_spec::lower(&spec, &universe, &base).map_err(|e| e.to_string()));
                         let t1 = Instant::now();
-                        let planned = lowered.and_then(|q| planner.plan_query(q, context.as_ref()).map_err(|e| format!("{}: {e}", e.rails_class())));
+                        let planned = lowered.and_then(|q| planner.plan_query(q, context.as_ref()).map_err(|e| format!("{}: {e}", e.error_class())));
                         let t2 = Instant::now();
                         match planned {
                             Ok(plan) => {

@@ -112,7 +112,9 @@ impl Plan {
     }
 }
 
-/// Planning errors, named after the Rails classes the goldens expect.
+/// Planning errors. The classes they answer with are 0sql's own; the
+/// goldens hold the Rails names they were captured under, which
+/// `zsql_golden` translates when it compares.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     #[error("not implemented: {0}")]
@@ -130,11 +132,12 @@ pub enum PlanError {
 
 impl PlanError {
     /// The Rails exception class this error corresponds to.
-    pub fn rails_class(&self) -> &'static str {
+    /// The `class` an API error carries; see `SpecError::error_class`.
+    pub fn error_class(&self) -> &'static str {
         match self {
-            PlanError::Resolution(_) => "Planner::ResolutionError",
-            PlanError::SegmentDatasource(_) => "Planner::SegmentDatasourceError",
-            PlanError::SecurityPolicy(_) => "Planner::SecurityPolicyError",
+            PlanError::Resolution(_) => "Unresolvable",
+            PlanError::SegmentDatasource(_) => "SegmentDatasource",
+            PlanError::SecurityPolicy(_) => "SecurityPolicy",
             PlanError::Unimplemented(_) | PlanError::Dialect(_) => "Unimplemented",
         }
     }

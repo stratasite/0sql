@@ -438,10 +438,13 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     if !dir.join(".git").exists() {
         let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&dir).status().map(|s| s.success()).unwrap_or(false);
         if ok {
-            println!("git init (branch main)");
+            // Deploying reads the checked-out branch, so an uncommitted
+            // project cannot be deployed. Say so here, where it is a step on
+            // a list, rather than at the deploy that fails.
+            println!("git init (branch main) — commit before deploying; zsql deploys the checked-out branch");
         }
     }
-    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `zsql auth --api-key ...`, `zsql deploy`");
+    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `git commit`, `zsql auth --api-key ...`, `zsql deploy`");
     Ok(())
 }
 
