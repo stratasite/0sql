@@ -76,7 +76,21 @@ pub struct ProjectTest {
 /// reserved keywords, aggregate functions and identifier quote, which the
 /// expression parser needs to find the columns an expression reads.
 pub fn load(dir: &Path, dialects: &Dialects) -> Result<Loaded> {
+    load_with(dir, dialects, false)
+}
+
+/// [`load`] for a directory the loader must not read outside of: the
+/// server's unpacked archive. An `imports` entry that resolves beyond
+/// the directory, or a link out of it, is an error rather than a read
+/// of whatever is there on the host. Locally the CLI reads the
+/// developer's own machine and keeps the freedom.
+pub fn load_confined(dir: &Path, dialects: &Dialects) -> Result<Loaded> {
+    load_with(dir, dialects, true)
+}
+
+fn load_with(dir: &Path, dialects: &Dialects, confined: bool) -> Result<Loaded> {
     let mut b = Builder::new(dir, dialects);
+    b.confined = confined;
     b.project()?;
     b.datasources()?;
     b.tables()?;
@@ -229,6 +243,8 @@ struct PendingRule {
 
 struct Builder<'d> {
     dir: PathBuf,
+    /// Every file read must resolve inside `dir`.
+    confined: bool,
     dialects: &'d Dialects,
     warnings: Vec<String>,
     project: Option<ProjectRef>,
@@ -265,6 +281,7 @@ impl<'d> Builder<'d> {
     fn new(dir: &Path, dialects: &'d Dialects) -> Self {
         Builder {
             dir: dir.to_path_buf(),
+            confined: false,
             dialects,
             warnings: vec![],
             project: None,
@@ -312,11 +329,25 @@ impl<'d> Builder<'d> {
         }
     }
 
+    /// Whether the file, with every link in its path followed, is under
+    /// the project directory.
+    fn inside(&self, path: &Path) -> bool {
+        match (path.canonicalize(), self.dir.canonicalize()) {
+            (Ok(p), Ok(root)) => p.starts_with(&root),
+            _ => false,
+        }
+    }
+
     fn files(&self, pattern_dir: &str, prefix: &str) -> Result<Vec<PathBuf>> {
         let root = self.dir.join(pattern_dir);
         let mut out = Vec::new();
         if root.is_dir() {
             walk(&root, &mut out).map_err(|e| ProjectError::Io(root.display().to_string(), e))?;
+        }
+        if self.confined {
+            if let Some(out_of_bounds) = out.iter().find(|p| !self.inside(p)) {
+                return Err(invalid(out_of_bounds, "this file is a link to somewhere outside the project"));
+            }
         }
         out.retain(|p| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -435,6 +466,9 @@ impl<'d> Builder<'d> {
             let path = if base.exists() { base } else { self.dir.join(import) };
             if !path.exists() {
                 return Err(invalid(file, format!("Import not found: {import}")));
+            }
+            if self.confined && !self.inside(&path) {
+                return Err(invalid(file, format!("Import outside the project: {import}")));
             }
             let sub = self.resolve_imports(&path, visiting)?;
             if let Some(Yaml::Sequence(fields)) = get(&sub, "fields") {
@@ -1274,6 +1308,9 @@ impl<'d> Builder<'d> {
             .collect();
         files.sort();
         for file in files {
+            if self.confined && !self.inside(&file) {
+                return Err(invalid(&file, "this file is a link to somewhere outside the project"));
+            }
             let v = read_yaml(&file)?;
             let Some(m) = as_map(&v) else { continue };
             let name = str_of(m, "name").ok_or_else(|| invalid(&file, "Test must have a name"))?;

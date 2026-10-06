@@ -61,12 +61,12 @@ server answers 401 without one, 403 when the key may not do the action.
 ## Endpoints
 
 ```
-POST   /signup                                 {account, email, name?} → account, user, key, secret (once)
+POST   /signup                                 {account, email, name?, password?} → account, user, key, secret (once; an email that is already a user's needs that user's password)
 GET    /me
 GET    /account/members                        POST {email, name?, role}  (admin; a member without a key also gets an invite token, once)
 DELETE /account/members/{email}                                           (admin)
 POST   /account/members/{email}/invite         a fresh invite token        (admin)
-POST   /invites/accept                         {token, name?, key_name?} → account, user, key, secret (no auth; the token is the credential)
+POST   /invites/accept                         {token, name?, key_name?, password?} → account, user, key, secret (no auth; the token is the credential; newcomers only, 7 days)
 POST   /password-reset                         {email} → {ok} always              (no auth)
 POST   /password-reset/accept                  {token, password} → user, account  (no auth; opens a session)
 POST   /verify-email                           {token} → {verified, user, account} (no auth)
@@ -119,9 +119,26 @@ Sessions are a cookie (`zsql_session`, HttpOnly, SameSite=Lax, Secure
 when `ZSQL_PUBLIC_URL` is https) backed by a hashed row with a 30-day
 expiry. Any state-changing call under a cookie must also carry the
 `x-requested-with: zsql` header the app's scripts send, which a
-cross-site form cannot. Passwords are argon2 hashes; sign-up and invite
-acceptance set them. `POST /login`, `POST /logout`,
-`POST /account/password`.
+cross-site form cannot, `/logout` included. Passwords are argon2 hashes;
+sign-up and invite acceptance set them. `POST /login`, `POST /logout`,
+`POST /account/password` (which ends the user's other sessions).
+
+## One person, several accounts
+
+Users are global by email; accounts hold memberships. A personal key
+belongs to the account that issued it and acts there alone, and leaving
+an account ends only that account's keys. A login lands in the user's
+home account: the one they opened themselves, else the one they were
+first invited into, else their oldest membership.
+
+Because sign-up is open, an address that already belongs to a user
+opens another account only with that user's password; without one the
+user proves the address through a password reset link first. Nothing
+about the existing user is changed, and no key is minted, until then.
+An invite token is relayed by an admin and so proves nothing about the
+address: it sets up a newcomer with no password and no key anywhere,
+and is refused for anyone who can already sign in, who is a member
+already and simply signs in. Tokens expire after seven days.
 
 ## Verification and password reset
 

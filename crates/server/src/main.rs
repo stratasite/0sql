@@ -27,7 +27,7 @@ mod limits;
 mod mail;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use zsql_accounts::{Level, Principal, Project, Role, Store, Verb};
 use axum::http::StatusCode;
@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use tokio::sync::OwnedSemaphorePermit;
 use std::time::{Duration, Instant};
 use zsql_dialect::Dialects;
 use zsql_project::values::ValueCatalog;
@@ -141,6 +142,14 @@ struct Auth(Option<Principal>);
 #[derive(Clone)]
 struct Caller(Option<Principal>);
 
+/// The admission permit, carried on the request. The guard holds one
+/// clone until it answers; a handler that does its work on the blocking
+/// pool moves another into that work, so the permit is released when
+/// the work ends and not when the deadline gives up on it. Otherwise
+/// deploys that outlive their deadline would pile up past the cap.
+#[derive(Clone)]
+struct Held(#[allow(dead_code)] Arc<Option<OwnedSemaphorePermit>>);
+
 /// Who is calling: the key in the Authorization header, else the session
 /// cookie the web app holds.
 fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError> {
@@ -239,16 +248,17 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
 
     // Room to run, or come back later. The permit is held until the
     // handler has finished with it.
-    let permit = match app.admission.admit(class).await {
-        Ok(p) => p,
+    let held = match app.admission.admit(class).await {
+        Ok(p) => Held(Arc::new(p)),
         Err(secs) => return busy(secs, class),
     };
+    parts.extensions.insert(held.clone());
     let req = axum::extract::Request::from_parts(parts, body);
     let mut response = match tokio::time::timeout(limits::deadline(class), next.run(req)).await {
         Ok(r) => r,
         Err(_) => retry_later(StatusCode::SERVICE_UNAVAILABLE, "Timeout", format!("this request passed its {}s deadline", limits::deadline(class).as_secs()), 0),
     };
-    drop(permit);
+    drop(held);
     if let Some(d) = allowance {
         rate_headers(&mut response, &d);
     }
@@ -359,7 +369,11 @@ const SESSION_COOKIE: &str = "zsql_session";
 const SESSION_DAYS: i64 = 30;
 
 fn cookie(parts: &Parts, name: &str) -> Option<String> {
-    let header = parts.headers.get("cookie")?.to_str().ok()?;
+    cookie_in(&parts.headers, name)
+}
+
+fn cookie_in(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    let header = headers.get("cookie")?.to_str().ok()?;
     header.split(';').map(str::trim).find_map(|kv| kv.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')).map(str::to_string))
 }
 
@@ -411,6 +425,11 @@ fn accounts_error(e: zsql_accounts::Error) -> ApiError {
 /// with the tenant to look deployments up in. In single-tenant mode
 /// everything is allowed.
 fn gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, verb: Verb) -> Result<Tenant, ApiError> {
+    check_uid(uid)?;
+    // Project-level routes come through with no branch at all.
+    if !branch.is_empty() {
+        check_branch(branch)?;
+    }
     let scope = scope_of(who);
     let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
     let project = store.project(p.account().id, uid).map_err(internal)?.ok_or_else(|| not_found(uid, branch))?;
@@ -448,6 +467,48 @@ struct ApiError(StatusCode, &'static str, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({ "error": { "class": self.1, "message": self.2 } }))).into_response()
+    }
+}
+
+/// The longest project uid or branch name accepted. Both become one
+/// directory name, and the limit keeps them well inside what any
+/// filesystem allows.
+const NAME_LIMIT: usize = 100;
+
+/// A project uid as the URL carries it must be exactly the slug the
+/// account store would keep (lower-case letters, digits, `-`, `_`),
+/// because it names a directory under the account's slice of the data
+/// directory and a key in the models map. The store would find
+/// `Customer-Service` by lower-casing it, but the directory and the key
+/// would not be the canonical ones.
+fn check_uid(uid: &str) -> Result<(), ApiError> {
+    let ok = !uid.is_empty() && uid.len() <= NAME_LIMIT && uid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{uid}' is not a project uid (lower-case letters, digits, - and _, at most {NAME_LIMIT} characters)")))
+    }
+}
+
+/// A branch names a directory under the project's, and is read back
+/// from that directory's name on restart, so it is one path component:
+/// letters, digits, `-`, `_` and `.`, not starting with a dot. The
+/// router decodes `%2F` and `%2E` before the handler sees the name, so
+/// `..%2F..%2Fother-account%2Fproject%2Fmain` would otherwise reach
+/// another account's deployment on disk.
+fn check_branch(branch: &str) -> Result<(), ApiError> {
+    let ok = !branch.is_empty()
+        && branch.len() <= NAME_LIMIT
+        && !branch.starts_with('.')
+        && branch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            format!("'{branch}' is not a branch name this server accepts (letters, digits, - _ and ., not starting with a dot, at most {NAME_LIMIT} characters; a git branch with a / in its name cannot be deployed yet)"),
+        ))
     }
 }
 
@@ -522,12 +583,20 @@ fn run_tests(app: &App, d: &Deployed) -> Value {
 
 // ------------------------------------------------------------------ deploy
 
-async fn deploy(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    blocking(move || deploy_or_validate(app, who, uid, branch, body, true)).await
+async fn deploy(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let _held = held;
+        deploy_or_validate(app, who, uid, branch, body, true)
+    })
+    .await
 }
 
-async fn validate(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
-    blocking(move || deploy_or_validate(app, who, uid, branch, body, false)).await
+async fn validate(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let _held = held;
+        deploy_or_validate(app, who, uid, branch, body, false)
+    })
+    .await
 }
 
 /// Refuses a deploy that would put an account over its branch caps.
@@ -598,6 +667,8 @@ fn branch_counts<'a>(keys: impl Iterator<Item = &'a str>, scope: &str, project_p
 /// A user deploying to a project the account does not have yet creates
 /// it and owns it; validating needs no project. Query keys cannot deploy.
 fn deploy_gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, keep: bool, production_branch: &str, name: &str) -> Result<Tenant, ApiError> {
+    check_uid(uid)?;
+    check_branch(branch)?;
     let scope = scope_of(who);
     let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
     match store.project(p.account().id, uid).map_err(internal)? {
@@ -624,20 +695,26 @@ fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: 
     if matches!(who, Some(Principal::QueryKey { .. })) {
         return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "query keys are read only; deploy with your personal key".into()));
     }
+    // Before the caps are counted under these names, and before the
+    // archive is unpacked: a bad name is answered without doing work.
+    check_uid(&uid)?;
+    check_branch(&branch)?;
     // A validate keeps nothing, so it is not held to the caps.
     if keep {
         check_caps(&app, &who, &uid, &branch)?;
     }
     let work = std::env::temp_dir().join(format!("zsqld-deploy-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&work).map_err(|e| bad(e.to_string()))?;
+    // Paths in what the loader says are inside the work directory; the
+    // caller knows their project by its own layout, not by where the
+    // server unpacked it.
+    let work_prefix = format!("{}/", work.display());
     let result = (|| -> Result<Value, ApiError> {
-        let decoder = flate2::read::GzDecoder::new(&body[..]);
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(&work).map_err(|e| bad(format!("unpacking the archive: {e}")))?;
+        unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
-        let loaded = zsql_project::load(&root, app.dialects).map_err(|e| bad(e.to_string()))?;
+        let loaded = zsql_project::load_confined(&root, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let t = deploy_gate(&app, &who, &uid, &branch, keep, &loaded.snapshot.branch.uid, &loaded.snapshot.project.name)?;
-        let universe = Universe::build(loaded.snapshot.clone()).map_err(|e| bad(e.to_string()))?;
+        let universe = Universe::build(loaded.snapshot.clone()).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let mut warnings = loaded.warnings;
         warnings.extend(universe.warnings().iter().cloned());
         let engine = Engine::new(universe, |u| Planner::new(u, app.dialects, None));
@@ -670,6 +747,68 @@ fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: 
     })();
     let _ = std::fs::remove_dir_all(&work);
     result.map(Json)
+}
+
+/// The most an archive may hold once decompressed, and the most entries.
+/// The body limit bounds what is sent; gzip can grow a thousandfold on
+/// the way out, into a temp directory that is memory on the hosted box.
+const UNPACKED_LIMIT: u64 = 256 * 1024 * 1024;
+const ENTRY_LIMIT: usize = 20_000;
+
+/// A reader that stops with an error, not a quiet end, past a limit, so
+/// the archive reader's message says what happened.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    /// Set when the limit was hit, for the caller to tell that apart
+    /// from any other failure the archive reader wraps it in.
+    tripped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            self.tripped.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(std::io::Error::other("decompressed size limit"));
+        }
+        let want = buf.len().min(self.left as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Unpacks the project archive into `work`: regular files and
+/// directories only, within the size and count limits.
+///
+/// A symbolic or hard link is refused rather than created. The loader
+/// follows links when it reads, so a link to another account's
+/// directory, or to anything on the host, would be read as part of the
+/// project and shown back in the model or its errors. The CLI never
+/// writes one.
+fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<(), String> {
+    let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decoder = Capped { inner: flate2::read::GzDecoder::new(body), left: UNPACKED_LIMIT, tripped: tripped.clone() };
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_overwrite(false);
+    let too_big = || format!("the archive is larger than {} MiB when decompressed", UNPACKED_LIMIT / (1024 * 1024));
+    let failed = |what: &str, e: std::io::Error| if tripped.load(std::sync::atomic::Ordering::Relaxed) { too_big() } else { format!("{what} the archive: {e}") };
+    let entries = archive.entries().map_err(|e| failed("reading", e))?;
+    let mut n = 0usize;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| failed("reading", e))?;
+        n += 1;
+        if n > ENTRY_LIMIT {
+            return Err(format!("the archive holds more than {ENTRY_LIMIT} entries"));
+        }
+        let kind = entry.header().entry_type();
+        if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
+            let path = entry.path().map(|p| p.display().to_string()).unwrap_or_default();
+            return Err(format!("the archive holds {path}, which is not a file or a directory ({kind:?}); only those are deployed"));
+        }
+        entry.unpack_in(work).map_err(|e| failed("unpacking", e))?;
+    }
+    Ok(())
 }
 
 /// The directory holding project.yml: the archive root, or its single top folder.
@@ -1078,10 +1217,14 @@ async fn values(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch, d
     }
 }
 
-async fn test(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+async fn test(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let d = model(&app, &t, &uid, &branch)?;
-    blocking(move || Ok(Json(run_tests(&app, &d)))).await
+    blocking(move || {
+        let _held = held;
+        Ok(Json(run_tests(&app, &d)))
+    })
+    .await
 }
 
 async fn sampling_plan(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
@@ -1136,11 +1279,25 @@ async fn branch_summary(State(app): State<Shared>, Auth(who): Auth, Path((uid, b
     Ok(Json(summary(&d)))
 }
 
+/// The deployments in one account's slice of the models map: the keys
+/// that start with its scope (`acme/`), or every key in single-tenant
+/// mode, where the scope is empty.
+///
+/// The map holds every account's deployments side by side, and
+/// `Deployed` names its project and branch but not its account, so two
+/// accounts that both deploy `customer-service/main` are told apart by
+/// the key alone. Listing by project and branch without the key showed
+/// each of them the other's deployment as a second copy of their own.
+fn in_scope<'a, V>(models: &'a HashMap<String, V>, scope: &str) -> impl Iterator<Item = &'a V> {
+    let scope = scope.to_string();
+    models.iter().filter(move |(k, _)| k.starts_with(&scope)).map(|(_, d)| d)
+}
+
 /// Every deployment the caller may read; with accounts on, also the
 /// account's projects and the caller's level on each.
 async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
     let mut out = Vec::new();
-    for d in app.models.read().unwrap().values() {
+    for d in in_scope(&app.models.read().unwrap(), &scope_of(&who)) {
         if gate(&app, &who, &d.uid, &d.branch, Verb::Read).is_ok() {
             out.push(summary(d));
         }
@@ -1238,6 +1395,12 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> Resu
 
 async fn logout(State(app): State<Shared>, parts: axum::http::request::Parts) -> Result<Response, ApiError> {
     let store = store_of(&app)?;
+    // A cross-site form can post here with the cookie attached; it
+    // cannot send this header. Without the check it could sign the
+    // user out at will.
+    if parts.headers.get("x-requested-with").and_then(|v| v.to_str().ok()) != Some("zsql") {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "this request did not come from the app".into()));
+    }
     if let Some(token) = cookie(&parts, SESSION_COOKIE) {
         store.delete_session(&token).map_err(accounts_error)?;
     }
@@ -1249,13 +1412,16 @@ struct PasswordRequest {
     password: String,
 }
 
-async fn set_password(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<PasswordRequest>) -> Result<Json<Value>, ApiError> {
+async fn set_password(State(app): State<Shared>, Auth(who): Auth, headers: axum::http::HeaderMap, Json(req): Json<PasswordRequest>) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
+    // The session this change is made from survives it; any other is
+    // ended, which is the point of changing a password.
+    let keep = cookie_in(&headers, SESSION_COOKIE);
     let (user, account_id, password) = (user.clone(), account.id, req.password);
     let app = app.clone();
     blocking(move || {
-        store_of(&app)?.set_password(account_id, &user, &password).map_err(accounts_error)?;
+        store_of(&app)?.set_password(account_id, &user, &password, keep.as_deref()).map_err(accounts_error)?;
         Ok(Json(json!({ "ok": true })))
     })
     .await
@@ -1411,7 +1577,10 @@ async fn add_member(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<
     let role = zsql_accounts::parse_role(&req.role).map_err(accounts_error)?;
     let m = store.add_member(account.id, &user.email, &req.email, &req.name, role).map_err(accounts_error)?;
     let mut out = json!(m);
-    if store.user_keys(m.user.id).map_err(accounts_error)?.is_empty() {
+    // Only a newcomer gets a token: for someone who already signs in
+    // the membership is the whole of it, and a token could not be
+    // redeemed for them anyway.
+    if !store.can_sign_in(m.user.id).map_err(accounts_error)? {
         out["invite"] = json!(store.create_invite(account.id, &user.email, &m.user.email).map_err(accounts_error)?);
     }
     Ok(Json(out))
@@ -1501,8 +1670,21 @@ fn ui_file(path: &str) -> Response {
         Some((body, mime, stable)) => (body, mime, if stable { "public, max-age=86400" } else { "no-cache" }),
         None => (include_bytes!("../ui/app.html"), "text/html; charset=utf-8", "no-cache"),
     };
-    ([("content-type", mime.to_string()), ("cache-control", cache.to_string())], body).into_response()
+    let mut r = ([("content-type", mime.to_string()), ("cache-control", cache.to_string())], body).into_response();
+    let h = r.headers_mut();
+    h.insert("x-content-type-options", "nosniff".parse().unwrap());
+    h.insert("referrer-policy", "same-origin".parse().unwrap());
+    h.insert("x-frame-options", "DENY".parse().unwrap());
+    if mime.starts_with("text/html") {
+        // Every interpolation in the app escapes, so this is the net
+        // under that: a script or style from anywhere but here does not
+        // run, and the page cannot be framed.
+        h.insert("content-security-policy", UI_CSP.parse().unwrap());
+    }
+    r
 }
+
+const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 
 async fn root(State(app): State<Shared>) -> Response {
     if app.accounts.is_some() {
@@ -1526,8 +1708,8 @@ struct NameRequest {
 
 async fn user_keys(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
-    let (user, _, _) = user_of(&who)?;
-    Ok(Json(json!({ "keys": store.user_keys(user.id).map_err(accounts_error)? })))
+    let (user, account, _) = user_of(&who)?;
+    Ok(Json(json!({ "keys": store.user_keys(account.id, user.id).map_err(accounts_error)? })))
 }
 
 async fn create_user_key(State(app): State<Shared>, Auth(who): Auth, Json(req): Json<NameRequest>) -> Result<Json<Value>, ApiError> {
@@ -1615,6 +1797,8 @@ async fn revoke_grant(State(app): State<Shared>, Auth(who): Auth, Path((id, proj
 
 async fn project_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
+    // Who has access is for people, not for an application's query key.
+    user_of(&who)?;
     let t = gate(&app, &who, &uid, "", Verb::Read)?;
     let project = t.project.expect("accounts on");
     let access: Vec<Value> = store.project_access(&project).map_err(accounts_error)?.into_iter().map(|(u, l)| json!({ "user": u, "level": l })).collect();
@@ -1789,36 +1973,9 @@ fn humantime(t: std::time::SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let data_dir = PathBuf::from(std::env::var("ZSQL_DATA_DIR").unwrap_or_else(|_| "data".into()));
-    let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:3699".into());
-    std::fs::create_dir_all(&data_dir)?;
-    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
-    let accounts_on = matches!(std::env::var("ZSQL_ACCOUNTS").as_deref(), Ok("on") | Ok("1") | Ok("true"));
-    let accounts = if accounts_on { Some(Store::open(&data_dir.join("accounts.db"))?) } else { None };
-    let signup_open = !matches!(std::env::var("ZSQL_SIGNUP").as_deref(), Ok("closed") | Ok("off") | Ok("0"));
-    let secure_cookies = std::env::var("ZSQL_PUBLIC_URL").map(|u| u.starts_with("https://")).unwrap_or(false);
-    let limits = Limiter::new(limits::Config::from_env(accounts_on).map_err(|e| anyhow::anyhow!("{e}"))?);
-    let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
-    let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
-    let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
-    let (n, skipped) = reload(&app)?;
-    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
-    if !skipped.is_empty() {
-        // Said again, together, after the per-branch lines above: the
-        // one line someone watching a restart will actually read.
-        eprintln!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
-    }
-    if accounts_on {
-        let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
-        eprintln!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
-    }
-
+/// Every route, behind the guard, over the app. Built here so the
+/// tests drive the same router the binary serves.
+fn router(app: Shared) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/projects", get(projects))
@@ -1865,12 +2022,45 @@ async fn main() -> anyhow::Result<()> {
     for name in SITE_FILES {
         router = router.route(&format!("/{name}"), get(site_file));
     }
-    let router = router
+    router
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive
         // routes raise their own limit above.
         .layer(axum::extract::DefaultBodyLimit::max(JSON_LIMIT))
-        .with_state(app.clone());
+        .with_state(app)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let data_dir = PathBuf::from(std::env::var("ZSQL_DATA_DIR").unwrap_or_else(|_| "data".into()));
+    let bind = std::env::var("ZSQL_BIND").unwrap_or_else(|_| "127.0.0.1:3699".into());
+    std::fs::create_dir_all(&data_dir)?;
+    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
+    let accounts_on = matches!(std::env::var("ZSQL_ACCOUNTS").as_deref(), Ok("on") | Ok("1") | Ok("true"));
+    let accounts = if accounts_on { Some(Store::open(&data_dir.join("accounts.db"))?) } else { None };
+    let signup_open = !matches!(std::env::var("ZSQL_SIGNUP").as_deref(), Ok("closed") | Ok("off") | Ok("0"));
+    let secure_cookies = std::env::var("ZSQL_PUBLIC_URL").map(|u| u.starts_with("https://")).unwrap_or(false);
+    let limits = Limiter::new(limits::Config::from_env(accounts_on).map_err(|e| anyhow::anyhow!("{e}"))?);
+    let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+    let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
+    let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
+    let (n, skipped) = reload(&app)?;
+    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    if !skipped.is_empty() {
+        // Said again, together, after the per-branch lines above: the
+        // one line someone watching a restart will actually read.
+        eprintln!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
+    }
+    if accounts_on {
+        let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
+        eprintln!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
+    }
+
+    let router = router(app.clone());
 
     // Buckets for callers that have gone quiet, and failure windows that
     // have passed, are dropped now and then so an idle server does not
@@ -1896,6 +2086,9 @@ async fn main() -> anyhow::Result<()> {
 /// it no longer applies to every other route.
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
+
+#[cfg(test)]
+mod isolation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1948,6 +2141,54 @@ mod tests {
         // the account count is simply the total.
         let flat = ["sales/main", "sales/dev", "web/main"];
         assert_eq!(branch_counts(flat.iter().copied(), "", "sales/"), (2, 3));
+    }
+
+    /// Both names become directory names under the account's slice of
+    /// the data directory, and the router hands them over decoded, so
+    /// anything that could step out of that slice is refused before it
+    /// is used. The uid must also be the canonical slug, or the same
+    /// project gets a second directory and key per spelling.
+    #[test]
+    fn project_and_branch_names_stay_inside_the_account() {
+        for uid in ["customer-service", "tpcds", "bird_financial", "a1"] {
+            assert!(check_uid(uid).is_ok(), "{uid}");
+        }
+        for uid in ["", "Customer-Service", " customer-service", "../newco/customer-service", "a/b", "a\\b", "a.b", "a b", &"x".repeat(NAME_LIMIT + 1)] {
+            assert!(check_uid(uid).is_err(), "{uid:?}");
+        }
+        for branch in ["main", "master", "probe-holder-loan", "release_1.2", "v1.2.3", "RC1"] {
+            assert!(check_branch(branch).is_ok(), "{branch}");
+        }
+        for branch in ["", ".", "..", ".hidden", "../../newco/customer-service/main", "feature/x", "a\\b", "a b", "a\0b", "main\n", &"x".repeat(NAME_LIMIT + 1)] {
+            assert!(check_branch(branch).is_err(), "{branch:?}");
+        }
+    }
+
+    /// Two accounts may each deploy a project called `customer-service`
+    /// on `main`; the listing must show each only its own. The scope
+    /// ends in a slash, so `acme` does not reach into `acme-2` either.
+    #[test]
+    fn the_listing_shows_an_account_only_its_own_deployments() {
+        let models: HashMap<String, &str> = [
+            ("acme/customer-service/main", "acme's"),
+            ("acme/web/main", "acme's web"),
+            ("acme-2/customer-service/main", "acme-2's"),
+            ("newco/customer-service/main", "newco's"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let seen = |scope: &str| {
+            let mut v: Vec<&str> = in_scope(&models, scope).copied().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(seen("acme/"), ["acme's", "acme's web"]);
+        assert_eq!(seen("acme-2/"), ["acme-2's"]);
+        assert_eq!(seen("newco/"), ["newco's"]);
+        assert_eq!(seen("nobody/"), Vec::<&str>::new());
+        // Single-tenant: no scope, everything is in scope.
+        assert_eq!(seen("").len(), 4);
     }
 
     /// Which address a request is counted against decides whether the

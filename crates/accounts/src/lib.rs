@@ -146,6 +146,9 @@ pub struct Project {
 pub struct UserKey {
     pub id: i64,
     pub user_id: i64,
+    /// The account the key acts in. A user who belongs to several
+    /// accounts has keys in each; one key never crosses over.
+    pub account_id: Option<i64>,
     pub name: String,
     pub prefix: String,
     pub created_at: String,
@@ -233,7 +236,14 @@ pub struct Store {
     /// its answer away rather than caching it.
     generation: AtomicU64,
     ttl: Duration,
+    /// A real argon2 hash of nothing anyone knows, verified against when
+    /// a sign-in names an address with no password to check, so that a
+    /// miss takes as long as a wrong password.
+    decoy: String,
 }
+
+/// How long an invite token stays redeemable.
+pub const INVITE_DAYS: i64 = 7;
 
 /// How long an authentication decision may be reused. Long enough to
 /// take the store off the hot path, short enough that a change which
@@ -322,6 +332,15 @@ CREATE TABLE audit (
   id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));",
+    // 2. A personal key belongs to the account that issued it, and a
+    // user has a home account that a login lands in. Both are filled
+    // from the first membership, which is exactly what authentication
+    // and login resolved to before, so nothing changes for anyone
+    // already here.
+    "ALTER TABLE user_keys ADD COLUMN account_id INTEGER REFERENCES accounts(id);
+UPDATE user_keys SET account_id = (SELECT m.account_id FROM memberships m WHERE m.user_id = user_keys.user_id ORDER BY m.account_id LIMIT 1);
+ALTER TABLE users ADD COLUMN home_account_id INTEGER REFERENCES accounts(id);
+UPDATE users SET home_account_id = (SELECT m.account_id FROM memberships m WHERE m.user_id = users.id ORDER BY m.account_id LIMIT 1);",
 ];
 
 /// Brings a database up to the last step in [`MIGRATIONS`], applying
@@ -395,6 +414,16 @@ fn hash_password(password: &str) -> Result<String> {
     }
     let salt = SaltString::generate(&mut OsRng);
     Ok(argon2::Argon2::default().hash_password(password.as_bytes(), &salt).map_err(|e| Error::Invalid(e.to_string()))?.to_string())
+}
+
+/// Whether the password is the one the argon2 hash was made from. A
+/// hash that does not parse matches nothing.
+fn password_matches(stored: &str, password: &str) -> bool {
+    use argon2::{PasswordHash, PasswordVerifier};
+    match PasswordHash::new(stored) {
+        Ok(parsed) => argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
+        Err(_) => false,
+    }
 }
 
 fn hash(secret: &str) -> String {
@@ -476,7 +505,9 @@ pub fn parse_role(s: &str) -> Result<Role> {
 
 fn email_of(s: &str) -> Result<String> {
     let e = s.trim().to_lowercase();
-    if !e.contains('@') || e.len() < 3 {
+    // 254 is the longest address that fits in a mail envelope; anything
+    // longer is not one, and the failed-login table keys on addresses.
+    if !e.contains('@') || e.len() < 3 || e.len() > 254 {
         return Err(Error::Invalid(format!("'{s}' is not an email address")));
     }
     // Addresses end up in mail headers, where a control character or a
@@ -543,7 +574,8 @@ impl Store {
     }
 
     fn over(conn: Connection) -> Store {
-        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl: ttl_from_env() }
+        let decoy = hash_password(&new_secret("decoy")).expect("a generated secret is long enough");
+        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl: ttl_from_env(), decoy }
     }
 
     // --------------------------------------------------------- the cache
@@ -616,23 +648,34 @@ impl Store {
         }
         tx.execute("INSERT INTO accounts (uid, name) VALUES (?1, ?2)", params![uid, name])?;
         let account = Account { id: tx.last_insert_rowid(), uid, name: name.to_string() };
-        let user = match tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()? {
-            Some(u) => {
-                if let Some(h) = &password_hash {
-                    tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2 AND password_hash IS NULL", params![h, u.id])?;
+        let user = match tx.query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get::<_, Option<String>>(4)?))).optional()? {
+            // The address is already someone's. Sign-up is open to the
+            // world, so whoever typed it has to show they are that
+            // someone: the user's own password. Nothing about the user
+            // is changed, and no credential is issued, until they have.
+            // A user with no password yet proves the address through a
+            // reset link, which sets one.
+            Some((u, stored)) => match (stored, password) {
+                (Some(h), Some(p)) if password_matches(&h, p) => u,
+                (Some(_), _) => {
+                    return Err(Error::Denied("this email already belongs to a user; to open another account, sign up with that user's password, or reset it first".into()));
                 }
-                u
-            }
+                (None, _) => {
+                    return Err(Error::Denied("this email already belongs to a user who has no password yet; request a password reset link, set one, then sign up with it".into()));
+                }
+            },
             None => {
                 tx.execute("INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)", params![email, user_name.trim(), password_hash])?;
                 User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string(), email_verified: false }
             }
         };
         tx.execute("INSERT INTO memberships (account_id, user_id, role) VALUES (?1, ?2, 'admin')", params![account.id, user.id])?;
+        // The account someone opens themselves is where a login lands.
+        tx.execute("UPDATE users SET home_account_id = ?1 WHERE id = ?2", params![account.id, user.id])?;
         let secret = new_secret("zsk");
         tx.execute(
-            "INSERT INTO user_keys (user_id, name, prefix, hash) VALUES (?1, 'default', ?2, ?3)",
-            params![user.id, prefix_of(&secret), hash(&secret)],
+            "INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, 'default', ?3, ?4)",
+            params![user.id, account.id, prefix_of(&secret), hash(&secret)],
         )?;
         let key_id = tx.last_insert_rowid();
         self.audit(&tx, account.id, &user.email, "signup", &account.uid)?;
@@ -678,20 +721,23 @@ impl Store {
         if secret.starts_with("zsk_") {
             let row = conn
                 .query_row(
-                    "SELECT k.id, k.user_id, k.name, k.prefix, k.created_at, k.last_used_at FROM user_keys k WHERE k.hash = ?1 AND k.revoked_at IS NULL",
+                    "SELECT k.id, k.user_id, k.account_id, k.name, k.prefix, k.created_at, k.last_used_at FROM user_keys k WHERE k.hash = ?1 AND k.revoked_at IS NULL",
                     params![h],
-                    |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_at: r.get(4)?, last_used_at: r.get(5)? }),
+                    |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, account_id: r.get(2)?, name: r.get(3)?, prefix: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }),
                 )
                 .optional()?;
             let Some(key) = row else { return Ok((None, generation)) };
+            // A key acts in the account that issued it, and only while
+            // its user is still a member there. A key with no account
+            // belonged to a user with no membership when the column was
+            // added, and answers for nothing.
+            let Some(account_id) = key.account_id else { return Ok((None, generation)) };
             touch(&conn, "user_keys", key.id, key.last_used_at.as_deref())?;
             let user = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![key.user_id], user_row)?;
-            // A user key answers for the user's account; several accounts
-            // per user is a later feature, so the first membership wins.
             let membership = conn
                 .query_row(
-                    "SELECT a.id, a.uid, a.name, m.role FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 ORDER BY a.id LIMIT 1",
-                    params![user.id],
+                    "SELECT a.id, a.uid, a.name, m.role FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 AND m.account_id = ?2",
+                    params![user.id, account_id],
                     |r| Ok((Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }, role_of(&r.get::<_, String>(3)?))),
                 )
                 .optional()?;
@@ -841,7 +887,7 @@ impl Store {
         }
         // Their keys stop working; their project access goes; projects they
         // owned alone fall to the admins, who own everything anyway.
-        tx.execute("UPDATE user_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id = ?1 AND revoked_at IS NULL", params![user.id])?;
+        tx.execute("UPDATE user_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id = ?1 AND account_id = ?2 AND revoked_at IS NULL", params![user.id, account_id])?;
         tx.execute("DELETE FROM project_access WHERE user_id = ?1 AND project_id IN (SELECT id FROM projects WHERE account_id = ?2)", params![user.id, account_id])?;
         self.audit(&tx, account_id, actor, "member_removed", &user.email)?;
         tx.commit()?;
@@ -869,14 +915,27 @@ impl Store {
 
     /// Redeems an invite: the member's name is set when given, and a
     /// first personal key is issued. The token stops working.
+    ///
+    /// An invite is for a newcomer: someone with no password and no key
+    /// anywhere. The token passes through the admin who asked for it,
+    /// so for a user who can already sign in it proves nothing, and it
+    /// is refused rather than let whoever holds it set that user's
+    /// password. Such a member is already in the account; they sign in.
     pub fn accept_invite(&self, token: &str, name: &str, key_name: &str, password: Option<&str>) -> Result<(Account, User, UserKey, String)> {
         let password_hash = password.map(hash_password).transpose()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (invite_id, account_id, user_id): (i64, i64, i64) = tx
-            .query_row("SELECT id, account_id, user_id FROM invites WHERE hash = ?1 AND accepted_at IS NULL", params![hash(token.trim())], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row(
+                "SELECT id, account_id, user_id FROM invites WHERE hash = ?1 AND accepted_at IS NULL AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now', ?2)",
+                params![hash(token.trim()), format!("-{INVITE_DAYS} days")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()?
-            .ok_or_else(|| Error::NotFound("this invite is not valid or was already used".into()))?;
+            .ok_or_else(|| Error::NotFound("this invite is not valid, was already used, or has expired".into()))?;
+        if Self::has_credentials(&tx, user_id)? {
+            return Err(Error::Denied("this invite is for someone who can already sign in; the membership is in place, so sign in with your own password or key".into()));
+        }
         tx.execute("UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![invite_id])?;
         if !name.trim().is_empty() {
             tx.execute("UPDATE users SET name = ?1 WHERE id = ?2", params![name.trim(), user_id])?;
@@ -884,11 +943,12 @@ impl Store {
         if let Some(h) = &password_hash {
             tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user_id])?;
         }
+        tx.execute("UPDATE users SET home_account_id = ?1 WHERE id = ?2 AND home_account_id IS NULL", params![account_id, user_id])?;
         let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
         let account = tx.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
         let key_name = if key_name.trim().is_empty() { "default" } else { key_name.trim() };
         let secret = new_secret("zsk");
-        tx.execute("INSERT INTO user_keys (user_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4)", params![user.id, key_name, prefix_of(&secret), hash(&secret)])?;
+        tx.execute("INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)", params![user.id, account_id, key_name, prefix_of(&secret), hash(&secret)])?;
         let key = Self::user_key_in(&tx, tx.last_insert_rowid())?;
         self.audit(&tx, account.id, &user.email, "invite_accepted", &account.uid)?;
         tx.commit()?;
@@ -903,9 +963,9 @@ impl Store {
 
     fn user_key_in(conn: &Connection, id: i64) -> Result<UserKey> {
         Ok(conn.query_row(
-            "SELECT id, user_id, name, prefix, created_at, last_used_at FROM user_keys WHERE id = ?1",
+            "SELECT id, user_id, account_id, name, prefix, created_at, last_used_at FROM user_keys WHERE id = ?1",
             params![id],
-            |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_at: r.get(4)?, last_used_at: r.get(5)? }),
+            |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, account_id: r.get(2)?, name: r.get(3)?, prefix: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }),
         )?)
     }
 
@@ -914,11 +974,28 @@ impl Store {
         Self::user_key_in(&conn, id)
     }
 
-    pub fn user_keys(&self, user_id: i64) -> Result<Vec<UserKey>> {
+    /// The user's live keys in this account.
+    pub fn user_keys(&self, account_id: i64, user_id: i64) -> Result<Vec<UserKey>> {
         let conn = self.conn.lock().unwrap();
-        let mut st = conn.prepare("SELECT id, user_id, name, prefix, created_at, last_used_at FROM user_keys WHERE user_id = ?1 AND revoked_at IS NULL ORDER BY id")?;
-        let rows = st.query_map(params![user_id], |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_at: r.get(4)?, last_used_at: r.get(5)? }))?;
+        let mut st = conn.prepare("SELECT id, user_id, account_id, name, prefix, created_at, last_used_at FROM user_keys WHERE user_id = ?1 AND account_id = ?2 AND revoked_at IS NULL ORDER BY id")?;
+        let rows = st.query_map(params![user_id, account_id], |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, account_id: r.get(2)?, name: r.get(3)?, prefix: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether the user can already sign in some way: a password, or a
+    /// live key in any account. Such a user is not a newcomer, needs no
+    /// invite token, and may not be set up by one.
+    pub fn can_sign_in(&self, user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(Self::has_credentials(&conn, user_id)?)
+    }
+
+    fn has_credentials(conn: &Connection, user_id: i64) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT (password_hash IS NOT NULL) OR EXISTS (SELECT 1 FROM user_keys k WHERE k.user_id = users.id AND k.revoked_at IS NULL) FROM users WHERE id = ?1",
+            params![user_id],
+            |r| r.get::<_, bool>(0),
+        )
     }
 
     /// A new personal key; the secret is returned once.
@@ -929,7 +1006,7 @@ impl Store {
         }
         let secret = new_secret("zsk");
         let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT INTO user_keys (user_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4)", params![user.id, name, prefix_of(&secret), hash(&secret)])?;
+        conn.execute("INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)", params![user.id, account_id, name, prefix_of(&secret), hash(&secret)])?;
         let id = conn.last_insert_rowid();
         self.audit(&conn, account_id, &user.email, "user_key_created", &format!("{name} {}", prefix_of(&secret)))?;
         Ok((Self::user_key_in(&conn, id)?, secret))
@@ -1195,10 +1272,14 @@ impl Store {
 
     // ----------------------------------------------------- passwords, sessions
 
-    pub fn set_password(&self, account_id: i64, user: &User, password: &str) -> Result<()> {
+    /// Sets the password and ends the user's other sessions: someone
+    /// changing a password they think is known keeps only the session
+    /// they are doing it from, `keep`, when the caller has one.
+    pub fn set_password(&self, account_id: i64, user: &User, password: &str, keep: Option<&str>) -> Result<()> {
         let h = hash_password(password)?;
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user.id])?;
+        conn.execute("DELETE FROM sessions WHERE user_id = ?1 AND hash != ?2", params![user.id, keep.map(|t| hash(t.trim())).unwrap_or_default()])?;
         self.audit(&conn, account_id, &user.email, "password_set", "")?;
         Ok(())
     }
@@ -1211,19 +1292,26 @@ impl Store {
         let row: Option<(User, Option<String>)> = conn
             .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get(4)?)))
             .optional()?;
-        let Some((user, Some(h))) = row else { return Ok(None) };
-        use argon2::{PasswordHash, PasswordVerifier};
-        let parsed = PasswordHash::new(&h).map_err(|e| Error::Invalid(e.to_string()))?;
-        Ok(argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok().then_some(user))
+        // An unknown address, or one with no password, is answered in
+        // the time a wrong password takes, so the clock does not say
+        // which addresses are registered.
+        let Some((user, Some(h))) = row else {
+            password_matches(&self.decoy, password);
+            return Ok(None);
+        };
+        Ok(password_matches(&h, password).then_some(user))
     }
 
     /// A browser session for the user on an account; the token is the
     /// cookie value, stored hashed, good for `days`.
     pub fn create_session(&self, user: &User, days: i64) -> Result<(String, Account)> {
         let conn = self.conn.lock().unwrap();
+        // The home account when the user is still a member of it: the
+        // one they opened, or were first invited into. Else the oldest
+        // membership, which is what it always was.
         let account = conn
             .query_row(
-                "SELECT a.id, a.uid, a.name FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 ORDER BY a.id LIMIT 1",
+                "SELECT a.id, a.uid, a.name FROM memberships m JOIN accounts a ON a.id = m.account_id WHERE m.user_id = ?1 ORDER BY (a.id = (SELECT home_account_id FROM users WHERE id = ?1)) DESC, a.id LIMIT 1",
                 params![user.id],
                 |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }),
             )
@@ -1592,6 +1680,142 @@ mod tests {
         assert!(s.authenticate(&bob_secret).unwrap().is_none());
     }
 
+    /// Sign-up is open to anyone, so an address that is already
+    /// someone's must be proven with that person's password before it
+    /// opens another account, and nothing is minted or changed before.
+    #[test]
+    fn signup_with_an_existing_email_needs_that_users_password() {
+        let s = Store::in_memory().unwrap();
+        let ann = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let sales = s.create_project(ann.account.id, &ann.user, "sales", "", "").unwrap();
+
+        // Someone else, with Ann's address and their own password.
+        assert!(matches!(s.signup("Evil", "ann@acme.test", "Mallory", Some("attackerpass1")), Err(Error::Denied(_))));
+        assert!(matches!(s.signup("Evil", "ann@acme.test", "Mallory", None), Err(Error::Denied(_))));
+        // Nothing was opened, Ann's password is hers, her key still acts in Acme.
+        assert_eq!(s.members(ann.account.id).unwrap().len(), 1);
+        assert!(s.verify_password("ann@acme.test", "hunter2hunter2").unwrap().is_some());
+        assert!(s.verify_password("ann@acme.test", "attackerpass1").unwrap().is_none());
+        assert_eq!(principal(&s, &ann.secret).account().uid, "acme");
+
+        // Ann herself opens a second account with her password: the new
+        // key acts there and only there, and her login lands there.
+        let second = s.signup("Ann Side Project", "ann@acme.test", "", Some("hunter2hunter2")).unwrap();
+        assert_eq!(second.user.id, ann.user.id);
+        let p2 = principal(&s, &second.secret);
+        assert_eq!(p2.account().uid, "ann-side-project");
+        assert!(matches!(s.authorize(&p2, &sales, "main", Verb::Read), Err(Error::NotFound(_))));
+        assert_eq!(principal(&s, &ann.secret).account().uid, "acme");
+        let (_, landed) = s.create_session(&ann.user, 1).unwrap();
+        assert_eq!(landed.uid, "ann-side-project");
+
+        // A user with no password yet cannot be claimed by a sign-up either.
+        let bob = s.add_member(ann.account.id, "ann@acme.test", "bob@acme.test", "Bob", Role::Developer).unwrap();
+        assert!(matches!(s.signup("Bobs", "bob@acme.test", "", Some("bobpassword1")), Err(Error::Denied(_))));
+        assert!(s.verify_password("bob@acme.test", "bobpassword1").unwrap().is_none());
+        let _ = bob;
+    }
+
+    /// An invite token passes through the admin who asked for it, so it
+    /// may only ever set up someone who has no way to sign in yet.
+    #[test]
+    fn an_invite_cannot_take_over_someone_who_can_already_sign_in() {
+        let s = Store::in_memory().unwrap();
+        let ann = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let mal = s.signup("Evil", "mal@evil.test", "Mallory", Some("attackerpass1")).unwrap();
+
+        // Mallory adds Ann to Evil and redeems the invite herself.
+        s.add_member(mal.account.id, "mal@evil.test", "ann@acme.test", "", Role::Developer).unwrap();
+        let token = s.create_invite(mal.account.id, "mal@evil.test", "ann@acme.test").unwrap();
+        assert!(matches!(s.accept_invite(&token, "Owned", "", Some("hijacked1234")), Err(Error::Denied(_))));
+        assert!(s.verify_password("ann@acme.test", "hunter2hunter2").unwrap().is_some());
+        assert!(s.verify_password("ann@acme.test", "hijacked1234").unwrap().is_none());
+        assert_eq!(s.user_keys(mal.account.id, ann.user.id).unwrap().len(), 0);
+        // Ann's login still lands in her own account.
+        assert_eq!(s.create_session(&ann.user, 1).unwrap().1.uid, "acme");
+
+        // A newcomer is set up by the invite, and a token has a shelf life.
+        s.add_member(ann.account.id, "ann@acme.test", "bob@acme.test", "Bob", Role::Developer).unwrap();
+        let token = s.create_invite(ann.account.id, "ann@acme.test", "bob@acme.test").unwrap();
+        s.conn.lock().unwrap().execute("UPDATE invites SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-8 days')", []).unwrap();
+        assert!(matches!(s.accept_invite(&token, "Bob", "", Some("bobpassword1")), Err(Error::NotFound(_))));
+        let token = s.create_invite(ann.account.id, "ann@acme.test", "bob@acme.test").unwrap();
+        let (acct, bob, key, secret) = s.accept_invite(&token, "Bob", "", Some("bobpassword1")).unwrap();
+        assert_eq!((acct.uid.as_str(), key.account_id), ("acme", Some(ann.account.id)));
+        assert_eq!(principal(&s, &secret).account().uid, "acme");
+        // Having been set up once, Bob cannot be set up again by another token.
+        let again = s.create_invite(ann.account.id, "ann@acme.test", "bob@acme.test").unwrap();
+        assert!(matches!(s.accept_invite(&again, "", "", Some("replaced1234")), Err(Error::Denied(_))));
+        assert!(s.verify_password("bob@acme.test", "bobpassword1").unwrap().is_some());
+        let _ = bob;
+    }
+
+    /// A key is issued by one account and acts there alone; leaving that
+    /// account ends that key and no other.
+    #[test]
+    fn a_personal_key_acts_only_in_the_account_that_issued_it() {
+        let s = Store::in_memory().unwrap();
+        let ann = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let ned = s.signup("Newco", "ned@newco.test", "Ned", Some("nedpassword1")).unwrap();
+        s.add_member(ned.account.id, "ned@newco.test", "ann@acme.test", "", Role::Admin).unwrap();
+        let (k, newco_secret) = s.create_user_key(ned.account.id, &ann.user, "for newco").unwrap();
+        assert_eq!(k.account_id, Some(ned.account.id));
+        assert_eq!(principal(&s, &newco_secret).account().uid, "newco");
+        assert_eq!(principal(&s, &ann.secret).account().uid, "acme");
+        // Listing is per account.
+        assert_eq!(s.user_keys(ned.account.id, ann.user.id).unwrap().len(), 1);
+        assert_eq!(s.user_keys(ann.account.id, ann.user.id).unwrap().len(), 1);
+        // Removed from Newco: that key dies, the Acme one lives.
+        s.remove_member(ned.account.id, "ned@newco.test", "ann@acme.test").unwrap();
+        assert!(s.authenticate(&newco_secret).unwrap().is_none());
+        assert_eq!(principal(&s, &ann.secret).account().uid, "acme");
+    }
+
+    #[test]
+    fn changing_the_password_ends_other_sessions() {
+        let s = Store::in_memory().unwrap();
+        let ann = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
+        let (mine, _) = s.create_session(&ann.user, 1).unwrap();
+        let (theirs, _) = s.create_session(&ann.user, 1).unwrap();
+        s.set_password(ann.account.id, &ann.user, "freshpassword1", Some(&mine)).unwrap();
+        assert!(s.session(&mine).unwrap().is_some(), "the session the change was made from stays");
+        assert!(s.session(&theirs).unwrap().is_none(), "every other session is gone");
+        assert!(s.verify_password("ann@acme.test", "freshpassword1").unwrap().is_some());
+        // Without a session to keep, all of them go.
+        let (c, _) = s.create_session(&ann.user, 1).unwrap();
+        s.set_password(ann.account.id, &ann.user, "freshpassword2", None).unwrap();
+        assert!(s.session(&c).unwrap().is_none());
+    }
+
+    /// A database from before keys had accounts comes up with every key
+    /// and every login resolving exactly as it did: to the first account.
+    #[test]
+    fn upgrading_a_v1_database_keeps_every_key_working() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 1; COMMIT;", MIGRATIONS[0])).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, uid, name) VALUES (1, 'acme', 'Acme'), (2, 'newco', 'Newco');
+             INSERT INTO users (id, email) VALUES (1, 'ann@acme.test'), (2, 'nobody@x.test');
+             INSERT INTO memberships (account_id, user_id, role) VALUES (2, 1, 'developer'), (1, 1, 'admin');
+             INSERT INTO user_keys (id, user_id, name, prefix, hash) VALUES (1, 1, 'default', 'p', 'h1'), (2, 2, 'orphan', 'q', 'h2');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        // Ann's key is now Acme's (her first account by id), as it answered before.
+        let acct: Option<i64> = conn.query_row("SELECT account_id FROM user_keys WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(acct, Some(1));
+        let home: Option<i64> = conn.query_row("SELECT home_account_id FROM users WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(home, Some(1));
+        // A key whose user belongs nowhere has no account, and answers for nothing.
+        let orphan: Option<i64> = conn.query_row("SELECT account_id FROM user_keys WHERE id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, None);
+        let s = Store::over(conn);
+        assert!(s.authenticate("zsk_whatever").unwrap().is_none());
+    }
+
     #[test]
     fn query_keys_read_granted_branches_only() {
         let s = Store::in_memory().unwrap();
@@ -1790,14 +2014,10 @@ mod tests {
         let dir = scratch("unversioned");
         let path = dir.join("accounts.db");
         {
+            // Every table of version 1, as the live file had, and no
+            // version stamp, as it also had.
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE users (
-                   id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '',
-                   password_hash TEXT,
-                   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));",
-            )
-            .unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
         }
 
         let Err(err) = Store::open(&path) else { panic!("tables with no version must not be taken for an empty file") };
@@ -1806,9 +2026,11 @@ mod tests {
         assert!(said.contains("user_version = 1"), "and what to do about it: {said}");
 
         // Stamping it, which is what step 4 of the plan does on the live
-        // service, is enough to make it open.
+        // service, is enough to make it open; the later steps then run.
         Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
         assert!(Store::open(&path).is_ok(), "a stamped file opens");
+        let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len(), "and is brought up to date");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

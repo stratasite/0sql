@@ -306,6 +306,9 @@
   // the one thing they came to do should not be followed by a login form.
   function viewReset() {
     const token = new URLSearchParams(location.search).get("token") || "";
+    // The token is a credential; once read it leaves the address bar,
+    // so it is not kept in history or sent along as a referrer.
+    if (token) history.replaceState(null, "", location.pathname);
     authFrame(h`
       <h1 style="margin-bottom:4px">Set a new password</h1>
       <p class="muted" style="margin-bottom:16px">This signs you in, and signs out anything else that was.</p>
@@ -369,6 +372,9 @@
 
   function viewInvite() {
     const token = new URLSearchParams(location.search).get("token") || "";
+    // The token is a credential; once read it leaves the address bar,
+    // so it is not kept in history or sent along as a referrer.
+    if (token) history.replaceState(null, "", location.pathname);
     authFrame(h`
       <h1 style="margin-bottom:4px">Join the account</h1>
       <p class="muted" style="margin-bottom:16px">Set your name and a password. You get a personal key for the CLI as well.</p>
@@ -643,7 +649,7 @@
     }
 
     const exploreBlock = (r) => {
-      const rows = (arr, kind) => arr.map((f) => h`<button class="row row-btn" data-add="${f.name}"><span class="grow"><span class="title">${f.name}</span> <span class="faint mono">${f.uid}</span>${f.score !== undefined && f.score < 1 ? raw(` <span class="faint">~${f.score}</span>`) : ""}</span><span class="meta">${(f.tables || []).join(", ")}</span>${kindBadge(kind)}</button>`).join("");
+      const rows = (arr, kind) => arr.map((f) => h`<button class="row row-btn" data-add="${f.name}"><span class="grow"><span class="title">${f.name}</span> <span class="faint mono">${f.uid}</span>${f.score !== undefined && f.score < 1 ? h` <span class="faint">~${f.score}</span>` : ""}</span><span class="meta">${(f.tables || []).join(", ")}</span>${kindBadge(kind)}</button>`).join("");
       return h`<div class="card"><div class="card-head"><h2>${icon("compass")}Can add</h2><span class="muted small">${r.dimensions.length} dimensions · ${r.measures.length} measures · server ${r.total_us} µs</span></div>
         <div class="card-body flush rows">${raw(rows(r.dimensions, "dim") + rows(r.measures, "msr") || h`<div class="empty">${icon("inbox", "xl")}<div>Nothing can be added to this query.</div></div>`)}</div></div>`;
     };
@@ -696,7 +702,7 @@
       try {
         const r = await api("GET", `/projects/${encodeURIComponent(uid)}/branches/${encodeURIComponent(branchOf())}/fields?q=${encodeURIComponent(q)}`);
         const fields = r.fields.slice(0, 60);
-        $("field-list").innerHTML = fields.map((f) => h`<button class="field-item" data-add="${f.name}">${kindBadge(f.kind === "dimension" ? "dim" : "msr")}<span class="grow">${f.name}</span>${f.score !== undefined && f.score < 1 ? raw(`<span class="faint">~${f.score}</span>`) : ""}</button>`).join("") || h`<div class="empty small">no fields match</div>`;
+        $("field-list").innerHTML = fields.map((f) => h`<button class="field-item" data-add="${f.name}">${kindBadge(f.kind === "dimension" ? "dim" : "msr")}<span class="grow">${f.name}</span>${f.score !== undefined && f.score < 1 ? h`<span class="faint">~${f.score}</span>` : ""}</button>`).join("") || h`<div class="empty small">no fields match</div>`;
         $("field-list").querySelectorAll("[data-add]").forEach((btn) => btn.onclick = () => {
           if (mode !== "expr") return;
           query.value = query.value.trim().replace(/,\s*$/, "") + (query.value.trim() ? ", " : "") + btn.dataset.add;

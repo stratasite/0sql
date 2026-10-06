@@ -26,3 +26,7 @@ flate2.workspace = true
 tar = "0.4"
 regex = "1"
 self_cell = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
