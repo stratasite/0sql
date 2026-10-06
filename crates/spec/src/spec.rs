@@ -448,7 +448,9 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
         corrections: cx.corrections.take(),
         population: false,
         name: spec.name.clone(),
-        limit: Some(spec.limit.unwrap_or(5000)),
+        // No default: a limit the caller did not ask for is not ours to
+        // invent, and the server emits one only when it is here.
+        limit: spec.limit,
         db_settings: spec.db_settings.clone().unwrap_or_default(),
         hints: spec.hints.clone(),
         filter_tree,

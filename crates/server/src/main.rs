@@ -869,6 +869,9 @@ struct Planned {
     timings: Timings,
     spec: Option<Value>,
     items: Vec<String>,
+    /// The caller's row limit, taken off the spec before planning. `None`
+    /// when they did not send one, and no default is supplied for them.
+    limit: Option<u64>,
 }
 
 fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<Planned, ApiError> {
@@ -883,22 +886,27 @@ fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, 
     let spec = zsql_spec::Spec::from_value(spec_value).map_err(spec_error)?;
     let mut query = zsql_spec::lower(&spec, d.universe(), &base).map_err(spec_error)?;
     let corrections = std::mem::take(&mut query.corrections);
+    // Planning does not read the limit, so take it here while the query is
+    // still whole. A zero or negative limit is nothing to emit.
+    let limit = query.limit.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0);
     let t1 = Instant::now();
     let planner = d.planner();
     let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.rails_class(), e.to_string()))?;
     let t2 = Instant::now();
-    Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items })
+    Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items, limit })
 }
 
 async fn sql(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
     let p = plan_request(&app, &who, &uid, &branch, req, false)?;
-    Ok(Json(SqlResponse { sql: p.plan.sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items }))
+    Ok(Json(SqlResponse { sql: p.plan.sql_with_limit(p.limit), datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items }))
 }
 
 async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
     let p = plan_request(&app, &who, &uid, &branch, req, true)?;
+    // Before taking `explain` out of the plan, which moves part of it.
+    let sql = p.plan.sql_with_limit(p.limit);
     let x = p.plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-    Ok(Json(ExplainResponse { sql: p.plan.sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes }))
+    Ok(Json(ExplainResponse { sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes }))
 }
 
 /// What a query can take on: the visible dimensions and measures the
