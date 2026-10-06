@@ -133,3 +133,39 @@ without breaking parity.
 Worth doing in one pass rather than drifting message by message, so the
 surface stays consistent.
 
+
+## Conversion measures (event-to-event within a window)
+
+Idea noted 2026-10-06 while writing the Cube / MetricFlow comparison on
+0sql.io: MetricFlow's `conversion` metric type is the one row in that table
+where 0sql shows a gap.
+
+What it computes: for an entity (a customer), how often a base event (a
+visit) is followed by a conversion event (a purchase) within a window
+(7 days), as a count or a rate. MetricFlow's SQL shape, from its docs: join
+conversion rows to base rows on the entity where the conversion time falls
+in `(base_time, base_time + window]`, attribute each conversion to the
+nearest preceding base event with `first_value(...) over (partition by
+conversion row order by base_time desc)`, `distinct` so one conversion
+counts once, aggregate both sides to the query grain, divide. Optional
+constant properties (same product on both events) become extra join
+predicates.
+
+What segments already give: cohort conversion. A segment keyed on
+`customer_id` with membership through the visits measure (plus filters),
+applied to the purchases measure, is "purchases by customers who visited";
+project purchases twice and a calculation makes the rate. What a segment
+cannot express is the window relative to *each* base event, or attribution
+to the nearest prior event; a date filter on the segment gives a calendar
+cohort, not an event window.
+
+Form, if picked up: a measure kind (`conversion`) on the conversion event's
+fact, declaring `entity` (the join keys), `base` (a measure on the base
+fact), `window` (a duration), `calculation: count | rate`, and optional
+`constant_properties`. Spec-level variant: a segment with `within` on the
+key, which is the smaller change and may be enough.
+
+Parked because: no customer has asked, and the cohort form covers the
+common "did they come back this month" question. The marketing table says
+"Cohort conversion through segments. No per-event window." and should
+change when this ships.
