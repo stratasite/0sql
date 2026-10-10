@@ -1,0 +1,4 @@
+#!/bin/sh
+# Let the netdata user send alert mail via zsqld's msmtp account
+# without reading /etc/msmtprc. Sudoers grants only this command.
+exec sudo -n -u zsqld /usr/bin/msmtp "$@"

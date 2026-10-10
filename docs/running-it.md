@@ -143,6 +143,27 @@ zsqld-signup-watch` shows each run, and `echo "0 0" >
 /var/lib/zsqld-signup-watch/last` followed by `systemctl start
 zsqld-signup-watch.service` forces a full report as a test.
 
+### Host monitoring
+
+Netdata runs on buzz for CPU, memory, disk, network and per-service
+charts, installed 2026-10-07 from the stable channel with telemetry off
+and daily auto-updates. `/etc/netdata/netdata.conf` binds it to the
+Tailscale address only, so the dashboard is
+`http://100.116.106.53:19999` from the tailnet and nothing listens on
+the public interface or localhost. The stock alerts are on; email goes
+to `ajo@strata.do` through zsqld's msmtp account. `ops/netdata/` holds
+the two pieces that make that work: `netdata-sendmail`, installed at
+`/usr/local/bin/`, runs msmtp as the zsqld user so the netdata user
+never reads `/etc/msmtprc`, and `sudoers-netdata-msmtp`, installed as
+`/etc/sudoers.d/netdata-msmtp`, grants exactly that one command.
+`/etc/netdata/health_alarm_notify.conf` points `sendmail` at the
+wrapper. `sudo -u netdata /usr/libexec/netdata/plugins.d/alarm-notify.sh
+test` sends three test mails through the real path. `go.d-docker.conf`,
+installed as `/etc/netdata/go.d/docker.conf`, polls Docker every 30s
+instead of every second: the host uses the containerd image store, and
+the stock one-second image listing kept dockerd and containerd near a
+full core, which showed up as 16% CPU pressure the day Netdata went in.
+
 ### Building without releasing
 
 `release.yml` also has `workflow_dispatch`, which builds and attaches
