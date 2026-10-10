@@ -155,16 +155,17 @@ def final_spec(text):
             pass
     return None
 
-def run_agent(question, model, mcp_config, max_turns, timeout_s):
+def run_agent(question, model, mcp_config, max_turns, timeout_s, env_extra=None):
     prompt = (HERE / "task.md").read_text().replace("{question}", question)
     work = tempfile.mkdtemp(prefix="mcp-eval-")
+    env = dict(os.environ, **(env_extra or {}))
     cmd = ["claude", "-p", prompt, "--mcp-config", mcp_config, "--strict-mcp-config",
            "--allowedTools", "mcp__zsql__*", "--disallowedTools", DENIED_TOOLS,
            "--output-format", "stream-json", "--verbose", "--model", model, "--max-turns", str(max_turns),
            "--no-session-persistence"]
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, cwd=work, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
+        proc = subprocess.run(cmd, cwd=work, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired as e:
         shutil.rmtree(work, ignore_errors=True)
         return {"error": "timeout", "stdout": (e.stdout or "")[-4000:] if isinstance(e.stdout, str) else ""}
@@ -179,6 +180,7 @@ def run_agent(question, model, mcp_config, max_turns, timeout_s):
     if proc.returncode != 0 and not any(e.get("type") == "result" for e in events):
         return {"error": f"claude exited {proc.returncode}: {proc.stderr[-1500:]}"}
     trace, calls, sql_calls, tool_errors, turns, model_seen = [{"role": "user", "content": prompt}], 0, 0, 0, 0, None
+    api_ids = set()  # distinct assistant message ids: one per API round trip
     last_text, last_ok_sql_spec, usage = "", None, {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
     pending, result = {}, {}
     for e in events:
@@ -186,6 +188,8 @@ def run_agent(question, model, mcp_config, max_turns, timeout_s):
         if t == "assistant":
             turns += 1
             msg = e["message"]
+            if msg.get("id"):
+                api_ids.add(msg["id"])
             model_seen = msg.get("model") or model_seen
             for k in usage:
                 usage[k] += (msg.get("usage") or {}).get(k, 0) or 0
@@ -223,7 +227,7 @@ def run_agent(question, model, mcp_config, max_turns, timeout_s):
     source = "final" if spec is not None else ("tool" if last_ok_sql_spec is not None else "none")
     if spec is None:
         spec = last_ok_sql_spec
-    return {"trace": trace, "spec": spec, "spec_source": source, "turns": turns, "tool_calls": calls, "sql_calls": sql_calls,
+    return {"trace": trace, "spec": spec, "spec_source": source, "turns": turns, "api_turns": len(api_ids) or calls + 1, "tool_calls": calls, "sql_calls": sql_calls,
             "tool_errors": tool_errors, "wall_s": wall, "latency_s": (result.get("duration_ms") or wall * 1000) / 1000,
             "api_s": (result.get("duration_api_ms") or 0) / 1000, "cost_usd": result.get("total_cost_usd"),
             "model": model_seen or model, "usage": usage, "num_turns": result.get("num_turns"),
@@ -284,6 +288,7 @@ def main():
     ap.add_argument("--check-refs", action="store_true")
     ap.add_argument("--null-check", action="store_true")
     ap.add_argument("--regrade", action="store_true", help="re-grade stored specs in the variant without running the agent")
+    ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for the claude process, e.g. ENABLE_TOOL_SEARCH=false")
     a = ap.parse_args()
     if not KEY:
         sys.exit("no key: put the eval query key in harness/mcp-eval/.key or ZSQL_EVAL_KEY")
@@ -342,7 +347,7 @@ def main():
             if l.strip():
                 r = json.loads(l)
                 done.add((r["prompt_id"], r["rep"]))
-    (vdir / "summary.json").write_text(json.dumps({"description": a.description or a.variant, "target": "tools", "model": a.model}, indent=2))
+    (vdir / "summary.json").write_text(json.dumps({"description": a.description or a.variant, "target": "tools", "model": a.model, "env": a.env}, indent=2))
     mcp_config = write_mcp_config(flow)
     train = set(state["train_ids"])
     jobs = [(c, k) for c in cases for k in range(a.reps) if (c["id"], k) not in done]
@@ -355,7 +360,7 @@ def main():
         c, k = job
         if a.regrade:
             return
-        run = run_agent(c["prompt"], a.model, mcp_config, a.max_turns, a.timeout_s)
+        run = run_agent(c["prompt"], a.model, mcp_config, a.max_turns, a.timeout_s, dict(kv.split("=", 1) for kv in a.env))
         with lock:
             if "error" in run:
                 with errors_path.open("a") as f:
@@ -372,7 +377,7 @@ def main():
         row = {"prompt_id": c["id"], "rep": k, "prompt": c["prompt"], "tags": c["tags"], "grade": g,
                "explanation": {"pass": reason}, "model": run["model"], "latency_s": round(run["latency_s"], 2),
                "api_s": round(run["api_s"], 2), "cost_usd": run["cost_usd"], "tool_calls": run["tool_calls"],
-               "sql_calls": run["sql_calls"], "tool_errors": run["tool_errors"], "turns": run["turns"],
+               "sql_calls": run["sql_calls"], "tool_errors": run["tool_errors"], "turns": run["turns"], "api_turns": run["api_turns"],
                "usage": run["usage"], "status": "ok" if run["subtype"] == "success" else (run["subtype"] or "unknown"),
                "meta": {"spec_source": run["spec_source"], "candidate_spec": run["spec"], "candidate_sql": sql, "num_turns": run["num_turns"]}}
         with lock:

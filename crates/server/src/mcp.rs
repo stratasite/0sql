@@ -181,7 +181,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": prompts().instructions,
+                "instructions": format!("{}\n\n{}", prompts().instructions, catalogue(app, who)),
             }))
         }
         "ping" => Ok(json!({})),
@@ -193,6 +193,110 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
         }
         _ => Err(Fail::Rpc(METHOD_NOT_FOUND, format!("no method {method}"))),
     }
+}
+
+// -------------------------------------------------------------- catalogue
+
+/// How much catalogue `initialize` carries, in bytes, before it falls
+/// back to naming the branches and leaving discovery to `fields`.
+const CATALOGUE_BYTES: usize = 48 * 1024;
+
+/// Every field of every branch the caller may read, with its uid, as
+/// part of the instructions. A client puts the server's instructions in
+/// its system prompt, so this is what lets a question be answered in one
+/// `sql` call with no discovery round trips: the same move an
+/// application makes when it pastes the field catalogue into its own
+/// prompt. Measures carry their description and synonyms, since that is
+/// where the business definitions live; dimensions are named by table,
+/// where the table says which thing they describe. Deterministic, so the
+/// text is byte-identical from one connection to the next and a client's
+/// prompt cache can hold it.
+fn catalogue(app: &App, who: &Option<Principal>) -> String {
+    let models = app.models.read().unwrap();
+    let mut readable: Vec<Arc<Deployed>> = in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
+    drop(models);
+    readable.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+    if readable.is_empty() {
+        return "This key reads no deployed branch yet.".into();
+    }
+    let mut out = String::new();
+    for d in &readable {
+        out.push_str(&branch_catalogue(d));
+        out.push('\n');
+    }
+    if out.len() <= CATALOGUE_BYTES {
+        return format!("# Catalogue\nEvery field of the branches this key may read, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
+    }
+    let mut short = String::from("# Branches this key may read\nToo many fields to list here; call fields with q to find them.\n");
+    for d in &readable {
+        let s = d.universe().snapshot();
+        short.push_str(&format!("- {}/{}: {} tables, {} fields\n", d.uid, d.branch, s.tables.len(), s.fields.len()));
+    }
+    short
+}
+
+fn branch_catalogue(d: &Deployed) -> String {
+    let u = d.universe();
+    let s = u.snapshot();
+    // Field id to the uids of the tables carrying it, sorted.
+    let mut tables_of: HashMap<i64, Vec<String>> = HashMap::new();
+    for e in &s.expressions {
+        if let Some(t) = u.table(e.table_id) {
+            tables_of.entry(e.field_id).or_default().push(t.uid.clone());
+        }
+    }
+    for v in tables_of.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    let home = |f: &zsql_semantic::Field| tables_of.get(&f.id).and_then(|t| t.first().cloned()).unwrap_or_else(|| "?".into());
+    let mut out = format!("## Project {}, branch {}: {} tables, {} fields, {} policies\n", d.uid, d.branch, s.tables.len(), s.fields.len(), s.security_policies.len());
+    let mut measures: Vec<&zsql_semantic::Field> = u.fields().iter().filter(|f| !f.hidden && f.kind == FieldKind::Measure).collect();
+    measures.sort_by(|a, b| (home(a), &a.name).cmp(&(home(b), &b.name)));
+    out.push_str("### Measures, by table (uid: name (type), description [synonyms])\n");
+    let mut last = String::new();
+    for f in measures {
+        let h = home(f);
+        if h != last {
+            out.push_str(&format!("{h}:\n"));
+            last = h;
+        }
+        let data_type = serde_json::to_value(&f.data_type).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "?".into());
+        out.push_str(&format!("- {}: {} ({})", f.uid, f.name, data_type));
+        if let Some(desc) = f.description.as_deref().filter(|d| !d.trim().is_empty()) {
+            out.push_str(&format!(", {}", desc.trim()));
+        }
+        if !f.synonyms.is_empty() {
+            out.push_str(&format!(" [{}]", f.synonyms.join(", ")));
+        }
+        out.push('\n');
+    }
+    // Dimensions by table, each with its uid and the start of its
+    // description: that is where "the city" or "at the time of the
+    // contact" lives, and it is what tells two same-worded fields apart.
+    out.push_str("### Dimensions, by table (name (uid): description)\n");
+    let mut dims: Vec<&zsql_semantic::Field> = u.fields().iter().filter(|f| !f.hidden && f.kind == FieldKind::Dimension).collect();
+    dims.sort_by(|a, b| (home(a), &a.name).cmp(&(home(b), &b.name)));
+    let mut last = String::new();
+    for f in dims {
+        let h = home(f);
+        if h != last {
+            if !last.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{h}: "));
+            last = h;
+        } else {
+            out.push_str("; ");
+        }
+        out.push_str(&format!("{} ({})", f.name, f.uid));
+        if let Some(desc) = f.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            let short: String = desc.chars().take(110).collect();
+            out.push_str(&format!(": {}{}", short.trim_end(), if short.len() < desc.len() { "…" } else { "" }));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 // ------------------------------------------------------------------ tools
@@ -346,7 +450,23 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
             let _seat = admit_explore(app, who).await?;
-            branch_for(app, who, &a.project, a.branch).and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q: a.q.unwrap_or_default(), hidden: a.hidden }))
+            let q = a.q.unwrap_or_default();
+            if q.trim().is_empty() && !a.hidden {
+                // No search: the whole catalogue, as one text, the same
+                // one initialize carries. One call is all the discovery a
+                // question needs, and a client that cut the instructions
+                // short gets it here in full.
+                let text = branch_for(app, who, &a.project, a.branch).and_then(|b| {
+                    let t = gate(app, who, &a.project, &b, Verb::Read)?;
+                    let d = model(app, &t, &a.project, &b)?;
+                    Ok(branch_catalogue(&d))
+                });
+                return Ok(match text {
+                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalogue": text } }),
+                    Err(ApiError(status, class, message)) => json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true }),
+                });
+            }
+            branch_for(app, who, &a.project, a.branch).and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;

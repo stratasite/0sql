@@ -74,7 +74,7 @@
         },
         "hidden": {
           "type": "boolean",
-          "description": "Take part in the query without being a visible column."
+          "description": "A hint for the client's display only: the column is still selected and grouped in the SQL. Not a way to keep a column out of the result; leave out what the question did not ask for."
         },
         "decorators": {
           "type": "array",
