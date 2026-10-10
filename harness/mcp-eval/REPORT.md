@@ -1,27 +1,35 @@
-| round | variant | test | train | s/case | calls | turns | tool err | $/case | spend |
+| round | variant | test | train | s/case | calls | round trips | tool err | $/case | spend |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | baseline | 0.95 | 1.00 | 17.4 | 5.39 | 9.54 | 0.11 | $0.39 | $48 |
-| 1 | v1 | 0.90 | 0.97 | 13.7 | 3.38 | 6.98 | 0.16 | $0.31 | $66 |
-| 2 | v2 | 0.86 | 1.00 | 13.6 | 3.30 | 6.80 | 0.14 | $0.31 | $104 |
-| 3 | v3 | 0.88 | 1.00 | 13.6 | 3.29 | 6.75 | 0.09 | $0.31 | $142 |
-| 4 | v4 | 0.86 | 1.00 | 14.0 | 3.40 | 7.10 | 0.15 | $0.32 | $180 |
-| 5 | v5 | 0.95 | 1.00 | 15.7 | 4.53 | 8.92 | 0.16 | $0.39 | $228 |
+| 0 | baseline | 0.95 | 1.00 | 17.4 | 5.39 | 6.39 | 0.11 | $0.39 | $48 |
+| 1 | v1 | 0.90 | 0.97 | 13.7 | 3.38 | 4.38 | 0.16 | $0.31 | $66 |
+| 2 | v2 | 0.86 | 1.00 | 13.6 | 3.30 | 4.30 | 0.14 | $0.31 | $104 |
+| 3 | v3 | 0.88 | 1.00 | 13.6 | 3.29 | 4.29 | 0.09 | $0.31 | $142 |
+| 4 | v4 | 0.86 | 1.00 | 14.0 | 3.40 | 4.40 | 0.15 | $0.32 | $180 |
+| 5 | v5 | 0.95 | 1.00 | 15.7 | 4.53 | 5.53 | 0.16 | $0.39 | $228 |
+| 6 | v6 | 0.93 | 1.00 | 15.8 | 4.16 | 4.65 | 0.11 | $0.34 | $270 |
+| 7 | v7 | 0.90 | 0.97 | 14.8 | 3.97 | 4.75 | 0.15 | $0.27 | $303 |
+| 8 | v8 | 0.98 | 1.00 | 11.6 | 3.22 | 3.36 | 0.07 | $0.28 | $337 |
+| 9 | v9 | 0.95 | 1.00 | 11.5 | 3.25 | 3.35 | 0.07 | $0.28 | $371 |
+| 10 | v9-default | 0.95 | 1.00 | 14.9 | 3.98 | 4.75 | 0.07 | $0.33 | $411 |
+| 12 | v11 | 1.00 | 1.00 | 7.5 | 1.07 | 2.03 | 0.05 | $0.35 | $433 |
+| 13 | v12 | 0.95 | 1.00 | 11.1 | 3.27 | 3.31 | 0.10 | $0.31 | $471 |
+| 14 | v13 | 0.90 | 0.97 | 12.5 | 2.30 | 3.29 | 1.13 | $0.21 | $496 |
 
 ## Recommended change
 
-v5, now committed in `crates/server/src/mcp_prompts.json` and `mcp_spec_schema.json`: skip `list_projects` when the project is known; `fields` is a search, one call per phrase of the request; same-worded fields on other tables are different things and the name's qualifier and the tables decide; the chosen uid goes in the spec; and the schema states the window decorator's real rules (mode required, size is rows preceding, order_by and partition_refs take projected uids), points period-over-period at temporalize, and prefers uids in field references.
+The committed server (v12 content): spec-only tools with the schema in the tool definitions; instructions under 2,000 characters; the catalogue of every branch the key may read appended to `initialize` and returned whole by `fields` with no q; dimension descriptions in the catalogue; a field refusal carrying the nearest fields with uid, kind, description and table; `ZSQL_MCP_TOOLS` to expose a subset. For Claude Code users, `ENABLE_TOOL_SEARCH=false`.
 
-## Versus baseline
+## Versus baseline, on claude-opus-5
 
-On claude-opus-5, two reps each: test 0.95 to 0.95 and train 1.00 to 1.00, so no accuracy change on the stronger client; tool calls 5.4 to 4.5 per case, 17.4 s to 15.7 s, cost unchanged per case, and no spec retries left on train (baseline had cases spending three or four `sql` calls learning the window decorator). On claude-sonnet-5, one rep: train 0.95 to 1.00 and test 0.90 to 0.95, calls 5.4 to 5.0; the three cases it gained were the two temporalize cases, where it had used a lag window, and a top-n ordering.
+Client as installed: test 0.95 to 0.95, train 1.00 to 1.00, 17.4 s to 14.9 s, 6.4 to 4.8 round trips per question. Client with tool search off: 11.5 s and 3.4 round trips, test 0.95 to 0.98 depending on one flaky case. With the catalogue visible to the model (v11), which this client does not allow but which is what the demo application's prompt gives its model: 7.5 s, 2.0 round trips, 1.00 on both splits.
 
-## Why trust this
+## Why the demo answers in two turns and MCP through Claude Code does not
 
-Every case is deterministic across reps on Opus, so a flip is a change, not noise; the two reference errors and three ambiguous prompts found at baseline were fixed and re-scored under each variant's own instruction files before any comparison; the analyzer that proposed changes read train traces only and the headline is the test split; the grader passes every reference and fails every deliberately wrong spec; and the winner was confirmed on a second model.
+Measured, not inferred. (1) Claude Code keeps about 2,000 characters of a server's `initialize` instructions and of a tool description, marking the rest `[truncated]`; two headless probes quoted the cut. The demo's catalogue lives in its own system prompt, so its first turn is the query. (2) Claude Code defers MCP tool definitions behind a `ToolSearch` round trip; `ENABLE_TOOL_SEARCH=false` removes it and lets the model run its searches in parallel. (3) Claude Code sends 40,000 to 96,000 tokens of context per model call, nearly all cached, against the demo's 10,000; a round trip costs 2.7 to 3.4 s on Opus 5. (4) Given a `fields` tool and no catalogue, the model searches before it writes, instruction or not (v12), and without a `fields` tool it writes, is refused, and retries (v13), so three round trips is the floor on this client. Nothing in MCP itself is slower than function calling: v11 is the same server and client with the catalogue in view, and it behaves exactly like the demo.
 
 ## What else was tried
 
-v1 (one broad `fields` call for everything) and v3 (v1 plus the same-worded-field rule) run at 3.3 calls and 13.6 s, 39% fewer calls and 22% less time than baseline, but lose one test case every rep: a question qualifying an attribute by its role, where a broad search ranks the plain field first and can leave the qualified one out of the ranked band. v4 added an extra search for qualified phrases and did not recover it. v2 alone (the schema fixes) kept train at 1.00 and the efficiency but not the test case. The remaining miss on both models is a segment keyed on an id that two fact tables carry; it resisted three rounds and is a candidate for a model-side fix (a description on the field) rather than more instruction text.
+v1 to v5: the instruction text (REPORT.md's first section). v6: catalogue in `initialize`, no effect, which led to the cap probe. v7: `fields` with no q as the catalogue. v8: tool search off. v9: dimension descriptions in the catalogue. v10: catalogue in the `sql` tool description, truncated the same way, not run. v12: sql first with refusals carrying candidates, no behaviour change. v13: only `sql` exposed, same round trips, lower accuracy. One round was voided by the subscription's session limit and re-run.
 
 ## Before and after, on train cases
 
@@ -45,4 +53,4 @@ No harness or serving errors in any scored round. Every failure is a well-formed
 
 ## Spend
 
-About $228 on Opus 5 across the baseline and five rounds (two reps on baseline, v2 to v5; one on v1), plus $21 on the two Sonnet 5 passes.
+About $496 on Opus 5 across the baseline and thirteen rounds, plus $21 on the two Sonnet 5 passes.
