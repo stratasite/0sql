@@ -239,7 +239,7 @@ def load_cases(only=None):
     return cases
 
 def write_mcp_config(flow):
-    cfg = flow / ".mcp.json"
+    cfg = flow.resolve() / ".mcp.json"
     cfg.write_text(json.dumps({"mcpServers": {"zsql": {"type": "http", "url": f"{SERVER}/mcp", "headers": {"Authorization": f"Bearer {KEY}"}}}}))
     return str(cfg)
 
@@ -288,7 +288,7 @@ def main():
     if not KEY:
         sys.exit("no key: put the eval query key in harness/mcp-eval/.key or ZSQL_EVAL_KEY")
     cases = load_cases(a.cases)
-    flow = Path(a.flow)
+    flow = Path(a.flow).resolve()
 
     if a.check_refs or a.null_check:
         bad = 0
@@ -317,6 +317,23 @@ def main():
 
     state = ensure_state(flow, load_cases())
     vdir = flow / a.variant
+    if a.regrade:
+        # Re-score the stored candidate specs after a reference or grader fix; no agent runs.
+        path = vdir / "results.jsonl"
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        by_id = {c["id"]: c for c in load_cases()}
+        changed = 0
+        for r in rows:
+            c = by_id.get(r["prompt_id"])
+            if not c:
+                continue
+            g, reason, sql = grade(c, r["meta"].get("candidate_spec"))
+            if g != r["grade"]:
+                changed += 1
+            r["grade"], r["explanation"], r["meta"]["candidate_sql"] = g, {"pass": reason}, sql
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        print(f"regraded {len(rows)} rows, {changed} changed")
+        return
     (vdir / "traces").mkdir(parents=True, exist_ok=True)
     results_path, errors_path = vdir / "results.jsonl", vdir / "errors.jsonl"
     done = set()
