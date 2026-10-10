@@ -153,14 +153,43 @@ auth cache, and a client that initializes often, or a hostile key
 holder that does so on purpose, would keep the cache cold for everyone.
 `last_used_at` on the key is touched as on any request.
 
+## What the client is told, and what reaches the model
+
+`initialize` answers with the instructions from `mcp_prompts.json`
+followed by a catalogue of every branch the key may read: measures by
+table with uid, type, description and synonyms, dimensions by table with
+uid and the start of their description, under 48 KB in all. A client
+that puts the server's instructions in its system prompt then has what
+an application has when it pastes the field catalogue into its own
+prompt, and a question is one `sql` call. `fields` with no `q` returns
+the same catalogue as one text, for the client that does not.
+
+Measured on Claude Code 2.1, which is that client: it keeps about 2,000
+characters of a server's instructions and marks the rest `[truncated]`,
+so the catalogue in `initialize` never reaches the model there and the
+instructions themselves are kept under that cap. It also loads MCP tool
+definitions lazily behind a `ToolSearch` call, one extra model round
+trip per conversation. `ENABLE_TOOL_SEARCH=false` in the environment
+turns that off; in the eval it was the single largest gain: 11.6 s and
+3.4 round trips per question against 14.8 s and 4.8, and a higher pass
+rate, because the model sees the full tool schemas from the start and
+makes its field searches in parallel. The demo application answers in
+two model turns because its catalogue is in its own prompt and it has
+no harness in between; through Claude Code the floor is the catalogue
+or a search, the `sql` call, and the answer.
+
 ## Connecting
 
 Claude Code, with a query key:
 
 ```
-claude mcp add --transport http 0sql https://app.0sql.io/mcp \
+ENABLE_TOOL_SEARCH=false claude mcp add --transport http 0sql https://app.0sql.io/mcp \
   --header "Authorization: Bearer zqk_..."
 ```
+
+`ENABLE_TOOL_SEARCH=false` belongs in the environment Claude Code runs
+in, not only on the `add`; it applies to every MCP server the session
+has.
 
 claude.ai and Claude Desktop: a custom connector at the same URL with
 "fixed credentials", the key as the bearer token. The API's MCP
