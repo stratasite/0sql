@@ -47,17 +47,33 @@ struct Prompts {
     tools: HashMap<String, String>,
 }
 
+/// The compiled-in file, unless `ZSQL_MCP_PROMPTS` names one to read
+/// instead: the eval that tunes these restarts the server per variant,
+/// and an operator may want their own wording. A file that does not
+/// parse is a startup failure, not a silent fallback.
 fn prompts() -> &'static Prompts {
     static P: OnceLock<Prompts> = OnceLock::new();
-    P.get_or_init(|| serde_json::from_str(include_str!("mcp_prompts.json")).expect("mcp_prompts.json parses"))
+    P.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_PROMPTS", include_str!("mcp_prompts.json"))).expect("the MCP prompts parse"))
 }
 
 /// The query spec's JSON schema, as the sql, explain and explore tools
 /// declare their `spec` argument. Its `$defs` are hoisted to the root of
-/// each tool's input schema, where the `$ref`s point.
+/// each tool's input schema, where the `$ref`s point. `ZSQL_MCP_SPEC_SCHEMA`
+/// names a file to read instead of the compiled-in one.
 fn spec_schema() -> &'static Value {
     static S: OnceLock<Value> = OnceLock::new();
-    S.get_or_init(|| serde_json::from_str(include_str!("mcp_spec_schema.json")).expect("mcp_spec_schema.json parses"))
+    S.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_SPEC_SCHEMA", include_str!("mcp_spec_schema.json"))).expect("the MCP spec schema parses"))
+}
+
+fn file_or(var: &str, compiled: &str) -> String {
+    match std::env::var(var) {
+        Ok(path) if !path.trim().is_empty() => {
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{var}: cannot read {path}: {e}"));
+            eprintln!("zsqld: mcp: {var} read from {path}");
+            text
+        }
+        _ => compiled.to_string(),
+    }
 }
 
 /// The protocol revisions answered, newest first. A client that asks
