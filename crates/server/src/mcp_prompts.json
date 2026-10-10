@@ -1,0 +1,12 @@
+{
+  "instructions": "0sql plans SQL from a semantic model; it never runs it. Start with list_projects. Every other tool takes a project uid and a branch; the branch defaults to the project's production branch. fields and explore find what a query can use; sql takes a query spec and returns the statement to run against the named datasource. Who the query is planned for is fixed by the key, not by you.",
+  "tools": {
+    "list_projects": "The deployed branches this key may read, with the size of each model, and the projects of the account.",
+    "fields": "The dimensions and measures of a branch, each with its data type, description, synonyms, tags and the tables it is on. With q, the ones containing or near the text come first with a score.",
+    "tables": "The tables of a branch: physical name, datasource, cost and the fields on each.",
+    "values": "The sampled values of one dimension, when the project uploaded samples.",
+    "explore": "Given a query spec, the dimensions and measures that can still be added to it, narrowed by q.",
+    "sql": "The SQL for a query spec, and the datasource and adapter it is for. Run it yourself; this server does not.",
+    "explain": "The SQL for a query spec with how it was planned: timings, phases and the node graph."
+  }
+}

@@ -2,8 +2,18 @@
 //!
 //! An agent connects with the same key an application would and gets
 //! the server's reads as tools: the deployments it may see, a branch's
-//! fields, tables and sampled values, and the SQL for a spec or a line
-//! of shorthand. Nothing here deploys, changes or executes anything.
+//! fields, tables and sampled values, and the SQL for a query spec.
+//! Specs only, never the shorthand: a spec is JSON against a published
+//! schema, which is what a model writes reliably, and the schema itself
+//! is handed to the client in the tool definition. Nothing here deploys,
+//! changes or executes anything.
+//!
+//! What the client is told, the server's instructions and each tool's
+//! description, lives in `mcp_prompts.json` next to this file, and the
+//! spec's schema in `mcp_spec_schema.json`. Both are compiled in. They
+//! are the instruction set an agent plans from, and they are tuned
+//! against the eval in `harness/mcp-eval`, so they are kept apart from
+//! the code that enforces who may read what.
 //!
 //! Every tool runs the function the matching REST handler runs, with
 //! the principal the guard worked out, so a key reaches through MCP
@@ -25,8 +35,30 @@
 
 use super::*;
 use axum::http::HeaderMap;
+use std::sync::OnceLock;
 
 pub const PATH: &str = "/mcp";
+
+/// The instruction set: what `initialize` tells the client, and what
+/// each tool says about itself.
+#[derive(Deserialize)]
+struct Prompts {
+    instructions: String,
+    tools: HashMap<String, String>,
+}
+
+fn prompts() -> &'static Prompts {
+    static P: OnceLock<Prompts> = OnceLock::new();
+    P.get_or_init(|| serde_json::from_str(include_str!("mcp_prompts.json")).expect("mcp_prompts.json parses"))
+}
+
+/// The query spec's JSON schema, as the sql, explain and explore tools
+/// declare their `spec` argument. Its `$defs` are hoisted to the root of
+/// each tool's input schema, where the `$ref`s point.
+fn spec_schema() -> &'static Value {
+    static S: OnceLock<Value> = OnceLock::new();
+    S.get_or_init(|| serde_json::from_str(include_str!("mcp_spec_schema.json")).expect("mcp_spec_schema.json parses"))
+}
 
 /// The protocol revisions answered, newest first. A client that asks
 /// for one of these gets it back; any other gets the newest.
@@ -133,7 +165,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": INSTRUCTIONS,
+                "instructions": prompts().instructions,
             }))
         }
         "ping" => Ok(json!({})),
@@ -147,8 +179,6 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
     }
 }
 
-const INSTRUCTIONS: &str = "0sql plans SQL from a semantic model; it never runs it. Start with list_projects. Every other tool takes a project uid and a branch; the branch defaults to the project's production branch. fields and explore find what a query can use; sql returns the statement to run against the named datasource. A query is a comma-separated line of field names, filters (Region = EMEA, Date between 2024-01-01 and 2024-12-31, Revenue top 10) and decorated fields (month(Date), yoy(Revenue)); there is no 'by' or 'where'. Who the query is planned for is fixed by the key, not by you.";
-
 // ------------------------------------------------------------------ tools
 
 /// The tools, as the client lists them. Every schema refuses unknown
@@ -159,32 +189,32 @@ fn tools() -> Vec<Value> {
         "project": { "type": "string", "description": "the project uid" },
         "branch": { "type": "string", "description": "a deployed branch; the project's production branch when omitted" },
     });
-    let spec_or_expr = json!({
-        "expr": { "type": "string", "description": "a line of the shorthand: comma-separated fields, filters and calculations, e.g. 'Category, Revenue desc, Region = EMEA' or 'month(Order Date), yoy(Revenue)'" },
-        "spec": { "type": "object", "description": "a full query spec, instead of expr" },
-    });
-    let schema = |props: &[&Value], required: &[&str], description: &str| {
+    let mut spec = spec_schema().clone();
+    let defs = spec.as_object_mut().and_then(|m| m.remove("$defs")).unwrap_or(Value::Null);
+    let spec_arg = json!({ "spec": spec });
+    let describe = |name: &str| prompts().tools.get(name).cloned().unwrap_or_default();
+    let schema = |props: &[&Value], required: &[&str], description: &str, with_defs: bool| {
         let mut p = serde_json::Map::new();
         for v in props {
             p.extend(v.as_object().unwrap().clone());
         }
-        json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description })
+        let mut out = json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description });
+        if with_defs && !defs.is_null() {
+            out["$defs"] = defs.clone();
+        }
+        out
     };
     vec![
-        json!({ "name": "list_projects", "description": "The deployed branches this key may read, with the size of each model, and the projects of the account.",
-                "inputSchema": schema(&[], &[], "no arguments") }),
-        json!({ "name": "fields", "description": "The dimensions and measures of a branch, each with its data type, description, synonyms, tags and the tables it is on. With q, the ones containing or near the text come first with a score.",
-                "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for") }),
-        json!({ "name": "tables", "description": "The tables of a branch: physical name, datasource, cost and the fields on each.",
-                "inputSchema": schema(&[&target], &["project"], "which branch") }),
-        json!({ "name": "values", "description": "The sampled values of one dimension, when the project uploaded samples.",
-                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } })], &["project", "dimension"], "which dimension") }),
-        json!({ "name": "explore", "description": "Given a query, the dimensions and measures that can still be added to it, narrowed by q.",
-                "inputSchema": schema(&[&target, &spec_or_expr, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project"], "a query to extend") }),
-        json!({ "name": "sql", "description": "The SQL for a query, and the datasource and adapter it is for. Run it yourself; this server does not.",
-                "inputSchema": schema(&[&target, &spec_or_expr], &["project"], "a query, as expr or spec") }),
-        json!({ "name": "explain", "description": "The SQL for a query with how it was planned: timings, phases and the node graph.",
-                "inputSchema": schema(&[&target, &spec_or_expr], &["project"], "a query, as expr or spec") }),
+        json!({ "name": "list_projects", "description": describe("list_projects"), "inputSchema": schema(&[], &[], "no arguments", false) }),
+        json!({ "name": "fields", "description": describe("fields"),
+                "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for", false) }),
+        json!({ "name": "tables", "description": describe("tables"), "inputSchema": schema(&[&target], &["project"], "which branch", false) }),
+        json!({ "name": "values", "description": describe("values"),
+                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } })], &["project", "dimension"], "which dimension", false) }),
+        json!({ "name": "explore", "description": describe("explore"),
+                "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
+        json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
+        json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
     ]
 }
 
@@ -227,10 +257,7 @@ struct QueryArgs {
     project: String,
     #[serde(default)]
     branch: Option<String>,
-    #[serde(default)]
-    spec: Option<Value>,
-    #[serde(default)]
-    expr: Option<String>,
+    spec: Value,
     #[serde(default)]
     q: Option<String>,
 }
@@ -317,7 +344,7 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             let a: QueryArgs = args(arguments)?;
             let _seat = admit_explore(app, who).await?;
             branch_for(app, who, &a.project, a.branch)
-                .and_then(|b| explore_of(app, who, &a.project, &b, ExploreRequest { spec: a.spec, expr: a.expr, context: context_for(who), q: a.q }))
+                .and_then(|b| explore_of(app, who, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context: context_for(who), q: a.q }))
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -325,7 +352,7 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             if a.q.is_some() {
                 return Err(Fail::Rpc(INVALID_PARAMS, "arguments: q is for explore".into()));
             }
-            let req = SqlRequest { spec: a.spec, expr: a.expr, context: context_for(who) };
+            let req = SqlRequest { spec: Some(a.spec), expr: None, context: context_for(who) };
             branch_for(app, who, &a.project, a.branch).and_then(|b| {
                 if name == "sql" {
                     sql_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))

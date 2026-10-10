@@ -333,6 +333,11 @@ fn archive_with_link(uid: &str, link_path: &str, target: &str) -> Vec<u8> {
 
 const CS: &str = "customer-service";
 
+/// The spec a shorthand line makes, for the tools, which take specs only.
+fn spec_of(expr: &str) -> Value {
+    zsql_shorthand::parse_line(expr).unwrap().0
+}
+
 // ---------------------------------------------------------------- tests
 
 /// The case that was found in production: two accounts, one project
@@ -813,23 +818,23 @@ async fn mcp_tools_reach_what_the_key_may_read_and_nothing_else() {
     assert!(a.body["result"]["isError"].is_null(), "{}", a.body);
 
     // Planning: the other account's column is unreachable by any name.
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Marker acme, Revenue" })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Marker acme, Revenue") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
     assert!(sql.contains("marker_acme"), "{}", a.body);
-    let a = s.tool(Some(&ned), "sql", json!({ "project": CS, "expr": "Marker acme, Revenue" })).await;
+    let a = s.tool(Some(&ned), "sql", json!({ "project": CS, "spec": spec_of("Marker acme, Revenue") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
     assert!(!sql.contains("marker_acme"), "{}", a.body);
-    let a = s.tool(Some(&ned), "explain", json!({ "project": CS, "expr": "Marker newco, Revenue" })).await;
+    let a = s.tool(Some(&ned), "explain", json!({ "project": CS, "spec": spec_of("Marker newco, Revenue") })).await;
     assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap().contains("marker_newco"), "{}", a.body);
     assert!(a.body["result"]["structuredContent"]["nodes"].is_array());
-    let a = s.tool(Some(&secret), "explore", json!({ "project": CS, "expr": "Revenue", "q": "cat" })).await;
+    let a = s.tool(Some(&secret), "explore", json!({ "project": CS, "spec": spec_of("Revenue"), "q": "cat" })).await;
     assert!(a.body["result"]["structuredContent"]["dimensions"].as_array().unwrap().iter().any(|d| d["name"] == "Category"), "{}", a.body);
 
     // Arguments the tools do not take.
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue", "context": { "system_admin": true } })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Revenue"), "context": { "system_admin": true } })).await;
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
     assert!(a.body["error"]["message"].as_str().unwrap().contains("fixed by the key"));
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue", "limit": 5 })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Revenue"), "limit": 5 })).await;
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
     let a = s.tool(Some(&secret), "deploy", json!({ "project": CS })).await;
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
@@ -862,7 +867,7 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
     let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert!(a.body["sql"].as_str().unwrap().contains("emea"), "{}", a.body["sql"]);
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
     assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
     assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().starts_with("ContextRequired"), "{}", a.body);
 
@@ -880,7 +885,7 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
     let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": apac })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(a.body["grant"]["context"]["groups"][0]["name"], "apac");
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
     assert!(sql.contains("apac") && !sql.contains("emea"), "{}", a.body);
     let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue" })).await;
@@ -906,7 +911,7 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
     // Rotation keeps it; a grant without one clears it.
     let a = s.post(&format!("/account/query-keys/{qk}/rotate"), Some(&ann), json!({})).await;
     let secret2 = a.body["secret"].as_str().unwrap().to_string();
-    let a = s.tool(Some(&secret2), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let a = s.tool(Some(&secret2), "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
     assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("apac"), "{}", a.body);
     let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "branch": "*" })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
@@ -925,15 +930,15 @@ async fn a_personal_key_plans_as_its_user_over_mcp() {
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
 
-    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Category" })).await;
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "spec": spec_of("Category") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
     assert!(sql.contains("ann@acme.test"), "{}", a.body);
     // The regions policy has no group to resolve for a person: denied,
     // not bypassed, even though Ann is the account's admin.
-    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
     assert!(sql.contains("1 = 0"), "{}", a.body);
-    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Revenue", "context": { "system_admin": true } })).await;
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "spec": spec_of("Revenue"), "context": { "system_admin": true } })).await;
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
 
     // REST is unchanged for a person.
@@ -965,7 +970,7 @@ async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
         "Revenue, Region = apac, Revenue > 10",
         "Category, Revenue desc, Region = apac",
     ] {
-        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": expr })).await;
+        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of(expr) })).await;
         let sql = a.body["result"]["structuredContent"]["sql"].as_str().map(str::to_string).unwrap_or_else(|| format!("ERROR {}", a.body));
         let lower = sql.to_lowercase();
         let secured = lower.contains("in ('emea')") || lower.contains("1 = 0");
@@ -993,7 +998,7 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
     let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     for expr in ["Total Revenue, Region = apac", "Global Revenue, Region = apac", "Peak Region Revenue, Region = apac"] {
-        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": expr })).await;
+        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of(expr) })).await;
         let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").to_lowercase();
         assert!(sql.contains("sum(t0.\"revenue\")"), "{expr}: {}", a.body);
         assert!(!sql.contains("in ('emea')") && !sql.contains("apac"), "{expr}: the measure ignores both the caller's filter and the policy's: {sql}");
@@ -1001,6 +1006,6 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
     // A caller whose context resolves nothing is still denied.
     let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": {} })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Global Revenue" })).await;
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Global Revenue") })).await;
     assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("1 = 0"), "{}", a.body);
 }
