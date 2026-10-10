@@ -23,6 +23,18 @@ of it.
   guard worked out. No deploy, no management, and the server never
   executes SQL, so a leaked key exposes model metadata and SQL text,
   not rows.
+- **Specs only, never the shorthand.** `sql`, `explain` and `explore`
+  take a query spec, and the spec's JSON schema travels in the tool
+  definition, so a client knows the shape before it writes one. A spec
+  is what a model writes reliably; the shorthand is for people at a
+  prompt.
+- **The instruction set is two files beside the code.**
+  `crates/server/src/mcp_prompts.json` holds what `initialize` tells
+  the client and each tool's description;
+  `crates/server/src/mcp_spec_schema.json` is the spec schema. Both are
+  compiled in. They are tuned against `harness/mcp-eval`, which runs
+  Claude Code as a real MCP client over the demo model and grades the
+  spec it settles on by the rows it returns; see its README.
 - **Written by hand**, not taken from a library. The subset needed is
   `initialize`, `notifications/initialized`, `ping`, `tools/list`,
   `tools/call` and version negotiation, which is a few hundred lines,
