@@ -168,11 +168,19 @@ pub struct QueryKey {
 
 /// A query key's right to read one project: on its production branch
 /// when `branch` is `None`, on every branch when `*`, else on that branch.
+///
+/// `context` is the security context the key plans with on this project
+/// when the project's owner has bound one. It is the owner's claim about
+/// who the key acts as, so a bound context cannot be overridden by the
+/// caller; an unbound grant leaves the context to the application, as
+/// before. Stored as the JSON the owner sent; the server validates its
+/// shape before it gets here.
 #[derive(Debug, Clone, Serialize)]
 pub struct Grant {
     pub project_id: i64,
     pub project_uid: String,
     pub branch: Option<String>,
+    pub context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +349,10 @@ CREATE TABLE audit (
 UPDATE user_keys SET account_id = (SELECT m.account_id FROM memberships m WHERE m.user_id = user_keys.user_id ORDER BY m.account_id LIMIT 1);
 ALTER TABLE users ADD COLUMN home_account_id INTEGER REFERENCES accounts(id);
 UPDATE users SET home_account_id = (SELECT m.account_id FROM memberships m WHERE m.user_id = users.id ORDER BY m.account_id LIMIT 1);",
+    // 3. A grant may carry the security context the key plans with on
+    // that project, bound by the project's owner. NULL is the state
+    // every existing grant is in: the application supplies the context.
+    "ALTER TABLE query_key_grants ADD COLUMN context TEXT;",
 ];
 
 /// Brings a database up to the last step in [`MIGRATIONS`], applying
@@ -441,6 +453,13 @@ fn new_secret(kind: &str) -> String {
 /// The part of a secret safe to show: its kind and first eight characters.
 pub fn prefix_of(secret: &str) -> String {
     secret.chars().take(12).collect()
+}
+
+/// A bound context as stored. A row that does not parse is treated as
+/// unbound rather than failing every request on the key; it cannot be
+/// written by the server, which validates before storing.
+fn context_of(text: Option<String>) -> Option<serde_json::Value> {
+    text.and_then(|t| serde_json::from_str(&t).ok())
 }
 
 /// ActiveSupport-style slug, the same the CLI derives project uids with.
@@ -1085,8 +1104,8 @@ impl Store {
     }
 
     fn grants_in(conn: &Connection, key_id: i64) -> rusqlite::Result<Vec<Grant>> {
-        let mut st = conn.prepare("SELECT g.project_id, p.uid, g.branch FROM query_key_grants g JOIN projects p ON p.id = g.project_id WHERE g.query_key_id = ?1 ORDER BY p.uid")?;
-        let rows = st.query_map(params![key_id], |r| Ok(Grant { project_id: r.get(0)?, project_uid: r.get(1)?, branch: r.get(2)? }))?;
+        let mut st = conn.prepare("SELECT g.project_id, p.uid, g.branch, g.context FROM query_key_grants g JOIN projects p ON p.id = g.project_id WHERE g.query_key_id = ?1 ORDER BY p.uid")?;
+        let rows = st.query_map(params![key_id], |r| Ok(Grant { project_id: r.get(0)?, project_uid: r.get(1)?, branch: r.get(2)?, context: context_of(r.get::<_, Option<String>>(3)?) }))?;
         rows.collect()
     }
 
@@ -1098,16 +1117,22 @@ impl Store {
 
     /// Grants the key read on a project: its production branch when
     /// `branch` is `None`, every branch for `*`, else the named branch.
-    pub fn grant(&self, account_id: i64, actor: &User, key_id: i64, project: &Project, branch: Option<&str>) -> Result<Grant> {
+    /// With a `context`, the key plans on this project as that context
+    /// and nothing the caller sends can change it; without one the
+    /// grant is unbound, which also clears a context set earlier, so a
+    /// grant is always exactly what its last call said.
+    pub fn grant(&self, account_id: i64, actor: &User, key_id: i64, project: &Project, branch: Option<&str>, context: Option<&serde_json::Value>) -> Result<Grant> {
         let conn = self.conn.lock().unwrap();
         let key = Self::query_key_in(&conn, account_id, key_id)?;
         let branch = branch.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
+        let context_text = context.map(serde_json::Value::to_string);
         conn.execute(
-            "INSERT INTO query_key_grants (query_key_id, project_id, branch) VALUES (?1, ?2, ?3) ON CONFLICT (query_key_id, project_id) DO UPDATE SET branch = excluded.branch",
-            params![key.id, project.id, branch],
+            "INSERT INTO query_key_grants (query_key_id, project_id, branch, context) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (query_key_id, project_id) DO UPDATE SET branch = excluded.branch, context = excluded.context",
+            params![key.id, project.id, branch, context_text],
         )?;
-        self.audit(&conn, account_id, &actor.email, "grant", &format!("{} on {}/{}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)))?;
-        Ok(Grant { project_id: project.id, project_uid: project.uid.clone(), branch })
+        let bound = if context.is_some() { " with a bound context" } else { "" };
+        self.audit(&conn, account_id, &actor.email, "grant", &format!("{} on {}/{}{bound}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)))?;
+        Ok(Grant { project_id: project.id, project_uid: project.uid.clone(), branch, context: context.cloned() })
     }
 
     pub fn revoke_grant(&self, account_id: i64, actor: &User, key_id: i64, project: &Project) -> Result<()> {
@@ -1125,12 +1150,12 @@ impl Store {
     pub fn keys_granted_on(&self, project: &Project) -> Result<Vec<(QueryKey, Grant)>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
-            "SELECT k.id, k.account_id, k.name, k.prefix, k.created_by, k.created_at, k.last_used_at, g.branch FROM query_key_grants g JOIN query_keys k ON k.id = g.query_key_id WHERE g.project_id = ?1 AND k.revoked_at IS NULL ORDER BY k.name",
+            "SELECT k.id, k.account_id, k.name, k.prefix, k.created_by, k.created_at, k.last_used_at, g.branch, g.context FROM query_key_grants g JOIN query_keys k ON k.id = g.query_key_id WHERE g.project_id = ?1 AND k.revoked_at IS NULL ORDER BY k.name",
         )?;
         let rows = st.query_map(params![project.id], |r| {
             Ok((
                 QueryKey { id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_by: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? },
-                Grant { project_id: project.id, project_uid: project.uid.clone(), branch: r.get(7)? },
+                Grant { project_id: project.id, project_uid: project.uid.clone(), branch: r.get(7)?, context: context_of(r.get::<_, Option<String>>(8)?) },
             ))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1567,7 +1592,7 @@ mod tests {
         // A query key: rotation keeps the grants and kills the old secret.
         let project = s.create_project(su.account.id, &ann, "sales", "Sales", "main").unwrap();
         let (qk, old_secret) = s.create_query_key(su.account.id, &ann, "web app").unwrap();
-        s.grant(su.account.id, &ann, qk.id, &project, None).unwrap();
+        s.grant(su.account.id, &ann, qk.id, &project, None, None).unwrap();
         let before = principal(&s, &old_secret);
         s.authorize(&before, &project, "main", Verb::Read).unwrap();
         let (_, new_secret) = s.rotate_query_key(su.account.id, &ann, qk.id).unwrap();
@@ -1826,13 +1851,13 @@ mod tests {
         assert!(secret.starts_with("zqk_"));
         let p = principal(&s, &secret);
         assert!(matches!(s.authorize(&p, &sales, "main", Verb::Read), Err(Error::Denied(_))));
-        s.grant(su.account.id, &su.user, qk.id, &sales, None).unwrap();
+        s.grant(su.account.id, &su.user, qk.id, &sales, None, None).unwrap();
         let p = principal(&s, &secret);
         s.authorize(&p, &sales, "main", Verb::Read).unwrap();
         assert!(matches!(s.authorize(&p, &sales, "dev", Verb::Read), Err(Error::Denied(_))));
         assert!(matches!(s.authorize(&p, &hr, "main", Verb::Read), Err(Error::Denied(_))));
         assert!(matches!(s.authorize(&p, &sales, "main", Verb::Write), Err(Error::Denied(_))));
-        s.grant(su.account.id, &su.user, qk.id, &sales, Some("*")).unwrap();
+        s.grant(su.account.id, &su.user, qk.id, &sales, Some("*"), None).unwrap();
         let p = principal(&s, &secret);
         s.authorize(&p, &sales, "dev", Verb::Read).unwrap();
         // Rotation keeps the grants and kills the old secret.
@@ -1844,6 +1869,30 @@ mod tests {
         s.revoke_query_key(su.account.id, &su.user, qk.id).unwrap();
         assert!(s.authenticate(&secret2).unwrap().is_none());
         assert!(s.audit_log(su.account.id, 50).unwrap().len() >= 6);
+    }
+
+    /// A bound context rides on the grant: it comes back on the cached
+    /// principal, a re-grant without one clears it, and a revoke drops it.
+    #[test]
+    fn a_grant_carries_the_context_its_owner_bound() {
+        let s = Store::in_memory().unwrap();
+        let su = s.signup("Acme", "ann@acme.com", "Ann", None).unwrap();
+        let sales = s.create_project(su.account.id, &su.user, "sales", "Sales", "main").unwrap();
+        let (qk, secret) = s.create_query_key(su.account.id, &su.user, "web app").unwrap();
+        let ctx = serde_json::json!({ "groups": [{ "name": "emea" }] });
+        let g = s.grant(su.account.id, &su.user, qk.id, &sales, None, Some(&ctx)).unwrap();
+        assert_eq!(g.context, Some(ctx.clone()));
+        let p = principal(&s, &secret);
+        let Principal::QueryKey { grants, .. } = &p else { panic!("a query key") };
+        assert_eq!(grants[0].context, Some(ctx.clone()));
+        assert_eq!(s.keys_granted_on(&sales).unwrap()[0].1.context, Some(ctx.clone()));
+        // The change is felt at once: the cached principal is gone.
+        s.grant(su.account.id, &su.user, qk.id, &sales, Some("*"), None).unwrap();
+        let Principal::QueryKey { grants, .. } = principal(&s, &secret) else { panic!("a query key") };
+        assert_eq!(grants[0].context, None, "a grant without a context is unbound again");
+        assert_eq!(grants[0].branch.as_deref(), Some("*"));
+        let log = s.audit_log(su.account.id, 10).unwrap();
+        assert!(log.iter().any(|r| r["subject"].as_str().unwrap_or("").ends_with("with a bound context")), "{log:?}");
     }
 
     /// A reset link is a password in waiting, so each of its edges is

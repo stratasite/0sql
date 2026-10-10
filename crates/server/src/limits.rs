@@ -68,6 +68,9 @@ pub fn classify(method: &str, path: &str) -> Class {
         (_, [one]) if SITE_FILES.contains(one) => Class::Exempt,
         ("POST", ["login"]) | ("POST", ["signup"]) | ("POST", ["invites", "accept"]) | ("POST", ["account", "password"]) => Class::Password,
         ("POST", ["password-reset"]) | ("POST", ["password-reset", "accept"]) | ("POST", ["verify-email"]) | ("POST", ["account", "verify-email"]) => Class::Password,
+        // One HTTP request carries one tool call, charged here as a plan;
+        // the explore-class tools take an explore token too, in mcp.rs.
+        ("POST", ["mcp"]) => Class::Plan,
         (_, ["projects", _, "branches", _, verb]) => match *verb {
             "deploy" | "validate" | "test" | "sampling-plan" => Class::Heavy,
             "sql" | "explain" => Class::Plan,
@@ -743,6 +746,7 @@ mod tests {
             ("GET", "/projects/a/branches/main", Plan),
             ("DELETE", "/projects/a/branches/main", Manage),
             ("GET", "/projects", Plan),
+            ("POST", "/mcp", Plan),
             ("POST", "/login", Password),
             ("POST", "/signup", Password),
             ("POST", "/invites/accept", Password),

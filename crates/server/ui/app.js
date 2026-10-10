@@ -424,7 +424,7 @@
     const depRows = deps.map((x) => h`<tr><td class="mono">${x.branch}</td><td>${x.tables} tables · ${x.fields} fields · ${x.joins} joins · ${x.policies} policies</td><td class="muted small">${x.deployed_at}</td><td class="actions"><a class="btn sm" href="/app/projects/${uid}/play?branch=${encodeURIComponent(x.branch)}" data-link>${icon("play")}Playground</a></td></tr>`).join("");
     const accessRows = access.access.map((a) => h`<tr><td>${a.user.email}${a.user.name ? raw(` <span class="faint">${esc(a.user.name)}</span>`) : ""}</td><td>${pill(a.level)}</td>
       <td class="actions">${owner ? raw(h`<select class="sm" data-level="${a.user.email}" style="width:auto"><option ${a.level === "read" ? "selected" : ""}>read</option><option ${a.level === "write" ? "selected" : ""}>write</option><option ${a.level === "owner" ? "selected" : ""}>owner</option></select><button class="btn sm quiet danger" data-remove-access="${a.user.email}">${icon("x")}Remove</button>`) : ""}</td></tr>`).join("");
-    const keyRows = access.query_keys.map((k) => h`<tr><td>${k.key.name} <span class="faint mono">${k.key.prefix}…</span></td><td class="mono">${k.grant.branch === null ? p.production_branch + " (production)" : k.grant.branch === "*" ? "every branch" : k.grant.branch}</td>
+    const keyRows = access.query_keys.map((k) => h`<tr><td>${k.key.name} <span class="faint mono">${k.key.prefix}…</span></td><td class="mono">${k.grant.branch === null ? p.production_branch + " (production)" : k.grant.branch === "*" ? "every branch" : k.grant.branch}</td><td>${raw(contextCell(k.grant.context))}</td>
       <td class="actions">${owner ? raw(h`<button class="btn sm quiet danger" data-revoke-grant="${k.key.id}">${icon("x")}Revoke</button>`) : ""}</td></tr>`).join("");
     frame("/app/", h`
       <div class="page-head"><div><div class="crumbs"><a href="/app/" data-link>Projects</a>${icon("chevron-right")}<span>${p.uid}</span></div><h1>${p.name || p.uid}</h1></div>
@@ -444,7 +444,7 @@
           <div class="card-body flush"><table><thead><tr><th>user</th><th>level</th><th></th></tr></thead><tbody>${raw(accessRows)}</tbody></table>
           ${owner ? raw(h`<form id="grant-user" class="inline" style="padding:12px 16px;border-top:1px solid var(--line)"><div class="field"><label>Member email</label><input name="email" type="email" required placeholder="bob@acme.com"></div><div class="field narrow"><label>Level</label><select name="level"><option>read</option><option>write</option><option>owner</option></select></div><button class="btn" type="submit">${icon("plus")}Grant</button></form>`) : ""}</div></div>
         <div class="card"><div class="card-head"><h2>${icon("key-round")}Query keys on this project</h2><a href="/app/query-keys" data-link class="small">manage keys ${icon("arrow-right", "sm")}</a></div>
-          <div class="card-body flush">${raw(access.query_keys.length ? h`<table><thead><tr><th>key</th><th>branch</th><th></th></tr></thead><tbody>${raw(keyRows)}</tbody></table>` : h`<div class="empty">${icon("key-round", "xl")}<div>No query key reads this project.</div></div>`)}</div></div>
+          <div class="card-body flush">${raw(access.query_keys.length ? h`<table><thead><tr><th>key</th><th>branch</th><th>plans as</th><th></th></tr></thead><tbody>${raw(keyRows)}</tbody></table>` : h`<div class="empty">${icon("key-round", "xl")}<div>No query key reads this project.</div></div>`)}</div></div>
       </div>`);
     if (owner) {
       const settings = document.getElementById("settings");
@@ -467,6 +467,20 @@
   }
 
   // ----------------------------------------------------------- query keys
+  // How a grant's security context reads in a table: the owner's claim,
+  // or the application's to send.
+  function contextCell(ctx) {
+    if (ctx === null || ctx === undefined) return '<span class="muted small">the app sends one</span>';
+    const parts = [];
+    if (ctx.email) parts.push(ctx.email);
+    if (ctx.system_admin) parts.push("system admin");
+    if (ctx.project_admin) parts.push("project admin");
+    (ctx.groups || []).forEach((g) => parts.push("group " + (g.name || (g.tags || []).join(" "))));
+    (ctx.tags || []).forEach((t) => parts.push("tag " + t));
+    const summary = parts.length ? parts.join(", ") : "nobody: an empty context";
+    return h`<span class="mono small" title="${JSON.stringify(ctx)}">${summary}</span>`;
+  }
+
   async function viewQueryKeys(reveal) {
     const [d, list] = await Promise.all([api("GET", "/account/query-keys"), api("GET", "/projects")]);
     const projects = (list.projects || []).filter((p) => p.level === "owner");
@@ -483,11 +497,14 @@
       <div class="card"><div class="card-head"><h2>${icon("key-round")}${key.name} <span class="faint mono" style="font-weight:400">${key.prefix}…</span></h2>
         <div class="actions"><span class="muted small stat">${icon("clock", "sm")}${key.last_used_at ? "used " + when(key.last_used_at) : "never used"}</span><button class="btn sm" data-rotate="${key.id}">${icon("refresh-cw")}Rotate</button><button class="btn sm quiet danger" data-revoke-key="${key.id}">${icon("trash-2")}Revoke</button></div></div>
         <div class="card-body flush">
-          ${raw(grants.length ? h`<table><thead><tr><th>project</th><th>branch</th><th></th></tr></thead><tbody>${raw(grants.map((g) => h`<tr><td><a href="/app/projects/${g.project_uid}" data-link>${g.project_uid}</a></td><td class="mono">${g.branch === null ? "production" : g.branch === "*" ? "every branch" : g.branch}</td><td class="actions"><button class="btn sm quiet danger" data-revoke-grant="${key.id}" data-project="${g.project_uid}">${icon("x")}Revoke</button></td></tr>`).join(""))}</tbody></table>` : h`<div class="empty small">Reads nothing yet. Grant it a project below.</div>`)}
-          ${projects.length ? raw(h`<form class="inline" data-grant="${key.id}" style="padding:12px 16px;border-top:1px solid var(--line)"><div class="field"><label>Project you own</label><select name="project">${raw(options)}</select></div><div class="field narrow"><label>Branch</label><select name="branch" class="mono">${raw(branchOptions(projects[0].uid))}</select></div><button class="btn" type="submit">${icon("plus")}Grant read</button></form>`) : ""}
+          ${raw(grants.length ? h`<table><thead><tr><th>project</th><th>branch</th><th>plans as</th><th></th></tr></thead><tbody>${raw(grants.map((g) => h`<tr><td><a href="/app/projects/${g.project_uid}" data-link>${g.project_uid}</a></td><td class="mono">${g.branch === null ? "production" : g.branch === "*" ? "every branch" : g.branch}</td><td>${raw(contextCell(g.context))}</td><td class="actions"><button class="btn sm quiet danger" data-revoke-grant="${key.id}" data-project="${g.project_uid}">${icon("x")}Revoke</button></td></tr>`).join(""))}</tbody></table>` : h`<div class="empty small">Reads nothing yet. Grant it a project below.</div>`)}
+          ${projects.length ? raw(h`<form data-grant="${key.id}" style="padding:12px 16px;border-top:1px solid var(--line)"><div class="inline"><div class="field"><label>Project you own</label><select name="project">${raw(options)}</select></div><div class="field narrow"><label>Branch</label><select name="branch" class="mono">${raw(branchOptions(projects[0].uid))}</select></div><button class="btn" type="submit">${icon("plus")}Grant read</button></div>
+            <details class="small"><summary class="muted">Bind who this key plans as on the project (optional)</summary>
+              <div class="field" style="margin-top:8px"><label>Security context, as JSON</label><textarea name="context" class="mono" rows="3" placeholder='{"groups": [{"name": "emea"}]}'></textarea>
+              <div class="muted small">Bound, the key always plans as this context on the project, over MCP and over the API, and a context sent with a request is refused. Left empty, the application sends one with each request, and agents over MCP cannot plan on branches that have policies. Granting again replaces what was bound.</div></div></details></form>`) : ""}
         </div></div>`).join("");
     frame("/app/query-keys", h`
-      <div class="page-head"><div><h1>Query keys</h1><div class="sub">What your applications send. Read only, on the projects and branches they are granted. <code>*</code> means every branch.</div></div></div>
+      <div class="page-head"><div><h1>Query keys</h1><div class="sub">What your applications and agents send. Read only, on the projects and branches they are granted. <code>*</code> means every branch. An MCP client connects to <code>/mcp</code> with the key as its Bearer token.</div></div></div>
       ${raw(reveal ? h`<div class="card" style="margin-bottom:20px"><div class="card-body"><h2>${icon("key-round")}${reveal.name}</h2>${raw(secretBlock(reveal.secret, "Put it in your app's configuration as the Bearer token for /sql and /explore."))}</div></div>` : "")}
       <div class="card" style="margin-bottom:20px"><div class="card-body"><form id="new-key" class="inline"><div class="field"><label>New query key</label><input name="name" required placeholder="web app, prod"></div><button class="btn primary" type="submit">${icon("plus")}Create</button></form></div></div>
       <div class="grid">${raw(cards || h`<div class="card"><div class="empty">${icon("key-round", "xl")}<div>No query keys yet. Your applications send one as the Bearer token.</div></div></div>`)}</div>`);
@@ -495,7 +512,13 @@
     nk.onsubmit = async (e) => { e.preventDefault(); try { const r = await api("POST", "/account/query-keys", Object.fromEntries(new FormData(nk).entries())); viewQueryKeys({ name: r.key.name, secret: r.secret }); } catch (err) { toast(err.message); } };
     root.querySelectorAll("[data-grant]").forEach((f) => {
       f.project.onchange = () => { f.branch.innerHTML = branchOptions(f.project.value); };
-      f.onsubmit = async (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(f).entries()); if (!d.branch) delete d.branch; try { await api("POST", `/account/query-keys/${f.dataset.grant}/grants`, d); viewQueryKeys(); } catch (err) { toast(err.message); } };
+      f.onsubmit = async (e) => {
+        e.preventDefault();
+        const d = Object.fromEntries(new FormData(f).entries());
+        if (!d.branch) delete d.branch;
+        if (d.context && d.context.trim()) { try { d.context = JSON.parse(d.context); } catch (_) { return toast("the context is not valid JSON"); } } else delete d.context;
+        try { await api("POST", `/account/query-keys/${f.dataset.grant}/grants`, d); viewQueryKeys(); } catch (err) { toast(err.message); }
+      };
     });
     root.querySelectorAll("[data-revoke-grant]").forEach((b) => b.onclick = async () => { try { await api("DELETE", `/account/query-keys/${b.dataset.revokeGrant}/grants/${encodeURIComponent(b.dataset.project)}`); viewQueryKeys(); } catch (err) { toast(err.message); } });
     root.querySelectorAll("[data-rotate]").forEach((b) => b.onclick = async () => { if (!confirm("Rotate this key? The current secret stops working at once.")) return; try { const r = await api("POST", `/account/query-keys/${b.dataset.rotate}/rotate`); viewQueryKeys({ name: r.key.name + " (rotated)", secret: r.secret }); } catch (err) { toast(err.message); } });

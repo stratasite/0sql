@@ -20,11 +20,13 @@
 //! GET  /projects/{uid}/branches/{branch}/sampling-plan  the SQL the CLI runs to sample values
 //! DELETE /projects/{uid}/branches/{branch}
 //! GET  /projects                                       every deployed branch
+//! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! GET  /healthz
 //! ```
 
 mod limits;
 mod mail;
+mod mcp;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Query, State};
@@ -93,6 +95,9 @@ struct App {
     signup_open: bool,
     /// Session cookies marked Secure, for a server behind https.
     secure_cookies: bool,
+    /// Where the service is reached, `ZSQL_PUBLIC_URL`: the one origin a
+    /// browser may speak MCP from.
+    public_url: String,
     /// What each caller may ask for, and how fast.
     limits: Limiter,
     /// How much of each kind of work may be in the server at once.
@@ -162,6 +167,12 @@ fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError>
             None => Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "this API key is not valid".into())),
         };
     }
+    // The MCP endpoint takes a key and nothing else. A session cookie
+    // is never read there, so a signed-in browser cannot be made to
+    // speak MCP as its user, whatever page it is on.
+    if mcp::is_endpoint(parts.uri.path()) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "the MCP endpoint takes an API key: Authorization: Bearer <key>".into()));
+    }
     // The web app: a session cookie. Anything but a read must also
     // carry the header the app's own scripts send, which a cross-site
     // form cannot, so a stolen navigation cannot act as the user.
@@ -214,6 +225,16 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
         }
     }
 
+    // MCP is reached by programs, and a browser page is not one. The
+    // Origin check is the transport's own rule and comes before any
+    // key is looked at.
+    let mcp = mcp::is_endpoint(parts.uri.path());
+    if mcp {
+        if let Err(r) = mcp::check_origin(&app.public_url, &parts.headers) {
+            return r;
+        }
+    }
+
     let mut who = None;
     if limits::authenticates(parts.uri.path()) {
         match authenticate(&app, &parts) {
@@ -227,7 +248,11 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
                         return too_many(&d);
                     }
                 }
-                return e.into_response();
+                let mut r = e.into_response();
+                if mcp {
+                    mcp::challenge(&mut r);
+                }
+                return r;
             }
         }
     }
@@ -435,6 +460,24 @@ fn gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, verb: Verb)
     let project = store.project(p.account().id, uid).map_err(internal)?.ok_or_else(|| not_found(uid, branch))?;
     store.authorize(p, &project, branch, verb).map_err(accounts_error)?;
     Ok(Tenant { scope, project: Some(project) })
+}
+
+/// The security context a plan runs under.
+///
+/// A query key whose grant on this project carries a context bound by
+/// the project's owner plans as that context and nothing else. A
+/// context in the request is refused then, even an identical one, so
+/// there is never a question of which won. Everyone else plans as the
+/// context they sent, as before: an application acting for many users
+/// sends each one's.
+fn effective_context(t: &Tenant, who: &Option<Principal>, sent: Option<SecurityContext>) -> Result<Option<SecurityContext>, ApiError> {
+    let (Some(Principal::QueryKey { grants, .. }), Some(project)) = (who, &t.project) else { return Ok(sent) };
+    let Some(bound) = grants.iter().find(|g| g.project_id == project.id).and_then(|g| g.context.as_ref()) else { return Ok(sent) };
+    if sent.is_some() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "ContextBound", format!("this key's context on {} is bound by the project's owner; do not send one", project.uid)));
+    }
+    let ctx: SecurityContext = serde_json::from_value(bound.clone()).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", format!("the context bound on {} does not parse: {e}", project.uid)))?;
+    Ok(Some(ctx))
 }
 
 /// The user behind a request, for actions only people may take.
@@ -1016,7 +1059,8 @@ struct Planned {
 fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest, explain: bool) -> Result<Planned, ApiError> {
     let t = gate(app, who, uid, branch, Verb::Read)?;
     let d = model(app, &t, uid, branch)?;
-    if req.context.is_none() && !d.universe().policies().is_empty() {
+    let context = effective_context(&t, who, req.context)?;
+    if context.is_none() && !d.universe().policies().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "ContextRequired", "this branch has security policies; a context is required to plan".into()));
     }
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
@@ -1030,22 +1074,34 @@ fn plan_request(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, 
     let limit = query.limit.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0);
     let t1 = Instant::now();
     let planner = d.planner();
-    let plan = planner.plan_query_explained(query, req.context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.error_class(), e.to_string()))?;
+    let plan = planner.plan_query_explained(query, context.as_ref(), explain).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.error_class(), e.to_string()))?;
     let t2 = Instant::now();
     Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items, limit })
 }
 
+// The read handlers are each a thin wrapper over a plain function, so
+// the MCP tools in mcp.rs run exactly the same code with the same
+// principal, and there is one place per read where access is decided.
+
 async fn sql(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
-    let p = plan_request(&app, &who, &uid, &branch, req, false)?;
-    Ok(Json(SqlResponse { sql: p.plan.sql_with_limit(p.limit), datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items }))
+    Ok(Json(sql_of(&app, &who, &uid, &branch, req)?))
+}
+
+fn sql_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest) -> Result<SqlResponse, ApiError> {
+    let p = plan_request(app, who, uid, branch, req, false)?;
+    Ok(SqlResponse { sql: p.plan.sql_with_limit(p.limit), datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items })
 }
 
 async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
-    let p = plan_request(&app, &who, &uid, &branch, req, true)?;
+    Ok(Json(explain_of(&app, &who, &uid, &branch, req)?))
+}
+
+fn explain_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: SqlRequest) -> Result<ExplainResponse, ApiError> {
+    let p = plan_request(app, who, uid, branch, req, true)?;
     // Before taking `explain` out of the plan, which moves part of it.
     let sql = p.plan.sql_with_limit(p.limit);
     let x = p.plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-    Ok(Json(ExplainResponse { sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes }))
+    Ok(ExplainResponse { sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes })
 }
 
 /// What a query can take on: the visible dimensions and measures the
@@ -1058,9 +1114,9 @@ struct ExploreRequest {
     #[serde(default)]
     expr: Option<String>,
     /// Accepted for symmetry with sql and explain; exploring resolves
-    /// universes only, so no policy applies yet.
+    /// universes only, so no policy applies yet. Still held to the
+    /// bound-context rule, so a key behaves the same on every read.
     #[serde(default)]
-    #[allow(dead_code)]
     context: Option<SecurityContext>,
     /// Keep only fields whose name, uid or synonyms contain this, or come
     /// close to it.
@@ -1076,8 +1132,13 @@ struct ExploreResponse {
 }
 
 async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<ExploreRequest>) -> Result<Json<ExploreResponse>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
-    let d = model(&app, &t, &uid, &branch)?;
+    Ok(Json(explore_of(&app, &who, &uid, &branch, req)?))
+}
+
+fn explore_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, req: ExploreRequest) -> Result<ExploreResponse, ApiError> {
+    let t = gate(app, who, uid, branch, Verb::Read)?;
+    let d = model(app, &t, uid, branch)?;
+    let _ = effective_context(&t, who, req.context)?;
     let base = app.dialects.base().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Dialect", e.to_string()))?;
     let (spec_value, _, _) = spec_of(req.spec, req.expr.as_deref())?;
     let t0 = Instant::now();
@@ -1123,7 +1184,7 @@ async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch))
         }
         out.into_iter().map(|(_, v)| v).collect()
     };
-    Ok(Json(ExploreResponse { dimensions: describe(x.dimensions), measures: describe(x.measures), total_us: t0.elapsed().as_micros() }))
+    Ok(ExploreResponse { dimensions: describe(x.dimensions), measures: describe(x.measures), total_us: t0.elapsed().as_micros() })
 }
 
 fn spec_error(e: zsql_spec::SpecError) -> ApiError {
@@ -1144,8 +1205,12 @@ struct FieldsQuery {
 /// model order, then near matches by trigram similarity, each with its
 /// `score` (1 for a containing match).
 async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
-    let d = model(&app, &t, &uid, &branch)?;
+    Ok(Json(fields_of(&app, &who, &uid, &branch, q)?))
+}
+
+fn fields_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, q: FieldsQuery) -> Result<Value, ApiError> {
+    let t = gate(app, who, uid, branch, Verb::Read)?;
+    let d = model(app, &t, uid, branch)?;
     check_term(&q.q)?;
     let needle = q.q.trim().to_lowercase();
     let visible = |f: &&zsql_semantic::Field| q.hidden || !f.hidden;
@@ -1162,7 +1227,7 @@ async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)):
         v
     };
     if needle.is_empty() {
-        return Ok(Json(json!({ "fields": d.universe().fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() })));
+        return Ok(json!({ "fields": d.universe().fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() }));
     }
     let mut out: Vec<Value> = d
         .universe()
@@ -1182,12 +1247,16 @@ async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)):
             out.push(describe(s.field, Some(s.score)));
         }
     }
-    Ok(Json(json!({ "fields": out })))
+    Ok(json!({ "fields": out }))
 }
 
 async fn tables(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
-    let d = model(&app, &t, &uid, &branch)?;
+    Ok(Json(tables_of(&app, &who, &uid, &branch)?))
+}
+
+fn tables_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str) -> Result<Value, ApiError> {
+    let t = gate(app, who, uid, branch, Verb::Read)?;
+    let d = model(app, &t, uid, branch)?;
     let out: Vec<Value> = d
         .universe()
         .tables()
@@ -1200,19 +1269,23 @@ async fn tables(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)):
             })
         })
         .collect();
-    Ok(Json(json!({ "tables": out })))
+    Ok(json!({ "tables": out }))
 }
 
 async fn values(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch, dim)): Path<(String, String, String)>) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
-    let d = model(&app, &t, &uid, &branch)?;
-    let field = d.universe().field_by_uid(&dim, Some(FieldKind::Dimension)).or_else(|| d.universe().field_by_name(&dim, FieldKind::Dimension));
+    Ok(Json(values_of(&app, &who, &uid, &branch, &dim)?))
+}
+
+fn values_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, dim: &str) -> Result<Value, ApiError> {
+    let t = gate(app, who, uid, branch, Verb::Read)?;
+    let d = model(app, &t, uid, branch)?;
+    let field = d.universe().field_by_uid(dim, Some(FieldKind::Dimension)).or_else(|| d.universe().field_by_name(dim, FieldKind::Dimension));
     let Some(field) = field else {
         return Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no dimension {dim}")));
     };
     let entry = d.values.as_ref().and_then(|v| v.get(&field.uid));
     match entry {
-        Some(e) => Ok(Json(serde_json::to_value(e).unwrap())),
+        Some(e) => Ok(serde_json::to_value(e).unwrap()),
         None => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no sampled values for {}", field.uid))),
     }
 }
@@ -1296,15 +1369,19 @@ fn in_scope<'a, V>(models: &'a HashMap<String, V>, scope: &str) -> impl Iterator
 /// Every deployment the caller may read; with accounts on, also the
 /// account's projects and the caller's level on each.
 async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
+    Ok(Json(projects_of(&app, &who)?))
+}
+
+fn projects_of(app: &Shared, who: &Option<Principal>) -> Result<Value, ApiError> {
     let mut out = Vec::new();
-    for d in in_scope(&app.models.read().unwrap(), &scope_of(&who)) {
-        if gate(&app, &who, &d.uid, &d.branch, Verb::Read).is_ok() {
+    for d in in_scope(&app.models.read().unwrap(), &scope_of(who)) {
+        if gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok() {
             out.push(summary(d));
         }
     }
     out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
     let mut answer = json!({ "deployments": out });
-    if let (Some(store), Some(p)) = (&app.accounts, &who) {
+    if let (Some(store), Some(p)) = (&app.accounts, who) {
         let mut projects = Vec::new();
         for project in store.projects(p.account().id).map_err(internal)? {
             let level = match p {
@@ -1318,7 +1395,7 @@ async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Val
         }
         answer["projects"] = json!(projects);
     }
-    Ok(Json(answer))
+    Ok(answer)
 }
 
 // ---------------------------------------------------------------- accounts
@@ -1773,16 +1850,36 @@ struct GrantRequest {
     project: String,
     #[serde(default)]
     branch: Option<String>,
+    /// The security context the key plans with on this project, bound
+    /// by its owner. Absent or null leaves the grant unbound.
+    #[serde(default)]
+    context: Option<Value>,
 }
 
-/// Granting a key read on a project is the project owner's call (or an admin's).
+/// Granting a key read on a project is the project owner's call (or an
+/// admin's), and so is binding the context it plans with there: that
+/// context can assert claims that bypass the model's policies, which is
+/// the owner's to decide and nobody else's.
 async fn grant(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>, Json(req): Json<GrantRequest>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
     let key = store.query_key(account.id, id).map_err(accounts_error)?;
     let t = gate(&app, &who, &req.project, "", Verb::Owner)?;
     let project = t.project.expect("accounts on");
-    let g = store.grant(account.id, user, key.id, &project, req.branch.as_deref()).map_err(accounts_error)?;
+    let context = match req.context {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v.to_string().len();
+            if n > shape::TEXT {
+                return Err(too_big("bytes in this context", n, shape::TEXT));
+            }
+            // Stored in its canonical shape, so what the owner sees back
+            // is exactly what the planner will be given.
+            let ctx: SecurityContext = serde_json::from_value(v).map_err(|e| ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("this is not a security context: {e}")))?;
+            Some(serde_json::to_value(ctx).expect("a context serializes"))
+        }
+    };
+    let g = store.grant(account.id, user, key.id, &project, req.branch.as_deref(), context.as_ref()).map_err(accounts_error)?;
     Ok(Json(json!({ "key": key, "grant": g })))
 }
 
@@ -1991,6 +2088,7 @@ fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/fields", get(fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(values))
+        .route(mcp::PATH, post(mcp::endpoint))
         .route("/", get(root))
         .route("/app", get(ui_root))
         .route("/app/", get(ui_root))
@@ -2044,10 +2142,10 @@ async fn main() -> anyhow::Result<()> {
     let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
-    let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mailer = mail::Mailer::from_env(public_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
     let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, public_url: public_url.clone(), limits, admission, caps, mailer });
     let (n, skipped) = reload(&app)?;
     eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
     if !skipped.is_empty() {

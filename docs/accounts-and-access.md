@@ -23,7 +23,11 @@ is superseded.
   branch, or one named branch. Any developer can create a query key;
   grants on a project are given by that project's owners (or an admin).
   Rotation issues a new secret and keeps the grants; the old secret stops
-  at once.
+  at once. A grant may carry the **security context** the key plans as
+  on that project, bound by the project's owner: then the key plans as
+  that context on every path, a context sent with a request is refused,
+  and over MCP, where the caller never chooses, it is the only way a
+  query key plans on a branch with policies. `docs/mcp.md` has the rule.
 - A project's **protected production** flag makes deploys to its
   production branch need an owner.
 - An account may keep **5 deployed branches per project and 20 in all**
@@ -57,6 +61,8 @@ and the mode the CLI's tests run against.
 
 The CLI is unchanged: it sends whatever key `zsql auth` stored, and the
 server answers 401 without one, 403 when the key may not do the action.
+An MCP client sends the same key to `POST /mcp` and gets the reads as
+tools; `docs/mcp.md`.
 
 ## Endpoints
 
@@ -76,7 +82,7 @@ DELETE /account/keys/{id}
 GET    /account/query-keys                     POST {name} → key, secret
 DELETE /account/query-keys/{id}                                           (admin or creator)
 POST   /account/query-keys/{id}/rotate         → key, secret               (admin or creator)
-POST   /account/query-keys/{id}/grants         {project, branch?}          (project owner)
+POST   /account/query-keys/{id}/grants         {project, branch?, context?} (project owner; the context the key plans as there, see docs/mcp.md)
 DELETE /account/query-keys/{id}/grants/{project}                          (project owner)
 GET    /account/audit?limit=                                              (admin)
 GET    /projects                               deployments the caller may read, and the account's projects with the caller's level
@@ -191,8 +197,8 @@ operational side of this list.
   keeps this open.
 - A user in several accounts: the schema allows it, the key answers for
   the first membership for now.
-- Key expiry, a viewer role, teams, binding a query key to the security
-  context claims it may assert.
+- Key expiry, a viewer role, teams. Binding a query key to a security
+  context is done, per grant: see `docs/mcp.md`.
 - Multiple server instances: a storage trait with a Postgres and S3
   backend behind the same endpoints (see the hosted-service notes in the
   conversation of 2026-10-01: lazy load, LRU, version stamps).

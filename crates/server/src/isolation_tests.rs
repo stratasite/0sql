@@ -52,6 +52,7 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         accounts: Some(Store::in_memory().unwrap()),
         signup_open: true,
         secure_cookies: false,
+        public_url: "http://test".into(),
         limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
         admission: Admission::from_env().unwrap(),
         caps: Caps { per_project: 5, per_account: 20 },
@@ -64,6 +65,7 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
 struct Answer {
     status: StatusCode,
     body: Value,
+    headers: axum::http::HeaderMap,
 }
 
 impl Answer {
@@ -77,9 +79,16 @@ impl Answer {
 
 impl Server {
     async fn send(&self, method: Method, path: &str, key: Option<&str>, body: Option<(&str, Vec<u8>)>) -> Answer {
+        self.send_with(method, path, key, &[], body).await
+    }
+
+    async fn send_with(&self, method: Method, path: &str, key: Option<&str>, headers: &[(&str, &str)], body: Option<(&str, Vec<u8>)>) -> Answer {
         let mut req = Request::builder().method(method).uri(path);
         if let Some(k) = key {
             req = req.header("authorization", format!("Bearer {k}"));
+        }
+        for (name, value) in headers {
+            req = req.header(*name, *value);
         }
         let body = match body {
             Some((ct, bytes)) => {
@@ -92,8 +101,36 @@ impl Server {
         req.extensions_mut().insert(ConnectInfo(PEER));
         let res = self.router.clone().oneshot(req).await.unwrap();
         let status = res.status();
+        let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), 16 << 20).await.unwrap();
-        Answer { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null) }
+        Answer { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers }
+    }
+
+    /// One JSON-RPC message to the MCP endpoint, with any extra headers.
+    async fn mcp(&self, key: Option<&str>, headers: &[(&str, &str)], msg: Value) -> Answer {
+        self.send_with(Method::POST, "/mcp", key, headers, Some(("application/json", serde_json::to_vec(&msg).unwrap()))).await
+    }
+
+    /// A tool call; answers the JSON-RPC envelope.
+    async fn tool(&self, key: Option<&str>, name: &str, args: Value) -> Answer {
+        self.mcp(key, &[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } })).await
+    }
+
+    /// The names a caller's `list_projects` tool answers, as `project/branch`.
+    async fn mcp_listing(&self, key: &str) -> Vec<String> {
+        let a = self.tool(Some(key), "list_projects", json!({})).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        let r = &a.body["result"];
+        assert!(r["isError"].is_null(), "{r}");
+        r["structuredContent"]["deployments"].as_array().unwrap().iter().map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap())).collect()
+    }
+
+    /// A session cookie for the web app, as a browser would hold it.
+    async fn login_cookie(&self, email: &str, password: &str) -> String {
+        let a = self.post("/login", None, json!({ "email": email, "password": password })).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+        let set = a.headers.get("set-cookie").unwrap().to_str().unwrap();
+        set.split(';').next().unwrap().to_string()
     }
 
     async fn get(&self, path: &str, key: Option<&str>) -> Answer {
@@ -205,6 +242,51 @@ fn fixture_files(uid: &str, marker: &str) -> Vec<(String, String)> {
         ),
         ("tests/smoke.yml".into(), "name: smoke\nprojections: [Category, Revenue]\nassert_regex: SELECT\n".into()),
     ]
+}
+
+/// The fixture with two row-level policies: `Revenue` is filtered by the
+/// groups in the context on `Region`, and `Category` by the context's
+/// email on `Owner Email`. Both deny when nothing resolves.
+fn archive_with_policies(uid: &str, marker: &str) -> Vec<u8> {
+    let mut files = fixture_files(uid, marker);
+    let model = files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap();
+    model.1.push_str(
+        "  - type: dimension\n    name: Region\n    data_type: string\n    expression:\n      sql: region\n\
+         \x20 - type: dimension\n    name: Owner Email\n    data_type: string\n    expression:\n      sql: owner_email\n",
+    );
+    files.push((
+        "security.yml".into(),
+        "policies:\n\
+         \x20 - name: regions\n    mode: filter_data\n    context_dimension: Region\n    triggers:\n      field_names: [Revenue]\n\
+         \x20   permission_resolution:\n      source: groups\n      value_from: name\n      unresolved: deny\n\
+         \x20 - name: owners\n    mode: filter_data\n    context_dimension: Owner Email\n    triggers:\n      field_names: [Category]\n\
+         \x20   permission_resolution:\n      source: user\n      value_from: email\n      unresolved: deny\n"
+            .into(),
+    ));
+    archive_of(&files)
+}
+
+/// The policy fixture plus measures whose own rules touch the context
+/// dimension: one that ignores a caller's Region filter, one that
+/// ignores every filter, and one computed per Region then rolled up.
+/// The regions policy is triggered by the `secure` tag they all carry.
+fn archive_with_exclusions(uid: &str, marker: &str) -> Vec<u8> {
+    let mut files = fixture_files(uid, marker);
+    let model = files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap();
+    model.1.push_str(
+        "  - type: dimension\n    name: Region\n    data_type: string\n    expression:\n      sql: region\n\
+         \x20 - type: measure\n    name: Total Revenue\n    data_type: decimal\n    tags: [secure]\n    exclusion_type: exclude\n    exclusions:\n      - type: dimension\n        filter: ignore\n        entities: [Region]\n    expression:\n      sql: sum(revenue)\n\
+         \x20 - type: measure\n    name: Global Revenue\n    data_type: decimal\n    tags: [secure]\n    exclusion_type: exclude_all\n    expression:\n      sql: sum(revenue)\n\
+         \x20 - type: measure\n    name: Peak Region Revenue\n    data_type: decimal\n    tags: [secure]\n    inclusions:\n      filter: ignore\n      aggregation: max\n      dimensions: [Region]\n    expression:\n      sql: sum(revenue)\n",
+    );
+    files.push((
+        "security.yml".into(),
+        "policies:\n\
+         \x20 - name: regions\n    mode: filter_data\n    context_dimension: Region\n    triggers:\n      field_tags: [secure]\n\
+         \x20   permission_resolution:\n      source: groups\n      value_from: name\n      unresolved: deny\n"
+            .into(),
+    ));
+    archive_of(&files)
 }
 
 fn archive_of(files: &[(String, String)]) -> Vec<u8> {
@@ -616,4 +698,309 @@ fn decompression_stops_at_the_limit() {
     assert_eq!(total, UNPACKED_LIMIT);
     assert!(tripped.load(std::sync::atomic::Ordering::Relaxed));
     assert_eq!(err.kind(), std::io::ErrorKind::Other);
+}
+
+// ------------------------------------------------------------------- mcp
+
+/// The endpoint takes a key in the Authorization header and nothing
+/// else: no cookie, no key in the query string, no page from another
+/// origin, and no stream to hold open.
+#[tokio::test]
+async fn mcp_takes_a_key_and_nothing_else() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "test", "version": "0" } } });
+
+    // No key: 401 with the challenge a client reads, and no OAuth to chase.
+    let a = s.mcp(None, &[], init.clone()).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(a.headers.get("www-authenticate").unwrap().to_str().unwrap(), "Bearer realm=\"0sql\"");
+
+    // A signed-in browser's cookie, with the header the app sends: still no.
+    let cookie = s.login_cookie("ann@acme.test", "annpassword1").await;
+    let a = s.mcp(None, &[("cookie", &cookie), ("x-requested-with", "zsql")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.error());
+    let a = s.get("/me", None).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    let a = s.send_with(Method::GET, "/me", None, &[("cookie", &cookie)], None).await;
+    assert_eq!(a.status, StatusCode::OK, "the cookie is good elsewhere: {}", a.error());
+
+    // A key that is not valid.
+    let a = s.mcp(Some("zqk_nothing"), &[], init.clone()).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    assert!(a.headers.contains_key("www-authenticate"));
+
+    // The key: initialize answers the version asked for, and names the tools.
+    let a = s.mcp(Some(&ann), &[], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(a.body["result"]["serverInfo"]["name"], "0sql");
+    let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } })).await;
+    assert_eq!(a.body["result"]["protocolVersion"], "2025-11-25", "an unknown version gets the newest");
+
+    // Origin: the app's own passes, any other is refused before the key is read.
+    let a = s.mcp(Some(&ann), &[("origin", "http://test")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = s.mcp(Some(&ann), &[("origin", "https://evil.example")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    let a = s.mcp(None, &[("origin", "https://evil.example")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "refused even before authentication");
+    let a = s.mcp(Some(&ann), &[("origin", "null")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+
+    // No stream: GET and DELETE are not offered.
+    let a = s.get("/mcp", Some(&ann)).await;
+    assert_eq!(a.status, StatusCode::METHOD_NOT_ALLOWED);
+    let a = s.delete("/mcp", Some(&ann)).await;
+    assert_eq!(a.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // The wire: a notification is taken, a batch is not, an unknown
+    // method and an unsupported version header are named.
+    let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+    assert_eq!(a.status, StatusCode::ACCEPTED);
+    let a = s.mcp(Some(&ann), &[], json!([init.clone()])).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" })).await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(a.body["error"]["code"], -32601);
+    let a = s.mcp(Some(&ann), &[("mcp-protocol-version", "2024-11-05")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = s.mcp(Some(&ann), &[("mcp-protocol-version", "2025-11-25")], json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["result"], json!({}));
+}
+
+/// Through the tools a key sees and plans against exactly the branches
+/// it may read, and no tool takes a context.
+#[tokio::test]
+async fn mcp_tools_reach_what_the_key_may_read_and_nothing_else() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy(CS, "dev", &ann, archive(CS, "acme-dev")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+
+    // The listed tools, and not one of them takes a context.
+    let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+    let tools = a.body["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["list_projects", "fields", "tables", "values", "explore", "sql", "explain"]);
+    for t in tools {
+        assert!(t["inputSchema"]["properties"]["context"].is_null(), "{}", t["name"]);
+        assert_eq!(t["inputSchema"]["additionalProperties"], false, "{}", t["name"]);
+    }
+
+    // A query key on one branch of one project.
+    let (qk, secret) = s.query_key(&ann).await;
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(s.mcp_listing(&secret).await, ["customer-service/main"]);
+    assert_eq!(s.mcp_listing(&ann).await, ["billing/main", "customer-service/dev", "customer-service/main"]);
+    assert_eq!(s.mcp_listing(&ned).await, ["customer-service/main"]);
+
+    // The branch defaults to production; a named one is held to the grant.
+    let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "hidden": true })).await;
+    let names: Vec<&str> = a.body["result"]["structuredContent"]["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"Marker acme") && !names.contains(&"Marker newco"), "{names:?}");
+    let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "branch": "dev" })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().contains("not granted"), "{}", a.body);
+    let a = s.tool(Some(&secret), "tables", json!({ "project": "billing" })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    let a = s.tool(Some(&ann), "tables", json!({ "project": "billing" })).await;
+    assert!(a.body["result"]["isError"].is_null(), "{}", a.body);
+
+    // Planning: the other account's column is unreachable by any name.
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Marker acme, Revenue" })).await;
+    let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
+    assert!(sql.contains("marker_acme"), "{}", a.body);
+    let a = s.tool(Some(&ned), "sql", json!({ "project": CS, "expr": "Marker acme, Revenue" })).await;
+    let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
+    assert!(!sql.contains("marker_acme"), "{}", a.body);
+    let a = s.tool(Some(&ned), "explain", json!({ "project": CS, "expr": "Marker newco, Revenue" })).await;
+    assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap().contains("marker_newco"), "{}", a.body);
+    assert!(a.body["result"]["structuredContent"]["nodes"].is_array());
+    let a = s.tool(Some(&secret), "explore", json!({ "project": CS, "expr": "Revenue", "q": "cat" })).await;
+    assert!(a.body["result"]["structuredContent"]["dimensions"].as_array().unwrap().iter().any(|d| d["name"] == "Category"), "{}", a.body);
+
+    // Arguments the tools do not take.
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue", "context": { "system_admin": true } })).await;
+    assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
+    assert!(a.body["error"]["message"].as_str().unwrap().contains("fixed by the key"));
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue", "limit": 5 })).await;
+    assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
+    let a = s.tool(Some(&secret), "deploy", json!({ "project": CS })).await;
+    assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
+
+    // Revoked, the very next call is refused.
+    let a = s.delete(&format!("/account/query-keys/{qk}"), Some(&ann)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.tool(Some(&secret), "list_projects", json!({})).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+}
+
+/// Who a query key plans as is the project owner's decision, made on
+/// the grant, and once made the caller cannot change it on any path.
+#[tokio::test]
+async fn a_bound_context_decides_who_a_query_key_plans_as() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let dev = s.member(&ann, "dev@acme.test", "developer").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+    let (qk, secret) = s.query_key(&ann).await;
+    let sql_path = format!("/projects/{CS}/branches/main/sql");
+    let emea = json!({ "groups": [{ "name": "emea" }] });
+    let apac = json!({ "groups": [{ "name": "apac" }] });
+
+    // Unbound: REST is as it was, MCP has no context to plan with.
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue" })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextRequired"), "{}", a.error());
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(a.body["sql"].as_str().unwrap().contains("emea"), "{}", a.body["sql"]);
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().starts_with("ContextRequired"), "{}", a.body);
+
+    // A developer who does not own the project cannot bind one.
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&dev), json!({ "project": CS, "context": apac })).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.error());
+    // Nor can anyone bind something that is not a context.
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "admin": true } })).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": "emea" })).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+
+    // The owner binds apac: MCP plans as apac, REST plans as apac, and a
+    // context in a request is refused, the same one included.
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": apac })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["grant"]["context"]["groups"][0]["name"], "apac");
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
+    assert!(sql.contains("apac") && !sql.contains("emea"), "{}", a.body);
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(a.body["sql"].as_str().unwrap().contains("apac"), "{}", a.body["sql"]);
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextBound"), "{}", a.error());
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": apac })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextBound"), "the same context is still the caller's to send: {}", a.error());
+    let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": { "system_admin": true } })).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    let a = s.post(&format!("/projects/{CS}/branches/main/explore"), Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextBound"), "{}", a.error());
+    let a = s.post(&format!("/projects/{CS}/branches/main/explore"), Some(&secret), json!({ "expr": "Revenue" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    // The owners see what is bound.
+    let a = s.get(&format!("/projects/{CS}/access"), Some(&ann)).await;
+    assert_eq!(a.body["query_keys"][0]["grant"]["context"]["groups"][0]["name"], "apac", "{}", a.body);
+    let a = s.get("/account/query-keys", Some(&ann)).await;
+    assert_eq!(a.body["query_keys"][0]["grants"][0]["context"]["groups"][0]["name"], "apac", "{}", a.body);
+
+    // Rotation keeps it; a grant without one clears it.
+    let a = s.post(&format!("/account/query-keys/{qk}/rotate"), Some(&ann), json!({})).await;
+    let secret2 = a.body["secret"].as_str().unwrap().to_string();
+    let a = s.tool(Some(&secret2), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("apac"), "{}", a.body);
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "branch": "*" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(a.body["grant"]["context"].is_null());
+    let a = s.post(&sql_path, Some(&secret2), json!({ "expr": "Revenue" })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextRequired"), "{}", a.error());
+    let a = s.post(&sql_path, Some(&secret2), json!({ "expr": "Revenue", "context": emea })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+}
+
+/// A person over MCP is exactly themselves: their email and no flag,
+/// whatever their role. Over REST they still choose, as in the playground.
+#[tokio::test]
+async fn a_personal_key_plans_as_its_user_over_mcp() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Category" })).await;
+    let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
+    assert!(sql.contains("ann@acme.test"), "{}", a.body);
+    // The regions policy has no group to resolve for a person: denied,
+    // not bypassed, even though Ann is the account's admin.
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Revenue" })).await;
+    let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
+    assert!(sql.contains("1 = 0"), "{}", a.body);
+    let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "expr": "Revenue", "context": { "system_admin": true } })).await;
+    assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
+
+    // REST is unchanged for a person.
+    let a = s.post(&format!("/projects/{CS}/branches/main/sql"), Some(&ann), json!({ "expr": "Revenue", "context": { "system_admin": true } })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(!a.body["sql"].as_str().unwrap().contains("1 = 0"), "{}", a.body["sql"]);
+}
+
+/// A caller's own filter on the policy's context dimension must narrow
+/// the rows the policy allows, never replace the policy's filter.
+#[tokio::test]
+async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+    let (qk, secret) = s.query_key(&ann).await;
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let mut failed = Vec::new();
+    for expr in [
+        "Revenue, Region = apac",
+        "Category, Revenue, Region = apac",
+        "Region, Revenue, Region = apac",
+        "Revenue, Region in (apac, amer)",
+        "Revenue, Region != emea",
+        "Revenue, Region is not null",
+        "Region, Revenue, Region not in (emea)",
+        "Category, Revenue, Region = apac, Category = books",
+        "Revenue, Region = apac, Revenue > 10",
+        "Category, Revenue desc, Region = apac",
+    ] {
+        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": expr })).await;
+        let sql = a.body["result"]["structuredContent"]["sql"].as_str().map(str::to_string).unwrap_or_else(|| format!("ERROR {}", a.body));
+        let lower = sql.to_lowercase();
+        let secured = lower.contains("in ('emea')") || lower.contains("1 = 0");
+        let user_filter_present = lower.contains("apac") || lower.contains("amer") || lower.contains("!= 'emea'") || lower.contains("<> 'emea'") || lower.contains("is not null") || lower.contains("not in");
+        eprintln!("--- {expr}\n{sql}\n");
+        if !secured || !user_filter_present {
+            failed.push(format!("{expr}: secured={secured} user_filter={user_filter_present}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A measure's own exclusion or inclusion rule on the context dimension
+/// outranks a resolved policy filter: the modeler decided that measure
+/// is computed without regard to that dimension, and the decision holds
+/// for the policy as it does for a caller's filter. Decided 2026-10-09,
+/// on purpose: only the deployer of the model can write such a rule, so
+/// a caller cannot reach this. A denial still lands as `1 = 0`.
+#[tokio::test]
+async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive_with_exclusions(CS, "acme")).await.status, StatusCode::OK);
+    let (qk, secret) = s.query_key(&ann).await;
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    for expr in ["Total Revenue, Region = apac", "Global Revenue, Region = apac", "Peak Region Revenue, Region = apac"] {
+        let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": expr })).await;
+        let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").to_lowercase();
+        assert!(sql.contains("sum(t0.\"revenue\")"), "{expr}: {}", a.body);
+        assert!(!sql.contains("in ('emea')") && !sql.contains("apac"), "{expr}: the measure ignores both the caller's filter and the policy's: {sql}");
+    }
+    // A caller whose context resolves nothing is still denied.
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": {} })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "expr": "Global Revenue" })).await;
+    assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("1 = 0"), "{}", a.body);
 }

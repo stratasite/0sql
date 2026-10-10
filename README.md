@@ -45,6 +45,13 @@ values or masks the field outside them. A fired policy that resolves
 nothing denies by default (no rows, or every value masked); a policy may
 say `unresolved: allow` under `permission_resolution` to be skipped
 instead, which is what strata does. Bypass flags open the door explicitly.
+A measure's own exclusion or inclusion rule on a policy's context
+dimension outranks the policy, as it outranks a caller's filter: a
+`total across all regions` measure is the unsecured total for everyone,
+and so is the list of regions beside it. That is the modeler's decision,
+made in the model where only the deployer can make it; a denial still
+holds. Who a query is planned for can also be fixed on a query key by
+the project's owner, see `docs/mcp.md`.
 
 ## The CLI
 
@@ -132,6 +139,7 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |
 | `GET /projects/{uid}/branches/{branch}/values/{dim}` | sampled values of a dimension |
 | `GET /projects`, `GET /healthz` | every deployment; liveness |
+| `POST /mcp` | the reads above as MCP tools for an agent, under the same key; `docs/mcp.md` |
 
 A branch with security policies refuses to plan without a context.
 

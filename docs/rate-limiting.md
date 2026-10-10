@@ -106,8 +106,8 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 |---|---|---|---|
 | heavy | deploy, validate, test, sampling-plan | 2 | 5 s |
 | password | login, signup, invites/accept, account/password, the reset and verification routes | 2 | 2 s |
-| explore | explore, fields | cores | 1 s |
-| plan | sql, explain, tables, values, branch summary, projects | cores × 4 | 1 s |
+| explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
+| plan | sql, explain, tables, values, branch summary, projects, `POST /mcp` | cores × 4 | 1 s |
 | manage | the account endpoints | cores × 2 | 1 s |
 
 The heavy and password classes also run on `tokio::task::spawn_blocking`,
@@ -140,6 +140,11 @@ account's token is given back.
 | explore | 20/s, burst 60 | 10/s, burst 30 |
 | heavy | 10/min, burst 3 | not allowed: query keys are read only |
 | manage | 60/min, burst 120 | n/a |
+
+An MCP request is one tool call and is charged as a plan by the guard;
+the two explore-class tools take an explore token and seat as well,
+inside the dispatcher, so an agent exploring is paced like an
+application exploring. See `docs/mcp.md`.
 
 These are fairness knobs, not capacity: 100/s per account is a quarter of
 a percent of what one core does. About 130 accounts could run at their

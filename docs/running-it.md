@@ -407,6 +407,42 @@ it is in on the first line it logs.
 **Nothing watches whether mail is actually going out.** A failed send is
 one journal line, next to the backup failures that are also unwatched.
 
+### The MCP endpoint, and the context bound to a grant
+
+`POST /mcp` serves the reads as tools to an agent holding a key;
+`docs/mcp.md` has the design and the rules. Operationally it is nothing
+new: the same binary, the same unit and port, the same tunnel, no
+setting. Two things to know on the box:
+
+- **Migration step 3** adds `context` to `query_key_grants`, so the
+  release that carries it is one of the restarts that wants a backup
+  first, per the order above. Existing grants come up unbound, which is
+  the behaviour they had.
+- **`ZSQL_PUBLIC_URL` is now also the one Origin a browser may speak
+  MCP from.** It is set on buzz. A server without it falls back to its
+  bind address, which refuses every browser origin but its own.
+
+Checking a release from the outside, with a query key granted one
+branch:
+
+```
+curl -si -X POST https://app.0sql.io/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+```
+
+answers 401 with `WWW-Authenticate: Bearer realm="0sql"`, which is the
+line to read: it proves Cloudflare passes the challenge through. With
+`-H 'authorization: Bearer zqk_...'` the same call answers the server's
+name and version, and then
+
+```
+claude mcp add --transport http 0sql https://app.0sql.io/mcp \
+  --header "Authorization: Bearer zqk_..."
+```
+
+gives Claude Code the tools; `list_projects` should show exactly the
+granted branch.
+
 ## Open
 
 ### Startup when it cannot fit everything
