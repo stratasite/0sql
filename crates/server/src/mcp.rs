@@ -304,6 +304,17 @@ fn branch_catalogue(d: &Deployed) -> String {
 /// The tools, as the client lists them. Every schema refuses unknown
 /// properties, so a `context` can be reported for what it is rather
 /// than silently dropped.
+/// The tools an operator chose to expose, `ZSQL_MCP_TOOLS` as a comma
+/// list, or every tool. A call to a tool not exposed is refused like
+/// an unknown one.
+fn exposed(name: &str) -> bool {
+    static E: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    match E.get_or_init(|| std::env::var("ZSQL_MCP_TOOLS").ok().filter(|v| !v.trim().is_empty()).map(|v| v.split(',').map(|t| t.trim().to_string()).collect())) {
+        Some(list) => list.iter().any(|t| t == name),
+        None => true,
+    }
+}
+
 fn tools() -> Vec<Value> {
     let target = json!({
         "project": { "type": "string", "description": "the project uid" },
@@ -324,7 +335,7 @@ fn tools() -> Vec<Value> {
         }
         out
     };
-    vec![
+    let all = vec![
         json!({ "name": "list_projects", "description": describe("list_projects"), "inputSchema": schema(&[], &[], "no arguments", false) }),
         json!({ "name": "fields", "description": describe("fields"),
                 "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for", false) }),
@@ -335,7 +346,8 @@ fn tools() -> Vec<Value> {
                 "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
         json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
         json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
-    ]
+    ];
+    all.into_iter().filter(|t| exposed(t["name"].as_str().unwrap_or(""))).collect()
 }
 
 #[derive(Deserialize)]
@@ -479,6 +491,9 @@ fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &st
 }
 
 async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
+    if !exposed(name) {
+        return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
+    }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
             let NoArgs {} = args(arguments)?;
