@@ -441,6 +441,43 @@ async fn admit_explore(app: &App, who: &Option<Principal>) -> Result<Held, Fail>
     }
 }
 
+/// A refusal for a field that did not resolve, with the fields nearest
+/// the term appended: uid, kind, type, description and tables. The
+/// refusal then carries the search the client would otherwise make
+/// next, so a spec written from the request's own words costs one
+/// round trip when it is right and still only two when it is not.
+fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, e: ApiError) -> ApiError {
+    let ApiError(status, class, message) = e;
+    if class != "FieldNotFound" && class != "FieldAmbiguous" {
+        return ApiError(status, class, message);
+    }
+    // The term is the first single-quoted span of the message.
+    let term = message.split('\'').nth(1).unwrap_or("").trim().to_string();
+    if term.is_empty() || term.len() > 200 {
+        return ApiError(status, class, message);
+    }
+    let found = fields_of(app, who, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
+    let Ok(found) = found else { return ApiError(status, class, message) };
+    let mut lines = Vec::new();
+    for f in found["fields"].as_array().into_iter().flatten().take(8) {
+        let desc = f["description"].as_str().map(|d| d.chars().take(110).collect::<String>()).filter(|d| !d.trim().is_empty());
+        let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        lines.push(format!(
+            "- {}: {} ({}, {}){} [{}]",
+            f["uid"].as_str().unwrap_or(""),
+            f["name"].as_str().unwrap_or(""),
+            f["kind"].as_str().unwrap_or(""),
+            f["data_type"].as_str().unwrap_or(""),
+            desc.map(|d| format!(", {d}")).unwrap_or_default(),
+            tables.join(", ")
+        ));
+    }
+    if lines.is_empty() {
+        return ApiError(status, class, message);
+    }
+    ApiError(status, class, format!("{message}\nFields near '{term}', by uid:\n{}", lines.join("\n")))
+}
+
 async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
@@ -490,11 +527,12 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             }
             let req = SqlRequest { spec: Some(a.spec), expr: None, context: context_for(who) };
             branch_for(app, who, &a.project, a.branch).and_then(|b| {
-                if name == "sql" {
+                let planned = if name == "sql" {
                     sql_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 } else {
                     explain_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
-                }
+                };
+                planned.map_err(|e| with_candidates(app, who, &a.project, &b, e))
             })
         }
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),

@@ -155,8 +155,15 @@ def final_spec(text):
             pass
     return None
 
-def run_agent(question, model, mcp_config, max_turns, timeout_s, env_extra=None):
-    prompt = (HERE / "task.md").read_text().replace("{question}", question)
+def catalogue_text():
+    """The branch catalogue as the fields tool returns it with no q."""
+    req = urllib.request.Request(f"{SERVER}/mcp", data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "fields", "arguments": {"project": PROJECT, "branch": BRANCH}}}).encode(),
+                                 headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)["result"]["content"][0]["text"]
+
+def run_agent(question, model, mcp_config, max_turns, timeout_s, env_extra=None, preamble=""):
+    prompt = preamble + (HERE / "task.md").read_text().replace("{question}", question)
     work = tempfile.mkdtemp(prefix="mcp-eval-")
     env = dict(os.environ, **(env_extra or {}))
     cmd = ["claude", "-p", prompt, "--mcp-config", mcp_config, "--strict-mcp-config",
@@ -289,6 +296,7 @@ def main():
     ap.add_argument("--null-check", action="store_true")
     ap.add_argument("--regrade", action="store_true", help="re-grade stored specs in the variant without running the agent")
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for the claude process, e.g. ENABLE_TOOL_SEARCH=false")
+    ap.add_argument("--catalogue-in-prompt", action="store_true", help="prepend the branch catalogue to the user prompt, as a client that shows server instructions whole would")
     a = ap.parse_args()
     if not KEY:
         sys.exit("no key: put the eval query key in harness/mcp-eval/.key or ZSQL_EVAL_KEY")
@@ -349,6 +357,7 @@ def main():
                 done.add((r["prompt_id"], r["rep"]))
     (vdir / "summary.json").write_text(json.dumps({"description": a.description or a.variant, "target": "tools", "model": a.model, "env": a.env}, indent=2))
     mcp_config = write_mcp_config(flow)
+    preamble = ("The MCP server zsql gave these instructions and this catalogue of the project's fields:\n\n" + catalogue_text() + "\n\n") if a.catalogue_in_prompt else ""
     train = set(state["train_ids"])
     jobs = [(c, k) for c in cases for k in range(a.reps) if (c["id"], k) not in done]
     lock = threading.Lock()
@@ -360,7 +369,7 @@ def main():
         c, k = job
         if a.regrade:
             return
-        run = run_agent(c["prompt"], a.model, mcp_config, a.max_turns, a.timeout_s, dict(kv.split("=", 1) for kv in a.env))
+        run = run_agent(c["prompt"], a.model, mcp_config, a.max_turns, a.timeout_s, dict(kv.split("=", 1) for kv in a.env), preamble)
         with lock:
             if "error" in run:
                 with errors_path.open("a") as f:

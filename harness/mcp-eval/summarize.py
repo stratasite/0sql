@@ -4,7 +4,7 @@ import json, sys, statistics as st, os
 from pathlib import Path
 flow = Path(sys.argv[1] if len(sys.argv) > 1 else "hillclimb")
 state = json.load(open(flow / "_state.json")); train, test = set(state["train_ids"]), set(state["test_ids"])
-variants = ["baseline"] + sorted([d.name for d in flow.iterdir() if d.is_dir() and d.name.startswith("v")], key=lambda v: int(v[1:]))
+variants = ["baseline"] + sorted([d.name for d in flow.iterdir() if d.is_dir() and d.name[:1] == "v" and d.name[1:2].isdigit()], key=lambda v: (int(v[1:].split("-")[0]), v))
 spend = 0
 print("| round | variant | test | train | s/case | calls | round trips | tool err | $/case | spend |")
 print("|---|---|---|---|---|---|---|---|---|---|")
