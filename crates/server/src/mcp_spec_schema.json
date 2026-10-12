@@ -1,0 +1,427 @@
+{
+  "type": "object",
+  "description": "A 0sql query spec: the columns to project, the rows to keep, formulas and populations. Field references are names, uids or synonyms from the model; add @d or @m when a name is both a dimension and a measure.",
+  "additionalProperties": false,
+  "required": [
+    "projections"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "A short name for the query; carried, not planned."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "A real LIMIT after ordering. It cuts rows, it does not rank; for a top N use a top_n filter."
+    },
+    "projections": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The output columns, in order. Projecting a dimension groups by it; a measure is already aggregated.",
+      "items": {
+        "$ref": "#/$defs/projection"
+      }
+    },
+    "calculations": {
+      "type": "array",
+      "description": "Formulas appended after the projections; every entry is a calculation.",
+      "items": {
+        "$ref": "#/$defs/projection"
+      }
+    },
+    "filters": {
+      "description": "A flat AND list of filter leaves, or an and/or tree of leaves.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/filter"
+          }
+        },
+        {
+          "$ref": "#/$defs/filter_tree"
+        }
+      ]
+    },
+    "segments": {
+      "type": "array",
+      "description": "Populations that constrain the whole query or named measures.",
+      "items": {
+        "$ref": "#/$defs/segment"
+      }
+    }
+  },
+  "$defs": {
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "A dimension or measure, best given as the uid from a fields result; a name or synonym also resolves, but several fields may share one. Omit only on a calculation."
+        },
+        "alias": {
+          "type": "string",
+          "description": "The output column name."
+        },
+        "order_by": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        },
+        "hidden": {
+          "type": "boolean",
+          "description": "A hint for the client's display only: the column is still selected and grouped in the SQL. Not a way to keep a column out of the result; leave out what the question did not ask for."
+        },
+        "decorators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/decorator"
+          }
+        },
+        "calculation": {
+          "type": "boolean",
+          "description": "true for a formula instead of a field."
+        },
+        "sql": {
+          "type": "string",
+          "description": "A calculation formula over [Name]@m, [Name]@d and [Alias] references. Needs alias."
+        },
+        "data_type": {
+          "type": "string",
+          "enum": [
+            "string",
+            "integer",
+            "decimal",
+            "date",
+            "date_time",
+            "boolean",
+            "bigint"
+          ],
+          "description": "A calculation's result type; decimal when absent."
+        }
+      }
+    },
+    "decorator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "truncate",
+            "extract",
+            "temporalize",
+            "contribute",
+            "window",
+            "customize"
+          ],
+          "description": "truncate, extract and customize apply to dimensions; temporalize, contribute and window apply to measures."
+        },
+        "grain": {
+          "type": "string",
+          "enum": [
+            "day",
+            "week",
+            "month",
+            "quarter",
+            "year",
+            "hour",
+            "minute"
+          ],
+          "description": "truncate: the bucket."
+        },
+        "extract": {
+          "type": "string",
+          "enum": [
+            "minute",
+            "hour",
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "week_of_year",
+            "month",
+            "quarter",
+            "year",
+            "day_name",
+            "month_name",
+            "year_month"
+          ],
+          "description": "extract: the part."
+        },
+        "transform": {
+          "type": "string",
+          "enum": [
+            "year_over_year",
+            "quarter_over_quarter",
+            "month_over_month",
+            "week_over_week",
+            "day_over_day"
+          ],
+          "description": "temporalize: the prior period to compare the measure with. Needs a date projection truncated to the matching grain in the same spec. This is the tool for prior-period and period-over-period questions: it aligns on the calendar period, where a lag window takes the previous row even when a period is missing."
+        },
+        "percent_change": {
+          "type": "boolean",
+          "description": "temporalize: the relative change instead of the prior period's value."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "running",
+            "moving"
+          ],
+          "description": "window: required on every window. running covers all rows from the first to the current one; moving covers the last size rows before the current one plus the current one."
+        },
+        "function": {
+          "type": "string",
+          "enum": [
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "count",
+            "row_number",
+            "rank",
+            "dense_rank",
+            "percent_rank",
+            "cume_dist",
+            "ntile",
+            "lag",
+            "lead",
+            "first_value",
+            "last_value"
+          ],
+          "description": "window: the function."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "window moving: rows preceding the current row in the frame, so the frame holds size + 1 rows and a 7-row moving average is size 6. 7 when absent."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "window lag/lead: rows back or forward."
+        },
+        "buckets": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "window ntile: number of buckets."
+        },
+        "partition_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "window and contribute: uids of projected dimensions to partition by (PARTITION BY for a window; the group whose total is the share's denominator for contribute). Names and aliases are not accepted and are dropped silently, which turns a share within a group into a share of the whole."
+        },
+        "order_by": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ]
+          },
+          "description": "window: the row order the function runs over, as a map from a projected dimension's uid to asc or desc. Keys must be uids of projected dimensions, never names or aliases: any other key is dropped silently and the window runs unordered. Absent, the first projected date ascending."
+        },
+        "ignore_partition_filters": {
+          "type": "boolean",
+          "description": "contribute: whether filters on the partition dimensions are left out of the total (true when absent)."
+        },
+        "custom_sql": {
+          "type": "string",
+          "description": "customize: SQL around @expression, no aggregates."
+        }
+      }
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "predicate"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "The field to filter, best given as its uid. A measure here filters the aggregate (HAVING)."
+        },
+        "predicate": {
+          "type": "string",
+          "enum": [
+            "equals",
+            "does_not_equal",
+            "greater_than",
+            "greater_than_or_equal_to",
+            "less_than",
+            "less_than_or_equal_to",
+            "between",
+            "in_list",
+            "exclude_list",
+            "contains",
+            "does_not_contain",
+            "starts_with",
+            "does_not_start_with",
+            "ends_with",
+            "does_not_end_with",
+            "keyword",
+            "is_null",
+            "is_not_null",
+            "top_n"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ],
+          "description": "One value; a comma-separated list for in_list, exclude_list and keyword; a date (2026-01-31) or a relative date (28d, 3m, 1y: that many units ago, w/m/q/y snapped to the unit's start); N for top_n."
+        },
+        "value_end": {
+          "type": [
+            "string",
+            "number"
+          ],
+          "description": "between: the upper bound (a relative date snaps to the unit's end)."
+        },
+        "top_n_measure": {
+          "type": "string",
+          "description": "top_n: the measure to rank by; row count when absent."
+        }
+      }
+    },
+    "filter_tree": {
+      "type": "object",
+      "description": "An and/or node holding filter leaves or further nodes.",
+      "additionalProperties": false,
+      "properties": {
+        "and": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/filter"
+              },
+              {
+                "$ref": "#/$defs/filter_tree"
+              }
+            ]
+          }
+        },
+        "or": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/filter"
+              },
+              {
+                "$ref": "#/$defs/filter_tree"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "keys"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "include",
+            "exclude"
+          ],
+          "description": "include keeps members (default), exclude drops them."
+        },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Dimensions identifying a member: the join grain."
+        },
+        "measures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Measures whose fact tables define membership; several means any of them."
+        },
+        "filters": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/filter"
+              }
+            },
+            {
+              "$ref": "#/$defs/filter_tree"
+            }
+          ]
+        },
+        "apply_to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Measure projections (alias or name) the segment constrains; absent constrains the whole query."
+        },
+        "expanding": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "field"
+            ],
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Dimensions of the other members sharing the key, carried into the query as columns."
+        },
+        "join": {
+          "type": "string",
+          "enum": [
+            "inner",
+            "left"
+          ],
+          "description": "expanding segments only."
+        },
+        "pair_dedupe": {
+          "type": "string",
+          "enum": [
+            "neq",
+            "lt",
+            "none"
+          ],
+          "description": "expanding segments only."
+        }
+      }
+    }
+  }
+}

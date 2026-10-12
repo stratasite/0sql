@@ -2,8 +2,18 @@
 //!
 //! An agent connects with the same key an application would and gets
 //! the server's reads as tools: the deployments it may see, a branch's
-//! fields, tables and sampled values, and the SQL for a spec or a line
-//! of shorthand. Nothing here deploys, changes or executes anything.
+//! fields, tables and sampled values, and the SQL for a query spec.
+//! Specs only, never the shorthand: a spec is JSON against a published
+//! schema, which is what a model writes reliably, and the schema itself
+//! is handed to the client in the tool definition. Nothing here deploys,
+//! changes or executes anything.
+//!
+//! What the client is told, the server's instructions and each tool's
+//! description, lives in `mcp_prompts.json` next to this file, and the
+//! spec's schema in `mcp_spec_schema.json`. Both are compiled in. They
+//! are the instruction set an agent plans from, and they are tuned
+//! against the eval in `harness/mcp-eval`, so they are kept apart from
+//! the code that enforces who may read what.
 //!
 //! Every tool runs the function the matching REST handler runs, with
 //! the principal the guard worked out, so a key reaches through MCP
@@ -25,8 +35,46 @@
 
 use super::*;
 use axum::http::HeaderMap;
+use std::sync::OnceLock;
 
 pub const PATH: &str = "/mcp";
+
+/// The instruction set: what `initialize` tells the client, and what
+/// each tool says about itself.
+#[derive(Deserialize)]
+struct Prompts {
+    instructions: String,
+    tools: HashMap<String, String>,
+}
+
+/// The compiled-in file, unless `ZSQL_MCP_PROMPTS` names one to read
+/// instead: the eval that tunes these restarts the server per variant,
+/// and an operator may want their own wording. A file that does not
+/// parse is a startup failure, not a silent fallback.
+fn prompts() -> &'static Prompts {
+    static P: OnceLock<Prompts> = OnceLock::new();
+    P.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_PROMPTS", include_str!("mcp_prompts.json"))).expect("the MCP prompts parse"))
+}
+
+/// The query spec's JSON schema, as the sql, explain and explore tools
+/// declare their `spec` argument. Its `$defs` are hoisted to the root of
+/// each tool's input schema, where the `$ref`s point. `ZSQL_MCP_SPEC_SCHEMA`
+/// names a file to read instead of the compiled-in one.
+fn spec_schema() -> &'static Value {
+    static S: OnceLock<Value> = OnceLock::new();
+    S.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_SPEC_SCHEMA", include_str!("mcp_spec_schema.json"))).expect("the MCP spec schema parses"))
+}
+
+fn file_or(var: &str, compiled: &str) -> String {
+    match std::env::var(var) {
+        Ok(path) if !path.trim().is_empty() => {
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{var}: cannot read {path}: {e}"));
+            eprintln!("zsqld: mcp: {var} read from {path}");
+            text
+        }
+        _ => compiled.to_string(),
+    }
+}
 
 /// The protocol revisions answered, newest first. A client that asks
 /// for one of these gets it back; any other gets the newest.
@@ -133,7 +181,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": INSTRUCTIONS,
+                "instructions": format!("{}\n\n{}", prompts().instructions, catalogue(app, who)),
             }))
         }
         "ping" => Ok(json!({})),
@@ -147,45 +195,159 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
     }
 }
 
-const INSTRUCTIONS: &str = "0sql plans SQL from a semantic model; it never runs it. Start with list_projects. Every other tool takes a project uid and a branch; the branch defaults to the project's production branch. fields and explore find what a query can use; sql returns the statement to run against the named datasource. A query is a comma-separated line of field names, filters (Region = EMEA, Date between 2024-01-01 and 2024-12-31, Revenue top 10) and decorated fields (month(Date), yoy(Revenue)); there is no 'by' or 'where'. Who the query is planned for is fixed by the key, not by you.";
+// -------------------------------------------------------------- catalogue
+
+/// How much catalogue `initialize` carries, in bytes, before it falls
+/// back to naming the branches and leaving discovery to `fields`.
+const CATALOGUE_BYTES: usize = 48 * 1024;
+
+/// Every field of every branch the caller may read, with its uid, as
+/// part of the instructions. A client puts the server's instructions in
+/// its system prompt, so this is what lets a question be answered in one
+/// `sql` call with no discovery round trips: the same move an
+/// application makes when it pastes the field catalogue into its own
+/// prompt. Measures carry their description and synonyms, since that is
+/// where the business definitions live; dimensions are named by table,
+/// where the table says which thing they describe. Deterministic, so the
+/// text is byte-identical from one connection to the next and a client's
+/// prompt cache can hold it.
+fn catalogue(app: &App, who: &Option<Principal>) -> String {
+    let models = app.models.read().unwrap();
+    let mut readable: Vec<Arc<Deployed>> = in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
+    drop(models);
+    readable.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+    if readable.is_empty() {
+        return "This key reads no deployed branch yet.".into();
+    }
+    let mut out = String::new();
+    for d in &readable {
+        out.push_str(&branch_catalogue(d));
+        out.push('\n');
+    }
+    if out.len() <= CATALOGUE_BYTES {
+        return format!("# Catalogue\nEvery field of the branches this key may read, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
+    }
+    let mut short = String::from("# Branches this key may read\nToo many fields to list here; call fields with q to find them.\n");
+    for d in &readable {
+        let s = d.universe().snapshot();
+        short.push_str(&format!("- {}/{}: {} tables, {} fields\n", d.uid, d.branch, s.tables.len(), s.fields.len()));
+    }
+    short
+}
+
+fn branch_catalogue(d: &Deployed) -> String {
+    let u = d.universe();
+    let s = u.snapshot();
+    // Field id to the uids of the tables carrying it, sorted.
+    let mut tables_of: HashMap<i64, Vec<String>> = HashMap::new();
+    for e in &s.expressions {
+        if let Some(t) = u.table(e.table_id) {
+            tables_of.entry(e.field_id).or_default().push(t.uid.clone());
+        }
+    }
+    for v in tables_of.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    let home = |f: &zsql_semantic::Field| tables_of.get(&f.id).and_then(|t| t.first().cloned()).unwrap_or_else(|| "?".into());
+    let mut out = format!("## Project {}, branch {}: {} tables, {} fields, {} policies\n", d.uid, d.branch, s.tables.len(), s.fields.len(), s.security_policies.len());
+    let mut measures: Vec<&zsql_semantic::Field> = u.fields().iter().filter(|f| !f.hidden && f.kind == FieldKind::Measure).collect();
+    measures.sort_by(|a, b| (home(a), &a.name).cmp(&(home(b), &b.name)));
+    out.push_str("### Measures, by table (uid: name (type), description [synonyms])\n");
+    let mut last = String::new();
+    for f in measures {
+        let h = home(f);
+        if h != last {
+            out.push_str(&format!("{h}:\n"));
+            last = h;
+        }
+        let data_type = serde_json::to_value(&f.data_type).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "?".into());
+        out.push_str(&format!("- {}: {} ({})", f.uid, f.name, data_type));
+        if let Some(desc) = f.description.as_deref().filter(|d| !d.trim().is_empty()) {
+            out.push_str(&format!(", {}", desc.trim()));
+        }
+        if !f.synonyms.is_empty() {
+            out.push_str(&format!(" [{}]", f.synonyms.join(", ")));
+        }
+        out.push('\n');
+    }
+    // Dimensions by table, each with its uid and the start of its
+    // description: that is where "the city" or "at the time of the
+    // contact" lives, and it is what tells two same-worded fields apart.
+    out.push_str("### Dimensions, by table (name (uid): description)\n");
+    let mut dims: Vec<&zsql_semantic::Field> = u.fields().iter().filter(|f| !f.hidden && f.kind == FieldKind::Dimension).collect();
+    dims.sort_by(|a, b| (home(a), &a.name).cmp(&(home(b), &b.name)));
+    let mut last = String::new();
+    for f in dims {
+        let h = home(f);
+        if h != last {
+            if !last.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{h}: "));
+            last = h;
+        } else {
+            out.push_str("; ");
+        }
+        out.push_str(&format!("{} ({})", f.name, f.uid));
+        if let Some(desc) = f.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            let short: String = desc.chars().take(110).collect();
+            out.push_str(&format!(": {}{}", short.trim_end(), if short.len() < desc.len() { "…" } else { "" }));
+        }
+    }
+    out.push('\n');
+    out
+}
 
 // ------------------------------------------------------------------ tools
 
 /// The tools, as the client lists them. Every schema refuses unknown
 /// properties, so a `context` can be reported for what it is rather
 /// than silently dropped.
+/// The tools an operator chose to expose, `ZSQL_MCP_TOOLS` as a comma
+/// list, or every tool. A call to a tool not exposed is refused like
+/// an unknown one.
+fn exposed(name: &str) -> bool {
+    static E: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    match E.get_or_init(|| std::env::var("ZSQL_MCP_TOOLS").ok().filter(|v| !v.trim().is_empty()).map(|v| v.split(',').map(|t| t.trim().to_string()).collect())) {
+        Some(list) => list.iter().any(|t| t == name),
+        None => true,
+    }
+}
+
 fn tools() -> Vec<Value> {
     let target = json!({
         "project": { "type": "string", "description": "the project uid" },
         "branch": { "type": "string", "description": "a deployed branch; the project's production branch when omitted" },
     });
-    let spec_or_expr = json!({
-        "expr": { "type": "string", "description": "a line of the shorthand: comma-separated fields, filters and calculations, e.g. 'Category, Revenue desc, Region = EMEA' or 'month(Order Date), yoy(Revenue)'" },
-        "spec": { "type": "object", "description": "a full query spec, instead of expr" },
-    });
-    let schema = |props: &[&Value], required: &[&str], description: &str| {
+    let mut spec = spec_schema().clone();
+    let defs = spec.as_object_mut().and_then(|m| m.remove("$defs")).unwrap_or(Value::Null);
+    let spec_arg = json!({ "spec": spec });
+    let describe = |name: &str| prompts().tools.get(name).cloned().unwrap_or_default();
+    let schema = |props: &[&Value], required: &[&str], description: &str, with_defs: bool| {
         let mut p = serde_json::Map::new();
         for v in props {
             p.extend(v.as_object().unwrap().clone());
         }
-        json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description })
+        let mut out = json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description });
+        if with_defs && !defs.is_null() {
+            out["$defs"] = defs.clone();
+        }
+        out
     };
-    vec![
-        json!({ "name": "list_projects", "description": "The deployed branches this key may read, with the size of each model, and the projects of the account.",
-                "inputSchema": schema(&[], &[], "no arguments") }),
-        json!({ "name": "fields", "description": "The dimensions and measures of a branch, each with its data type, description, synonyms, tags and the tables it is on. With q, the ones containing or near the text come first with a score.",
-                "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for") }),
-        json!({ "name": "tables", "description": "The tables of a branch: physical name, datasource, cost and the fields on each.",
-                "inputSchema": schema(&[&target], &["project"], "which branch") }),
-        json!({ "name": "values", "description": "The sampled values of one dimension, when the project uploaded samples.",
-                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } })], &["project", "dimension"], "which dimension") }),
-        json!({ "name": "explore", "description": "Given a query, the dimensions and measures that can still be added to it, narrowed by q.",
-                "inputSchema": schema(&[&target, &spec_or_expr, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project"], "a query to extend") }),
-        json!({ "name": "sql", "description": "The SQL for a query, and the datasource and adapter it is for. Run it yourself; this server does not.",
-                "inputSchema": schema(&[&target, &spec_or_expr], &["project"], "a query, as expr or spec") }),
-        json!({ "name": "explain", "description": "The SQL for a query with how it was planned: timings, phases and the node graph.",
-                "inputSchema": schema(&[&target, &spec_or_expr], &["project"], "a query, as expr or spec") }),
-    ]
+    let all = vec![
+        json!({ "name": "list_projects", "description": describe("list_projects"), "inputSchema": schema(&[], &[], "no arguments", false) }),
+        json!({ "name": "fields", "description": describe("fields"),
+                "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for", false) }),
+        json!({ "name": "tables", "description": describe("tables"), "inputSchema": schema(&[&target], &["project"], "which branch", false) }),
+        json!({ "name": "values", "description": describe("values"),
+                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } })], &["project", "dimension"], "which dimension", false) }),
+        json!({ "name": "explore", "description": describe("explore"),
+                "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
+        json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
+        json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
+    ];
+    all.into_iter().filter(|t| exposed(t["name"].as_str().unwrap_or(""))).collect()
 }
 
 #[derive(Deserialize)]
@@ -227,10 +389,7 @@ struct QueryArgs {
     project: String,
     #[serde(default)]
     branch: Option<String>,
-    #[serde(default)]
-    spec: Option<Value>,
-    #[serde(default)]
-    expr: Option<String>,
+    spec: Value,
     #[serde(default)]
     q: Option<String>,
 }
@@ -294,7 +453,47 @@ async fn admit_explore(app: &App, who: &Option<Principal>) -> Result<Held, Fail>
     }
 }
 
+/// A refusal for a field that did not resolve, with the fields nearest
+/// the term appended: uid, kind, type, description and tables. The
+/// refusal then carries the search the client would otherwise make
+/// next, so a spec written from the request's own words costs one
+/// round trip when it is right and still only two when it is not.
+fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, e: ApiError) -> ApiError {
+    let ApiError(status, class, message) = e;
+    if class != "FieldNotFound" && class != "FieldAmbiguous" {
+        return ApiError(status, class, message);
+    }
+    // The term is the first single-quoted span of the message.
+    let term = message.split('\'').nth(1).unwrap_or("").trim().to_string();
+    if term.is_empty() || term.len() > 200 {
+        return ApiError(status, class, message);
+    }
+    let found = fields_of(app, who, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
+    let Ok(found) = found else { return ApiError(status, class, message) };
+    let mut lines = Vec::new();
+    for f in found["fields"].as_array().into_iter().flatten().take(8) {
+        let desc = f["description"].as_str().map(|d| d.chars().take(110).collect::<String>()).filter(|d| !d.trim().is_empty());
+        let tables: Vec<&str> = f["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        lines.push(format!(
+            "- {}: {} ({}, {}){} [{}]",
+            f["uid"].as_str().unwrap_or(""),
+            f["name"].as_str().unwrap_or(""),
+            f["kind"].as_str().unwrap_or(""),
+            f["data_type"].as_str().unwrap_or(""),
+            desc.map(|d| format!(", {d}")).unwrap_or_default(),
+            tables.join(", ")
+        ));
+    }
+    if lines.is_empty() {
+        return ApiError(status, class, message);
+    }
+    ApiError(status, class, format!("{message}\nFields near '{term}', by uid:\n{}", lines.join("\n")))
+}
+
 async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
+    if !exposed(name) {
+        return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
+    }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
             let NoArgs {} = args(arguments)?;
@@ -303,7 +502,23 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
             let _seat = admit_explore(app, who).await?;
-            branch_for(app, who, &a.project, a.branch).and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q: a.q.unwrap_or_default(), hidden: a.hidden }))
+            let q = a.q.unwrap_or_default();
+            if q.trim().is_empty() && !a.hidden {
+                // No search: the whole catalogue, as one text, the same
+                // one initialize carries. One call is all the discovery a
+                // question needs, and a client that cut the instructions
+                // short gets it here in full.
+                let text = branch_for(app, who, &a.project, a.branch).and_then(|b| {
+                    let t = gate(app, who, &a.project, &b, Verb::Read)?;
+                    let d = model(app, &t, &a.project, &b)?;
+                    Ok(branch_catalogue(&d))
+                });
+                return Ok(match text {
+                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalogue": text } }),
+                    Err(ApiError(status, class, message)) => json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true }),
+                });
+            }
+            branch_for(app, who, &a.project, a.branch).and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
@@ -317,7 +532,7 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             let a: QueryArgs = args(arguments)?;
             let _seat = admit_explore(app, who).await?;
             branch_for(app, who, &a.project, a.branch)
-                .and_then(|b| explore_of(app, who, &a.project, &b, ExploreRequest { spec: a.spec, expr: a.expr, context: context_for(who), q: a.q }))
+                .and_then(|b| explore_of(app, who, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context: context_for(who), q: a.q }))
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -325,13 +540,14 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             if a.q.is_some() {
                 return Err(Fail::Rpc(INVALID_PARAMS, "arguments: q is for explore".into()));
             }
-            let req = SqlRequest { spec: a.spec, expr: a.expr, context: context_for(who) };
+            let req = SqlRequest { spec: Some(a.spec), expr: None, context: context_for(who) };
             branch_for(app, who, &a.project, a.branch).and_then(|b| {
-                if name == "sql" {
+                let planned = if name == "sql" {
                     sql_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 } else {
                     explain_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
-                }
+                };
+                planned.map_err(|e| with_candidates(app, who, &a.project, &b, e))
             })
         }
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),
