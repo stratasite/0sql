@@ -715,14 +715,25 @@ async fn mcp_takes_a_key_and_nothing_else() {
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "test", "version": "0" } } });
 
-    // No key: 401 with the challenge a client reads, and no OAuth to chase.
+    // No key: the handshake is answered, so a hosted client can see the
+    // server is here before its user's key is applied, but it carries no
+    // catalogue, and the first tool call is a 401 with the challenge.
     let a = s.mcp(None, &[], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let text = a.body["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("No key was presented") && !text.contains("## Project"), "{text}");
+    let a = s.mcp(None, &[], json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" })).await;
+    assert_eq!(a.status, StatusCode::OK);
+    let a = s.tool(None, "list_projects", json!({})).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
     assert_eq!(a.headers.get("www-authenticate").unwrap().to_str().unwrap(), "Bearer realm=\"0sql\"");
 
-    // A signed-in browser's cookie, with the header the app sends: still no.
+    // A signed-in browser's cookie, with the header the app sends: the
+    // same as no key, since no cookie is read here.
     let cookie = s.login_cookie("ann@acme.test", "annpassword1").await;
-    let a = s.mcp(None, &[("cookie", &cookie), ("x-requested-with", "zsql")], init.clone()).await;
+    let a = s.tool(None, "list_projects", json!({})).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    let a = s.mcp(None, &[("cookie", &cookie), ("x-requested-with", "zsql")], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } })).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.error());
     let a = s.get("/me", None).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
@@ -746,7 +757,7 @@ async fn mcp_takes_a_key_and_nothing_else() {
     // and without one it gets the 401, because nothing here is a cookie.
     let a = s.mcp(Some(&ann), &[("origin", "https://claude.ai")], init.clone()).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let a = s.mcp(None, &[("origin", "https://evil.example")], init.clone()).await;
+    let a = s.mcp(None, &[("origin", "https://evil.example")], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "fields", "arguments": { "project": CS } } })).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
 
     // OAuth discovery finds nothing, plainly: a 404, not a request for a key.
@@ -840,6 +851,12 @@ async fn mcp_tools_reach_what_the_key_may_read_and_nothing_else() {
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
     let a = s.tool(Some(&secret), "deploy", json!({ "project": CS })).await;
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
+
+    // Without a key, nothing of anyone's: the handshake only.
+    let a = s.tool(None, "list_projects", json!({})).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    let a = s.tool(None, "fields", json!({ "project": CS })).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
 
     // Revoked, the very next call is refused.
     let a = s.delete(&format!("/account/query-keys/{qk}"), Some(&ann)).await;

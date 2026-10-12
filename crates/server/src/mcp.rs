@@ -105,6 +105,20 @@ pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
     eprintln!("zsqld: mcp: refused {} (key {}, origin {origin}, agent {agent})", status.as_u16(), if keyed { "present" } else { "absent" });
 }
 
+/// Whether the caller may read anything: with accounts on, a key must
+/// have been presented. A keyless request is let through the guard for
+/// the handshake alone, and `None` would otherwise read as the
+/// single-tenant mode, so every tool checks this first.
+fn keyed(app: &App, who: &Option<Principal>) -> bool {
+    app.accounts.is_none() || who.is_some()
+}
+
+fn needs_key() -> Response {
+    let mut r = ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required for tool calls: Authorization: Bearer <key>".into()).into_response();
+    challenge(&mut r);
+    r
+}
+
 /// On a 401, the header the specification has clients read. No
 /// `resource_metadata` is named because there is no OAuth server to
 /// discover; a client falls through to the fixed credential its user
@@ -167,12 +181,12 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
             let asked = params["protocolVersion"].as_str().unwrap_or("");
             let version = VERSIONS.iter().copied().find(|v| *v == asked).unwrap_or(VERSIONS[0]);
             let client = format!("{} {}", params["clientInfo"]["name"].as_str().unwrap_or("a client"), params["clientInfo"]["version"].as_str().unwrap_or("")).trim().to_string();
-            eprintln!("zsqld: mcp: {} connected: {client}", who.as_ref().map(Principal::describe).unwrap_or_else(|| "single-tenant".into()));
+            eprintln!("zsqld: mcp: {} connected: {client}", who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() { "no key".into() } else { "single-tenant".into() }));
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", prompts().instructions, catalogue(app, who)),
+                "instructions": format!("{}\n\n{}", prompts().instructions, if keyed(app, who) { catalogue(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalogue of the branches a key may read follows the instructions once one is.".into() }),
             }))
         }
         "ping" => Ok(json!({})),
@@ -484,6 +498,9 @@ fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &st
 async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
     if !exposed(name) {
         return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
+    }
+    if !keyed(app, who) {
+        return Err(Fail::Http(needs_key()));
     }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
