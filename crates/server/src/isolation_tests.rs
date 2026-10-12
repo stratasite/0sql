@@ -52,7 +52,6 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         accounts: Some(Store::in_memory().unwrap()),
         signup_open: true,
         secure_cookies: false,
-        public_url: "http://test".into(),
         limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
         admission: Admission::from_env().unwrap(),
         caps: Caps { per_project: 5, per_account: 20 },
@@ -743,15 +742,18 @@ async fn mcp_takes_a_key_and_nothing_else() {
     let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } })).await;
     assert_eq!(a.body["result"]["protocolVersion"], "2025-11-25", "an unknown version gets the newest");
 
-    // Origin: the app's own passes, any other is refused before the key is read.
-    let a = s.mcp(Some(&ann), &[("origin", "http://test")], init.clone()).await;
+    // Origin is not read: a page from anywhere gets what its key allows,
+    // and without one it gets the 401, because nothing here is a cookie.
+    let a = s.mcp(Some(&ann), &[("origin", "https://claude.ai")], init.clone()).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let a = s.mcp(Some(&ann), &[("origin", "https://evil.example")], init.clone()).await;
-    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
     let a = s.mcp(None, &[("origin", "https://evil.example")], init.clone()).await;
-    assert_eq!(a.status, StatusCode::FORBIDDEN, "refused even before authentication");
-    let a = s.mcp(Some(&ann), &[("origin", "null")], init.clone()).await;
-    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+
+    // OAuth discovery finds nothing, plainly: a 404, not a request for a key.
+    let a = s.get("/.well-known/oauth-protected-resource", None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    let a = s.get("/.well-known/oauth-authorization-server", None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
 
     // No stream: GET and DELETE are not offered.
     let a = s.get("/mcp", Some(&ann)).await;

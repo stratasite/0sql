@@ -95,9 +95,6 @@ struct App {
     signup_open: bool,
     /// Session cookies marked Secure, for a server behind https.
     secure_cookies: bool,
-    /// Where the service is reached, `ZSQL_PUBLIC_URL`: the one origin a
-    /// browser may speak MCP from.
-    public_url: String,
     /// What each caller may ask for, and how fast.
     limits: Limiter,
     /// How much of each kind of work may be in the server at once.
@@ -225,15 +222,7 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
         }
     }
 
-    // MCP is reached by programs, and a browser page is not one. The
-    // Origin check is the transport's own rule and comes before any
-    // key is looked at.
     let mcp = mcp::is_endpoint(parts.uri.path());
-    if mcp {
-        if let Err(r) = mcp::check_origin(&app.public_url, &parts.headers) {
-            return r;
-        }
-    }
 
     let mut who = None;
     if limits::authenticates(parts.uri.path()) {
@@ -251,6 +240,7 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
                 let mut r = e.into_response();
                 if mcp {
                     mcp::challenge(&mut r);
+                    mcp::note_refusal(r.status(), &parts.headers);
                 }
                 return r;
             }
@@ -2142,10 +2132,10 @@ async fn main() -> anyhow::Result<()> {
     let admission = Admission::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
-    let mailer = mail::Mailer::from_env(public_url.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
     let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
     let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, public_url: public_url.clone(), limits, admission, caps, mailer });
+    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
     let (n, skipped) = reload(&app)?;
     eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
     if !skipped.is_empty() {

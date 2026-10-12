@@ -57,10 +57,16 @@ answered; a client asking for another gets the newest. An
 - **A key and nothing else.** A session cookie is never read on `/mcp`,
   so a signed-in browser cannot be made to speak MCP as its user, on
   any page. A key in the query string is not read anywhere.
-- **Origin.** A request that names an `Origin` must name
-  `ZSQL_PUBLIC_URL`'s, or it is refused with 403 before any key is
-  looked at. Programs send no Origin and pass; a page from another site
-  does not. This is the transport's own rule against DNS rebinding.
+- **No Origin check, on purpose.** The specification asks servers to
+  refuse unknown Origins against DNS rebinding, a threat to a local
+  server that trusts whoever reaches it. This endpoint trusts nothing
+  but a bearer key and never reads a cookie, so a page from any origin
+  gets what its key allows and a 401 without one. The first version
+  did refuse foreign Origins, and claude.ai's connector could not
+  connect; nor could it while the OAuth discovery paths under
+  `/.well-known` answered 401 instead of 404. Both fixed in 0.5.1.
+  Refused MCP requests are logged with status, whether a key was
+  present, Origin and user agent, never the key.
 - **401 carries `WWW-Authenticate: Bearer realm="0sql"`** and no
   `resource_metadata`. There is no OAuth server to discover, and
   naming one would send clients looking for it. Claude's clients fall
@@ -190,6 +196,15 @@ ENABLE_TOOL_SEARCH=false claude mcp add --transport http 0sql https://app.0sql.i
 `ENABLE_TOOL_SEARCH=false` belongs in the environment Claude Code runs
 in, not only on the `add`; it applies to every MCP server the session
 has.
+
+claude.ai and Claude Desktop, with a query key: Customize, Connectors,
+Add custom connector. Name it, give the URL `https://app.0sql.io/mcp`,
+Continue. When asked how to sign in choose **No sign in**: there is no
+OAuth here, and the key is the credential. Under **Request headers**
+add `Authorization` with the value `Bearer zqk_...`, then Add. The
+connector's tools appear in a new conversation once it is enabled
+there. The server's journal on buzz shows `mcp: ... connected:
+claude-ai` on success and `mcp: refused ...` with the reason on failure.
 
 claude.ai and Claude Desktop: a custom connector at the same URL with
 "fixed credentials", the key as the bearer token. The API's MCP

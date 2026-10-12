@@ -64,7 +64,7 @@ const SITE_FILES: &[&str] =
 pub fn classify(method: &str, path: &str) -> Class {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method, p.as_slice()) {
-        (_, []) | (_, ["healthz"]) | (_, ["app", ..]) => Class::Exempt,
+        (_, []) | (_, ["healthz"]) | (_, ["app", ..]) | (_, [".well-known", ..]) => Class::Exempt,
         (_, [one]) if SITE_FILES.contains(one) => Class::Exempt,
         ("POST", ["login"]) | ("POST", ["signup"]) | ("POST", ["invites", "accept"]) | ("POST", ["account", "password"]) => Class::Password,
         ("POST", ["password-reset"]) | ("POST", ["password-reset", "accept"]) | ("POST", ["verify-email"]) | ("POST", ["account", "verify-email"]) => Class::Password,
@@ -93,9 +93,12 @@ pub fn classify(method: &str, path: &str) -> Class {
 /// their own link, so it needs to know who the caller is.
 pub fn authenticates(path: &str) -> bool {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // `.well-known` is where OAuth clients look for an authorization
+    // server before they present anything; there is none here, and the
+    // answer must be a plain 404, not a 401 asking for the key.
     !matches!(
         p.as_slice(),
-        [] | ["healthz"] | ["app", ..] | ["login"] | ["signup"] | ["logout"] | ["invites", "accept"] | ["password-reset"] | ["password-reset", "accept"] | ["verify-email"]
+        [] | ["healthz"] | ["app", ..] | [".well-known", ..] | ["login"] | ["signup"] | ["logout"] | ["invites", "accept"] | ["password-reset"] | ["password-reset", "accept"] | ["verify-email"]
     ) && !matches!(p.as_slice(), [one] if SITE_FILES.contains(one))
 }
 
