@@ -193,6 +193,11 @@ pub enum Gate {
     /// Keys that are not valid: cheap to answer, but not free, and a
     /// stream of them is someone guessing.
     BadKey,
+    /// The MCP handshake without a key: initialize, ping, tools/list,
+    /// which a hosted client sends before its user's key is applied.
+    /// Cheap, and it carries no principal to charge, so the address
+    /// pays for it.
+    Handshake,
 }
 
 /// Whose bucket this is.
@@ -253,6 +258,7 @@ pub struct Config {
     pub invite: Rate,
     pub reset: Rate,
     pub bad_key: Rate,
+    pub handshake: Rate,
     /// Failed logins for one email before it is refused for a while,
     /// whichever address they came from, which is what working through
     /// a password list looks like. `0` turns it off: it is the one
@@ -280,6 +286,7 @@ impl Default for Config {
             invite: Rate { per_sec: 10.0 / 60.0, burst: 10.0 },
             reset: Rate { per_sec: 10.0 / 3600.0, burst: 5.0 },
             bad_key: Rate { per_sec: 1.0, burst: 60.0 },
+            handshake: Rate { per_sec: 0.5, burst: 30.0 },
             email_failures: 5,
             email_window: Duration::from_secs(15 * 60),
             trusted_proxy: false,
@@ -314,6 +321,7 @@ impl Config {
         env_rate("ZSQL_LIMIT_INVITE", &mut c.invite)?;
         env_rate("ZSQL_LIMIT_RESET", &mut c.reset)?;
         env_rate("ZSQL_LIMIT_BAD_KEY", &mut c.bad_key)?;
+        env_rate("ZSQL_LIMIT_HANDSHAKE", &mut c.handshake)?;
         if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_FAILURES") {
             c.email_failures = if v.trim().eq_ignore_ascii_case("off") { 0 } else { v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))? };
         }
@@ -431,6 +439,7 @@ impl Limiter {
             Gate::Invite => self.cfg.invite,
             Gate::Reset => self.cfg.reset,
             Gate::BadKey => self.cfg.bad_key,
+            Gate::Handshake => self.cfg.handshake,
         };
         self.take(BKey::Addr(addr, gate), rate, 1.0, Instant::now())
     }
@@ -814,6 +823,10 @@ mod address_tests {
         assert!(l.address(a, Gate::Signup).allowed, "signing up is a different allowance");
         assert!(!l.address(a, Gate::Signup).allowed);
         assert!(l.address(b, Gate::Login).allowed, "another address is unaffected");
+        let h = Limiter::new(Config { mode: Mode::On, handshake: Rate { per_sec: 0.01, burst: 1.0 }, ..Config::default() });
+        assert!(h.address(a, Gate::Handshake).allowed);
+        assert!(!h.address(a, Gate::Handshake).allowed, "a keyless handshake has its own allowance per address");
+        assert!(h.address(a, Gate::BadKey).allowed, "and does not spend the bad-key one");
     }
 }
 

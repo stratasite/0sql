@@ -231,6 +231,12 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
     // nothing else; mcp::call refuses it before any tool runs, and a
     // key that is presented and wrong is still refused here.
     let handshake = mcp && !parts.headers.contains_key("authorization");
+    if handshake {
+        let d = app.limits.address(addr, limits::Gate::Handshake);
+        if app.limits.enforced(&d, &format!("{addr} on the MCP handshake without a key")) {
+            return too_many(&d);
+        }
+    }
     if limits::authenticates(parts.uri.path()) && !handshake {
         match authenticate(&app, &parts) {
             Ok(p) => who = p,
@@ -293,6 +299,7 @@ fn gate_name(gate: limits::Gate) -> &'static str {
         limits::Gate::Invite => "redeeming a link",
         limits::Gate::Reset => "asking for a password reset",
         limits::Gate::BadKey => "keys that are not valid",
+        limits::Gate::Handshake => "the MCP handshake without a key",
     }
 }
 
