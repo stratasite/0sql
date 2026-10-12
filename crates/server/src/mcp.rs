@@ -24,6 +24,14 @@
 //! a `context` in a tool's arguments is refused outright. See
 //! `docs/mcp.md`.
 //!
+//! No Origin check, on purpose. The specification asks servers to
+//! refuse unknown Origins against DNS rebinding, which is a threat to a
+//! local server that trusts whoever can reach it. This endpoint trusts
+//! nothing but a bearer key and never reads a cookie, so a page from any
+//! origin gets exactly what its key allows, which without one is a 401;
+//! and the hosted clients that matter (claude.ai's connector among them)
+//! may send an Origin of their own, which a check would turn away.
+//!
 //! The transport is the smallest the specification allows. Each HTTP
 //! request carries one JSON-RPC message and its key; there is no
 //! `Mcp-Session-Id`, no server-sent events and no GET stream, so there
@@ -86,32 +94,15 @@ pub fn is_endpoint(path: &str) -> bool {
     p == ["mcp"]
 }
 
-/// The transport's rule against DNS rebinding: a request that names an
-/// `Origin` must name this service's own, or it is refused before any
-/// key is read. Programs send no Origin and pass; a page in a browser
-/// sends its own and is turned away unless it is the app itself.
-pub fn check_origin(public_url: &str, headers: &HeaderMap) -> Result<(), Response> {
-    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else { return Ok(()) };
-    if origin_of(origin) == origin_of(public_url) {
-        return Ok(());
-    }
-    Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", format!("origin {origin} may not use this endpoint")).into_response())
-}
-
-/// `scheme://host[:port]`, lower-cased, default ports dropped; `None`
-/// when the text is not an origin, which never equals anything.
-fn origin_of(text: &str) -> Option<String> {
-    let text = text.trim().to_lowercase();
-    let (scheme, rest) = text.split_once("://")?;
-    let host_port = rest.split(['/', '?', '#']).next()?;
-    if host_port.is_empty() {
-        return None;
-    }
-    let host_port = match (scheme, host_port.rsplit_once(':')) {
-        ("http", Some((h, "80"))) | ("https", Some((h, "443"))) => h.to_string(),
-        _ => host_port.to_string(),
-    };
-    Some(format!("{scheme}://{host_port}"))
+/// Why a request to the endpoint was refused, for the journal: the
+/// status, whether a key was presented, and the Origin if any. Never
+/// the key. Remote clients fail silently on their side ("could not
+/// reach the server"), so this line is what says what they sent.
+pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
+    let keyed = headers.get("authorization").map(|v| v.to_str().map(|s| s.starts_with("Bearer ") || s.starts_with("bearer ")).unwrap_or(false)).unwrap_or(false);
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    eprintln!("zsqld: mcp: refused {} (key {}, origin {origin}, agent {agent})", status.as_u16(), if keyed { "present" } else { "absent" });
 }
 
 /// On a 401, the header the specification has clients read. No
@@ -563,18 +554,6 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_origin_is_its_scheme_and_host() {
-        assert_eq!(origin_of("https://app.0sql.io"), Some("https://app.0sql.io".into()));
-        assert_eq!(origin_of("HTTPS://App.0sql.io:443/mcp"), Some("https://app.0sql.io".into()));
-        assert_eq!(origin_of("http://127.0.0.1:3699"), Some("http://127.0.0.1:3699".into()));
-        assert_eq!(origin_of("http://localhost:80/"), Some("http://localhost".into()));
-        assert_eq!(origin_of("null"), None);
-        assert_eq!(origin_of(""), None);
-        assert_eq!(origin_of("https://"), None);
-        assert_ne!(origin_of("https://app.0sql.io.evil.example"), origin_of("https://app.0sql.io"));
-    }
 
     #[test]
     fn the_endpoint_path_and_no_other() {
