@@ -54,9 +54,16 @@ answered; a client asking for another gets the newest. An
   is not on the exempt list, so the bearer key is checked once, bad
   keys count against the per-address gate, and the principal travels
   on the request. The handler reads only that.
-- **A key and nothing else.** A session cookie is never read on `/mcp`,
-  so a signed-in browser cannot be made to speak MCP as its user, on
-  any page. A key in the query string is not read anywhere.
+- **A key for anything that reads; the handshake without one.** A
+  hosted client such as claude.ai's connector sends `initialize` with
+  no credential to check that a server is there and what it speaks,
+  before its user's key is applied. So `initialize`, `ping` and
+  `tools/list` answer without a key, with no catalogue, and every tool
+  call without one is a 401 with the challenge, checked in the tool
+  dispatcher itself so a keyless caller can never be read as the
+  single-tenant mode. A session cookie is never read on `/mcp`, so a
+  signed-in browser cannot be made to speak MCP as its user, on any
+  page. A key in the query string is not read anywhere.
 - **No Origin check, on purpose.** The specification asks servers to
   refuse unknown Origins against DNS rebinding, a threat to a local
   server that trusts whoever reaches it. This endpoint trusts nothing

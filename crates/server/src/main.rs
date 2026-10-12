@@ -225,7 +225,13 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
     let mcp = mcp::is_endpoint(parts.uri.path());
 
     let mut who = None;
-    if limits::authenticates(parts.uri.path()) {
+    // The MCP handshake may come without a key: a hosted client checks
+    // that a server is there and what it speaks before its user's
+    // credential is applied. A keyless caller gets the handshake and
+    // nothing else; mcp::call refuses it before any tool runs, and a
+    // key that is presented and wrong is still refused here.
+    let handshake = mcp && !parts.headers.contains_key("authorization");
+    if limits::authenticates(parts.uri.path()) && !handshake {
         match authenticate(&app, &parts) {
             Ok(p) => who = p,
             Err(e) => {
