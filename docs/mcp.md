@@ -61,9 +61,22 @@ answered; a client asking for another gets the newest. An
   `tools/list` answer without a key, with no catalogue, and every tool
   call without one is a 401 with the challenge, checked in the tool
   dispatcher itself so a keyless caller can never be read as the
-  single-tenant mode. A session cookie is never read on `/mcp`, so a
-  signed-in browser cannot be made to speak MCP as its user, on any
-  page. A key in the query string is not read anywhere.
+  single-tenant mode. The keyless handshake is rate limited per
+  address. A session cookie is never read on `/mcp`, so a signed-in
+  browser cannot be made to speak MCP as its user, on any page. A key
+  in the query string is not read anywhere.
+
+  This is the pattern of the API-key MCP services, checked against
+  them on 2026-10-12: Context7, Firecrawl and Exa answer a keyless
+  `initialize` and gate their tools on the key; GitHub, Stripe, Zapier,
+  Notion and Linear answer it with a 401 that points at their OAuth
+  server, which this service does not have, since it is a component
+  for applications that do their own sign-in. It departs from one
+  sentence of the specification's security guidance, that a server
+  with authorization verifies every inbound request: here the three
+  handshake messages are answered unverified, and they carry the
+  server's name, version, generic instructions and static tool
+  definitions, nothing of any tenant's.
 - **No Origin check, on purpose.** The specification asks servers to
   refuse unknown Origins against DNS rebinding, a threat to a local
   server that trusts whoever reaches it. This endpoint trusts nothing
