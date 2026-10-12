@@ -204,6 +204,12 @@ subject of an open issue asking for it to be reversed.
 Neither header is read uninvited. That is how per-address limits get
 bypassed.
 
+The MCP handshake without a key (`initialize`, `ping`, `tools/list`,
+which a hosted client sends before its user's key is applied) carries
+no principal to charge, so the address pays: 30 at once, then one every
+two seconds (`ZSQL_LIMIT_HANDSHAKE`). A tool call without a key is
+refused before it costs anything.
+
 ### 4. Shape limits: bound the cost of one request
 
 Rate limits cap how many requests; these cap how big one can be. Each
