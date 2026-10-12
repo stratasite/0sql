@@ -1009,3 +1009,65 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
     let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of("Global Revenue") })).await;
     assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("1 = 0"), "{}", a.body);
 }
+
+/// What a client is told on connect and by a bare fields call: the
+/// catalogue of exactly the branches the key may read, with uids; and a
+/// refused field name comes back with the fields nearest it.
+#[tokio::test]
+async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await.status, StatusCode::OK);
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
+
+    // A key with no grants is told so; a key granted one project gets
+    // that project's catalogue and not the other's.
+    let (qk, secret) = s.query_key(&ann).await;
+    let a = s.mcp(Some(&secret), &[], init.clone()).await;
+    let text = a.body["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("reads no deployed branch yet"), "{text}");
+    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.mcp(Some(&secret), &[], init.clone()).await;
+    let text = a.body["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("## Project customer-service, branch main"), "{text}");
+    assert!(text.contains("- revenue: Revenue (decimal)"), "{text}");
+    assert!(text.contains("Marker acme (marker-acme)"), "{text}");
+    assert!(!text.contains("billing"), "the other project is not this key's to see: {text}");
+    // The admin sees both.
+    let a = s.mcp(Some(&ann), &[], init).await;
+    let text = a.body["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("## Project billing, branch main") && text.contains("## Project customer-service, branch main"), "{text}");
+
+    // fields with no q is the same catalogue as text; with q it is the search.
+    let a = s.tool(Some(&secret), "fields", json!({ "project": CS })).await;
+    let r = &a.body["result"];
+    assert!(r["isError"].is_null(), "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().starts_with("## Project customer-service, branch main"), "{r}");
+    assert!(r["structuredContent"]["catalogue"].is_string());
+    let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "q": "revenue" })).await;
+    assert_eq!(a.body["result"]["structuredContent"]["fields"][0]["uid"], "revenue", "{}", a.body);
+
+    // A near miss with one clear winner is corrected silently and said
+    // so under corrections; one the planner cannot settle between two
+    // candidates is refused, and the refusal carries the nearest fields.
+    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Grand Total" }] } })).await;
+    assert_eq!(a.body["result"]["structuredContent"]["corrections"][0]["field_uid"], "revenue", "{}", a.body);
+    // A model with two revenues and no plain one, so "Revenue Total" has
+    // two candidates at the same distance and no containing match.
+    let mut files = fixture_files("billing", "two-revenues");
+    files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap().1 = "name: Sales\nphysical_name: sales\ndatasource: dw\ncost: 10\nfields:\n\
+         \x20 - type: dimension\n    name: Category\n    data_type: string\n    expression:\n      sql: category\n\
+         \x20 - type: measure\n    name: Revenue Net\n    data_type: decimal\n    expression:\n      sql: sum(net)\n\
+         \x20 - type: measure\n    name: Revenue Gross\n    data_type: decimal\n    expression:\n      sql: sum(gross)\n"
+        .into();
+    files.retain(|(p, _)| p != "tests/smoke.yml");
+    assert_eq!(s.deploy("billing", "main", &ann, archive_of(&files)).await.status, StatusCode::OK);
+    let a = s.tool(Some(&ann), "sql", json!({ "project": "billing", "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Total" }] } })).await;
+    let r = &a.body["result"];
+    assert_eq!(r["isError"], true, "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("FieldNotFound"), "{text}");
+    assert!(text.contains("Fields near 'Revenue Total'") && text.contains("- revenue-net: Revenue Net (measure, decimal)") && text.contains("- revenue-gross: Revenue Gross (measure, decimal)"), "{text}");
+}
