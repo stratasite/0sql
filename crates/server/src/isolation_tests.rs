@@ -745,6 +745,14 @@ async fn mcp_takes_a_key_and_nothing_else() {
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
     assert!(a.headers.contains_key("www-authenticate"));
 
+    // A bare key in the header, with no scheme, is taken; another scheme is not.
+    let a = s.mcp(None, &[("authorization", &ann)], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = s.mcp(None, &[("authorization", &format!("Basic {ann}"))], init.clone()).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    let a = s.mcp(None, &[("authorization", &format!("BEARER {ann}"))], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "the scheme is matched without regard to case: {}", a.body);
+
     // The key: initialize answers the version asked for, and names the tools.
     let a = s.mcp(Some(&ann), &[], init.clone()).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);

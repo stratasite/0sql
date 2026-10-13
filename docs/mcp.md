@@ -221,7 +221,8 @@ claude.ai and Claude Desktop, with a query key: Customize, Connectors,
 Add custom connector. Name it, give the URL `https://app.0sql.io/mcp`,
 Continue. When asked how to sign in choose **No sign in**: there is no
 OAuth here, and the key is the credential. Under **Request headers**
-add `Authorization` with the value `Bearer zqk_...`, then Add. The
+add `Authorization` with the value `Bearer zqk_...`, then Add. The bare
+key, `zqk_...` with no scheme, is taken too; any other scheme is not. The
 connector's tools appear in a new conversation once it is enabled
 there. The server's journal on buzz shows `mcp: ... connected:
 claude-ai` on success and `mcp: refused ...` with the reason on failure.

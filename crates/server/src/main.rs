@@ -156,8 +156,15 @@ struct Held(#[allow(dead_code)] Arc<Option<OwnedSemaphorePermit>>);
 /// cookie the web app holds.
 fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError> {
     let Some(store) = &app.accounts else { return Ok(None) };
-    let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let secret = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")).map(str::trim).unwrap_or("");
+    let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").trim();
+    // `Bearer <key>` is the form; a bare key is taken too, since a
+    // connector's header box is typed by hand and the key names its own
+    // kind. Any other scheme is nothing.
+    let secret = match header.split_once(' ') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim(),
+        None if header.starts_with("zsk_") || header.starts_with("zqk_") => header,
+        _ => "",
+    };
     if !secret.is_empty() {
         return match store.authenticate(secret).map_err(internal)? {
             Some(p) => Ok(Some(p)),
