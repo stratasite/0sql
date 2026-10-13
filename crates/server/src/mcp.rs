@@ -99,10 +99,19 @@ pub fn is_endpoint(path: &str) -> bool {
 /// the key. Remote clients fail silently on their side ("could not
 /// reach the server"), so this line is what says what they sent.
 pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
-    let keyed = headers.get("authorization").map(|v| v.to_str().map(|s| s.starts_with("Bearer ") || s.starts_with("bearer ")).unwrap_or(false)).unwrap_or(false);
+    // How the Authorization header looked, never what it held: the
+    // scheme word, or that it was a bare key, or that it was absent.
+    let auth = match headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::trim) {
+        None | Some("") => "no Authorization header".to_string(),
+        Some(v) if v.starts_with("zsk_") || v.starts_with("zqk_") => "a bare key".to_string(),
+        Some(v) => match v.split_once(' ') {
+            Some((scheme, _)) => format!("scheme {scheme}"),
+            None => "one word, not a key".to_string(),
+        },
+    };
     let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
     let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    eprintln!("zsqld: mcp: refused {} (key {}, origin {origin}, agent {agent})", status.as_u16(), if keyed { "present" } else { "absent" });
+    eprintln!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
 }
 
 /// Whether the caller may read anything: with accounts on, a key must
