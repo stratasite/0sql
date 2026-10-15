@@ -4,10 +4,10 @@
 //! the same code behind the same gate.
 
 use crate::auth::{Auth, Held};
-use crate::error::{internal, key_required, ApiError};
+use crate::error::{internal, key_required, ApiError, Input, Params, Search};
 use crate::tenancy::{effective_context, gate, in_scope, model, scope_of};
 use crate::{blocking, read, Shared};
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
@@ -133,8 +133,8 @@ fn shape_check(v: &Value) -> Result<(), ServiceError> {
 pub(crate) async fn sql(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
-    Json(req): Json<SqlRequest>,
+    Params((uid, branch)): Params<(String, String)>,
+    Input(req): Input<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
     Ok(Json(sql_of(&app, &who, &uid, &branch, req)?))
 }
@@ -150,8 +150,8 @@ pub(crate) fn sql_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &
 pub(crate) async fn explain(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
-    Json(req): Json<SqlRequest>,
+    Params((uid, branch)): Params<(String, String)>,
+    Input(req): Input<SqlRequest>,
 ) -> Result<Json<ExplainResponse>, ApiError> {
     Ok(Json(explain_of(&app, &who, &uid, &branch, req)?))
 }
@@ -173,8 +173,8 @@ pub(crate) fn explain_of(
 pub(crate) async fn explore(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
-    Json(req): Json<ExploreRequest>,
+    Params((uid, branch)): Params<(String, String)>,
+    Input(req): Input<ExploreRequest>,
 ) -> Result<Json<ExploreResponse>, ApiError> {
     Ok(Json(explore_of(&app, &who, &uid, &branch, req)?))
 }
@@ -213,8 +213,8 @@ pub(crate) struct FieldsQuery {
 pub(crate) async fn fields(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
-    Query(q): Query<FieldsQuery>,
+    Params((uid, branch)): Params<(String, String)>,
+    Search(q): Search<FieldsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(fields_of(&app, &who, &uid, &branch, q)?))
 }
@@ -229,7 +229,7 @@ pub(crate) fn fields_of(app: &Shared, who: &Option<Principal>, uid: &str, branch
 pub(crate) async fn tables(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(tables_of(&app, &who, &uid, &branch)?))
 }
@@ -243,7 +243,7 @@ pub(crate) fn tables_of(app: &Shared, who: &Option<Principal>, uid: &str, branch
 pub(crate) async fn values(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch, dim)): Path<(String, String, String)>,
+    Params((uid, branch, dim)): Params<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(values_of(&app, &who, &uid, &branch, &dim)?))
 }
@@ -258,7 +258,7 @@ pub(crate) async fn test(
     State(app): State<Shared>,
     Auth(who): Auth,
     held: Option<Extension<Held>>,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let d = model(&app, &t, &uid, &branch)?;
@@ -272,7 +272,7 @@ pub(crate) async fn test(
 pub(crate) async fn branch_summary(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
     let d = model(&app, &t, &uid, &branch)?;

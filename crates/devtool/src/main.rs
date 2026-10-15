@@ -5,7 +5,7 @@
 //! snapshot export.
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -74,6 +74,13 @@ fn summary(snap: &Snapshot) -> String {
     )
 }
 
+/// Where the goldens take their join paths from.
+#[derive(Clone, Copy, ValueEnum)]
+enum Paths {
+    Formed,
+    Snapshot,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Load the model, build the universe and report what is in it.
@@ -99,9 +106,9 @@ enum Command {
         /// Write expected and produced SQL of every failing case into this directory.
         #[arg(long)]
         dump: Option<PathBuf>,
-        /// Join paths to plan over: `formed` (computed here) or `snapshot` (the stored paths).
-        #[arg(long, default_value = "formed")]
-        paths: String,
+        /// Join paths to plan over: formed here, or the ones stored with the snapshot.
+        #[arg(long, value_enum, default_value_t = Paths::Formed)]
+        paths: Paths,
     },
     /// Time loading a project directory, step by step: the YAML load with formation, the universe index, the planner index.
     LoadBench {
@@ -157,7 +164,10 @@ fn main() -> Result<()> {
             println!("wrote {} ({})", out.display(), summary(&model.snapshot));
         }
         Command::Golden { filter, strict, fixtures, dump, paths } => {
-            let source = if paths == "snapshot" { PathSource::Snapshot } else { PathSource::Formed };
+            let source = match paths {
+                Paths::Formed => PathSource::Formed,
+                Paths::Snapshot => PathSource::Snapshot,
+            };
             let fx = Fixtures::open(fixtures.unwrap_or_else(Fixtures::default_root));
             let report = score(&fx, &filter, source)?;
             let (total, passed) = print_scoreboard(&report);

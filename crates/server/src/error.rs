@@ -1,8 +1,11 @@
 //! One error type for the API: a status, a class the goldens would
 //! name, and a message, and the conversions into it.
 
+use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use zsql_service::{Kind, ServiceError};
 
@@ -65,4 +68,50 @@ pub(crate) fn retry_later(status: StatusCode, class: &'static str, message: Stri
         }
     }
     res
+}
+
+// The extractors below are axum's, with the refusal in the API's own
+// shape. axum's rejections are plain text, and a client that reads
+// `error.class` from every other answer would get nothing from them.
+
+/// A JSON body.
+pub(crate) struct Input<T>(pub(crate) T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Input<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(Input(v)),
+            Err(e) => Err(ApiError(e.status(), "Invalid", e.body_text())),
+        }
+    }
+}
+
+/// The path's parameters.
+pub(crate) struct Params<T>(pub(crate) T);
+
+impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Params<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(v)) => Ok(Params(v)),
+            Err(e) => Err(ApiError(e.status(), "Invalid", e.body_text())),
+        }
+    }
+}
+
+/// The query string.
+pub(crate) struct Search<T>(pub(crate) T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Search<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(v)) => Ok(Search(v)),
+            Err(e) => Err(ApiError(e.status(), "Invalid", e.body_text())),
+        }
+    }
 }

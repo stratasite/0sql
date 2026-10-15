@@ -605,11 +605,12 @@ fn remap_reference(r: &mut Reference, base: usize) {
 pub struct Graph<'a> {
     pub nodes: Vec<Node<'a>>,
     pub datasource: &'a Datasource,
-    pub dialect: Dialect,
+    /// Shared with every sub-graph the visitors cut from this one.
+    pub dialect: std::sync::Arc<Dialect>,
 }
 
 impl<'a> Graph<'a> {
-    pub fn new(datasource: &'a Datasource, dialect: Dialect) -> Self {
+    pub fn new(datasource: &'a Datasource, dialect: std::sync::Arc<Dialect>) -> Self {
         Graph { nodes: vec![], datasource, dialect }
     }
 

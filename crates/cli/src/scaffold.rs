@@ -47,7 +47,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
     let name = name.unwrap_or_else(|| {
         dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into())
     });
-    let uid = uid.map(|u| u.to_lowercase()).unwrap_or_else(|| config::slug(&name));
+    let uid = uid.map(|u| u.to_lowercase()).unwrap_or_else(|| zsql_project::parameterize(&name));
     let write = |rel: &str, text: &str| -> Result<()> {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
@@ -94,7 +94,7 @@ pub fn new_file(what: NewCommand) -> Result<()> {
     let (project_dir, rel, text) = match what {
         NewCommand::Table { name, datasource, physical_name, domain, project } => {
             let p = project_of(project)?;
-            let file = config::slug(&name).replace('-', "_");
+            let file = zsql_project::parameterize(&name).replace('-', "_");
             (
                 p.dir,
                 format!("models/{domain}/tbl.{file}.yml"),
@@ -107,7 +107,7 @@ pub fn new_file(what: NewCommand) -> Result<()> {
         }
         NewCommand::Test { name, project } => {
             let p = project_of(project)?;
-            let file = config::slug(&name).replace('-', "_");
+            let file = zsql_project::parameterize(&name).replace('-', "_");
             (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name))
         }
     };

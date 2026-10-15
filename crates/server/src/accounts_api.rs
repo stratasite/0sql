@@ -2,11 +2,11 @@
 //! resets, members, keys, grants, project access and the audit log.
 
 use crate::auth::{admin_of, cookie, cookie_in, store_of, user_of, with_session_cookie, Auth, SESSION_COOKIE, SESSION_DAYS};
-use crate::error::{accounts_error, retry_later, ApiError};
+use crate::error::{accounts_error, retry_later, ApiError, Input, Params, Search};
 use crate::reads::{shape, too_big};
 use crate::tenancy::gate;
 use crate::{blocking, lock, mail, write, App, Shared};
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
@@ -28,7 +28,7 @@ pub(crate) struct SignupRequest {
 
 /// A new account with its first admin and key. The secret is shown once.
 /// With a password, the answer also opens a session.
-pub(crate) async fn signup(State(app): State<Shared>, Json(req): Json<SignupRequest>) -> Result<Response, ApiError> {
+pub(crate) async fn signup(State(app): State<Shared>, Input(req): Input<SignupRequest>) -> Result<Response, ApiError> {
     store_of(&app)?;
     if !app.signup_open {
         return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "sign-up is closed on this server".into()));
@@ -62,7 +62,7 @@ pub(crate) struct LoginRequest {
     password: String,
 }
 
-pub(crate) async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> Result<Response, ApiError> {
+pub(crate) async fn login(State(app): State<Shared>, Input(req): Input<LoginRequest>) -> Result<Response, ApiError> {
     store_of(&app)?;
     // Enough wrong passwords for one email and it is refused for a
     // while, whichever address they come from: that is what someone
@@ -115,7 +115,7 @@ pub(crate) async fn set_password(
     State(app): State<Shared>,
     Auth(who): Auth,
     headers: axum::http::HeaderMap,
-    Json(req): Json<PasswordRequest>,
+    Input(req): Input<PasswordRequest>,
 ) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
@@ -178,7 +178,7 @@ pub(crate) struct ResetRequest {
 /// to no account, or asked moments ago. Saying which would turn this
 /// into a way to test whether an address is registered, and the answer
 /// would be worth having for whoever asked.
-pub(crate) async fn request_reset(State(app): State<Shared>, Json(req): Json<EmailRequest>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn request_reset(State(app): State<Shared>, Input(req): Input<EmailRequest>) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let (app, email) = (app.clone(), req.email);
     blocking(move || {
@@ -197,7 +197,7 @@ pub(crate) async fn request_reset(State(app): State<Shared>, Json(req): Json<Ema
 ///
 /// No auth: the token is the credential. It stops working here, and
 /// every other session of that user is dropped.
-pub(crate) async fn accept_reset(State(app): State<Shared>, Json(req): Json<ResetRequest>) -> Result<Response, ApiError> {
+pub(crate) async fn accept_reset(State(app): State<Shared>, Input(req): Input<ResetRequest>) -> Result<Response, ApiError> {
     store_of(&app)?;
     let (account, user) = {
         let (app, token, password) = (app.clone(), req.token, req.password);
@@ -211,7 +211,7 @@ pub(crate) async fn accept_reset(State(app): State<Shared>, Json(req): Json<Rese
 /// Confirms an address from a verification link. No auth: the token is
 /// the credential, and the link is often opened in another browser than
 /// the one that signed up.
-pub(crate) async fn verify_email(State(app): State<Shared>, Json(req): Json<TokenRequest>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn verify_email(State(app): State<Shared>, Input(req): Input<TokenRequest>) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let (app, token) = (app.clone(), req.token);
     blocking(move || {
@@ -282,7 +282,7 @@ pub(crate) fn developer() -> String {
 pub(crate) async fn add_member(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Json(req): Json<MemberRequest>,
+    Input(req): Input<MemberRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account) = admin_of(&who)?;
@@ -299,7 +299,7 @@ pub(crate) async fn add_member(
 }
 
 /// A fresh invite token for a member, for when the first was lost.
-pub(crate) async fn invite(State(app): State<Shared>, Auth(who): Auth, Path(email): Path<String>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn invite(State(app): State<Shared>, Auth(who): Auth, Params(email): Params<String>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account) = admin_of(&who)?;
     Ok(Json(json!({ "invite": store.create_invite(account.id, &user.email, &email).map_err(accounts_error)? })))
@@ -318,7 +318,7 @@ pub(crate) struct AcceptRequest {
 
 /// No auth: the token is the credential. Answers with the member's first
 /// personal key, shown once, and opens a session when a password was set.
-pub(crate) async fn accept_invite(State(app): State<Shared>, Json(req): Json<AcceptRequest>) -> Result<Response, ApiError> {
+pub(crate) async fn accept_invite(State(app): State<Shared>, Input(req): Input<AcceptRequest>) -> Result<Response, ApiError> {
     store_of(&app)?;
     let password = req.password.filter(|p| !p.is_empty());
     let (account, user, key, secret) = {
@@ -334,7 +334,11 @@ pub(crate) async fn accept_invite(State(app): State<Shared>, Json(req): Json<Acc
     Ok(Json(body).into_response())
 }
 
-pub(crate) async fn remove_member(State(app): State<Shared>, Auth(who): Auth, Path(email): Path<String>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn remove_member(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Params(email): Params<String>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account) = admin_of(&who)?;
     store.remove_member(account.id, &user.email, &email).map_err(accounts_error)?;
@@ -355,7 +359,7 @@ pub(crate) async fn user_keys(State(app): State<Shared>, Auth(who): Auth) -> Res
 pub(crate) async fn create_user_key(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Json(req): Json<NameRequest>,
+    Input(req): Input<NameRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
@@ -363,7 +367,7 @@ pub(crate) async fn create_user_key(
     Ok(Json(json!({ "key": key, "secret": secret })))
 }
 
-pub(crate) async fn revoke_user_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn revoke_user_key(State(app): State<Shared>, Auth(who): Auth, Params(id): Params<i64>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
     store.revoke_user_key(account.id, user, id).map_err(accounts_error)?;
@@ -384,7 +388,7 @@ pub(crate) async fn query_keys(State(app): State<Shared>, Auth(who): Auth) -> Re
 pub(crate) async fn create_query_key(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Json(req): Json<NameRequest>,
+    Input(req): Input<NameRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
@@ -406,14 +410,14 @@ fn may_manage_key(
     Ok((user.clone(), account.clone(), key))
 }
 
-pub(crate) async fn rotate_query_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn rotate_query_key(State(app): State<Shared>, Auth(who): Auth, Params(id): Params<i64>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = may_manage_key(store, &who, id)?;
     let (key, secret) = store.rotate_query_key(account.id, &user, id).map_err(accounts_error)?;
     Ok(Json(json!({ "key": key, "secret": secret })))
 }
 
-pub(crate) async fn revoke_query_key(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn revoke_query_key(State(app): State<Shared>, Auth(who): Auth, Params(id): Params<i64>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = may_manage_key(store, &who, id)?;
     store.revoke_query_key(account.id, &user, id).map_err(accounts_error)?;
@@ -438,8 +442,8 @@ pub(crate) struct GrantRequest {
 pub(crate) async fn grant(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path(id): Path<i64>,
-    Json(req): Json<GrantRequest>,
+    Params(id): Params<i64>,
+    Input(req): Input<GrantRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
@@ -467,7 +471,7 @@ pub(crate) async fn grant(
 pub(crate) async fn revoke_grant(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((id, project_uid)): Path<(i64, String)>,
+    Params((id, project_uid)): Params<(i64, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
@@ -477,7 +481,11 @@ pub(crate) async fn revoke_grant(
     Ok(Json(json!({ "revoked": { "key": id, "project": project_uid } })))
 }
 
-pub(crate) async fn project_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn project_access(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Params(uid): Params<String>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     // Who has access is for people, not for an application's query key.
     user_of(&who)?;
@@ -499,8 +507,8 @@ pub(crate) struct AccessRequest {
 pub(crate) async fn set_access(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path(uid): Path<String>,
-    Json(req): Json<AccessRequest>,
+    Params(uid): Params<String>,
+    Input(req): Input<AccessRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
@@ -514,7 +522,7 @@ pub(crate) async fn set_access(
 pub(crate) async fn remove_access(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, email)): Path<(String, String)>,
+    Params((uid, email)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
@@ -535,8 +543,8 @@ pub(crate) struct ProjectPatch {
 pub(crate) async fn update_project(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path(uid): Path<String>,
-    Json(req): Json<ProjectPatch>,
+    Params(uid): Params<String>,
+    Input(req): Input<ProjectPatch>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
@@ -556,7 +564,11 @@ pub(crate) async fn update_project(
 }
 
 /// Deletes the project record and every deployment of it.
-pub(crate) async fn delete_project(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn delete_project(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Params(uid): Params<String>,
+) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let t = gate(&app, &who, &uid, "", Verb::Owner)?;
     blocking(move || {
@@ -583,7 +595,7 @@ fn fifty() -> usize {
     50
 }
 
-pub(crate) async fn audit(State(app): State<Shared>, Auth(who): Auth, Query(q): Query<AuditQuery>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn audit(State(app): State<Shared>, Auth(who): Auth, Search(q): Search<AuditQuery>) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (_, account) = admin_of(&who)?;
     Ok(Json(json!({ "events": store.audit_log(account.id, q.limit.min(1000)).map_err(accounts_error)? })))

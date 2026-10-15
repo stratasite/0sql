@@ -782,6 +782,36 @@ fn decompression_stops_at_the_limit() {
     assert_eq!(err.kind(), std::io::ErrorKind::Other);
 }
 
+/// Every refusal is `{"error": {"class", "message"}}`, including the
+/// ones axum itself would make: a body that is not JSON, a path
+/// parameter of the wrong type, a query string that does not parse.
+/// A client reads one shape from every answer.
+#[tokio::test]
+async fn refusals_from_the_extractors_are_in_the_api_shape() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    let b = format!("/projects/{CS}/branches/main");
+    let a = s.send(Method::POST, &format!("{b}/sql"), Some(&ann), Some(("application/json", b"not json".to_vec()))).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+    assert!(a.headers["content-type"].to_str().unwrap().starts_with("application/json"));
+
+    let a = s.send(Method::POST, &format!("{b}/sql"), Some(&ann), Some(("text/plain", b"{}".to_vec()))).await;
+    assert_eq!(a.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+
+    let a = s.send(Method::DELETE, "/account/keys/not-a-number", Some(&ann), None).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+
+    let a = s.send(Method::GET, &format!("{b}/fields?hidden=maybe"), Some(&ann), None).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+}
+
 // ------------------------------------------------------------------- mcp
 
 /// The endpoint takes a key in the Authorization header and nothing

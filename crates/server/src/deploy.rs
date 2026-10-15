@@ -3,11 +3,11 @@
 //! removal of a branch, which takes the same lock.
 
 use crate::auth::{user_of, Auth, Held};
-use crate::error::{accounts_error, internal, key_required, not_found, ApiError};
+use crate::error::{accounts_error, internal, key_required, not_found, ApiError, Params};
 use crate::tenancy::{check_branch, check_uid, gate, scope_of, Tenant};
 use crate::{blocking, lock, read, write, App, Shared};
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde_json::{json, Value};
@@ -21,7 +21,7 @@ pub(crate) async fn deploy(
     State(app): State<Shared>,
     Auth(who): Auth,
     held: Option<Extension<Held>>,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
@@ -35,7 +35,7 @@ pub(crate) async fn validate(
     State(app): State<Shared>,
     Auth(who): Auth,
     held: Option<Extension<Held>>,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
@@ -304,7 +304,7 @@ fn project_root(work: &std::path::Path) -> Option<PathBuf> {
 pub(crate) async fn remove(
     State(app): State<Shared>,
     Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
+    Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     blocking(move || {

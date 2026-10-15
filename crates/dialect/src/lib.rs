@@ -56,12 +56,22 @@ impl Dialect {
     }
 
     /// A copy with per-query overrides applied (the query's `db_settings`).
-    pub fn with_overrides<'a>(&self, overrides: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>) -> Self {
-        let mut d = self.clone();
+    /// This dialect with a query's `db_settings` laid over it. Without
+    /// any, the dialect itself: a plan shares the catalogue's copy rather
+    /// than cloning the whole settings map.
+    pub fn with_overrides<'a>(
+        self: &std::sync::Arc<Self>,
+        overrides: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+    ) -> std::sync::Arc<Self> {
+        let mut overrides = overrides.into_iter().peekable();
+        if overrides.peek().is_none() {
+            return self.clone();
+        }
+        let mut d = Self::clone(self);
         for (k, v) in overrides {
             d.settings.insert(k.to_string(), json_to_yaml(v));
         }
-        d
+        std::sync::Arc::new(d)
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -231,7 +241,6 @@ impl Dialect {
         matches!(self.measure_filtering_strategy(), "both" | "final")
     }
 
-    /// Aggregate function names, base list plus the adapter's extras, lowercased.
     /// The SQL keywords an expression parser must not read as columns:
     /// `base.yml`'s list plus the adapter's `extra_reserved_keywords`, lower-cased.
     pub fn reserved_keywords(&self) -> Vec<String> {
@@ -254,6 +263,8 @@ impl Dialect {
         out
     }
 
+    /// Aggregate function names: `base.yml`'s list plus the adapter's
+    /// `extra_aggregate_functions`, lower-cased.
     pub fn aggregate_functions(&self) -> Vec<String> {
         let mut out = Vec::new();
         for key in ["aggregate_functions", "extra_aggregate_functions"] {

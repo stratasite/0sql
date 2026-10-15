@@ -36,7 +36,8 @@ pub struct Snapshot {
     pub fields: Vec<Field>,
     pub expressions: Vec<Expression>,
     pub join_defs: Vec<JoinDef>,
-    /// Join paths as enumerated by Rails' formation engine. Oracle only.
+    /// The join paths stored with the snapshot; a loaded project forms
+    /// its own.
     pub paths: Vec<Path>,
     pub partitions: Vec<Partition>,
     pub security_policies: Vec<SecurityPolicy>,

@@ -2043,6 +2043,7 @@ dependencies = [
  "tar",
  "ureq",
  "zsql-dialect",
+ "zsql-project",
  "zsql-server",
  "zsql-service",
  "zsql-shorthand",

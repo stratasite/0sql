@@ -412,7 +412,7 @@ impl Limiter {
     }
 
     /// An address's allowance on a route that costs before anyone is
-    /// identified.
+    /// identified. See [`bucket`] for what counts as one address.
     pub fn address(&self, addr: IpAddr, gate: Gate) -> Decision {
         if self.cfg.mode == Mode::Off {
             return Decision::ok();
@@ -425,7 +425,7 @@ impl Limiter {
             Gate::BadKey => self.cfg.bad_key,
             Gate::Handshake => self.cfg.handshake,
         };
-        self.take(BKey::Addr(addr, gate), rate, 1.0, Instant::now())
+        self.take(BKey::Addr(bucket(addr), gate), rate, 1.0, Instant::now())
     }
 
     /// Whether a decision actually refuses: in shadow mode it never does,
@@ -507,6 +507,25 @@ impl Limiter {
         }
         let window = self.cfg.email_window;
         lock(&self.failures).retain(|_, (_, since)| now.saturating_duration_since(*since) <= window);
+    }
+}
+
+/// The address a per-address bucket is keyed by.
+///
+/// An IPv4 address is itself. An IPv6 host is usually handed a whole
+/// /64, so one caller could take a fresh address per request and never
+/// meet a limit; the bucket is the /64 instead. An IPv4 address
+/// arriving as IPv6 (`::ffff:a.b.c.d`) is the IPv4 address.
+pub(crate) fn bucket(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+        },
     }
 }
 
@@ -825,6 +844,22 @@ mod address_tests {
         assert!(h.address(a, Gate::Handshake).allowed);
         assert!(!h.address(a, Gate::Handshake).allowed, "a keyless handshake has its own allowance per address");
         assert!(h.address(a, Gate::BadKey).allowed, "and does not spend the bad-key one");
+    }
+
+    /// An IPv6 caller is one /64, not one address of the 2^64 it was
+    /// handed; an IPv4 address in IPv6 clothing is the IPv4 address.
+    #[test]
+    fn an_ipv6_caller_is_counted_by_its_sixty_four() {
+        let l = Limiter::new(Config { mode: Mode::On, login: Rate { per_sec: 0.01, burst: 1.0 }, ..Config::default() });
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let next: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(l.address(first, Gate::Login).allowed);
+        assert!(!l.address(next, Gate::Login).allowed, "the same /64 shares the allowance");
+        assert!(l.address(other, Gate::Login).allowed, "the next /64 has its own");
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(bucket(mapped), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_eq!(bucket("203.0.113.7".parse().unwrap()), "203.0.113.7".parse::<IpAddr>().unwrap());
     }
 }
 
