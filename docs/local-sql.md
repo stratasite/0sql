@@ -112,15 +112,36 @@ prints the error. `.reload` forces it. With `-r` the repl is unchanged.
 
 ### Loader efficiency, measured before cached
 
-`LoadOptions { tests, values }` so `sql` reads only project,
-datasources, security and models. `Universe::build` runs once per load
-instead of twice, and the builder stops cloning every vector to form
-paths. The dialect keyword lists are hoisted per datasource instead of
-allocated per field. Budget on the TPC-DS fixture: local `zsql sql`
-under 25 ms end to end, repl reload under 15 ms, both reported by
-`zsql-dev bench`. A compiled snapshot cache under
-`$XDG_CACHE_HOME/zsql/<uid>/`, keyed on `Loaded.sources` plus the
-snapshot format, is built only if those budgets are missed.
+Budget on the TPC-DS fixture: local `zsql sql` under 25 ms end to end,
+repl reload under 15 ms. `zsql-dev load-bench --project DIR` reports
+the loader step by step (`Loaded.phases`), which is what decided the
+work below. A compiled snapshot cache under `$XDG_CACHE_HOME/zsql/<uid>/`,
+keyed on `Loaded.sources` plus the snapshot format, is built only if the
+budgets are missed.
+
+What the measurement said, release build, TPC-DS fixture (33 tables,
+380 fields, 184 KB of YAML), per load:
+
+| step | before | after |
+|---|---|---|
+| table files parsed (YAML) | 2.5 ms | 0.9 ms, on threads |
+| fields built from them | 5.1 ms | 1.5 ms |
+| relationships, formation, post-universe, security, tests | 1.2 ms | 1.2 ms |
+| universe index, planner index | 0.6 ms | 0.6 ms |
+| whole load | 9.6 ms | 5.0 ms |
+| `zsql sql` end to end (wall clock) | 15 ms | 8 to 9 ms |
+
+What the plan guessed at and the numbers dismissed: `LoadOptions` to
+skip tests and values (32 us and 3 us), the second `Universe::build`
+inside formation and the snapshot clone (0.15 ms and 0.12 ms). Neither
+is worth an API. What was actually slow: the dialect's reserved-word
+and aggregate lists were rebuilt, hundreds of allocations each, for
+every one of 380 fields (now once per datasource); every YAML lookup
+allocated a key (now `&str`); each file's mapping was cloned on the way
+in (now moved); and the table files were parsed one at a time (now
+prefetched on up to eight threads, each outcome handed to the ordered
+read that would have produced it, so errors name the same file as
+before). The cache is not built: the budget is met three times over.
 
 ### Server in the CLI, embedded
 
@@ -176,7 +197,7 @@ Each is one PR that leaves the tree releasable.
 | 1 | `zsql-service` extracted; server refactored onto it; `Trust` enum; `Send + Sync` assertion; determinism test planning one spec on two threads and in two processes | isolation tests, handler tests and goldens pass unchanged; the thread-local counter is proven not to reach any alias, or fixed in the planner if it does |
 | 2 | `-r` and the implication rules; local reads; `show.rs` split; lazy git; per-command SIGPIPE; `ZSQL_HOME`; `--json` error contract; TPC-DS and grocery-store fixtures; parity test against an in-process server via `tower::oneshot` | byte-identical SQL and identical error JSON, local versus server, over the fixtures |
 | 3 | Local repl with the held model, `Loaded.sources`, mtime reload, `.reload` | reload after an edit, and a broken edit keeps the old model |
-| 4 | `LoadOptions`, single universe build, hoisted keyword lists, bench numbers in the PR; cache only if budgets missed | TPC-DS under 25 ms for `sql`, under 15 ms for reload |
+| 4 | measure the loader step by step, fix what is slow, bench numbers in the PR; cache only if budgets missed | TPC-DS under 25 ms for `sql`, under 15 ms for reload |
 | 5 | CI workflow with the feature matrix, fmt, clippy, tests; README and docs rewritten for the local rule; devtool loses `plan`, `repl`, `test`, `deploy`, `remote`, `values` and its parser after the diff; `publish = false` everywhere; release 0.6.0 | CI green on the matrix; `cli-v0.6.0` tagged |
 | A (later) | Server library split with `Config`, env reads out of the library, `OnceLock` removed; `zsql serve`; data-dir lock; graceful shutdown; atomic deploy writes; bind refusal; log test; `server start/stop/status/logs` | an embedded server survives a client closing early, a SIGTERM mid-deploy, and a second instance on its data dir |
 | B (later) | `server install`; release workflows merged into one public release carrying both artefacts; any deploy rework | one tag publishes CLI and server together |
@@ -205,4 +226,4 @@ history for secrets, and confirm the licence covers every crate.
 
 ## Progress
 
-- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).
+- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 4 done (loader measured and sped up: TPC-DS load 9.6 to 5.0 ms, `zsql sql` 8 to 9 ms end to end; no cache). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).

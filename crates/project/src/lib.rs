@@ -64,6 +64,8 @@ pub struct Loaded {
     /// what a cache would key on. A values file is listed whether or
     /// not it exists, since its appearing is a change too.
     pub sources: Vec<PathBuf>,
+    /// What each step of the load cost, in microseconds, in order.
+    pub phases: Vec<(&'static str, u128)>,
 }
 
 /// One `tests/*.yml` entry: fields to project by name and what the SQL
@@ -96,14 +98,22 @@ pub fn load_confined(dir: &Path, dialects: &Dialects) -> Result<Loaded> {
 fn load_with(dir: &Path, dialects: &Dialects, confined: bool) -> Result<Loaded> {
     let mut b = Builder::new(dir, dialects);
     b.confined = confined;
-    b.project()?;
-    b.datasources()?;
-    b.tables()?;
-    b.relationships()?;
-    b.form()?;
-    b.post_universe()?;
-    b.security()?;
-    b.tests()?;
+    macro_rules! step {
+        ($name:literal, $e:expr) => {{
+            let t = std::time::Instant::now();
+            let out = $e;
+            b.phases.push(($name, t.elapsed().as_micros()));
+            out
+        }};
+    }
+    step!("project", b.project()?);
+    step!("datasources", b.datasources()?);
+    step!("tables", b.tables()?);
+    step!("relationships", b.relationships()?);
+    step!("form", b.form()?);
+    step!("post_universe", b.post_universe()?);
+    step!("security", b.security()?);
+    step!("tests", b.tests()?);
     Ok(b.finish())
 }
 
@@ -120,7 +130,7 @@ fn as_map(v: &Yaml) -> Option<&serde_yaml::Mapping> {
 }
 
 fn get<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Yaml> {
-    m.get(Yaml::String(key.to_string())).filter(|v| !v.is_null())
+    m.get(key).filter(|v| !v.is_null())
 }
 
 fn text(v: &Yaml) -> Option<String> {
@@ -246,6 +256,16 @@ struct PendingRule {
     file: PathBuf,
 }
 
+/// What the expression parser needs from a datasource's dialect: its
+/// reserved words, its aggregate functions and its identifier quote.
+/// Built once per datasource; a model has hundreds of fields and the
+/// lists run to hundreds of words each.
+struct DialectLists {
+    reserved: Vec<String>,
+    aggregates: Vec<String>,
+    quote: String,
+}
+
 struct Builder<'d> {
     dir: PathBuf,
     /// Every file read must resolve inside `dir`.
@@ -272,6 +292,12 @@ struct Builder<'d> {
     pending_tables: Vec<PendingTable>,
     pending_rules: Vec<PendingRule>,
     sources: Vec<PathBuf>,
+    phases: Vec<(&'static str, u128)>,
+    /// By datasource index.
+    dialect_lists: HashMap<usize, std::rc::Rc<DialectLists>>,
+    /// Table files parsed ahead of time, on several threads; `read`
+    /// takes a file from here before going to disk.
+    prefetched: HashMap<PathBuf, Result<Yaml>>,
 }
 
 const TABLE_KEYS: &[&str] = &["datasource", "name", "physical_name", "cost", "description", "tags", "metadata", "snapshot", "snapshot_date", "partition", "partitions", "imports", "fields"];
@@ -309,13 +335,51 @@ impl<'d> Builder<'d> {
             pending_tables: vec![],
             pending_rules: vec![],
             sources: vec![],
+            phases: vec![],
+            dialect_lists: HashMap::new(),
+            prefetched: HashMap::new(),
         }
+    }
+
+    /// Parses the files on as many threads as there are cores, up to a
+    /// few, so a model of fifty table files is read in the time of a
+    /// dozen. Each file's outcome waits in `prefetched` for the ordered
+    /// read that would have produced it, so an error is reported for the
+    /// same file as it would have been one file at a time.
+    fn prefetch(&mut self, files: &[PathBuf]) {
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8).min(files.len() / 2);
+        if workers < 2 {
+            return;
+        }
+        let parsed: Vec<(PathBuf, Result<Yaml>)> = std::thread::scope(|scope| {
+            let chunks: Vec<_> = files.chunks(files.len().div_ceil(workers)).collect();
+            let handles: Vec<_> = chunks.into_iter().map(|chunk| scope.spawn(move || chunk.iter().map(|f| (f.clone(), read_yaml(f))).collect::<Vec<_>>())).collect();
+            handles.into_iter().flat_map(|h| h.join().expect("a parsing thread")).collect()
+        });
+        self.prefetched.extend(parsed);
+    }
+
+    fn dialect_lists(&mut self, ds: usize) -> Result<std::rc::Rc<DialectLists>> {
+        if let Some(l) = self.dialect_lists.get(&ds) {
+            return Ok(l.clone());
+        }
+        let dialect = self.dialects.get(&self.datasources[ds].adapter)?;
+        let lists = std::rc::Rc::new(DialectLists {
+            reserved: dialect.reserved_keywords(),
+            aggregates: dialect.aggregate_functions(),
+            quote: dialect.get("quote").and_then(|v| v.as_str()).unwrap_or("\"@exp\"").to_string(),
+        });
+        self.dialect_lists.insert(ds, lists.clone());
+        Ok(lists)
     }
 
     /// Reads a YAML file and remembers that it did.
     fn read(&mut self, path: &Path) -> Result<Yaml> {
         self.sources.push(path.to_path_buf());
-        read_yaml(path)
+        match self.prefetched.remove(path) {
+            Some(outcome) => outcome,
+            None => read_yaml(path),
+        }
     }
 
     fn warn(&mut self, file: &Path, message: impl Into<String>) {
@@ -448,10 +512,20 @@ impl<'d> Builder<'d> {
 
     fn tables(&mut self) -> Result<()> {
         let files = self.files("models", "tbl.")?;
+        let t = std::time::Instant::now();
+        self.prefetch(&files);
+        self.phases.push(("tables.prefetch", t.elapsed().as_micros()));
+        let (mut reading, mut building) = (0u128, 0u128);
         for file in files {
+            let t = std::time::Instant::now();
             let def = self.resolve_imports(&file, &mut Vec::new())?;
+            reading += t.elapsed().as_micros();
+            let t = std::time::Instant::now();
             self.table(&file, &def)?;
+            building += t.elapsed().as_micros();
         }
+        self.phases.push(("tables.yaml", reading));
+        self.phases.push(("tables.fields", building));
         Ok(())
     }
 
@@ -465,10 +539,11 @@ impl<'d> Builder<'d> {
             return Err(invalid(file, format!("Circular import detected: {}", cycle.join(" -> "))));
         }
         visiting.push(abs);
-        let v = self.read(file)?;
-        let mut m = as_map(&v).cloned().ok_or_else(|| invalid(file, "Empty file detected."))?;
+        let Yaml::Mapping(mut m) = self.read(file)? else {
+            return Err(invalid(file, "Empty file detected."));
+        };
         let imports = strs_of(&m, "imports");
-        m.remove(Yaml::String("imports".into()));
+        m.remove("imports");
         if imports.is_empty() {
             visiting.pop();
             return Ok(m);
@@ -721,9 +796,8 @@ impl<'d> Builder<'d> {
         if self.expressions.iter().any(|e| e.table_id == table_id && e.field_id == field_id) {
             return Err(invalid(file, format!("Expression errors for {name}: Field {name} is already mapped to this table.")));
         }
-        let dialect = self.dialects.get(&self.datasources[ds].adapter)?;
-        let quote = dialect.get("quote").and_then(|v| v.as_str()).unwrap_or("\"@exp\"").to_string();
-        let parsed = ParsedExpression::parse(&sql, &dialect.reserved_keywords(), &dialect.aggregate_functions(), &quote);
+        let lists = self.dialect_lists(ds)?;
+        let parsed = ParsedExpression::parse(&sql, &lists.reserved, &lists.aggregates, &lists.quote);
         if kind == FieldKind::Dimension && parsed.columns.is_empty() {
             return Err(invalid(file, format!("Expression errors for {name}: Column refs dimensions should reference a table column")));
         }
@@ -1342,7 +1416,10 @@ impl<'d> Builder<'d> {
     }
 
     fn finish(mut self) -> Loaded {
+        let t = std::time::Instant::now();
         let snapshot = self.snapshot();
+        self.phases.push(("snapshot", t.elapsed().as_micros()));
+        let t = std::time::Instant::now();
         let values_path = [self.dir.join("samples").join(values::FILE_NAME), self.dir.join(values::FILE_NAME)].into_iter().find(|p| p.exists()).unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
         self.sources.push(values_path.clone());
         let values = match values::ValueCatalog::read(&values_path) {
@@ -1350,10 +1427,11 @@ impl<'d> Builder<'d> {
             Err(e) => {
                 let mut warnings = self.warnings;
                 warnings.push(format!("{}: {e}", values::FILE_NAME));
-                return Loaded { snapshot, warnings, tests: self.tests, values: None, sources: self.sources };
+                return Loaded { snapshot, warnings, tests: self.tests, values: None, sources: self.sources, phases: self.phases };
             }
         };
-        Loaded { snapshot, warnings: self.warnings, tests: self.tests, values, sources: self.sources }
+        self.phases.push(("values", t.elapsed().as_micros()));
+        Loaded { snapshot, warnings: self.warnings, tests: self.tests, values, sources: self.sources, phases: self.phases }
     }
 }
 

@@ -140,6 +140,13 @@ enum Command {
         #[arg(long, default_value = "formed")]
         paths: String,
     },
+    /// Time loading a project directory, step by step: the YAML load with formation, the universe index, the planner index.
+    LoadBench {
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        rounds: usize,
+    },
     /// Time each phase over the golden cases: loading, formation, lowering and planning.
     Bench {
         #[arg(long)]
@@ -564,6 +571,41 @@ fn main() -> Result<()> {
             if strict && passed != total {
                 bail!("{} of {} golden cases failing", total - passed, total);
             }
+        }
+        Command::LoadBench { project, rounds } => {
+            use std::collections::BTreeMap;
+            use std::time::Duration;
+            let dialects = Dialects::builtin();
+            let (mut load, mut index, mut plan) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let mut steps: BTreeMap<&'static str, (usize, u128)> = BTreeMap::new();
+            let mut order: Vec<&'static str> = Vec::new();
+            for _ in 0..rounds.max(1) {
+                let t = Instant::now();
+                let loaded = zsql_project::load(&project, &dialects)?;
+                load += t.elapsed();
+                for (i, (name, us)) in loaded.phases.iter().enumerate() {
+                    let e = steps.entry(name).or_insert((i, 0));
+                    e.1 += us;
+                    if !order.contains(name) {
+                        order.push(name);
+                    }
+                }
+                let t = Instant::now();
+                let universe = Universe::build(loaded.snapshot)?;
+                index += t.elapsed();
+                let t = Instant::now();
+                let _p = zsql_planner::Planner::new(&universe, &dialects, None);
+                plan += t.elapsed();
+            }
+            let n = rounds.max(1) as f64;
+            println!("{:<20} {:>10}", "step", "per load us");
+            for name in order {
+                println!("  {:<18} {:>10.0}", name, steps[name].1 as f64 / n);
+            }
+            println!("{:<20} {:>10.0}", "load (yaml+form)", load.as_micros() as f64 / n);
+            println!("{:<20} {:>10.0}", "universe index", index.as_micros() as f64 / n);
+            println!("{:<20} {:>10.0}", "planner index", plan.as_micros() as f64 / n);
+            println!("{:<20} {:>10.0}", "total", (load + index + plan).as_micros() as f64 / n);
         }
         Command::Bench { fixtures, rounds } => {
             use std::time::Duration;
