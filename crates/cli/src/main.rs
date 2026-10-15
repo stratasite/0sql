@@ -227,14 +227,6 @@ impl Command {
     fn wants_json(&self) -> bool {
         matches!(self, Command::Sql { json: true, .. } | Command::Explain { json: true, .. } | Command::Explore { json: true, .. })
     }
-
-    /// Whether the command runs a server. A server must keep Rust's
-    /// default of ignoring SIGPIPE, or a client that hangs up mid-answer
-    /// would kill it; every other command resets the signal so a closed
-    /// pipe (`zsql ... | head`) ends it quietly instead of panicking.
-    fn serves(&self) -> bool {
-        false
-    }
 }
 
 #[derive(Subcommand)]
@@ -305,11 +297,13 @@ fn main() {
             return;
         }
     };
+    // A closed pipe (`zsql ... | head`) ends the command quietly instead
+    // of panicking. A command that runs a server must not do this, since
+    // a client hanging up mid-answer would then kill it; when one
+    // exists, it decides here before the reset.
     #[cfg(unix)]
-    if !command.serves() {
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        }
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let json = command.wants_json();
     if let Err(e) = run(command, at) {
@@ -1001,10 +995,9 @@ mod tests {
     }
 
     #[test]
-    fn json_and_serving_commands() {
+    fn json_commands() {
         assert!(Command::Sql { query: QueryArgs { spec: None, expr: Some("a".into()), context: None }, explain: false, json: true }
             .wants_json());
         assert!(!Command::Tables.wants_json());
-        assert!(!Command::Tables.serves());
     }
 }

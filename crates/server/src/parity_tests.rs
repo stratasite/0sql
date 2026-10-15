@@ -215,7 +215,10 @@ async fn local_and_server_answer_alike() {
                 "{uid} fields {q:?} hidden {hidden}"
             );
         }
-        assert_eq!(get(&router, &format!("{base}/values/department")).await, as_server(local.values_of("department")), "{uid} values");
+        // By name, by a unique substring, by one that matches several, and by none.
+        for dim in ["department", "depart", "d", "zzzz"] {
+            assert_eq!(get(&router, &format!("{base}/values/{dim}")).await, as_server(local.values_of(dim)), "{uid} values {dim}");
+        }
     }
     assert!(compared > 40, "only {compared} specs compared");
     let _ = std::fs::remove_dir_all(&data_dir);

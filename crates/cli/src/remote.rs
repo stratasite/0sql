@@ -172,25 +172,8 @@ pub fn explore(
     client.post(&format!("{}/explore", branch_path(uid, branch)), &body)
 }
 
-/// A dimension's sampled values by uid or name, else by a unique substring
-/// match over the deployment's dimensions.
+/// A dimension's sampled values by uid, name or unique substring; the
+/// server resolves the name.
 pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result<Value> {
-    if let Ok(v) = client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(dim))) {
-        return Ok(v);
-    }
-    let fields = client.get(&format!("{}/fields?q={}&hidden=true", branch_path(uid, branch), urlencode(dim)))?;
-    let dims: Vec<String> = fields["fields"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|f| f["kind"] == "dimension")
-        .filter_map(|f| f["uid"].as_str().map(str::to_string))
-        .collect();
-    match dims.as_slice() {
-        [one] => client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(one))),
-        [] => Err(Refusal { class: "NotFound".into(), message: format!("no dimension matches '{dim}'") }.into()),
-        many => {
-            Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into())
-        }
-    }
+    client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(dim)))
 }

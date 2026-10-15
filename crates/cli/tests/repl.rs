@@ -78,6 +78,13 @@ fn the_local_repl_holds_the_model_and_reloads_it() {
     assert!(answer.contains("reloaded in"), "{answer}");
     assert!(answer.contains(r#"sum(T0."net_sales_value")"#), "{answer}");
 
+    // A file that did not exist before: the directory moved, so the
+    // model loads again.
+    std::fs::write(project.join("tests/added.yml"), "name: added\nprojections:\n  - Department\nassert_regex: SELECT\n").unwrap();
+    writeln!(stdin, "department, sales value").unwrap();
+    let answer = read_until(&mut out, "-- planned here in");
+    assert!(answer.contains("reloaded in"), "{answer}");
+
     // Break the file: the error is said once, and the model from before
     // keeps answering.
     std::fs::write(&table, "name: Transactions\nfields: [\n").unwrap();

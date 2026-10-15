@@ -1,5 +1,5 @@
 //! zsqld: a light service. Deploy a project directory (as a tar.gz), then
-//! plan specs against it. Model models live in memory and under a data
+//! plan specs against it. Deployed models live in memory and under a data
 //! directory so a restart reloads them.
 //!
 //! With `ZSQL_ACCOUNTS=on` the server is multi-tenant: every request
@@ -647,7 +647,7 @@ fn caps_allow(app: &App, models: &HashMap<String, Arc<Model>>, scope: &str, uid:
     Ok(())
 }
 
-/// Model branches in this project, and in the whole account, counted
+/// Deployed branches in this project, and in the whole account, counted
 /// from the keys of the models map (`[account/]project/branch`).
 ///
 /// The trailing slash both prefixes carry is load-bearing: without it

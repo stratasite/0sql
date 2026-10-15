@@ -71,27 +71,10 @@ pub fn explore(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Opti
     Ok(serde_json::to_value(m.explore(req, &unlimited).map_err(Refusal::from)?)?)
 }
 
-/// A dimension's sampled values by uid or name, else by a unique substring
-/// match over the model's dimensions.
+/// A dimension's sampled values by uid, name or unique substring; the
+/// service resolves the name, the same way the server does.
 pub fn values_for(m: &Model, dim: &str) -> Result<Value> {
-    if let Ok(v) = m.values_of(dim) {
-        return Ok(v);
-    }
-    let found = m.fields(dim, true);
-    let dims: Vec<String> = found["fields"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|f| f["kind"] == "dimension")
-        .filter_map(|f| f["uid"].as_str().map(str::to_string))
-        .collect();
-    match dims.as_slice() {
-        [one] => Ok(m.values_of(one).map_err(Refusal::from)?),
-        [] => Err(Refusal { class: "NotFound".into(), message: format!("no dimension matches '{dim}'") }.into()),
-        many => {
-            Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into())
-        }
-    }
+    Ok(m.values_of(dim).map_err(Refusal::from)?)
 }
 
 /// What a validate answers with: the summary, the test results, and

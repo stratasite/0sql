@@ -59,10 +59,13 @@ pub struct Loaded {
     pub tests: Vec<ProjectTest>,
     /// Sampled dimension values (`values.jsonl.gz`), when the project has them.
     pub values: Option<values::ValueCatalog>,
-    /// Every file the load read, imports included, in the order they
-    /// were read: what a watcher stats to know the model moved, and
-    /// what a cache would key on. A values file is listed whether or
-    /// not it exists, since its appearing is a change too.
+    /// Everything the load depends on, each once, in the order it was
+    /// met: every file read, imports included; the directories walked
+    /// for model and test files, whose modification time moves when a
+    /// file is added or removed; and the optional files (project.yml,
+    /// security.yml, the values file) whether or not they exist, since
+    /// their appearing is a change too. What a watcher stats to know
+    /// the model moved, and what a cache would key on.
     pub sources: Vec<PathBuf>,
     /// What each step of the load cost, in microseconds, in order.
     pub phases: Vec<(&'static str, u128)>,
@@ -70,13 +73,19 @@ pub struct Loaded {
 
 /// One `tests/*.yml` entry: fields to project by name and what the SQL
 /// must equal or match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectTest {
+    /// Where the test came from; stored and shown by its file name only.
+    #[serde(serialize_with = "file_name_only")]
     pub file: PathBuf,
     pub name: String,
     pub projections: Vec<String>,
     pub assert_sql: Option<String>,
     pub assert_regex: Option<String>,
+}
+
+fn file_name_only<S: serde::Serializer>(path: &Path, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
 }
 
 /// Loads the project at `dir`. `dialects` supplies each datasource's
@@ -451,12 +460,14 @@ impl<'d> Builder<'d> {
         }
     }
 
-    fn files(&self, pattern_dir: &str, prefix: &str) -> Result<Vec<PathBuf>> {
+    fn files(&mut self, pattern_dir: &str, prefix: &str) -> Result<Vec<PathBuf>> {
         let root = self.dir.join(pattern_dir);
         let mut out = Vec::new();
+        let mut dirs = vec![root.clone()];
         if root.is_dir() {
-            walk(&root, &mut out).map_err(|e| ProjectError::Io(root.display().to_string(), e))?;
+            walk(&root, &mut out, &mut dirs).map_err(|e| ProjectError::Io(root.display().to_string(), e))?;
         }
+        self.sources.extend(dirs);
         if self.confined {
             if let Some(out_of_bounds) = out.iter().find(|p| !self.inside(p)) {
                 return Err(invalid(out_of_bounds, "this file is a link to somewhere outside the project"));
@@ -474,6 +485,7 @@ impl<'d> Builder<'d> {
 
     fn project(&mut self) -> Result<()> {
         let file = self.dir.join("project.yml");
+        self.sources.push(file.clone());
         let (name, uid, branch) = if file.exists() {
             let v = self.read(&file)?;
             let m = as_map(&v).ok_or_else(|| invalid(&file, "project.yml must be a mapping"))?;
@@ -1437,6 +1449,7 @@ impl<'d> Builder<'d> {
 
     fn security(&mut self) -> Result<()> {
         let file = self.dir.join("security.yml");
+        self.sources.push(file.clone());
         if !file.exists() {
             return Ok(());
         }
@@ -1522,6 +1535,7 @@ impl<'d> Builder<'d> {
 
     fn tests(&mut self) -> Result<()> {
         let dir = self.dir.join("tests");
+        self.sources.push(dir.clone());
         if !dir.is_dir() {
             return Ok(());
         }
@@ -1562,6 +1576,9 @@ impl<'d> Builder<'d> {
             .find(|p| p.exists())
             .unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
         self.sources.push(values_path.clone());
+        // An import shared by many tables was read once per table.
+        let mut seen = HashSet::new();
+        self.sources.retain(|p| seen.insert(p.clone()));
         let values = match values::ValueCatalog::read(&values_path) {
             Ok(v) => v,
             Err(e) => {
@@ -1575,11 +1592,12 @@ impl<'d> Builder<'d> {
     }
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn walk(dir: &Path, out: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            walk(&path, out)?;
+            dirs.push(path.clone());
+            walk(&path, out, dirs)?;
         } else {
             out.push(path);
         }

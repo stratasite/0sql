@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -154,9 +155,12 @@ pub struct Model {
     /// When it was loaded, as `humantime` writes it; the summary calls
     /// it `deployed_at`, which is what it is on a server.
     pub loaded_at: String,
-    /// The files a load from a directory read, for whoever wants to
-    /// know when they move. Empty for a model built any other way.
+    /// What a load from a directory depends on, for whoever wants to
+    /// know when it moves. Empty for a model built any other way.
     pub sources: Vec<PathBuf>,
+    /// Each field's tables, by field id, in model order: built once,
+    /// since the catalogue asks for it once per field.
+    tables_by_field: HashMap<zsql_semantic::Id, Vec<String>>,
 }
 
 /// What the files on disk are called under a model's directory.
@@ -174,6 +178,12 @@ impl Model {
     ) -> std::result::Result<Model, zsql_semantic::BuildError> {
         let universe = Universe::build(snapshot)?;
         let warnings = universe.warnings().to_vec();
+        let mut tables_by_field: HashMap<zsql_semantic::Id, Vec<String>> = HashMap::new();
+        for e in &universe.snapshot().expressions {
+            if let Some(t) = universe.table(e.table_id) {
+                tables_by_field.entry(e.field_id).or_default().push(t.uid.clone());
+            }
+        }
         let engine = Engine::new(universe, |u| Planner::new(u, dialects, None));
         Ok(Model {
             uid: uid.to_string(),
@@ -185,6 +195,7 @@ impl Model {
             warnings,
             loaded_at: now(),
             sources: vec![],
+            tables_by_field,
         })
     }
 
@@ -223,17 +234,8 @@ impl Model {
         m.values = ValueCatalog::read(&dir.join(zsql_project::values::FILE_NAME))?;
         m.tests = std::fs::read_to_string(dir.join(TESTS_FILE))
             .ok()
-            .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|v| ProjectTest {
-                file: PathBuf::from(v["file"].as_str().unwrap_or("")),
-                name: v["name"].as_str().unwrap_or("").to_string(),
-                projections: v["projections"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect(),
-                assert_sql: v["assert_sql"].as_str().map(str::to_string),
-                assert_regex: v["assert_regex"].as_str().map(str::to_string),
-            })
-            .collect();
+            .and_then(|t| serde_json::from_str::<Vec<ProjectTest>>(&t).ok())
+            .unwrap_or_default();
         m.loaded_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(humantime).unwrap_or_default();
         Ok(m)
     }
@@ -252,12 +254,9 @@ impl Model {
                 let _ = std::fs::remove_file(values_path);
             }
         }
-        let tests: Vec<Value> = self
-            .tests
-            .iter()
-            .map(|t| json!({ "file": t.file.file_name().map(|f| f.to_string_lossy().to_string()), "name": t.name, "projections": t.projections, "assert_sql": t.assert_sql, "assert_regex": t.assert_regex }))
-            .collect();
-        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&tests)?)
+        // ProjectTest serialises its file as a file name, so nothing of
+        // the directory it was loaded from is kept.
+        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)
     }
 
     pub fn universe(&self) -> &Universe {
@@ -459,14 +458,7 @@ impl Model {
 
     /// The uids of the tables carrying a field, in model order.
     fn tables_of(&self, field_id: zsql_semantic::Id) -> Vec<String> {
-        let u = self.universe();
-        u.snapshot()
-            .expressions
-            .iter()
-            .filter(|e| e.field_id == field_id)
-            .filter_map(|e| u.table(e.table_id))
-            .map(|t| t.uid.clone())
-            .collect()
+        self.tables_by_field.get(&field_id).cloned().unwrap_or_default()
     }
 
     /// Field discovery. With `q`, fields containing the text come first in
@@ -530,12 +522,31 @@ impl Model {
         json!({ "tables": out })
     }
 
-    /// A dimension's sampled values, by uid or by name.
+    /// A dimension's sampled values, by uid or by name, else by a unique
+    /// substring of a dimension's uid, name or synonyms (hidden ones
+    /// included). Several substring matches are an `Ambiguous` refusal
+    /// naming them; a near miss is never taken for the user.
     pub fn values_of(&self, dim: &str) -> Result<Value> {
         let u = self.universe();
-        let field = u.field_by_uid(dim, Some(FieldKind::Dimension)).or_else(|| u.field_by_name(dim, FieldKind::Dimension));
-        let Some(field) = field else {
-            return Err(ServiceError::not_found(format!("no dimension {dim}")));
+        let field = match u.field_by_uid(dim, Some(FieldKind::Dimension)).or_else(|| u.field_by_name(dim, FieldKind::Dimension)) {
+            Some(f) => f,
+            None => {
+                let needle = dim.trim().to_lowercase();
+                let contains = |s: &str| !needle.is_empty() && s.to_lowercase().contains(&needle);
+                let hits: Vec<&zsql_semantic::Field> = u
+                    .fields()
+                    .iter()
+                    .filter(|f| f.is_dimension() && (contains(&f.uid) || contains(&f.name) || f.synonyms.iter().any(|s| contains(s))))
+                    .collect();
+                match hits.as_slice() {
+                    [one] => *one,
+                    [] => return Err(ServiceError::not_found(format!("no dimension matches '{dim}'"))),
+                    many => {
+                        let uids: Vec<&str> = many.iter().map(|f| f.uid.as_str()).collect();
+                        return Err(ServiceError::invalid("Ambiguous", format!("'{dim}' matches several dimensions: {}", uids.join(", "))));
+                    }
+                }
+            }
         };
         match self.values.as_ref().and_then(|v| v.get(&field.uid)) {
             Some(e) => Ok(serde_json::to_value(e).expect("sampled values serialize")),
