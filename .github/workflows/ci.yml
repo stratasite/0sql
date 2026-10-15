@@ -1,8 +1,7 @@
-# Every push and pull request: clippy with warnings as errors, the
-# tests, the golden scoreboard, and the CLI's feature combinations.
-# The toolchain is whatever rust-toolchain.toml names, as the release
-# workflows use. rustfmt is not checked: the tree predates a format
-# pass, and that is a decision to take on its own.
+# Every push and pull request: formatting, clippy with warnings as
+# errors, the tests, the golden scoreboard, the CLI's feature
+# combinations, and cargo-deny over the dependency tree. The toolchain
+# is whatever rust-toolchain.toml names, as the release workflows use.
 name: ci
 
 on:
@@ -21,6 +20,8 @@ jobs:
       - name: Toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --exclude zsql-warehouse --all-targets --locked -- -D warnings
       - name: Tests
@@ -41,3 +42,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: CLI with the warehouse drivers
         run: cargo check --locked -p zsql-cli --features warehouse
+
+  # Advisories, licences and sources of every crate in the tree, from
+  # deny.toml. No build, so it is quick and runs on its own.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

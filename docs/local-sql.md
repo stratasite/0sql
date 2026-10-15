@@ -167,9 +167,9 @@ HTTP and accounts layer on top of it is the smaller addition.
 
 ### Build and CI
 
-`warehouse` and `server` give four feature combinations; CI checks all
-four, runs fmt, clippy with warnings denied, and the tests, on every push
-and pull request. This lands before the repo goes public. The README's
+`warehouse` and `server` give four feature combinations; CI checks
+them, runs fmt, clippy with warnings denied, the tests, the goldens and
+`cargo deny`, on every push and pull request. This lands before the repo goes public. The README's
 build section says the default CLI build needs a C compiler for SQLite
 and that `--no-default-features` is the slim build. musl's allocator is
 noted in the release notes; a `mimalloc` feature waits for someone to
@@ -204,11 +204,10 @@ Each is one PR that leaves the tree releasable.
 
 Before the repo flips public, separately from these phases: scrub
 `docs/running-it.md` and `ops/` of hostnames and addresses, scan git
-history for secrets, add a `LICENSE` file (the manifests say MIT; no
-file exists yet), and decide on rustfmt. The tree is not
-rustfmt-formatted (about 1,600 hunks, no `rustfmt.toml`), so CI does
-not check formatting; a format pass is one commit, but it is a whole
-tree's worth of diff and a style decision, so it is not taken here.
+history for secrets. Done on 2026-10-15: the MIT `LICENSE`, a format
+pass under `rustfmt.toml` (140 columns, the "Max" heuristic, so the
+dense style survives) checked in CI, `cargo deny` for advisories and
+licences, and Dependabot for crates and actions.
 
 ## Decisions register
 

@@ -51,9 +51,10 @@ refuses a tag that disagrees with it. Because the workspace shares one
 version, a CLI-only fix still means bumping the number the server
 carries. Worth revisiting if the two start moving at different rates.
 
-Since 0.6.0, `.github/workflows/ci.yml` runs clippy with warnings as
-errors, the tests, the golden scoreboard and the CLI's feature
-combinations on every push and pull request. A tag still builds
+Since 0.6.0, `.github/workflows/ci.yml` runs `cargo fmt --check`,
+clippy with warnings as errors, the tests, the golden scoreboard, the
+CLI's feature combinations and `cargo deny` (advisories, licences,
+sources; `deny.toml`) on every push and pull request. A tag still builds
 nothing but the release; the tests still run locally before tagging,
 because CI running them later does not stop a tag going out first.
 
