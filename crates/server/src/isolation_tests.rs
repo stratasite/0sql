@@ -15,10 +15,28 @@
 //! dimension named for whoever deployed it, so that which model answers
 //! can be read off `/fields`.
 
-use super::*;
+use crate::deploy::UNPACKED_LIMIT;
+use crate::deploy::{nanos, Capped};
+use crate::limits;
+use crate::limits::{Admission, Limiter};
+use crate::mail;
+use crate::mcp;
+use crate::run::{reload, router};
+use crate::{App, Caps, Shared};
 use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::StatusCode;
 use axum::http::{Method, Request};
+use axum::Router;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tower::ServiceExt;
+use zsql_accounts::Store;
+use zsql_dialect::Dialects;
 
 const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40000);
 
@@ -443,7 +461,8 @@ async fn a_key_from_another_account_finds_nothing() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     let b = format!("/projects/{CS}/branches/main");
     let reads: Vec<(Method, String, Option<Value>)> = vec![
@@ -484,7 +503,8 @@ async fn members_reach_only_what_their_level_allows() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let bob = s.member(&ann, "bob@acme.test", "developer").await;
-    assert_eq!(s.deploy("sales", "main", &ann, archive("sales", "sales")).await.status, StatusCode::OK);
+    let a = s.deploy("sales", "main", &ann, archive("sales", "sales")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let b = "/projects/sales/branches/main";
 
     // Visible to the account: Bob reads, cannot change.
@@ -529,7 +549,8 @@ async fn members_reach_only_what_their_level_allows() {
         s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "owner" })).await.status,
         StatusCode::OK
     );
-    assert_eq!(s.deploy("sales", "main", &bob, archive("sales", "bob")).await.status, StatusCode::OK);
+    let a = s.deploy("sales", "main", &bob, archive("sales", "bob")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     // Removed from the account, Bob's key is no key at all.
     assert_eq!(s.delete("/account/members/bob@acme.test", Some(&ann)).await.status, StatusCode::OK);
@@ -544,10 +565,14 @@ async fn query_keys_read_exactly_what_they_are_granted() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "staging", &ann, archive(CS, "acme-staging")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy("hr", "main", &ann, archive("hr", "hr")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "staging", &ann, archive(CS, "acme-staging")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("hr", "main", &ann, archive("hr", "hr")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "main", &ned, archive(CS, "newco")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let (id, qk) = s.query_key(&ann).await;
     let grants = format!("/account/query-keys/{id}/grants");
 
@@ -612,8 +637,10 @@ async fn one_person_in_two_accounts_has_a_key_for_each() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "main", &ned, archive(CS, "newco")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     // Ned invites Ann into Newco as an admin. She already signs in, so the
     // invite cannot mint her a key; she makes one from a Newco session.
@@ -648,8 +675,10 @@ async fn names_that_could_leave_the_account_are_refused() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "main", &ned, archive(CS, "newco")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let newco_snapshot = s.data_dir.join("newco").join(CS).join("main").join("snapshot.json.gz");
     let before = std::fs::read(&newco_snapshot).unwrap();
 
@@ -684,7 +713,8 @@ async fn an_archive_cannot_reach_outside_itself() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ned, archive(CS, "newco")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     // Something on the host that must never be read: here, a file with
     // a marker, standing in for another account's data.
@@ -871,10 +901,14 @@ async fn mcp_tools_reach_what_the_key_may_read_and_nothing_else() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let ned = s.signup("newco", "ned@newco.test", "nedpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "dev", &ann, archive(CS, "acme-dev")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy(CS, "main", &ned, archive(CS, "newco")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "dev", &ann, archive(CS, "acme-dev")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "main", &ned, archive(CS, "newco")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     // The listed tools, and not one of them takes a context.
     let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
@@ -949,7 +983,8 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let dev = s.member(&ann, "dev@acme.test", "developer").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let (qk, secret) = s.query_key(&ann).await;
     let sql_path = format!("/projects/{CS}/branches/main/sql");
     let emea = json!({ "groups": [{ "name": "emea" }] });
@@ -1029,7 +1064,8 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
 async fn a_personal_key_plans_as_its_user_over_mcp() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
 
     let a = s.tool(Some(&ann), "sql", json!({ "project": CS, "spec": spec_of("Category") })).await;
     let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("");
@@ -1056,7 +1092,8 @@ async fn a_personal_key_plans_as_its_user_over_mcp() {
 async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let (qk, secret) = s.query_key(&ann).await;
     let a = s
         .post(
@@ -1107,7 +1144,8 @@ async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
 async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive_with_exclusions(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive_with_exclusions(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let (qk, secret) = s.query_key(&ann).await;
     let a = s
         .post(
@@ -1140,8 +1178,10 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
 async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
-    assert_eq!(s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
 
     // A key with no grants is told so; a key granted one project gets
@@ -1193,7 +1233,8 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
          \x20 - type: measure\n    name: Revenue Gross\n    data_type: decimal\n    expression:\n      sql: sum(gross)\n"
             .into();
     files.retain(|(p, _)| p != "tests/smoke.yml");
-    assert_eq!(s.deploy("billing", "main", &ann, archive_of(&files)).await.status, StatusCode::OK);
+    let a = s.deploy("billing", "main", &ann, archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let a = s
         .tool(
             Some(&ann),
@@ -1220,7 +1261,8 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
 async fn without_a_key_nothing_is_reached_when_accounts_are_on() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
-    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.get("/projects", None).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(s.get(&format!("/projects/{CS}/branches/main/fields"), None).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(

@@ -41,8 +41,24 @@
 //! every byte between the Authorization header and `gate()` is in this
 //! crate, where it is tested with the rest of the isolation suite.
 
-use super::*;
-use axum::http::HeaderMap;
+use crate::auth::{busy, too_many, Auth, Held};
+use crate::error::{internal, ApiError};
+use crate::limits::Class;
+use crate::reads::{explain_of, explore_of, fields_of, projects_of, sql_of, tables_of, values_of, FieldsQuery};
+use crate::tenancy::{check_uid, gate, in_scope, model, scope_of};
+use crate::{read, App, Shared};
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use zsql_accounts::{Principal, Verb};
+use zsql_semantic::FieldKind;
+use zsql_service::{ExploreRequest, Model, SqlRequest};
+use zsql_spec::SecurityContext;
 
 pub const PATH: &str = "/mcp";
 
