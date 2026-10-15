@@ -51,7 +51,11 @@ refuses a tag that disagrees with it. Because the workspace shares one
 version, a CLI-only fix still means bumping the number the server
 carries. Worth revisiting if the two start moving at different rates.
 
-Tests are not run in CI by choice; they run locally before tagging.
+Since 0.6.0, `.github/workflows/ci.yml` runs clippy with warnings as
+errors, the tests, the golden scoreboard and the CLI's feature
+combinations on every push and pull request. A tag still builds
+nothing but the release; the tests still run locally before tagging,
+because CI running them later does not stop a tag going out first.
 
 Both builds are musl rather than glibc. For the server that is about
 portability. For the CLI it is sharper: it resolves the server's
@@ -78,9 +82,10 @@ not trigger it and a `v*` tag does not trigger the CLI's.
    to rewrite it. This is the step that is easy to miss, because nothing
    locally complains until CI does.
 
-3. **Run the tests.** CI does not; that is deliberate, and it means
-   nothing stands between a broken commit and a tag except this step.
-   `cargo test` for the workspace.
+3. **Run the tests.** CI runs them on the push, but a tag does not
+   wait for CI, so nothing stands between a broken commit and a tag
+   except this step. `cargo test` for the workspace, and `cargo run
+   --release -p zsql-devtool -- golden --strict`.
 
 4. **Tag and push the tag.** `git tag v0.2.2 && git push origin v0.2.2`.
    Pushing the branch does not build anything; only the tag does. The

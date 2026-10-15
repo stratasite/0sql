@@ -323,7 +323,7 @@ fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
                 root: n.is_root(),
                 table: base.map(|b| b.root.name.clone()),
                 datasource: base.map(|b| b.datasource.uid.clone()),
-                paths: n.subtrees.iter().map(|t| universe::Model::to_s(t)).collect(),
+                paths: n.subtrees.iter().map(universe::Model::to_s).collect(),
                 purpose: n.purpose,
                 transform: n.transform.clone(),
                 segment: n.owner.is_some(),

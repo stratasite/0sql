@@ -461,6 +461,9 @@ impl Snapshot {
         Self::from_str(&text)
     }
 
+    /// Not `FromStr`: the error is this crate's, and the name reads as
+    /// the pair of `from_path`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Result<Self, LoadError> {
         match serde_json::from_str(text) {
             Ok(s) => Ok(s),

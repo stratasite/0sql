@@ -11,7 +11,7 @@ use std::sync::Arc;
 use zsql_dialect::Dialects;
 use zsql_semantic::{Field, FieldKind, Id, Universe};
 
-fn uniq_fields<'a>(fields: Vec<&'a Field>) -> Vec<&'a Field> {
+fn uniq_fields(fields: Vec<&Field>) -> Vec<&Field> {
     let mut out: Vec<&Field> = Vec::new();
     for f in fields {
         if !out.iter().any(|o| o.id == f.id) {

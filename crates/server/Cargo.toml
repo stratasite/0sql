@@ -3,6 +3,7 @@ name = "zsql-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "zsqld: deploy a project, get SQL back"
 
 [[bin]]
@@ -28,3 +29,6 @@ zsql-shorthand.workspace = true
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[lints]
+workspace = true

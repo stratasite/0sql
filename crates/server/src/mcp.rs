@@ -275,7 +275,7 @@ fn branch_catalogue(d: &Model) -> String {
             out.push_str(&format!("{h}:\n"));
             last = h;
         }
-        let data_type = serde_json::to_value(&f.data_type).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "?".into());
+        let data_type = serde_json::to_value(f.data_type).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "?".into());
         out.push_str(&format!("- {}: {} ({})", f.uid, f.name, data_type));
         if let Some(desc) = f.description.as_deref().filter(|d| !d.trim().is_empty()) {
             out.push_str(&format!(", {}", desc.trim()));

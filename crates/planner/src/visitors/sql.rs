@@ -751,6 +751,9 @@ fn insert_after(tree: &mut PTree, target: usize, clause: String) -> bool {
                     kids.insert(i + 1, PTree::Clause(clause));
                     return true;
                 }
+                // Not a match guard: the guard would borrow `kids` a
+                // second time while the arm holds it.
+                #[allow(clippy::collapsible_match)]
                 PTree::Group(..) => {
                     if insert_after(&mut kids[i], target, clause.clone()) {
                         return true;

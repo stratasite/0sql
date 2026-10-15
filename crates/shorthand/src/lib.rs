@@ -111,13 +111,14 @@ fn escaped_field(s: &str) -> Option<String> {
         Some((b, k)) if b.ends_with(']') && matches!(k.to_lowercase().as_str(), "d" | "m" | "dim" | "measure") => (b, format!("@{k}")),
         _ => (s, String::new()),
     };
-    let inner = if body.len() >= 2 && body.starts_with('[') && body.ends_with(']') {
-        &body[1..body.len() - 1]
-    } else if suffix.is_empty() && body.len() >= 2 && ((body.starts_with('"') && body.ends_with('"')) || (body.starts_with('\'') && body.ends_with('\''))) {
-        &body[1..body.len() - 1]
-    } else {
+    // Brackets escape a name with or without a kind suffix; quotes
+    // escape one only when no suffix follows.
+    let bracketed = body.starts_with('[') && body.ends_with(']');
+    let quoted = suffix.is_empty() && ((body.starts_with('"') && body.ends_with('"')) || (body.starts_with('\'') && body.ends_with('\'')));
+    if body.len() < 2 || !(bracketed || quoted) {
         return None;
-    };
+    }
+    let inner = &body[1..body.len() - 1];
     let inner = inner.trim();
     (!inner.is_empty() && !inner.contains(['[', ']', '"', '\''])).then(|| format!("{inner}{suffix}"))
 }
@@ -137,7 +138,7 @@ fn masked(text: &str) -> String {
                 closer = None;
                 out.push(ch);
             }
-            Some(_) => out.extend(std::iter::repeat('_').take(ch.len_utf8())),
+            Some(_) => out.extend(std::iter::repeat_n('_', ch.len_utf8())),
             None => {
                 closer = match ch {
                     '[' => Some(']'),
@@ -444,5 +445,26 @@ mod tests {
         assert!(matches!(&items[8], Item::Calculation(c) if c["alias"] == "Peak"));
         assert!(matches!(&items[9], Item::Projection(p) if p["field"] == "Tables"));
         assert!(parse_item("frob(date)").is_err());
+    }
+
+    #[test]
+    fn items_split_outside_parens_and_quotes() {
+        assert_eq!(split_items("a, month(b), c in (x, y), 'p, q'"), vec!["a", "month(b)", "c in (x, y)", "'p, q'"]);
+    }
+
+    /// A name in brackets or quotes is a field whatever it says, with
+    /// its kind suffix kept; a formula keeps its brackets and is its
+    /// own alias when unnamed.
+    #[test]
+    fn escaped_names_are_fields_whatever_they_say() {
+        assert!(matches!(parse_item("\"Sales in Store\" > 5"), Ok(Item::Filter(f)) if f["field"] == "Sales in Store" && f["predicate"] == "greater_than"));
+        assert!(matches!(parse_item("month([Date between])"), Ok(Item::Projection(p)) if p["field"] == "Date between" && p["decorators"].as_array().unwrap().len() == 1));
+        assert!(matches!(parse_item("[Net Paid] as \"Paid\" desc"), Ok(Item::Projection(p)) if p["alias"] == "Paid" && p["order_by"] == "desc"));
+        assert!(matches!(parse_item("Share = [A]@m / [B]@m"), Ok(Item::Calculation(c)) if c["sql"] == "[A]@m / [B]@m"));
+        assert!(matches!(parse_item("max([gross sales]@m)"), Ok(Item::Calculation(c)) if c["alias"] == "max([gross sales]@m)"));
+        assert!(matches!(parse_item("[gross sales]@m > 100"), Ok(Item::Filter(f)) if f["field"] == "gross sales@m"));
+        assert!(matches!(parse_item("[Date]@d"), Ok(Item::Projection(p)) if p["field"] == "Date@d"));
+        let moving = parse_item("moving_avg(paid, 7)").unwrap();
+        assert!(matches!(&moving, Item::Projection(p) if p["decorators"][0]["type"] == "window"), "{moving:?}");
     }
 }

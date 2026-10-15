@@ -120,7 +120,8 @@ files will not load it says that and keeps answering from the model it
 had. With `-r` it asks the server, and `.branch` switches branches there.
 
 `zsql-dev` (the devtool crate) is the engine on the command line for its
-own developers: the golden scoreboard, the bench, formation checks and
+own developers: the golden scoreboard, the benches (`bench` over the
+goldens, `load-bench` over a project directory), formation checks and
 export. It is not part of the CLI release.
 
 `ZSQL_HOME` moves `~/.zsql` (the account-wide config and the repl

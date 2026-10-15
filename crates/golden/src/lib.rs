@@ -213,8 +213,7 @@ pub fn structural_form(sql: &str) -> String {
     let (ctes, last): (Vec<(String, String)>, String) = if let Some(rest) = text.strip_prefix("WITH ") {
         let mut ctes = Vec::new();
         let mut cur = rest;
-        loop {
-            let Some(pos) = cur.find(" AS (\n") else { break };
+        while let Some(pos) = cur.find(" AS (\n") {
             let name = cur[..pos].trim_start_matches(", ").to_string();
             let body_start = pos + " AS (\n".len();
             let Some(end) = cur[body_start..].find("\n)") else { break };
@@ -330,7 +329,7 @@ fn sort_conditions(s: &str) -> String {
         .split(" AND ")
         .map(|c| match c.split_once(" = ") {
             Some((a, b)) => {
-                let mut ops = vec![a.trim(), b.trim()];
+                let mut ops = [a.trim(), b.trim()];
                 ops.sort();
                 format!("{} = {}", ops[0], ops[1])
             }

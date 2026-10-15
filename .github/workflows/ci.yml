@@ -1,0 +1,43 @@
+# Every push and pull request: clippy with warnings as errors, the
+# tests, the golden scoreboard, and the CLI's feature combinations.
+# The toolchain is whatever rust-toolchain.toml names, as the release
+# workflows use. rustfmt is not checked: the tree predates a format
+# pass, and that is a decision to take on its own.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --exclude zsql-warehouse --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --exclude zsql-warehouse --locked
+      - name: Goldens
+        run: cargo run --release --locked -p zsql-devtool -- golden --strict
+      - name: CLI without defaults
+        run: cargo check --locked -p zsql-cli --no-default-features
+
+  # The warehouse drivers compile DuckDB from source, which takes a
+  # while, so they get a job of their own and the fast one stays fast.
+  warehouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: CLI with the warehouse drivers
+        run: cargo check --locked -p zsql-cli --features warehouse

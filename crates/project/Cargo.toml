@@ -3,6 +3,7 @@ name = "zsql-project"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Loads a strata CLI project directory (YAML models) into a semantic snapshot"
 
 [dependencies]
@@ -18,3 +19,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 zsql-planner.workspace = true
+
+[lints]
+workspace = true

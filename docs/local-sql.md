@@ -204,7 +204,11 @@ Each is one PR that leaves the tree releasable.
 
 Before the repo flips public, separately from these phases: scrub
 `docs/running-it.md` and `ops/` of hostnames and addresses, scan git
-history for secrets, and confirm the licence covers every crate.
+history for secrets, add a `LICENSE` file (the manifests say MIT; no
+file exists yet), and decide on rustfmt. The tree is not
+rustfmt-formatted (about 1,600 hunks, no `rustfmt.toml`), so CI does
+not check formatting; a format pass is one commit, but it is a whole
+tree's worth of diff and a style decision, so it is not taken here.
 
 ## Decisions register
 
@@ -226,4 +230,4 @@ history for secrets, and confirm the licence covers every crate.
 
 ## Progress
 
-- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 4 done (loader measured and sped up: TPC-DS load 9.6 to 5.0 ms, `zsql sql` 8 to 9 ms end to end; no cache). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).
+- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 5 done (ci.yml: clippy with warnings denied, tests, goldens, the slim CLI check, the warehouse check in its own job; the devtool keeps check, export, golden, bench, load-bench and form, and its private parser's tests moved to the shorthand crate; every crate `publish = false`; two stylistic clippy lints allowed workspace-wide, the rest fixed; version 0.6.0; README and running-it updated). Phase 4 done (loader measured and sped up: TPC-DS load 9.6 to 5.0 ms, `zsql sql` 8 to 9 ms end to end; no cache). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).

@@ -329,7 +329,7 @@ fn kind_hint(s: Option<&str>) -> Option<FieldKind> {
     if s.is_empty() {
         return None;
     }
-    let last = s.rsplit(|c| c == ':' || c == '@').next().unwrap_or(s).trim().to_lowercase();
+    let last = s.rsplit([':', '@']).next().unwrap_or(s).trim().to_lowercase();
     if last.is_empty() {
         None
     } else if last.starts_with('d') {
@@ -780,7 +780,7 @@ fn lower_decorator(d: &DecoratorSpec, field: Option<&Field>, owner: &str) -> Res
             attrs.insert("function".into(), json!(func));
             for (key, needed) in [("size", mode == "moving"), ("offset", matches!(func.as_str(), "lag" | "lead")), ("buckets", func == "ntile")] {
                 let n = attrs.get(key).and_then(Value::as_i64);
-                if needed && n.map_or(true, |n| n < 1) {
+                if needed && n.is_none_or(|n| n < 1) {
                     return Err(record_invalid(format!("{key} must be greater than or equal to 1 ({owner})")));
                 }
             }

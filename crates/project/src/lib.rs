@@ -1361,7 +1361,7 @@ impl<'d> Builder<'d> {
                 Some(other) => return Err(invalid(&file, format!("Policy '{name}': unresolved '{other}' should be deny or allow"))),
             };
             let bypass = get(pm, "bypass").and_then(as_map).cloned().unwrap_or_default();
-            let uid = self.policy_slugs.take(&[name.clone()]);
+            let uid = self.policy_slugs.take(std::slice::from_ref(&name));
             self.policies.push(SecurityPolicy {
                 uid,
                 name,

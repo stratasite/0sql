@@ -93,7 +93,7 @@ pub fn entity_gsub(sql: &str, entity_name: &str, replacement: &str) -> String {
             out.push_str(replacement);
             let mut after = close + 1;
             // An optional `@m`/`@d` suffix belongs to the reference.
-            let tail = rest[after..].as_bytes();
+            let tail = &rest.as_bytes()[after..];
             if tail.len() >= 2 && tail[0] == b'@' && matches!(tail[1], b'm' | b'd' | b'M' | b'D') {
                 after += 2;
             }
