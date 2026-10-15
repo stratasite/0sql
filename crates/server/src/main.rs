@@ -1822,6 +1822,9 @@ const JSON_LIMIT: usize = 1024 * 1024;
 mod isolation_tests;
 
 #[cfg(test)]
+mod parity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderName};

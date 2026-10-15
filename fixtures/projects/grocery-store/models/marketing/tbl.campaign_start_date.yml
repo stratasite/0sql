@@ -1,0 +1,88 @@
+# Role-playing view of dim_date anchored to a campaign's START_DAY.
+#
+# fact_campaign_received has only (household_key, campaign) - no event date -
+# so campaign exposure measures can never join to the transaction-grain "Date"
+# dimension. This role table gives campaign measures their own calendar axis
+# via Campaign Received -> Campaign -> Campaign Start Date (all many_to_one).
+#
+# Attribution is to the day the campaign STARTED, not to the day a household
+# was actually exposed - the data does not record the latter. Field names are
+# prefixed so this is never mistaken for transaction date.
+name: Campaign Start Date
+physical_name: dim_date
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Campaign Start Day Index
+    description: Day index the campaign started (join key to the calendar; mirrors Campaign Start Day)
+    data_type: integer
+    disable_listing: true
+    expression:
+      primary_key: true
+      lookup: true
+      sql: Day_Idx
+
+  - type: dimension
+    name: Campaign Start Date
+    description: Synthetic calendar date the campaign started (Day 1 anchored to 2020-01-01)
+    data_type: date
+    grains:
+      - day
+      - week
+      - month
+      - quarter
+      - year
+    expression:
+      lookup: true
+      sql: CAST(AnchorDate AS DATE)
+
+  - type: dimension
+    name: Campaign Start Month Index
+    description: Sequential month number in which the campaign started (1-24)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Month_Idx
+
+  - type: dimension
+    name: Campaign Start Quarter Index
+    description: Sequential quarter number in which the campaign started
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Quarter_Idx
+
+  - type: dimension
+    name: Campaign Start Year Index
+    description: Observation year in which the campaign started (1 or 2)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Year_Idx
+
+  - type: dimension
+    name: Campaign Start Year Month
+    description: Synthetic year-month label of the campaign start (e.g. 2020-01)
+    data_type: string
+    expression:
+      lookup: true
+      sql: YearMonth
+
+  - type: dimension
+    name: Campaign Start Year Label
+    description: Observation year label of the campaign start (Y1, Y2)
+    data_type: string
+    expression:
+      lookup: true
+      sql: YearLabel
+
+  - type: dimension
+    name: Campaign Start Week Label
+    description: Observation week label of the campaign start (W001-W102)
+    data_type: string
+    expression:
+      lookup: true
+      sql: WeekLabel

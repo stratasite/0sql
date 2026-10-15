@@ -1,0 +1,6 @@
+# A planner test: project these fields and compare the SQL.
+name: sales value by department
+projections:
+  - Department
+  - Sales Value
+assert_regex: SELECT.*fact_transactions.*GROUP BY

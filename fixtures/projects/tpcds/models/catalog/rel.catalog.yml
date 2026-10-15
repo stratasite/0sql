@@ -1,0 +1,231 @@
+# Required: The datasource these relationships are valid for.
+# The chosen tables will be scoped to those within this datasource.
+# Strata does not support cross datasource sqls
+datasource: tpcds
+
+# Define relationships between tables for the catalog channel
+# Relationships connect fact tables (catalog_sales, catalog_returns) to dimension tables
+
+# Catalog Sales to Date Dimension (sold date)
+catalog_sales_sold_date:
+  left: Catalog Sales
+  right: Date
+  sql: left.cs_sold_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Time Dimension (sold time)
+catalog_sales_sold_time:
+  left: Catalog Sales
+  right: Time
+  sql: left.cs_sold_time_sk = right.t_time_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Catalog Ship Date
+catalog_sales_ship_date:
+  left: Catalog Sales
+  right: Catalog Ship Date
+  sql: left.cs_ship_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Item Dimension
+catalog_sales_item:
+  left: Catalog Sales
+  right: Item
+  sql: left.cs_item_sk = right.i_item_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Billed Customer
+catalog_sales_billed_customer:
+  left: Catalog Sales
+  right: Billed Customer
+  sql: left.cs_bill_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Billed Customer Demographics
+catalog_sales_billed_customer_demographics:
+  left: Catalog Sales
+  right: Billed Customer Demographics
+  sql: left.cs_bill_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Billed Household Demographics
+catalog_sales_billed_household_demographics:
+  left: Catalog Sales
+  right: Billed Household Demographics
+  sql: left.cs_bill_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Billed Customer Address
+catalog_sales_billed_customer_address:
+  left: Catalog Sales
+  right: Billed Customer Address
+  sql: left.cs_bill_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Shipped Customer
+catalog_sales_customer:
+  left: Catalog Sales
+  right: Customer
+  sql: left.cs_ship_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Shipped Customer Demographics
+catalog_sales_customer_demographics:
+  left: Catalog Sales
+  right: Customer Demographics
+  sql: left.cs_ship_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Shipped Household Demographics
+catalog_sales_household_demographics:
+  left: Catalog Sales
+  right: Household Demographics
+  sql: left.cs_ship_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Shipped Customer Address
+catalog_sales_customer_address:
+  left: Catalog Sales
+  right: Customer Address
+  sql: left.cs_ship_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Call Center
+catalog_sales_call_center:
+  left: Catalog Sales
+  right: Call Center
+  sql: left.cs_call_center_sk = right.cc_call_center_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Catalog Page
+catalog_sales_catalog_page:
+  left: Catalog Sales
+  right: Catalog Page
+  sql: left.cs_catalog_page_sk = right.cp_catalog_page_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Ship Mode
+catalog_sales_ship_mode:
+  left: Catalog Sales
+  right: Ship Mode
+  sql: left.cs_ship_mode_sk = right.sm_ship_mode_sk
+  cardinality: many_to_one
+
+# Catalog Sales to Warehouse
+catalog_sales_warehouse:
+  left: Catalog Sales
+  right: Warehouse
+  sql: left.cs_warehouse_sk = right.w_warehouse_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Catalog Return Date
+catalog_returns_date:
+  left: Catalog Returns
+  right: Date
+  sql: left.cr_returned_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Time Dimension (return time)
+catalog_returns_returned_time:
+  left: Catalog Returns
+  right: Time
+  sql: left.cr_returned_time_sk = right.t_time_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Item Dimension
+catalog_returns_item:
+  left: Catalog Returns
+  right: Item
+  sql: left.cr_item_sk = right.i_item_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Refunded Customer
+catalog_returns_refunded_customer:
+  left: Catalog Returns
+  right: Customer
+  sql: left.cr_refunded_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Refunded Customer Demographics
+catalog_returns_refunded_customer_demographics:
+  left: Catalog Returns
+  right: Customer Demographics
+  sql: left.cr_refunded_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Refunded Household Demographics
+catalog_returns_refunded_household_demographics:
+  left: Catalog Returns
+  right: Household Demographics
+  sql: left.cr_refunded_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Refunded Customer Address
+catalog_returns_refunded_customer_address:
+  left: Catalog Returns
+  right: Customer Address
+  sql: left.cr_refunded_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Returning Customer
+catalog_returns_returning_customer:
+  left: Catalog Returns
+  right: Returning Customer
+  sql: left.cr_returning_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Returning Customer Demographics
+catalog_returns_returning_customer_demographics:
+  left: Catalog Returns
+  right: Returning Customer Demographics
+  sql: left.cr_returning_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Returning Household Demographics
+catalog_returns_returning_household_demographics:
+  left: Catalog Returns
+  right: Returning Household Demographics
+  sql: left.cr_returning_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Returning Customer Address
+catalog_returns_returning_customer_address:
+  left: Catalog Returns
+  right: Returning Customer Address
+  sql: left.cr_returning_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Call Center
+catalog_returns_call_center:
+  left: Catalog Returns
+  right: Call Center
+  sql: left.cr_call_center_sk = right.cc_call_center_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Catalog Page
+catalog_returns_catalog_page:
+  left: Catalog Returns
+  right: Catalog Page
+  sql: left.cr_catalog_page_sk = right.cp_catalog_page_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Ship Mode
+catalog_returns_ship_mode:
+  left: Catalog Returns
+  right: Ship Mode
+  sql: left.cr_ship_mode_sk = right.sm_ship_mode_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Warehouse
+catalog_returns_warehouse:
+  left: Catalog Returns
+  right: Warehouse
+  sql: left.cr_warehouse_sk = right.w_warehouse_sk
+  cardinality: many_to_one
+
+# Catalog Returns to Reason
+catalog_returns_reason:
+  left: Catalog Returns
+  right: Reason
+  sql: left.cr_reason_sk = right.r_reason_sk
+  cardinality: many_to_one

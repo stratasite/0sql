@@ -1,0 +1,84 @@
+# 30 direct marketing campaigns. TypeA are the largest (retargeting-style),
+# TypeB/TypeC are smaller targeted campaigns.
+name: Campaign
+physical_name: dim_campaign
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Campaign ID
+    description: Unique campaign identifier (1-30)
+    data_type: integer
+    expression:
+      primary_key: true
+      sql: CAMPAIGN
+
+  - type: dimension
+    name: Campaign Type
+    description: Campaign type (TypeA, TypeB, TypeC)
+    data_type: string
+    expression:
+      lookup: true
+      sql: CAMPAIGN_TYPE
+
+  - type: dimension
+    name: Campaign Start Day
+    description: Day index the campaign started
+    data_type: integer
+    expression:
+      lookup: true
+      sql: START_DAY
+
+  - type: dimension
+    name: Campaign End Day
+    description: Day index the campaign ended
+    data_type: integer
+    expression:
+      lookup: true
+      sql: END_DAY
+
+  - type: dimension
+    name: Campaign Duration Days
+    description: Campaign length in days
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Duration_Days
+
+  # Tagged into the "weeks" blend group (shared with Date.Week Number and
+  # Weekly Promotions.Promo Week) so campaign exposure measures can share a
+  # time axis with day-grain transaction and redemption measures. Receipts
+  # land in the campaign's start week, not spread across its run.
+  - type: dimension
+    name: Campaign Start Week
+    description: Week number the campaign started; blends with the shared weekly time axis
+    data_type: integer
+    extended_blend_group: weeks
+    expression:
+      lookup: true
+      sql: Start_Week
+
+  - type: dimension
+    name: Campaign End Week
+    description: Week number the campaign ended
+    data_type: integer
+    expression:
+      lookup: true
+      sql: End_Week
+
+  - type: dimension
+    name: Extends Past Observation
+    description: True if the campaign window extends past the last observed transaction day
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: Extends_Past_Observation
+
+  - type: measure
+    name: Campaign Count
+    description: Number of campaigns
+    data_type: integer
+    expression:
+      sql: count(*)

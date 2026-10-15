@@ -3040,7 +3040,10 @@ dependencies = [
  "serde_yaml",
  "tar",
  "ureq",
+ "zsql-dialect",
+ "zsql-service",
  "zsql-shorthand",
+ "zsql-spec",
  "zsql-warehouse",
 ]
 

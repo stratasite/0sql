@@ -1,0 +1,121 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Warehouse
+
+# The actual table no the target datasource
+physical_name: warehouse
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Warehouse ID
+    description: Business key for warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_warehouse_id
+
+  - type: dimension
+    name: Warehouse Name
+    description: Name of the warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_warehouse_name
+
+  - type: dimension
+    name: Warehouse Square Feet
+    description: Square footage of warehouse
+    data_type: integer
+    expression:
+      lookup: true
+      sql: w_warehouse_sq_ft
+
+  - type: dimension
+    name: Warehouse Street Number
+    description: Street number of warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_street_number
+
+  - type: dimension
+    name: Warehouse Street Name
+    description: Street name of warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_street_name
+
+  - type: dimension
+    name: Warehouse Street Type
+    description: Street type (e.g., Ave, St, Blvd)
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_street_type
+
+  - type: dimension
+    name: Warehouse Suite Number
+    description: Suite number of warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_suite_number
+
+  - type: dimension
+    name: Warehouse City
+    description: City where warehouse is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_city
+
+  - type: dimension
+    name: Warehouse County
+    description: County where warehouse is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_county
+
+  - type: dimension
+    name: Warehouse State
+    description: State where warehouse is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_state
+
+  - type: dimension
+    name: Warehouse ZIP
+    description: ZIP code of warehouse
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_zip
+
+  - type: dimension
+    name: Warehouse Country
+    description: Country where warehouse is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: w_country
+
+  - type: dimension
+    name: Warehouse GMT Offset
+    description: GMT offset for warehouse location
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: w_gmt_offset

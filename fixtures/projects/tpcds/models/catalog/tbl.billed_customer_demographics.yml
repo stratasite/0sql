@@ -1,0 +1,81 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Billed Customer Demographics
+
+# The actual table no the target datasource
+physical_name: customer_demographics
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Billed Customer Gender
+    description: Billed customer gender
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_gender
+
+  - type: dimension
+    name: Billed Customer Marital Status
+    description: Billed customer marital status
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_marital_status
+
+  - type: dimension
+    name: Billed Customer Education Status
+    description: Billed customer education level
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_education_status
+
+  - type: dimension
+    name: Billed Customer Purchase Estimate
+    description: Billed customer estimated purchase amount
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_purchase_estimate
+
+  - type: dimension
+    name: Billed Customer Credit Rating
+    description: Billed customer credit rating
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_credit_rating
+
+  - type: dimension
+    name: Billed Customer Dependent Count
+    description: Number of dependents for billed customer
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_count
+
+  - type: dimension
+    name: Billed Customer Employed Dependent Count
+    description: Number of employed dependents for billed customer
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_employed_count
+
+  - type: dimension
+    name: Billed Customer College Dependent Count
+    description: Number of dependents in college for billed customer
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_college_count

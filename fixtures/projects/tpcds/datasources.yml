@@ -1,0 +1,5 @@
+# 0sql never opens the warehouse; the adapter picks the SQL dialect.
+tpcds:
+  name: TPC-DS (DuckDb)
+  adapter: duckdb
+  tier: hot

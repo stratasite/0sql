@@ -6,6 +6,9 @@
 //!   when `.zsql` is absent): `api_key`, `server`, and per-datasource secrets.
 //! - `~/.zsql/config`: the same keys, account-wide.
 //! - `ZSQL_SERVER` and `ZSQL_API_KEY` in the environment, which win.
+//!
+//! `~/.zsql` is also where the repl history lives. `ZSQL_HOME` moves
+//! the whole directory, which is how tests keep out of the real one.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -33,7 +36,7 @@ pub fn find_project(start: &Path) -> Result<Project> {
             return read_project(&dir);
         }
         if !dir.pop() {
-            anyhow::bail!("no project.yml here or above; run `zsql init` to start a project");
+            anyhow::bail!("no project.yml here or above; run `zsql init` to start a project, or add -r --uid UID to use a server's copy");
         }
     }
 }
@@ -75,6 +78,14 @@ pub fn slug(s: &str) -> String {
     out
 }
 
+/// The account-wide directory: `ZSQL_HOME`, else `~/.zsql`.
+pub fn home() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("ZSQL_HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(h));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zsql"))
+}
+
 /// A key from the local secrets file (`.zsql`, else `.strata`) or the
 /// account-wide one.
 pub fn secret(project_dir: Option<&Path>, key: &str) -> Option<String> {
@@ -83,8 +94,8 @@ pub fn secret(project_dir: Option<&Path>, key: &str) -> Option<String> {
         let local = dir.join(LOCAL_FILE);
         files.push(if local.exists() { local } else { dir.join(STRATA_FILE) });
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        files.push(PathBuf::from(home).join(".zsql").join("config"));
+    if let Some(home) = home() {
+        files.push(home.join("config"));
     }
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else { continue };

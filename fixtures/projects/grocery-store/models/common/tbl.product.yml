@@ -1,0 +1,88 @@
+name: Product
+physical_name: dim_product
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Product ID
+    description: Unique product identifier
+    data_type: integer
+    disable_listing: true
+    expression:
+      primary_key: true
+      sql: PRODUCT_ID
+
+  - type: dimension
+    name: Manufacturer
+    description: Manufacturer code
+    data_type: integer
+    disable_listing: true
+    expression:
+      lookup: true
+      sql: MANUFACTURER
+
+  - type: dimension
+    name: Department
+    description: Product department (e.g. GROCERY, PRODUCE, MEAT)
+    data_type: string
+    expression:
+      lookup: true
+      sql: DEPARTMENT
+
+  - type: dimension
+    name: Brand Type
+    description: National or Private brand
+    data_type: string
+    expression:
+      lookup: true
+      sql: BRAND
+
+  - type: dimension
+    name: Commodity
+    description: Product commodity category
+    data_type: string
+    expression:
+      lookup: true
+      sql: COMMODITY_DESC
+
+  - type: dimension
+    name: Sub Commodity
+    description: Product sub-commodity category
+    data_type: string
+    expression:
+      lookup: true
+      sql: SUB_COMMODITY_DESC
+
+  - type: dimension
+    name: Product Size
+    description: Package size of the product
+    data_type: string
+    disable_listing: true
+    expression:
+      lookup: true
+      sql: CURR_SIZE_OF_PRODUCT
+
+  - type: dimension
+    name: Is Private Brand
+    description: True for private label products
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: Is_Private_Brand
+
+  - type: dimension
+    name: Has Real Category
+    description: False for products with placeholder/unknown category data
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: Has_Real_Category
+
+  - type: measure
+    name: Product Count
+    description: Number of products
+    data_type: integer
+    expression:
+      sql: count(*)

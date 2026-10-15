@@ -1,0 +1,23 @@
+# The dataset only exposes anonymized store IDs - no store attributes.
+name: Store
+physical_name: dim_store
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Store ID
+    description: Anonymized store identifier
+    data_type: integer
+    disable_listing: true
+    expression:
+      primary_key: true
+      sql: STORE_ID
+
+  - type: measure
+    name: Store Count
+    description: Number of stores
+    data_type: integer
+    expression:
+      sql: count(*)

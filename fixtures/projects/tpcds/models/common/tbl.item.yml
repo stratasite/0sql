@@ -1,0 +1,185 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Item
+
+# The actual table no the target datasource
+physical_name: item
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Item ID
+    description: Business key for item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_item_id
+
+  - type: dimension
+    name: Item Description
+    description: Description of the item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_item_desc
+
+  - type: dimension
+    name: Item Current Price
+    description: Current price of the item
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: i_current_price
+
+  - type: dimension
+    name: Item Wholesale Cost
+    description: Wholesale cost of the item
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: i_wholesale_cost
+
+  - type: dimension
+    name: Item Brand ID
+    description: Brand identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: i_brand_id
+
+  - type: dimension
+    name: Item Brand
+    description: Brand name
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_brand
+
+  - type: dimension
+    name: Item Class ID
+    description: Class identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: i_class_id
+
+  - type: dimension
+    name: Item Class
+    description: Class name
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_class
+
+  - type: dimension
+    name: Item Category ID
+    description: Category identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: i_category_id
+
+  - type: dimension
+    name: Item Category
+    description: Category name
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_category
+
+  - type: dimension
+    name: Item Manufacturer ID
+    description: Manufacturer identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: i_manufact_id
+
+  - type: dimension
+    name: Item Manufacturer
+    description: Manufacturer name
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_manufact
+
+  - type: dimension
+    name: Item Size
+    description: Size of the item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_size
+
+  - type: dimension
+    name: Item Formulation
+    description: Formulation of the item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_formulation
+
+  - type: dimension
+    name: Item Color
+    description: Color of the item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_color
+
+  - type: dimension
+    name: Item Units
+    description: Units of the item
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_units
+
+  - type: dimension
+    name: Item Container
+    description: Container type
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_container
+
+  - type: dimension
+    name: Item Manager ID
+    description: Manager identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: i_manager_id
+
+  - type: dimension
+    name: Item Product Name
+    description: Product name
+    data_type: string
+    expression:
+      lookup: true
+      sql: i_product_name
+
+  - type: dimension
+    name: Item Record Start Date
+    description: Start date of the item record
+    data_type: date
+    expression:
+      lookup: true
+      sql: i_rec_start_date
+
+  - type: dimension
+    name: Item Record End Date
+    description: End date of the item record
+    data_type: date
+    expression:
+      lookup: true
+      sql: i_rec_end_date

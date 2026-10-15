@@ -1,0 +1,234 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Store Return Date
+
+# The actual table no the target datasource
+physical_name: date_dim
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Store Return Date ID
+    description: Business key for store return date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_date_id
+
+  - type: dimension
+    name: Store Return Date
+    description: Actual store return date value
+    data_type: date
+    extended_blend_group: common_dates
+    expression:
+      lookup: true
+      sql: d_date
+
+  - type: dimension
+    name: Store Return Month Sequence
+    description: Sequential month number for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_month_seq
+
+  - type: dimension
+    name: Store Return Week Sequence
+    description: Sequential week number for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_week_seq
+
+  - type: dimension
+    name: Store Return Quarter Sequence
+    description: Sequential quarter number for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_quarter_seq
+
+  - type: dimension
+    name: Store Return Year
+    description: Year value for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_year
+
+  - type: dimension
+    name: Store Return Day of Week
+    description: Day of week for store return (0-6)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dow
+
+  - type: dimension
+    name: Store Return Month of Year
+    description: Month of year for store return (1-12)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_moy
+
+  - type: dimension
+    name: Store Return Day of Month
+    description: Day of month for store return (1-31)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dom
+
+  - type: dimension
+    name: Store Return Quarter of Year
+    description: Quarter of year for store return (1-4)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_qoy
+
+  - type: dimension
+    name: Store Return Fiscal Year
+    description: Fiscal year value for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_year
+
+  - type: dimension
+    name: Store Return Fiscal Quarter Sequence
+    description: Sequential fiscal quarter number for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_quarter_seq
+
+  - type: dimension
+    name: Store Return Fiscal Week Sequence
+    description: Sequential fiscal week number for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_week_seq
+
+  - type: dimension
+    name: Store Return Day Name
+    description: Name of the day for store return (Monday, Tuesday, etc.)
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_day_name
+
+  - type: dimension
+    name: Store Return Quarter Name
+    description: Name of the quarter for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_quarter_name
+
+  - type: dimension
+    name: Store Return Holiday
+    description: Holiday indicator for store return date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_holiday
+
+  - type: dimension
+    name: Store Return Weekend
+    description: Weekend indicator for store return date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_weekend
+
+  - type: dimension
+    name: Store Return Following Holiday
+    description: Following holiday indicator for store return date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_following_holiday
+
+  - type: dimension
+    name: Store Return First Day of Month
+    description: First day of month indicator for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_first_dom
+
+  - type: dimension
+    name: Store Return Last Day of Month
+    description: Last day of month indicator for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_last_dom
+
+  - type: dimension
+    name: Store Return Same Day Last Year
+    description: Same day last year indicator for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_same_day_ly
+
+  - type: dimension
+    name: Store Return Same Day Last Quarter
+    description: Same day last quarter indicator for store return
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_same_day_lq
+
+  - type: dimension
+    name: Store Return Current Day
+    description: Current day indicator for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_day
+
+  - type: dimension
+    name: Store Return Current Week
+    description: Current week indicator for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_week
+
+  - type: dimension
+    name: Store Return Current Month
+    description: Current month indicator for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_month
+
+  - type: dimension
+    name: Store Return Current Quarter
+    description: Current quarter indicator for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_quarter
+
+  - type: dimension
+    name: Store Return Current Year
+    description: Current year indicator for store return
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_year

@@ -1,0 +1,221 @@
+# Main fact: one row per product line item within a basket within a trip.
+# 2.6M rows covering all purchases of 2,500 households over ~2 years.
+# Discounts are stored as positive magnitudes: GROSS_SALES = SALES_VALUE + TOTAL_DISC.
+name: Transactions
+physical_name: fact_transactions
+datasource: complete_journey
+cost: 100
+
+fields:
+
+  - type: dimension
+    name: Basket ID
+    description: Basket / trip identifier grouping line items purchased together
+    data_type: bigint
+    disable_listing: true
+    expression:
+      sql: BASKET_ID
+
+  - type: dimension
+    name: Transaction Hour
+    description: Hour of day the transaction occurred (0-23)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: TRANS_HOUR
+
+  - type: measure
+    name: Sales Value
+    description: Amount the retailer received from the sale (net of discounts)
+    data_type: decimal
+    format: currency:2
+    synonyms:
+      - revenue
+      - spend
+      - net sales
+    expression:
+      sql: sum(SALES_VALUE)
+
+  - type: measure
+    name: Gross Sales
+    description: Sales value before retail and coupon discounts
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: sum(GROSS_SALES)
+
+  - type: measure
+    name: Quantity Sold
+    description: Number of units sold
+    data_type: integer
+    synonyms:
+      - units sold
+    expression:
+      sql: sum(QUANTITY)
+
+  - type: measure
+    name: Retail Discount
+    description: Discount from the retailer loyalty card program
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: sum(RETAIL_DISC)
+
+  - type: measure
+    name: Coupon Discount
+    description: Discount from manufacturer coupons
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: sum(COUPON_DISC)
+
+  - type: measure
+    name: Coupon Match Discount
+    description: Retailer match of manufacturer coupon discounts
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: sum(COUPON_MATCH_DISC)
+
+  - type: measure
+    name: Total Discount
+    description: Total of retail and coupon discounts
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: sum(TOTAL_DISC)
+
+  - type: measure
+    name: Basket Count
+    description: Number of distinct baskets (shopping trips)
+    data_type: integer
+    synonyms:
+      - trip count
+      - number of baskets
+    expression:
+      sql: count(distinct BASKET_ID)
+
+  - type: measure
+    name: Active Households
+    description: Number of distinct households that purchased
+    data_type: integer
+    synonyms:
+      - active customers
+      - purchasing households
+    expression:
+      sql: count(distinct household_key)
+
+  - type: measure
+    name: Line Item Count
+    description: Number of transaction line items
+    data_type: integer
+    expression:
+      sql: count(*)
+
+  - type: measure
+    name: Avg Basket Value
+    description: Average sales value per shopping trip
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: "[Sales Value] / [Basket Count]"
+
+  - type: measure
+    name: Spend per Household
+    description: Average sales value per active household
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: "[Sales Value] / [Active Households]"
+
+  - type: measure
+    name: Purchase Frequency
+    description: Average number of shopping trips per active household
+    data_type: decimal
+    synonyms:
+      - trips per household
+      - visit frequency
+    expression:
+      sql: "[Basket Count] / [Active Households]"
+
+  - type: measure
+    name: Units per Basket
+    description: Average units sold per shopping trip
+    data_type: decimal
+    expression:
+      sql: "[Quantity Sold] / [Basket Count]"
+
+  - type: measure
+    name: Discount Rate
+    description: Total discounts as a share of gross sales
+    data_type: decimal
+    format: percent:2
+    expression:
+      sql: "[Total Discount] / [Gross Sales]"
+
+  # Denominator for share-of-total metrics: ignores grouping and filters on
+  # Product attributes so each row can be expressed as a share of the
+  # unfiltered product total.
+  - type: measure
+    name: Total Sales All Products
+    description: Sales value ignoring any product grouping or filters (share-of-total denominator)
+    data_type: decimal
+    format: currency:2
+    exclusion_type: exclude
+    exclusions:
+      - type: table
+        filter: ignore
+        entities:
+          - Product
+    expression:
+      sql: sum(SALES_VALUE)
+
+  - type: measure
+    name: Share of Total Spend
+    description: Sales value as a share of total sales across all products
+    data_type: decimal
+    format: percent:2
+    synonyms:
+      - category share
+      - share of wallet
+    expression:
+      sql: "[Sales Value] / [Total Sales All Products]"
+
+  - type: measure
+    name: Household Panel Penetration
+    description: Share of the household panel active (purchasing) in the selected period or segment
+    data_type: decimal
+    format: percent:2
+    synonyms:
+      - active household share
+    expression:
+      sql: "[Active Households] / [Panel Size]"
+
+  # Median measures use inclusions: the base expression is first summed at
+  # the included grain (basket / household), then the outer percentile runs
+  # across those totals.
+  - type: measure
+    name: Median Basket Value
+    description: Median sales value per shopping trip
+    data_type: decimal
+    format: currency:2
+    inclusions:
+      filter: apply
+      aggregation: percentile_cont(0.5) WITHIN GROUP (ORDER BY @exp)
+      dimensions:
+        - Basket ID
+    expression:
+      sql: sum(SALES_VALUE)
+
+  - type: measure
+    name: Median Household Spend
+    description: Median sales value per active household
+    data_type: decimal
+    format: currency:2
+    inclusions:
+      filter: apply
+      aggregation: percentile_cont(0.5) WITHIN GROUP (ORDER BY @exp)
+      dimensions:
+        - Household Key
+    expression:
+      sql: sum(SALES_VALUE)

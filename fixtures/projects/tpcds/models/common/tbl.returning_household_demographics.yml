@@ -1,0 +1,41 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Returning Household Demographics
+
+# The actual table no the target datasource
+physical_name: household_demographics
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Returning Household Buy Potential
+    description: Household buying potential
+    data_type: string
+    expression:
+      lookup: true
+      sql: hd_buy_potential
+
+  - type: dimension
+    name: Returning Household Dependent Count
+    description: Number of dependents in household
+    data_type: integer
+    expression:
+      lookup: true
+      sql: hd_dep_count
+
+  - type: dimension
+    name: Returning Household Vehicle Count
+    description: Number of vehicles in household
+    data_type: integer
+    expression:
+      lookup: true
+      sql: hd_vehicle_count

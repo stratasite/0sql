@@ -1,0 +1,142 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Catalog Sales
+
+# The actual table no the target datasource
+physical_name: catalog_sales
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Fact tables should generally be higher cost.
+cost: 100
+
+fields:
+
+  - type: dimension
+    name: Date ID
+    data_type: integer
+    expression:
+      sql: cs_date_sk
+
+  - type: dimension
+    name: Catalog Order Number
+    description: Order number for catalog sale
+    data_type: integer
+    expression:
+      sql: cs_order_number
+
+  - type: measure
+    name: Catalog Quantity
+    description: Quantity of items sold via catalog
+    data_type: integer
+    expression:
+      sql: sum(cs_quantity)
+
+  - type: measure
+    name: Catalog Wholesale Cost
+    description: Wholesale cost for catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_wholesale_cost)
+
+  - type: measure
+    name: Catalog List Price
+    description: List price of catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_list_price)
+
+  - type: measure
+    name: Catalog Sales Price
+    description: Actual sales price of catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_sales_price)
+
+  - type: measure
+    name: Catalog Extended Discount Amount
+    description: Extended discount amount for catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_discount_amt)
+
+  - type: measure
+    name: Catalog Extended Sales Price
+    description: Extended sales price of catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_sales_price)
+
+  - type: measure
+    name: Catalog Extended Wholesale Cost
+    description: Extended wholesale cost of catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_wholesale_cost)
+
+  - type: measure
+    name: Catalog Extended List Price
+    description: Extended list price of catalog items
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_list_price)
+
+  - type: measure
+    name: Catalog Extended Tax
+    description: Extended tax amount on catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_tax)
+
+  - type: measure
+    name: Catalog Coupon Amount
+    description: Coupon amount applied to catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_coupon_amt)
+
+  - type: measure
+    name: Catalog Extended Ship Cost
+    description: Extended shipping cost for catalog orders
+    data_type: decimal
+    expression:
+      sql: sum(cs_ext_ship_cost)
+
+  - type: measure
+    name: Catalog Net Paid
+    description: Net amount paid for catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_net_paid)
+
+  - type: measure
+    name: Catalog Net Paid Including Tax
+    description: Net paid including tax for catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_net_paid_inc_tax)
+
+  - type: measure
+    name: Catalog Net Paid Including Ship
+    description: Net paid including shipping for catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_net_paid_inc_ship)
+
+  - type: measure
+    name: Catalog Net Paid Including Ship and Tax
+    description: Net paid including shipping and tax
+    data_type: decimal
+    expression:
+      sql: sum(cs_net_paid_inc_ship_tax)
+
+  - type: measure
+    name: Catalog Net Profit
+    description: Net profit from catalog sales
+    data_type: decimal
+    expression:
+      sql: sum(cs_net_profit)

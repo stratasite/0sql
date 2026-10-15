@@ -1,0 +1,162 @@
+# All 2,500 households in the study. Demographics are only available
+# for ~32% of households - filter with "Has Demographics" when analyzing
+# demographic breakdowns.
+name: Household
+physical_name: dim_household
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Household Key
+    description: Unique household identifier
+    data_type: integer
+    disable_listing: true
+    expression:
+      primary_key: true
+      sql: household_key
+
+  - type: dimension
+    name: Age Group
+    description: Estimated age range of head of household (null when demographics unknown)
+    data_type: string
+    expression:
+      lookup: true
+      sql: AGE_DESC
+
+  - type: dimension
+    name: Marital Status
+    description: Marital status code (A=married, B=single, U=unknown)
+    data_type: string
+    expression:
+      lookup: true
+      sql: MARITAL_STATUS_CODE
+
+  - type: dimension
+    name: Income Group
+    description: Household income bracket
+    data_type: string
+    expression:
+      lookup: true
+      sql: INCOME_DESC
+
+  - type: dimension
+    name: Homeowner Status
+    description: Homeowner / renter description
+    data_type: string
+    expression:
+      lookup: true
+      sql: HOMEOWNER_DESC
+
+  - type: dimension
+    name: Household Composition
+    description: Household composition description (e.g. 2 Adults Kids)
+    data_type: string
+    expression:
+      lookup: true
+      sql: HH_COMP_DESC
+
+  - type: dimension
+    name: Household Size
+    description: Number of people in the household
+    data_type: string
+    expression:
+      lookup: true
+      sql: HOUSEHOLD_SIZE_DESC
+
+  - type: dimension
+    name: Kid Category
+    description: Number of children in the household
+    data_type: string
+    expression:
+      lookup: true
+      sql: KID_CATEGORY_DESC
+
+  - type: dimension
+    name: Has Demographics
+    description: True for the ~32% of households with known demographics
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: HasDemographics
+
+  - type: dimension
+    name: Received Any Campaign
+    description: True if the household received at least one direct marketing campaign
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: ReceivedAnyCampaign
+
+  - type: dimension
+    name: Redeemed Any Coupon
+    description: True if the household redeemed at least one campaign coupon
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: RedeemedAnyCoupon
+
+  - type: dimension
+    name: Household Spend Trend
+    description: Precomputed year-over-year spend trajectory (Growing, Flat, Declining, New, Lost)
+    data_type: string
+    synonyms:
+      - spend trajectory
+      - customer trend
+    expression:
+      lookup: true
+      sql: HH_Trend
+
+  - type: dimension
+    name: Household First Day
+    description: First observed shopping day index for the household
+    data_type: integer
+    hidden: true
+    expression:
+      sql: First_Day
+
+  - type: dimension
+    name: Household Last Day
+    description: Last observed shopping day index for the household
+    data_type: integer
+    hidden: true
+    expression:
+      sql: Last_Day
+
+  - type: dimension
+    name: Household Active Days
+    description: Number of days between first and last observed shopping trip
+    data_type: integer
+    hidden: true
+    expression:
+      sql: Active_Days
+
+  - type: measure
+    name: Household Count
+    description: Number of households
+    data_type: integer
+    synonyms:
+      - number of households
+      - customer count
+    expression:
+      sql: count(*)
+
+  # Fixed denominator for penetration metrics: never grouped by query
+  # dimensions, so it stays the full (or segment-filtered) panel size even
+  # when the numerator is grouped by month or category.
+  - type: measure
+    name: Panel Size
+    description: Total households in the panel, unaffected by grouping (respects household filters)
+    data_type: integer
+    exclusion_type: exclude_all
+    expression:
+      sql: count(*)
+
+  - type: measure
+    name: Avg Household Lifetime Spend
+    description: Average precomputed total spend per household across the full 2-year window
+    data_type: decimal
+    format: currency:2
+    expression:
+      sql: avg(Spend_Total)

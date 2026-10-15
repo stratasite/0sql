@@ -1,0 +1,251 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Store
+
+# The actual table no the target datasource
+physical_name: store
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+# Uncomment and add relative paths to other files to import
+# fields that are common.  The imported fields can have
+# certain properties overwrritten by redefining them below
+# the import statement. Only fields under a "fields: " node
+# will be imported.
+# import:
+#   - ../common/common_dates.yml
+#   - ../common/geo_dimensions.yml
+
+# Uncomment and add partition logic to help the engine choose
+# alternative tables if this one can't answer the users questions.
+# Currently, partitioning by date range is the only type supported.
+# partitions:
+#   - dimension: Date # name of date field
+#     predicate: between
+#     filter_value: 24m # 24 months ago
+#     filter_value_end: 1d # yesterday
+
+fields:
+
+  - type: dimension
+    name: Store ID
+    description: Business key for store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_store_id
+
+  - type: dimension
+    name: Store Name
+    description: Name of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_store_name
+
+  - type: dimension
+    name: Store Manager
+    description: Manager of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_manager
+
+  - type: dimension
+    name: Store Number of Employees
+    description: Number of employees at the store
+    data_type: integer
+    expression:
+      lookup: true
+      sql: s_number_employees
+
+  - type: dimension
+    name: Store Floor Space
+    description: Floor space of the store in square feet
+    data_type: integer
+    expression:
+      lookup: true
+      sql: s_floor_space
+
+  - type: dimension
+    name: Store Hours
+    description: Operating hours of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_hours
+
+  - type: dimension
+    name: Store Geography Class
+    description: Geography classification of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_geography_class
+
+  - type: dimension
+    name: Store Market ID
+    description: Market identifier for the store
+    data_type: integer
+    expression:
+      lookup: true
+      sql: s_market_id
+
+  - type: dimension
+    name: Store Market Description
+    description: Description of the market
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_market_desc
+
+  - type: dimension
+    name: Store Market Manager
+    description: Manager of the market
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_market_manager
+
+  - type: dimension
+    name: Store Division ID
+    description: Division identifier for the store
+    data_type: integer
+    expression:
+      lookup: true
+      sql: s_division_id
+
+  - type: dimension
+    name: Store Division Name
+    description: Name of the division
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_division_name
+
+  - type: dimension
+    name: Store Company ID
+    description: Company identifier for the store
+    data_type: integer
+    expression:
+      lookup: true
+      sql: s_company_id
+
+  - type: dimension
+    name: Store Company Name
+    description: Name of the company
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_company_name
+
+  - type: dimension
+    name: Store Street Number
+    description: Street number of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_street_number
+
+  - type: dimension
+    name: Store Street Name
+    description: Street name of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_street_name
+
+  - type: dimension
+    name: Store Street Type
+    description: Street type (e.g., Ave, St, Blvd)
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_street_type
+
+  - type: dimension
+    name: Store Suite Number
+    description: Suite number of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_suite_number
+
+  - type: dimension
+    name: Store City
+    description: City where the store is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_city
+
+  - type: dimension
+    name: Store County
+    description: County where the store is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_county
+
+  - type: dimension
+    name: Store State
+    description: State where the store is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_state
+
+  - type: dimension
+    name: Store ZIP
+    description: ZIP code of the store
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_zip
+
+  - type: dimension
+    name: Store Country
+    description: Country where the store is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: s_country
+
+  - type: dimension
+    name: Store GMT Offset
+    description: GMT offset for the store location
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: s_gmt_offset
+
+  - type: dimension
+    name: Store Tax Percentage
+    description: Tax percentage applied at the store
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: s_tax_precentage
+
+  - type: dimension
+    name: Store Record Start Date
+    description: Start date of the store record
+    data_type: date
+    expression:
+      lookup: true
+      sql: s_rec_start_date
+
+  - type: dimension
+    name: Store Record End Date
+    description: End date of the store record
+    data_type: date
+    expression:
+      lookup: true
+      sql: s_rec_end_date

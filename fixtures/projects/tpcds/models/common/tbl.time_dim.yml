@@ -1,0 +1,89 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Time
+
+# The actual table no the target datasource
+physical_name: time_dim
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Time ID
+    description: Business key for time
+    data_type: string
+    expression:
+      lookup: true
+      sql: t_time_id
+
+  - type: dimension
+    name: Time
+    description: Time value in seconds
+    data_type: integer
+    expression:
+      lookup: true
+      sql: t_time
+
+  - type: dimension
+    name: Hour
+    description: Hour of day (0-23)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: t_hour
+
+  - type: dimension
+    name: Minute
+    description: Minute of hour (0-59)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: t_minute
+
+  - type: dimension
+    name: Second
+    description: Second of minute (0-59)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: t_second
+
+  - type: dimension
+    name: AM/PM
+    description: AM or PM indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: t_am_pm
+
+  - type: dimension
+    name: Shift
+    description: Work shift indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: t_shift
+
+  - type: dimension
+    name: Sub Shift
+    description: Sub shift indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: t_sub_shift
+
+  - type: dimension
+    name: Meal Time
+    description: Meal time indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: t_meal_time

@@ -202,3 +202,7 @@ history for secrets, and confirm the licence covers every crate.
 - Crates are not published to crates.io yet.
 - TPC-DS and grocery-store are public fixtures now; customer-service later.
 - Golden fixtures are read, never edited, without an explicit decision.
+
+## Progress
+
+- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Repl still on the server until phase 3.

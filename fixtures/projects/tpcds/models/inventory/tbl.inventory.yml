@@ -1,0 +1,32 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Inventory
+
+# The actual table no the target datasource
+physical_name: inventory
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Fact tables should generally be higher cost.
+cost: 100
+
+# If the table is a snapshot table like an inventory table.
+# define the date field that it snapshots on. It should be the 
+# name of date dimension that can be reached from this table. 
+# Either directly in this table or via join to another table like
+# a date_dim table.
+snapshot: Date
+
+fields:
+
+  - type: measure
+    name: Inventory Quantity On Hand
+    description: Quantity of inventory on hand
+    data_type: integer
+    snapshot: ending
+    expression:
+      sql: sum(inv_quantity_on_hand)
