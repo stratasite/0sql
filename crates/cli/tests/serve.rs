@@ -158,6 +158,10 @@ fn an_open_bind_with_accounts_off_is_refused() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+fn alive_self() -> bool {
+    true
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap().flatten() {
@@ -185,7 +189,7 @@ fn the_background_server_starts_reports_and_stops() {
             .args(args)
             .current_dir(&root)
             .env("ZSQL_HOME", &home)
-            .env("ZSQL_SERVER", format!("http://{bind}"))
+            .env_remove("ZSQL_SERVER")
             .output()
             .unwrap()
     };
@@ -196,7 +200,7 @@ fn the_background_server_starts_reports_and_stops() {
 
     let out = run(&["server", "status"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("running as process") && text.contains("answers"), "{text}");
+    assert!(text.contains("running as process") && text.contains(&bind) && text.contains("it answers"), "{text}");
 
     let out = run(&["server", "start", "--bind", &bind, "--no-project"]);
     assert!(!out.status.success(), "a second start must refuse");
@@ -210,5 +214,24 @@ fn the_background_server_starts_reports_and_stops() {
     assert!(!home.join("server.pid").exists());
     let out = run(&["server", "status"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
+
+    // A start that fails is reported as a failure, with the log's tail.
+    let out = run(&["server", "start", "--bind", "127.0.0.1:1", "--no-project", "--data-dir", root.join("data").to_str().unwrap()]);
+    assert!(!out.status.success(), "a bind to port 1 must fail for a user");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("stopped at once"), "{err}");
+    assert!(!home.join("server.pid").exists());
+
+    // A stale pidfile naming a process that is not the server is not believed.
+    std::fs::write(
+        home.join("server.pid"),
+        format!(r#"{{"pid":{},"bind":"{bind}","data_dir":{:?}}}"#, std::process::id(), root.join("data")),
+    )
+    .unwrap();
+    let out = run(&["server", "status"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not running"), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = run(&["server", "stop"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no server is running"));
+    assert!(alive_self(), "stop must not signal this process");
     let _ = std::fs::remove_dir_all(&root);
 }

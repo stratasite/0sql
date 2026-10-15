@@ -74,6 +74,9 @@ struct App {
     mailer: mail::Mailer,
     /// What MCP clients are told, and which tools they may call.
     mcp: mcp::Settings,
+    /// One deploy writes at a time: two for the same branch would race
+    /// each other's renames while swapping in.
+    deploying: std::sync::Mutex<()>,
 }
 
 /// How many deployed branches are allowed.
@@ -734,6 +737,7 @@ fn deploy_or_validate(
         if keep {
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
+            let _writing = app.deploying.lock().unwrap();
             let live = t.dir(&app, &uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
             deployed.write(&staged).and_then(|()| swap_in(&staged, &live)).map_err(|e| {
@@ -1841,11 +1845,15 @@ fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
             let uid = p.file_name().to_string_lossy().to_string();
             for b in std::fs::read_dir(p.path())?.flatten().filter(|e| e.path().is_dir()) {
                 let branch = b.file_name().to_string_lossy().to_string();
-                // A branch name never starts with a dot; a directory that
-                // does is a deploy's staging or previous copy, left by a
-                // crash between two renames.
+                // A branch name never starts with a dot. A deploy's own
+                // staging or previous copy, left by a crash between two
+                // renames, is swept; any other dot directory is somebody
+                // else's and is left alone, since a data directory can be
+                // pointed anywhere by a typo.
                 if branch.starts_with('.') {
-                    let _ = std::fs::remove_dir_all(b.path());
+                    if is_swap_leftover(&branch) {
+                        let _ = std::fs::remove_dir_all(b.path());
+                    }
                     continue;
                 }
                 if !b.path().join(zsql_service::SNAPSHOT_FILE).exists() {
@@ -2039,6 +2047,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         caps: config.caps,
         mailer,
         mcp: config.mcp,
+        deploying: std::sync::Mutex::new(()),
     });
     let (n, skipped) = reload(&app)?;
     eprintln!(
@@ -2143,6 +2152,15 @@ fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// What a deploy leaves beside a branch while it swaps:
+/// `.<branch>.staging-<n>`, then `.<branch>.previous-<n>`.
+fn is_swap_leftover(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else { return false };
+    [".staging-", ".previous-"]
+        .iter()
+        .any(|mark| rest.rsplit_once(mark).is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+}
+
 /// Puts `staged` where `live` is, by rename, so a reader of the data
 /// directory sees the branch as it was or as it is, never half
 /// written. A leftover `.previous` directory is swept at startup.
@@ -2179,6 +2197,17 @@ mod library_tests {
             let text = std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             assert!(!text.contains(&needle), "{f} reads the environment");
         }
+    }
+
+    /// Only a deploy's own leftovers are swept at startup.
+    #[test]
+    fn only_swap_leftovers_are_swept() {
+        assert!(is_swap_leftover(".main.staging-17"));
+        assert!(is_swap_leftover(".release-1.2.previous-1700000000"));
+        assert!(!is_swap_leftover(".git"));
+        assert!(!is_swap_leftover(".main.staging-"));
+        assert!(!is_swap_leftover(".main.staging-x"));
+        assert!(!is_swap_leftover("main"));
     }
 
     /// The swap leaves the new branch, whole, and nothing else.

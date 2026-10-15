@@ -35,6 +35,7 @@ fn single_tenant(data_dir: &std::path::Path) -> Shared {
         caps: Caps { per_project: usize::MAX, per_account: usize::MAX },
         mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
         mcp: mcp::Settings::builtin(),
+        deploying: std::sync::Mutex::new(()),
     })
 }
 

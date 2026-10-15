@@ -57,6 +57,7 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         caps: Caps { per_project: 5, per_account: 20 },
         mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
         mcp: mcp::Settings::builtin(),
+        deploying: std::sync::Mutex::new(()),
     })
 }
 
