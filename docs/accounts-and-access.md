@@ -99,7 +99,7 @@ archive's project.yml.
 
 ## The web app
 
-Served by zsqld itself at `/app/` (the root redirects there when accounts
+Served by the server itself at `/app/` (the root redirects there when accounts
 are on): sign-up, login, invite acceptance, projects with their deployed
 branches, settings and people, query keys with grants and rotation,
 personal keys and password, members with invites, the audit log for

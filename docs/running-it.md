@@ -6,14 +6,15 @@ What is deployed, how it gets there, and what is left to do. Written
 ## Where it runs
 
 A Debian 13 VPS with 4 cores and 16 GB, reachable on a private network
-for administration and publicly as **https://app.0sql.io**. zsqld is the
-only thing installed directly on the host; this document calls it "the
-host".
+for administration and publicly as **https://app.0sql.io**. `zsql`, run
+as `zsql serve`, is the only thing installed directly on the host; the
+unit, its environment file and its user keep the name `zsqld`. This
+document calls the machine "the host".
 
 | | |
 |---|---|
-| binary | `/usr/local/bin/zsqld` (the same server as `zsql serve`, configured from the environment) |
-| settings | `/etc/zsqld.env`, mode 0600 |
+| binary | `/usr/local/bin/zsql`; the unit runs `zsql serve --no-project` |
+| settings | `/etc/zsqld.env`, mode 0600, the unit's `EnvironmentFile`; `ZSQL_*` variables set what the flags do not |
 | unit | `/etc/systemd/system/zsqld.service` |
 | data | `/var/lib/zsqld`, owned by the `zsqld` system user |
 | listening | `127.0.0.1:3699`, nothing else |
@@ -38,18 +39,15 @@ request through Cloudflare immediately afterwards got its own allowance.
 
 ## Releasing
 
-Two tags, deliberately separate. The server ships to one machine we run;
-the CLI ships to everyone else.
-
-| what | tag | result |
-|---|---|---|
-| server | `v0.1.1` | one static binary on the private release |
-| CLI | `cli-v0.1.1` | four binaries, private release and public |
-
-Both read the version from the workspace manifest and the workflow
-refuses a tag that disagrees with it. Because the workspace shares one
-version, a CLI-only fix still means bumping the number the server
-carries. Worth revisiting if the two start moving at different rates.
+One tag, `v0.6.0`, one workflow (`.github/workflows/release.yml`), one
+binary per platform: `zsql`, which is the CLI and the server. Before
+0.6.0 the server (`zsqld`, tag `v*`) and the CLI (`cli-v*`) shipped
+separately; `zsqld` is gone, `zsql serve` is the server, and the four
+builds (Linux x86_64 and arm64, static musl; macOS Apple silicon and
+Intel) go on the release here and, with the `CLI_RELEASES_TOKEN`
+secret, on `stratasite/0sql-cli`, which is what `0sql.io/install.sh`
+reads. The workflow reads the version from the workspace manifest and
+refuses a tag that disagrees with it.
 
 Since 0.6.0, `.github/workflows/ci.yml` runs `cargo fmt --check`,
 clippy with warnings as errors, the tests, the golden scoreboard, the
@@ -58,29 +56,23 @@ sources; `deny.toml`) on every push and pull request. A tag still builds
 nothing but the release; the tests still run locally before tagging,
 because CI running them later does not stop a tag going out first.
 
-Both builds are musl rather than glibc. For the server that is about
-portability. For the CLI it is sharper: it resolves the server's
-hostname, and a statically linked glibc cannot, because it loads its
-name service modules at runtime and dumps core without them. That was
-observed, not assumed.
+The Linux builds are musl rather than glibc, and static. A statically
+linked glibc cannot resolve names, because it loads its name service
+modules at runtime and dumps core without them; the CLI resolves the
+server's hostname and the server may be given one to bind. That was
+observed, not assumed. SQLite, behind accounts, is C, so the x86_64
+build installs `musl-gcc` and the arm64 build goes through `cross`.
 
-### Releasing the server, in order
-
-`.github/workflows/release.yml` builds on a `v*` tag. It is not the CLI's
-workflow and does not share a step with it: no public repository, no
-`CLI_RELEASES_TOKEN`, one binary rather than four. A `cli-v*` tag does
-not trigger it and a `v*` tag does not trigger the CLI's.
+### Releasing, in order
 
 1. **Bump the version in `Cargo.toml`.** `[workspace.package]`, which is
    the first `^version` line in the file and the one CI compares a tag
-   against. The whole workspace shares it, so a server-only change still
-   moves the number the CLI carries.
+   against.
 
 2. **Refresh `Cargo.lock` and commit it with the bump.** Every workspace
    crate appears in the lock file with its version, one line each, and
    the build runs `cargo build --locked`, which fails rather than
-   updating it. `cargo check -p zsql-server` is enough
-   to rewrite it. This is the step that is easy to miss, because nothing
+   updating it. `cargo check --workspace` is enough to rewrite it. This is the step that is easy to miss, because nothing
    locally complains until CI does.
 
 3. **Run the tests.** CI runs them on the push, but a tag does not
@@ -88,25 +80,26 @@ not trigger it and a `v*` tag does not trigger the CLI's.
    except this step. `cargo test` for the workspace, and `cargo run
    --release -p zsql-devtool -- golden --strict`.
 
-4. **Tag and push the tag.** `git tag v0.2.2 && git push origin v0.2.2`.
+4. **Tag and push the tag.** `git tag v0.6.0 && git push origin v0.6.0`.
    Pushing the branch does not build anything; only the tag does. The
    workflow checks the tag against the manifest and stops if they
    disagree, so a forgotten step 1 costs a tag rather than a bad release.
 
-5. **Let the workflow prove the binary before trusting it.** It asserts
-   the result is really static, with no dynamic dependencies, then starts
-   it and waits for `/healthz`. If either fails there is no release, by
-   design. It publishes `zsqld-x86_64-linux` and a `.sha256` beside it on
-   a release of that tag, with generated notes.
+5. **Let the workflow prove the binaries before trusting them.** It
+   asserts the Linux build is really static, runs `--version` and
+   `--help` where it can, starts `zsql serve` and waits for `/healthz`,
+   and asks the public server how it is from the static Linux binary.
+   If any of that fails there is no release, by design. It publishes
+   the four builds and one `SHA256SUMS` on a release of that tag.
 
 6. **Install it on the host, keeping the one it replaces.**
 
    ```
-   gh release download v0.2.2 -p 'zsqld-x86_64-linux*'
-   sha256sum -c zsqld-x86_64-linux.sha256
-   ssh root@<host> 'cp /usr/local/bin/zsqld /usr/local/bin/zsqld.prev'
-   scp zsqld-x86_64-linux root@<host>:/tmp/zsqld
-   ssh root@<host> 'install -m755 /tmp/zsqld /usr/local/bin/zsqld && systemctl restart zsqld'
+   gh release download v0.6.0 -p 'zsql-x86_64-linux' -p SHA256SUMS
+   grep zsql-x86_64-linux SHA256SUMS | sha256sum -c
+   ssh root@<host> 'cp /usr/local/bin/zsql /usr/local/bin/zsql.prev'
+   scp zsql-x86_64-linux root@<host>:/tmp/zsql
+   ssh root@<host> 'install -m755 /tmp/zsql /usr/local/bin/zsql && systemctl restart zsqld'
    ```
 
 7. **Read the first lines it logs.** `journalctl -u zsqld -n 10`. The
@@ -116,7 +109,7 @@ not trigger it and a `v*` tag does not trigger the CLI's.
    loaded and are not being served. That line is the point of reading
    the journal rather than only checking that the unit is active.
 
-   Rolling back is `install -m755 /usr/local/bin/zsqld.prev` over it and
+   Rolling back is `install -m755 /usr/local/bin/zsql.prev` over it and
    another restart.
 
 A restart reloads deployments from disk in well under a second, sessions

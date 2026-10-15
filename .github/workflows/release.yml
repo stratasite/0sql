@@ -1,18 +1,17 @@
-# Builds the server and attaches it to a release. Only on a version tag,
-# or by hand from the Actions tab; nothing is built on an ordinary push.
+# Builds zsql for the platforms people install it on and attaches the
+# builds to a release. Only on a version tag, or by hand from the
+# Actions tab; nothing is built on an ordinary push.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.6.0 && git push origin v0.6.0
 #
-# The result is one statically linked binary. Everything the server
-# serves is compiled into it: the web app, the brand assets and the
-# dialect files. Deploying is copying that file and restarting the unit.
+# One binary is the whole product: the CLI, and the server it runs with
+# `zsql serve`, with the web app, the brand assets and the dialect
+# files compiled in. Deploying a server is copying that file.
 name: release
 
 on:
   push:
     tags: ["v*"]
-  # Build without cutting a release, to try the pipeline or grab a
-  # binary from a branch. The result lands in the run's artifacts.
   workflow_dispatch:
 
 permissions:
@@ -20,35 +19,136 @@ permissions:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: zsql-x86_64-linux
+            cross: false
+          # No arm64 Linux runner on this plan, so this one is built in
+          # a container for the target rather than on it.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: zsql-aarch64-linux
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: zsql-aarch64-macos
+            cross: false
+          # The runner is Apple silicon; Xcode carries both SDKs, so the
+          # Intel build is a cross-compile on the same machine.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset: zsql-x86_64-macos
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      # musl, not glibc, on Linux. A static glibc binary cannot resolve
+      # names: it loads its name service modules at runtime and dumps
+      # core without them. musl resolves names and still links
+      # statically, so the binary runs on any distribution and can be
+      # given a hostname to bind or to reach. SQLite, behind accounts,
+      # is C, so the target needs a C compiler of its own; cross brings
+      # one for the arm64 build.
+      - name: musl C toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: cross
+        if: matrix.cross
+        run: |
+          curl -fsSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar -xz -C /usr/local/bin cross
+          cross --version
+
+      # The default build: the CLI with the server, no warehouse
+      # drivers. `zsql values sample` is the `warehouse` build.
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }} -p zsql-cli
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p zsql-cli
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          install -m755 target/${{ matrix.target }}/release/zsql dist/${{ matrix.asset }}
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          else
+            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          fi
+          ls -l
+
+      - name: It is what it claims to be
+        run: file dist/${{ matrix.asset }}
+
+      # The Linux build must be static: that is what lets it run on any
+      # distribution.
+      - name: It is really static
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          file dist/${{ matrix.asset }} | grep -qE 'static(ally linked|-pie linked)'
+          ! ldd dist/${{ matrix.asset }} 2>/dev/null | grep -q '=>'
+
+      # Only the two that can run here. The cross-built ones are checked
+      # by whoever installs them, and by the installer's checksum.
+      - name: It really runs
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        run: |
+          ./dist/${{ matrix.asset }} --version
+          ./dist/${{ matrix.asset }} --help > /dev/null
+
+      # The server inside it comes up and answers. Job control is off in
+      # this shell, so the pid is kept by hand.
+      - name: The server really starts
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        run: |
+          ZSQL_HOME=$(mktemp -d) ./dist/${{ matrix.asset }} serve --no-project --bind 127.0.0.1:3699 &
+          pid=$!
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:3699/healthz >/dev/null 2>&1 && break || sleep 0.5; done
+          curl -fsS http://127.0.0.1:3699/healthz
+          kill "$pid"
+
+      # The one thing a static Linux binary can plausibly get wrong is
+      # reaching a server at all: a name to resolve and a certificate to
+      # check, both of which a statically linked glibc would fail. This
+      # asks the public server how it is, which exercises the resolver,
+      # TLS and HTTP in one go. It does mean a release needs that host
+      # to be up.
+      - name: It can reach a server
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: ./dist/${{ matrix.asset }} health --server https://app.0sql.io
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # musl rather than glibc, for two reasons. A glibc binary built on
-      # a modern runner needs that glibc or newer on the server, which
-      # no stable distribution has; and glibc's static mode cannot
-      # resolve names, so it crashes outright if ZSQL_BIND is ever given
-      # a hostname. musl links statically, resolves names, and will
-      # still be right when the server has to reach a Postgres or an S3
-      # by name.
-      - name: Toolchain
-        # The version and the musl target both come from
-        # rust-toolchain.toml, so there is one place to bump.
-        run: |
-          rustup show
-          rustup target add x86_64-unknown-linux-musl
-          rustc --version
-
-      # rusqlite bundles SQLite, which is C, so the target needs a C
-      # compiler of its own.
-      - name: musl C toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-
       # A tag says what version it is; the manifest has to agree.
       - name: Tag matches the crate version
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           tag="${GITHUB_REF_NAME#v}"
@@ -57,42 +157,48 @@ jobs:
             exit 1
           }
 
-      - name: Build
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p zsql-server
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          install -m755 target/x86_64-unknown-linux-musl/release/zsqld dist/zsqld-x86_64-linux
-          ( cd dist && sha256sum zsqld-x86_64-linux > zsqld-x86_64-linux.sha256 )
-          ls -l dist
-
-      # The point of the whole exercise, so it is worth asserting rather
-      # than assuming.
-      - name: It is really static
-        run: |
-          file dist/zsqld-x86_64-linux
-          file dist/zsqld-x86_64-linux | grep -qE 'static(ally linked|-pie linked)'
-          ! ldd dist/zsqld-x86_64-linux 2>/dev/null | grep -q '=>'
-
-      # Job control is off in this shell, so the pid is kept by hand.
-      - name: It really starts
-        run: |
-          ZSQL_DATA_DIR=$(mktemp -d) ZSQL_BIND=127.0.0.1:3699 ./dist/zsqld-x86_64-linux &
-          pid=$!
-          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:3699/healthz >/dev/null 2>&1 && break || sleep 0.5; done
-          curl -fsS http://127.0.0.1:3699/healthz
-          kill "$pid"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: zsqld-x86_64-linux
-          path: dist/*
+          path: dist
+          merge-multiple: true
+
+      - name: One checksum file for the installer to read
+        run: |
+          cd dist
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          rm -f *.sha256
+          ls -l
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes dist/zsqld-x86_64-linux dist/zsqld-x86_64-linux.sha256
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "zsql ${GITHUB_REF_NAME#v}" dist/*
+
+      # The installer, 0sql.io/install.sh, reads stratasite/0sql-cli
+      # through its permanent /releases/latest/download/ redirect, so
+      # the same files go there too. It needs a token because a
+      # workflow's own token only reaches the repository it runs in.
+      # Without the secret this does nothing and the release here is
+      # still made.
+      - name: Publish where the installer reads
+        env:
+          GH_TOKEN: ${{ secrets.CLI_RELEASES_TOKEN }}
+          PUBLIC_REPO: stratasite/0sql-cli
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "no CLI_RELEASES_TOKEN set; the release is on this repository only,"
+            echo "so the installer has nothing new to download. Add the secret and re-run."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME}"
+          gh release create "$version" --repo "$PUBLIC_REPO" \
+            --title "zsql $version" \
+            --notes "The 0sql command line tool and server, $version.
+
+          Install:
+
+              curl -fsSL https://0sql.io/install.sh | sh
+
+          Or take the build for your platform below and check it against \`SHA256SUMS\`." \
+            dist/*
+          echo "published https://github.com/$PUBLIC_REPO/releases/tag/$version"

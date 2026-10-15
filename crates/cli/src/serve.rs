@@ -6,9 +6,11 @@
 //! up it deploys the directory and redeploys as the files change, so
 //! one command gives a teammate a live endpoint over the model they
 //! are editing. Outside a project it serves whatever its data
-//! directory holds. The server itself is `zsql_server`, the crate
-//! `zsqld` is built from; this module only configures it from flags
-//! and keeps it company.
+//! directory holds. The server itself is the `zsql_server` library;
+//! this module configures it and keeps it company. The settings come
+//! from `ZSQL_*` variables, the environment file a deployment loads,
+//! with flags overriding what they name; this is the one place in the
+//! product a `ZSQL_*` variable is read.
 
 use crate::{config, project_archive, remote, show, Where};
 use anyhow::{bail, Context, Result};
@@ -17,6 +19,8 @@ use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zsql_server::limits::{Mode, Rate};
+use zsql_server::{Config, MailConfig, McpSettings};
 
 /// Where the server listens when nothing else is said: the address the
 /// CLI's other commands talk to by default.
@@ -24,13 +28,13 @@ const DEFAULT_BIND: &str = "127.0.0.1:3699";
 
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
-    /// Address to listen on; port 0 takes a free one, which is logged.
-    #[arg(long, default_value = DEFAULT_BIND)]
-    pub bind: String,
-    /// Where deployed models live; defaults to $ZSQL_HOME/data.
+    /// Address to listen on; port 0 takes a free one, which is logged. Default: ZSQL_BIND, else 127.0.0.1:3699.
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Where deployed models live. Default: ZSQL_DATA_DIR, else $ZSQL_HOME/data.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
-    /// Multi-tenant: keys, accounts, sign-up. Off, there is one tenant and no auth.
+    /// Multi-tenant: keys, accounts, sign-up (also ZSQL_ACCOUNTS=on). Off, there is one tenant and no auth.
     #[arg(long)]
     pub accounts: bool,
     /// Allow listening beyond the loopback with accounts off, which lets anyone who can reach the port deploy and plan.
@@ -45,19 +49,103 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
+    fn bind(&self) -> String {
+        self.bind.clone().or_else(|| var("ZSQL_BIND")).unwrap_or_else(|| DEFAULT_BIND.into())
+    }
+
+    fn accounts(&self) -> bool {
+        self.accounts || on("ZSQL_ACCOUNTS")
+    }
+
     /// Where deployed models live.
     fn data_dir(&self) -> Result<PathBuf> {
-        match &self.data_dir {
-            Some(d) => Ok(d.clone()),
+        match self.data_dir.clone().or_else(|| var("ZSQL_DATA_DIR").map(PathBuf::from)) {
+            Some(d) => Ok(d),
             None => Ok(home()?.join("data")),
         }
+    }
+
+    /// The whole configuration: the environment's settings, with the
+    /// flags over them.
+    fn config(&self) -> Result<Config> {
+        let accounts = self.accounts();
+        let mut cfg = Config::local(self.data_dir()?, self.bind());
+        cfg.accounts = accounts;
+        cfg.signup_open = !matches!(var("ZSQL_SIGNUP").as_deref(), Some("closed" | "off" | "0"));
+        cfg.public_url = self.public_url.clone().or_else(|| var("ZSQL_PUBLIC_URL"));
+        // The limits are about sharing one server between tenants, so
+        // they start with the accounts.
+        cfg.limits.mode = if accounts { Mode::On } else { Mode::Off };
+        if let Some(v) = var("ZSQL_LIMITS") {
+            cfg.limits.mode = Mode::parse(&v);
+        }
+        let l = &mut cfg.limits;
+        for (name, slot) in [
+            ("ZSQL_LIMIT_PLAN", &mut l.plan),
+            ("ZSQL_LIMIT_EXPLORE", &mut l.explore),
+            ("ZSQL_LIMIT_HEAVY", &mut l.heavy),
+            ("ZSQL_LIMIT_MANAGE", &mut l.manage),
+            ("ZSQL_LIMIT_KEY_PLAN", &mut l.key_plan),
+            ("ZSQL_LIMIT_KEY_EXPLORE", &mut l.key_explore),
+            ("ZSQL_LIMIT_LOGIN", &mut l.login),
+            ("ZSQL_LIMIT_SIGNUP", &mut l.signup),
+            ("ZSQL_LIMIT_INVITE", &mut l.invite),
+            ("ZSQL_LIMIT_RESET", &mut l.reset),
+            ("ZSQL_LIMIT_BAD_KEY", &mut l.bad_key),
+            ("ZSQL_LIMIT_HANDSHAKE", &mut l.handshake),
+        ] {
+            rate(name, slot)?;
+        }
+        if let Some(v) = var("ZSQL_LIMIT_EMAIL_FAILURES") {
+            l.email_failures = if v.eq_ignore_ascii_case("off") { 0 } else { number(&v, "ZSQL_LIMIT_EMAIL_FAILURES")? as u32 };
+        }
+        if let Some(v) = var("ZSQL_LIMIT_EMAIL_WINDOW") {
+            l.email_window = Duration::from_secs(number(&v, "ZSQL_LIMIT_EMAIL_WINDOW")? as u64);
+        }
+        l.trusted_proxy = on("ZSQL_TRUSTED_PROXY");
+
+        let a = &mut cfg.admission;
+        for (name, slot) in [
+            ("ZSQL_ADMIT_PLAN", &mut a.plan),
+            ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
+            ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
+            ("ZSQL_ADMIT_MANAGE", &mut a.manage),
+            ("ZSQL_ADMIT_PASSWORD", &mut a.password),
+        ] {
+            if let Some(v) = var(name) {
+                *slot = number(&v, name)?;
+            }
+        }
+        for (name, slot) in
+            [("ZSQL_MAX_BRANCHES_PER_PROJECT", &mut cfg.caps.per_project), ("ZSQL_MAX_BRANCHES_PER_ACCOUNT", &mut cfg.caps.per_account)]
+        {
+            match var(name) {
+                Some(v) if v.eq_ignore_ascii_case("off") => *slot = usize::MAX,
+                Some(v) => *slot = number(&v, name)?,
+                None => {}
+            }
+        }
+
+        cfg.mail =
+            MailConfig { command: var("ZSQL_MAIL_COMMAND"), from: var("ZSQL_MAIL_FROM").unwrap_or_default(), ..MailConfig::default() };
+        if let Some(v) = var("ZSQL_MAIL_TIMEOUT") {
+            cfg.mail.timeout = Duration::from_secs(number(&v, "ZSQL_MAIL_TIMEOUT")? as u64);
+        }
+
+        let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
+        cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(cfg)
     }
 
     /// These arguments as `zsql serve` would take them, for the
     /// background form to hand on; kept next to the fields so a new
     /// flag cannot be forgotten here.
     fn to_argv(&self, project: Option<&Path>) -> Vec<OsString> {
-        let mut argv: Vec<OsString> = vec!["serve".into(), "--bind".into(), self.bind.clone().into()];
+        let mut argv: Vec<OsString> = vec!["serve".into()];
+        if let Some(b) = &self.bind {
+            argv.extend(["--bind".into(), b.clone().into()]);
+        }
         if let Some(d) = &self.data_dir {
             argv.extend(["--data-dir".into(), d.clone().into()]);
         }
@@ -101,6 +189,39 @@ fn home() -> Result<PathBuf> {
     config::home().context("neither ZSQL_HOME nor HOME is set")
 }
 
+// ---------------------------------------------------- the environment
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn on(name: &str) -> bool {
+    matches!(var(name).as_deref(), Some("on" | "1" | "true"))
+}
+
+fn number(v: &str, name: &str) -> Result<usize> {
+    v.parse().with_context(|| format!("{name}: {v:?} is not a number"))
+}
+
+fn rate(name: &str, slot: &mut Rate) -> Result<()> {
+    if let Some(v) = var(name) {
+        *slot = Rate::parse(&v).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// A file named by a variable, read whole, or nothing.
+fn file(name: &str) -> Result<Option<String>> {
+    match var(name) {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path).with_context(|| format!("{name}: cannot read {path}"))?;
+            eprintln!("zsql: mcp: {name} read from {path}");
+            Ok(Some(text))
+        }
+        None => Ok(None),
+    }
+}
+
 fn loopback(bind: &str) -> bool {
     bind.parse::<SocketAddr>().map(|a| a.ip().is_loopback()).unwrap_or(false) || bind.starts_with("localhost:")
 }
@@ -109,23 +230,17 @@ fn loopback(bind: &str) -> bool {
 /// accounts off, the project is deployed to it and redeployed as its
 /// files change.
 pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
-    if !args.accounts && !args.open && !loopback(&args.bind) {
-        bail!("{} is not a loopback address, and with accounts off anyone who reaches it may deploy and plan; add --accounts, or --open to mean it", args.bind);
+    let (bind, accounts) = (args.bind(), args.accounts());
+    if !accounts && !args.open && !loopback(&bind) {
+        bail!("{bind} is not a loopback address, and with accounts off anyone who reaches it may deploy and plan; add --accounts, or --open to mean it");
     }
-    let data_dir = args.data_dir()?;
     // A project named explicitly must be there; one looked for is optional.
     let project = match (args.no_project, at.project.is_some()) {
         (true, _) => None,
         (false, true) => Some(at.project_dir()?),
         (false, false) => at.project_dir().ok(),
     };
-    let mut cfg = zsql_server::Config::local(data_dir, args.bind.clone());
-    cfg.accounts = args.accounts;
-    cfg.public_url = args.public_url;
-    if args.accounts {
-        // The limits are about sharing one server between tenants.
-        cfg.limits.mode = zsql_server::limits::Mode::On;
-    }
+    let cfg = args.config()?;
 
     let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
     let server = std::thread::Builder::new()
@@ -146,7 +261,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         }
     };
 
-    match (project, args.accounts) {
+    match (project, accounts) {
         (Some(p), false) => {
             // An unspecified address is listened on, not connected to.
             let reach = match addr.ip() {
@@ -318,7 +433,7 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         }
     }
     let mut child = cmd.spawn().context("starting zsql serve")?;
-    let started = Started { pid: child.id(), bind: args.bind.clone(), data_dir };
+    let started = Started { pid: child.id(), bind: args.bind(), data_dir };
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
     // Give it a moment to refuse, so a bad bind or a held data
     // directory is reported here and not only in the log. The child is

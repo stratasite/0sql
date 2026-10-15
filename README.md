@@ -16,9 +16,9 @@ crates/golden     golden cases and the scoreboard
 crates/cli        zsql: author, plan here or on a server (-r), deploy
 crates/devtool    zsql-dev: the engine on the command line for its developers (goldens, bench, formation)
 crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
-crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by zsql and zsqld
+crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by local planning and the server
 crates/accounts   accounts, users, keys and project access (SQLite)
-crates/server     zsqld: deploy a project, plan specs
+crates/server     the server, run by `zsql serve`: deploy a project, plan specs, accounts, MCP
 crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
@@ -92,9 +92,9 @@ teammate a live endpoint over the model they are editing; `--no-project`
 serves only the data directory. Accounts are off by default (one tenant,
 no auth), and listening beyond the loopback with them off is refused
 unless `--open` says you mean it. Two servers cannot share a data
-directory; the second is told which process has it. `zsqld` is the same
-server configured from `ZSQL_*` variables, for a deployment that reads an
-environment file.
+directory; the second is told which process has it. `ZSQL_*` variables,
+the environment file a deployment loads, set what the flags do not:
+accounts, limits, mail, the MCP wording; a flag wins over its variable.
 
 A refusal is reported the same way from either side: `class: message`
 on stderr and exit 1, or `{"error": {"class", "message"}}` on stdout
@@ -109,7 +109,7 @@ Every command takes `--project DIR`; the project is otherwise found from
 `project.yml` here or above. Against a server, `--branch NAME` names the
 branch (default: the checked-out git branch), `--server URL` the server
 (default: `ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` for a
-self-hosted zsqld, then the local one) and `--uid UID` the project when
+self-hosted server, then the local one) and `--uid UID` the project when
 there is no directory at hand. Planning here reads no git at all: the
 files are what they are, so `--branch` without `-r` is refused.
 `project.yml`'s `production_branch` names the branch production reads;
@@ -142,13 +142,13 @@ history) somewhere else, which is how tests keep out of the real one.
 
 ## The server
 
-`zsqld` is the light service: deploy a project, get SQL back. No accounts,
-users or keys yet. Deployed models live in memory and under `ZSQL_DATA_DIR`
-(default `data/`), so a restart reloads them. `ZSQL_BIND` sets the address
-(default `127.0.0.1:3699`).
+The server is `zsql serve`: deploy a project, get SQL back. Deployed
+models live in memory and under the data directory (`--data-dir`,
+`ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`), so a restart reloads them;
+`--bind` or `ZSQL_BIND` sets the address (default `127.0.0.1:3699`).
 
 ```
-cargo run --release -p zsql-server
+zsql serve --no-project
 zsql deploy --project ../myproject --server http://127.0.0.1:3699
 curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
      -H 'content-type: application/json' \

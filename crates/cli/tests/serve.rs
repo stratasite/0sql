@@ -235,3 +235,39 @@ fn the_background_server_starts_reports_and_stops() {
     assert!(alive_self(), "stop must not signal this process");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The environment file a deployment loads is the base: a `ZSQL_*`
+/// variable is honoured when no flag names the setting.
+#[cfg(unix)]
+#[test]
+fn the_environment_is_the_base_and_flags_win() {
+    let root = scratch("env");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["serve", "--no-project"])
+        .current_dir(&root)
+        .env("ZSQL_HOME", root.join("home"))
+        .env("ZSQL_BIND", "127.0.0.1:0")
+        .env("ZSQL_DATA_DIR", root.join("elsewhere"))
+        .env_remove("ZSQL_SERVER")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    let mut addr = None;
+    while stderr.read_line(&mut line).unwrap() > 0 {
+        if let Some(rest) = line.trim().strip_prefix("zsqld: listening on http://") {
+            addr = Some(rest.to_string());
+            break;
+        }
+        line.clear();
+    }
+    let addr = addr.expect("listening");
+    assert_eq!(get(&addr, "/healthz").0, 200);
+    assert!(root.join("elsewhere/lock").exists(), "ZSQL_DATA_DIR was not the data directory");
+    terminate(&child);
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&root);
+}
