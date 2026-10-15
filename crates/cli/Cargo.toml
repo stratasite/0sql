@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "zsql: author a semantic model, plan SQL from it here or on a zsqld server, deploy it"
+description = "zsql: author a semantic model, plan SQL from it here or on a server, deploy it, and serve it"
 
 [[bin]]
 name = "zsql"
@@ -14,14 +14,11 @@ path = "src/main.rs"
 # The default build plans locally, talks to a server, and is one:
 # `zsql serve` runs the server in this process. It needs a C compiler,
 # for the SQLite behind accounts; `--no-default-features` is the slim
-# build without the server. `warehouse` adds `zsql values sample`,
-# which runs the sampling SQL locally.
+# build without the server.
 default = ["server"]
 server = ["dep:zsql-server"]
-warehouse = ["dep:zsql-warehouse"]
 
 [dependencies]
-zsql-warehouse = { workspace = true, optional = true }
 zsql-server = { workspace = true, optional = true }
 zsql-service.workspace = true
 zsql-shorthand.workspace = true
@@ -36,7 +33,6 @@ flate2.workspace = true
 tar = "0.4"
 ureq = { version = "3", features = ["json"] }
 rustyline = "15"
-chrono = "0.4"
 libc = "0.2"
 
 [lints]

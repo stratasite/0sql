@@ -13,9 +13,9 @@ document calls the machine "the host".
 
 | | |
 |---|---|
-| binary | `/usr/local/bin/zsql`; the unit runs `zsql serve --no-project` |
+| binary | `/usr/local/bin/zsql`; the unit runs `zsql serve` |
 | settings | `/etc/zsqld.env`, mode 0600, the unit's `EnvironmentFile`; `ZSQL_*` variables set what the flags do not |
-| unit | `/etc/systemd/system/zsqld.service` |
+| unit | `/etc/systemd/system/zsqld.service`, the copy of `ops/zsqld.service` |
 | data | `/var/lib/zsqld`, owned by the `zsqld` system user |
 | listening | `127.0.0.1:3699`, nothing else |
 
@@ -101,6 +101,24 @@ build installs `musl-gcc` and the arm64 build goes through `cross`.
    scp zsql-x86_64-linux root@<host>:/tmp/zsql
    ssh root@<host> 'install -m755 /tmp/zsql /usr/local/bin/zsql && systemctl restart zsqld'
    ```
+
+   **The first 0.6.0 install is different**, because the host is
+   running `zsqld`, which 0.6.0 no longer ships. There is no
+   `/usr/local/bin/zsql` to keep, the unit's `ExecStart` still names
+   the old binary, and the data directory must be said: the old
+   default was `data` under the working directory, the new one is
+   under `ZSQL_HOME`. Once, by hand:
+
+   ```
+   scp zsql-x86_64-linux root@<host>:/tmp/zsql
+   scp ops/zsqld.service root@<host>:/etc/systemd/system/zsqld.service
+   ssh root@<host> 'install -m755 /tmp/zsql /usr/local/bin/zsql && systemctl daemon-reload && systemctl restart zsqld'
+   ```
+
+   `ops/zsqld.service` sets `ZSQL_DATA_DIR=/var/lib/zsqld`, where the
+   deployments already are, and runs `zsql serve` with the same
+   environment file. Confirm the startup line names the same number
+   of deployments as before, then remove `/usr/local/bin/zsqld`.
 
 7. **Read the first lines it logs.** `journalctl -u zsqld -n 10`. The
    startup line says how many deployments loaded, whether accounts and

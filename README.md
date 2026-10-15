@@ -19,7 +19,6 @@ crates/shorthand  the comma-separated query shorthand, shared by the CLI and the
 crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by local planning and the server
 crates/accounts   accounts, users, keys and project access (SQLite)
 crates/server     the server, run by `zsql serve`: deploy a project, plan specs, accounts, MCP
-crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
 harness/          import of the golden cases captured from strata
@@ -60,11 +59,10 @@ the project's owner, see `docs/mcp.md`.
 says where a command runs: anything that needs only the model runs here,
 from the project directory at hand; anything about a server's copy of
 the model takes `-r`. `--server` and `--uid` imply `-r`; `ZSQL_SERVER` in
-the environment does not. The CLI keeps the warehouse credentials, which
-is why value sampling runs here whichever side planned it.
+the environment does not.
 
 ```
-zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, samples/, git init
+zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, git init
 zsql new table Orders --datasource warehouse [--domain sales]
 zsql new relation --datasource warehouse
 zsql new test smoke
@@ -72,10 +70,9 @@ zsql sql --expr "department, sales value, department = PRODUCE" [--context user.
 zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
 zsql explore --expr "department, sales value" [-q customer]   # the dimensions and measures the query can take on
 zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes
-zsql fields depart | zsql tables | zsql values show department
+zsql fields depart | zsql tables | zsql values department
 zsql check                        # load, validate and test the project here (-r: validate on the server)
 zsql test                         # tests/*.yml here (-r: the deployed branch's, on the server)
-zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]   # runs the SQL here: needs the full build
 zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
 zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
 zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
@@ -102,8 +99,7 @@ under `--json`. A usage error is clap's and exits 2.
 
 The default build plans here, talks to a server, and is one. It needs
 a C compiler, for the SQLite behind accounts; `cargo build -p zsql-cli
---no-default-features` is the slim build without the server. `--features
-warehouse` adds DuckDB and Postgres for `zsql values sample`.
+--no-default-features` is the slim build without the server.
 
 Every command takes `--project DIR`; the project is otherwise found from
 `project.yml` here or above. Against a server, `--branch NAME` names the
@@ -148,7 +144,7 @@ models live in memory and under the data directory (`--data-dir`,
 `--bind` or `ZSQL_BIND` sets the address (default `127.0.0.1:3699`).
 
 ```
-zsql serve --no-project
+zsql serve
 zsql deploy --project ../myproject --server http://127.0.0.1:3699
 curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
      -H 'content-type: application/json' \
@@ -160,7 +156,6 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets; tests run, results in the answer |
 | `POST /projects/{uid}/branches/{branch}/validate` | the same, keeping nothing |
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
-| `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
 | `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` or `{expr, context?}` (a shorthand line; the answer then carries the `spec` it made and `items`) to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
@@ -229,20 +224,16 @@ The CLI covers every endpoint; see above.
 
 ## Dimension values
 
-`zsql values sample` asks the server which dimensions to sample and the SQL
-to run (the server knows the model), runs it against the project's
-warehouses with the local credentials, and writes `samples/values.jsonl.gz`:
-for text, the
-top `value_list_size` values by row count (default 1000) with their counts,
-or every value with `values: full` on the field (refused above 100k
-distinct); for numbers and dates, the min and max. Hidden dimensions,
-listing-disabled ones, `values: none`, and any dimension a security policy
-names are never sampled. The file is customer data: gitignore it unless
-you want it reviewed. `--dims a,b` limits the run, `--older-than 7`
-resamples only stale entries, `--dry-run` prints the SQL, `--deploy`
-redeploys afterwards. Connections come from `datasources.yml`, secrets from
-`.zsql` (or `.strata`) in the project or `ZSQL_DS_<KEY>_PASSWORD`; duckdb
-and postgres are the drivers so far.
+A project may carry `samples/values.jsonl.gz`: for each dimension, the
+values it takes with their row counts, or its range. `zsql values
+<dim>`, the `/values/{dim}` route and the MCP `values` tool answer from
+it, which is what lets an agent write `department = PRODUCE` rather than
+guess at the spelling. 0sql never runs SQL, so the file is written by
+whatever can: one JSON object per line, gzipped, as
+`crates/project/src/values.rs` reads it (`uid`, `name`, `table`,
+`sampled_at`, `distinct`, then `values: [{v, n}]` or `range: {min, max}`).
+It is customer data: keep it out of git unless you want it reviewed.
+Deploys carry it; a field's `values: none` says to leave it out.
 
 ## Parity
 

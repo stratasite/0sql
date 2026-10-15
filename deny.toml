@@ -29,7 +29,6 @@ allow = [
   "ISC",
   "Zlib",
   "Unicode-3.0",
-  "CC0-1.0",
   "BSL-1.0",
   # The Mozilla CA bundle webpki-roots ships for TLS.
   "CDLA-Permissive-2.0",

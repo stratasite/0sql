@@ -17,7 +17,6 @@
 //! GET  /projects/{uid}/branches/{branch}/fields        ?q=text&hidden=true
 //! GET  /projects/{uid}/branches/{branch}/tables
 //! GET  /projects/{uid}/branches/{branch}/values/{dim}
-//! GET  /projects/{uid}/branches/{branch}/sampling-plan  the SQL the CLI runs to sample values
 //! DELETE /projects/{uid}/branches/{branch}
 //! GET  /projects                                       every deployed branch
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
@@ -1096,26 +1095,6 @@ async fn test(
     .await
 }
 
-async fn sampling_plan(
-    State(app): State<Shared>,
-    Auth(who): Auth,
-    Path((uid, branch)): Path<(String, String)>,
-    Query(q): Query<SamplingQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
-    let d = model(&app, &t, &uid, &branch)?;
-    let dims: Vec<String> = q.dims.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    Ok(Json(d.sampling_plan(&dims, q.full)))
-}
-
-#[derive(Deserialize)]
-struct SamplingQuery {
-    #[serde(default)]
-    dims: String,
-    #[serde(default)]
-    full: bool,
-}
-
 async fn remove(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let removed = app.models.write().unwrap().remove(&t.key(&uid, &branch)).is_some();
@@ -1897,7 +1876,6 @@ fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/deploy", post(deploy).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
         .route("/projects/{uid}/branches/{branch}/validate", post(validate).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
         .route("/projects/{uid}/branches/{branch}/test", post(test))
-        .route("/projects/{uid}/branches/{branch}/sampling-plan", get(sampling_plan))
         .route("/projects/{uid}/branches/{branch}", delete(remove))
         .route("/projects/{uid}/branches/{branch}/sql", post(sql))
         .route("/projects/{uid}/branches/{branch}/explain", post(explain))
@@ -1947,10 +1925,10 @@ fn router(app: Shared) -> Router {
 
 // ----------------------------------------------------------------- running
 
-/// Everything the server is told. `zsqld` fills it from the
-/// environment; `zsql serve` from flags. The library itself reads no
-/// environment, so a flag and a variable can only ever mean the same
-/// thing, and two servers can start in one test process.
+/// Everything the server is told. `zsql serve` fills it from `ZSQL_*`
+/// variables and flags. The library itself reads no environment, so a
+/// flag and a variable can only ever mean the same thing, and two
+/// servers can start in one test process.
 pub struct Config {
     pub data_dir: PathBuf,
     /// `host:port`; port 0 takes a free one, and the chosen address is
@@ -1968,6 +1946,9 @@ pub struct Config {
     pub caps: Caps,
     pub mail: MailConfig,
     pub mcp: mcp::Settings,
+    /// How long an authentication decision may be reused; zero turns
+    /// the cache off.
+    pub auth_cache_ttl: Duration,
 }
 
 /// How mail goes out: a command fed the message on stdin, or nothing,
@@ -2000,6 +1981,7 @@ impl Config {
             caps: Caps::default(),
             mail: MailConfig::default(),
             mcp: mcp::Settings::builtin(),
+            auth_cache_ttl: zsql_accounts::DEFAULT_AUTH_CACHE_TTL,
         }
     }
 }
@@ -2018,7 +2000,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let _lock = lock_data_dir(&config.data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let accounts_on = config.accounts;
-    let accounts = if accounts_on { Some(Store::open(&config.data_dir.join("accounts.db"))?) } else { None };
+    let accounts = if accounts_on { Some(Store::open_with(&config.data_dir.join("accounts.db"), config.auth_cache_ttl)?) } else { None };
     let public_url = config.public_url.clone().unwrap_or_else(|| format!("http://{}", config.bind));
     let secure_cookies = public_url.starts_with("https://");
     let limits = Limiter::new(config.limits);
@@ -2087,6 +2069,10 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         }
     });
 
+    // The handlers are installed before the address is announced, so a
+    // signal sent the moment the listening line is read is a graceful
+    // stop and not the default disposition's instant death.
+    let shutdown = shutdown_signal();
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     // The address actually bound, so a port of 0 is answered with the
     // port it got.
@@ -2094,7 +2080,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     eprintln!("zsqld: listening on http://{addr}");
     listening(addr);
     // Connect info: the per-address limits need the peer's address.
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await?;
     eprintln!("zsqld: stopped");
     Ok(())
 }
@@ -2105,27 +2091,45 @@ pub fn run_blocking(config: Config, listening: impl FnOnce(SocketAddr) + Send + 
 }
 
 /// Resolves on SIGTERM or ctrl-c. What is in flight finishes; nothing
-/// new is accepted.
-async fn shutdown_signal() {
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// new is accepted. The handlers are installed when this is called,
+/// not when the future is first polled.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
+    let mut streams = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (signal(SignalKind::terminate()).ok(), signal(SignalKind::interrupt()).ok())
     };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = interrupt => {}
-        _ = terminate => {}
+    async move {
+        #[cfg(unix)]
+        {
+            let (term, int) = (&mut streams.0, &mut streams.1);
+            let terminate = async {
+                match term {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let interrupt = async {
+                match int {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = interrupt => {}
+                _ = terminate => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        eprintln!("zsqld: stopping");
     }
-    eprintln!("zsqld: stopping");
 }
 
 /// One server per data directory. The lock file holds the pid of the
@@ -2187,14 +2191,15 @@ fn swap_in(staged: &std::path::Path, live: &std::path::Path) -> std::io::Result<
 mod library_tests {
     use super::*;
 
-    /// The library is configured, never by the environment: a `zsql
-    /// serve` flag and a `zsqld` variable must mean the same thing, so
-    /// there is one place that reads variables and it is the binary.
+    /// The library, and the accounts crate it links, are configured,
+    /// never by the environment: a `zsql serve` flag and a `ZSQL_*`
+    /// variable must mean the same thing, so there is one place that
+    /// reads variables and it is the CLI's serve module.
     #[test]
     fn the_library_reads_no_environment() {
         let needle = ["env::", "var("].concat();
-        for f in ["lib.rs", "limits.rs", "mail.rs", "mcp.rs"] {
-            let text = std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for f in ["server/src/lib.rs", "server/src/limits.rs", "server/src/mail.rs", "server/src/mcp.rs", "accounts/src/lib.rs"] {
+            let text = std::fs::read_to_string(format!("{}/../{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             assert!(!text.contains(&needle), "{f} reads the environment");
         }
     }

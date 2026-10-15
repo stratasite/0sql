@@ -1,0 +1,45 @@
+# The server on the host: `zsql serve`, configured by /etc/zsqld.env
+# (ZSQL_* variables; mode 0600) and the data directory systemd owns.
+# Installed as /etc/systemd/system/zsqld.service; the unit, its
+# environment file and its user keep the name zsqld.
+[Unit]
+Description=0sql server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=zsqld
+Group=zsqld
+EnvironmentFile=/etc/zsqld.env
+# The data directory is StateDirectory, so systemd creates and owns it;
+# the variable points the server at it, since the default is under
+# the user's home.
+Environment=ZSQL_DATA_DIR=/var/lib/zsqld
+Environment=ZSQL_HOME=/var/lib/zsqld
+ExecStart=/usr/local/bin/zsql serve
+StateDirectory=zsqld
+Restart=on-failure
+RestartSec=2
+# No capabilities, a read-only filesystem apart from the state
+# directory, a private temp directory, a system call filter, and
+# network limited to IPv4, IPv6 and Unix sockets.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -253,13 +253,12 @@ pub struct Store {
 /// How long an invite token stays redeemable.
 pub const INVITE_DAYS: i64 = 7;
 
-/// How long an authentication decision may be reused. Long enough to
-/// take the store off the hot path, short enough that a change which
-/// somehow skipped invalidation is forgotten quickly. `0` turns the
-/// cache off, which is also how to prove a bug is not the cache's.
-fn ttl_from_env() -> Duration {
-    Duration::from_secs(std::env::var("ZSQL_AUTH_CACHE_TTL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60))
-}
+/// How long an authentication decision may be reused when the caller
+/// does not say: long enough to take the store off the hot path, short
+/// enough that a change which somehow skipped invalidation is forgotten
+/// quickly. Zero turns the cache off, which is also how to prove a bug
+/// is not the cache's.
+pub const DEFAULT_AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// The schema as numbered steps, oldest first. `PRAGMA user_version`
 /// holds how many of them a file has seen, so the length of this list is
@@ -575,25 +574,31 @@ pub struct Signup {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
+        Self::open_with(path, DEFAULT_AUTH_CACHE_TTL)
+    }
+
+    /// [`Store::open`] with how long an authentication decision may be
+    /// reused.
+    pub fn open_with(path: &Path, auth_cache_ttl: Duration) -> Result<Store> {
         let conn = Connection::open(path)?;
         // WAL with synchronous=NORMAL: a commit does not fsync, the
         // checkpoint does, so a power cut can lose the last moments of
         // writes but never corrupts the file. Right for key metadata.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
         migrate(&conn)?;
-        Ok(Store::over(conn))
+        Ok(Store::over(conn, auth_cache_ttl))
     }
 
     pub fn in_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         migrate(&conn)?;
-        Ok(Store::over(conn))
+        Ok(Store::over(conn, DEFAULT_AUTH_CACHE_TTL))
     }
 
-    fn over(conn: Connection) -> Store {
+    fn over(conn: Connection, ttl: Duration) -> Store {
         let decoy = hash_password(&new_secret("decoy")).expect("a generated secret is long enough");
-        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl: ttl_from_env(), decoy }
+        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl, decoy }
     }
 
     // --------------------------------------------------------- the cache
@@ -1968,7 +1973,7 @@ mod tests {
         // A key whose user belongs nowhere has no account, and answers for nothing.
         let orphan: Option<i64> = conn.query_row("SELECT account_id FROM user_keys WHERE id = 2", [], |r| r.get(0)).unwrap();
         assert_eq!(orphan, None);
-        let s = Store::over(conn);
+        let s = Store::over(conn, DEFAULT_AUTH_CACHE_TTL);
         assert!(s.authenticate("zsk_whatever").unwrap().is_none());
     }
 

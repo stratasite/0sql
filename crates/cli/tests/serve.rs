@@ -9,6 +9,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// The environment a deployment loads must not reach the tests: a
+/// shell with `/etc/zsqld.env` sourced would change what they exercise.
+fn clean(cmd: &mut Command) -> &mut Command {
+    for (k, _) in std::env::vars() {
+        if k.starts_with("ZSQL_") {
+            cmd.env_remove(k);
+        }
+    }
+    cmd
+}
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects/grocery-store")
 }
@@ -29,13 +40,13 @@ struct Server {
 /// `zsql serve` on a free port, with the rest of the arguments given,
 /// read until it says where it listens.
 fn start(cwd: &Path, home: &Path, args: &[&str]) -> Server {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zsql"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+    let mut child = clean(&mut cmd)
         .arg("serve")
         .args(["--bind", "127.0.0.1:0"])
         .args(args)
         .current_dir(cwd)
         .env("ZSQL_HOME", home)
-        .env_remove("ZSQL_SERVER")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,7 +99,8 @@ fn the_server_comes_up_survives_a_hang_up_and_stops_on_sigterm() {
     assert_eq!(get(&s.addr, "/healthz").0, 200, "the server died when a client hung up");
 
     // Another server on the same data directory is refused, and says who has it.
-    let second = Command::new(env!("CARGO_BIN_EXE_zsql"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+    let second = clean(&mut cmd)
         .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.join("data").to_str().unwrap()])
         .env("ZSQL_HOME", root.join("home"))
         .output()
@@ -148,7 +160,8 @@ fn inside_a_project_it_serves_that_project() {
 #[test]
 fn an_open_bind_with_accounts_off_is_refused() {
     let root = scratch("open");
-    let out = Command::new(env!("CARGO_BIN_EXE_zsql"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+    let out = clean(&mut cmd)
         .args(["serve", "--bind", "0.0.0.0:0", "--no-project", "--data-dir", root.join("data").to_str().unwrap()])
         .env("ZSQL_HOME", root.join("home"))
         .output()
@@ -185,13 +198,8 @@ fn the_background_server_starts_reports_and_stops() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let bind = format!("127.0.0.1:{port}");
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_zsql"))
-            .args(args)
-            .current_dir(&root)
-            .env("ZSQL_HOME", &home)
-            .env_remove("ZSQL_SERVER")
-            .output()
-            .unwrap()
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+        clean(&mut cmd).args(args).current_dir(&root).env("ZSQL_HOME", &home).output().unwrap()
     };
     let out = run(&["server", "start", "--bind", &bind, "--no-project", "--data-dir", root.join("data").to_str().unwrap()]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -242,13 +250,13 @@ fn the_background_server_starts_reports_and_stops() {
 #[test]
 fn the_environment_is_the_base_and_flags_win() {
     let root = scratch("env");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zsql"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+    let mut child = clean(&mut cmd)
         .args(["serve", "--no-project"])
         .current_dir(&root)
         .env("ZSQL_HOME", root.join("home"))
         .env("ZSQL_BIND", "127.0.0.1:0")
         .env("ZSQL_DATA_DIR", root.join("elsewhere"))
-        .env_remove("ZSQL_SERVER")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -269,5 +277,38 @@ fn the_environment_is_the_base_and_flags_win() {
     assert!(root.join("elsewhere/lock").exists(), "ZSQL_DATA_DIR was not the data directory");
     terminate(&child);
     assert!(child.wait().unwrap().success());
+
+    // The flag wins over the variable: the same variables, a --data-dir of its own.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
+    let mut child = clean(&mut cmd)
+        .args(["serve", "--no-project", "--data-dir", root.join("here").to_str().unwrap()])
+        .current_dir(&root)
+        .env("ZSQL_HOME", root.join("home"))
+        .env("ZSQL_BIND", "127.0.0.1:0")
+        .env("ZSQL_DATA_DIR", root.join("elsewhere"))
+        .env("ZSQL_ACCOUNTS", "on")
+        .arg("--no-accounts")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut banner = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "ended early:\n{banner}");
+        banner.push_str(&line);
+        if line.contains("listening on") {
+            break;
+        }
+    }
+    assert!(root.join("here/lock").exists(), "--data-dir did not win over ZSQL_DATA_DIR");
+    assert!(banner.contains("accounts off"), "--no-accounts did not win over ZSQL_ACCOUNTS=on:\n{banner}");
+    terminate(&child);
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(status.success(), "{status}; stderr:\n{banner}{rest}");
     let _ = std::fs::remove_dir_all(&root);
 }

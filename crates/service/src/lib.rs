@@ -553,31 +553,6 @@ impl Model {
             None => Err(ServiceError::not_found(format!("no sampled values for {}", field.uid))),
         }
     }
-
-    /// The SQL that samples each listable dimension's values, for the
-    /// CLI to run where the warehouse credentials are. `dims` narrows
-    /// to those uids or names; empty means every listable dimension.
-    pub fn sampling_plan(&self, dims: &[String], full: bool) -> Value {
-        let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
-            match self.dialects.get(adapter) {
-                Ok(dl) => zsql_planner::sql::expr::qualify(sql, columns, &dl, alias),
-                Err(_) => sql.to_string(),
-            }
-        };
-        let (jobs, skipped) = zsql_project::values::plan(self.universe(), dims, full, &qualify);
-        let jobs: Vec<Value> = jobs
-            .iter()
-            .map(|j| {
-                json!({
-                    "uid": j.uid, "name": j.name, "table": j.table_uid, "datasource": j.datasource_uid, "adapter": j.adapter,
-                    "mode": j.mode, "cap": j.cap, "distinct_sql": j.distinct_sql, "values_sql": j.values_sql, "range_sql": j.range_sql,
-                    "sampled_at": self.values.as_ref().and_then(|v| v.get(&j.uid)).map(|e| e.sampled_at.clone()),
-                })
-            })
-            .collect();
-        let skipped: Vec<Value> = skipped.iter().map(|(uid, why)| json!({ "uid": uid, "reason": why })).collect();
-        json!({ "jobs": jobs, "skipped": skipped, "full_ceiling": zsql_project::values::FULL_CEILING })
-    }
 }
 
 // ---------------------------------------------------------------- requests

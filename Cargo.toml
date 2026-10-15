@@ -7,7 +7,6 @@ members = [
   "crates/spec",
   "crates/planner",
   "crates/project",
-  "crates/warehouse",
   "crates/accounts",
   "crates/shorthand",
   "crates/service",
@@ -37,14 +36,13 @@ serde_yaml = "0.9"
 flate2 = "1"
 anyhow = "1"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 zsql-semantic = { path = "crates/semantic" }
 zsql-formation = { path = "crates/formation" }
 zsql-dialect = { path = "crates/dialect" }
 zsql-spec = { path = "crates/spec" }
 zsql-planner = { path = "crates/planner" }
 zsql-project = { path = "crates/project" }
-zsql-warehouse = { path = "crates/warehouse" }
 zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
 zsql-service = { path = "crates/service" }

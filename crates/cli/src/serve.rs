@@ -28,15 +28,18 @@ const DEFAULT_BIND: &str = "127.0.0.1:3699";
 
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
-    /// Address to listen on; port 0 takes a free one, which is logged. Default: ZSQL_BIND, else 127.0.0.1:3699.
-    #[arg(long)]
-    pub bind: Option<String>,
-    /// Where deployed models live. Default: ZSQL_DATA_DIR, else $ZSQL_HOME/data.
-    #[arg(long)]
+    /// Address to listen on; port 0 takes a free one, which is logged.
+    #[arg(long, env = "ZSQL_BIND", default_value = DEFAULT_BIND)]
+    pub bind: String,
+    /// Where deployed models live; $ZSQL_HOME/data when neither this nor the variable says.
+    #[arg(long, env = "ZSQL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Multi-tenant: keys, accounts, sign-up (also ZSQL_ACCOUNTS=on). Off, there is one tenant and no auth.
-    #[arg(long)]
+    /// Multi-tenant: keys, accounts, sign-up. Off, there is one tenant and no auth. ZSQL_ACCOUNTS=on means the same.
+    #[arg(long, overrides_with = "no_accounts")]
     pub accounts: bool,
+    /// One tenant and no auth, whatever ZSQL_ACCOUNTS says.
+    #[arg(long)]
+    pub no_accounts: bool,
     /// Allow listening beyond the loopback with accounts off, which lets anyone who can reach the port deploy and plan.
     #[arg(long)]
     pub open: bool,
@@ -44,23 +47,28 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_project: bool,
     /// Where the app is reached from outside, for links and cookies; the bind address otherwise.
-    #[arg(long)]
+    #[arg(long, env = "ZSQL_PUBLIC_URL")]
     pub public_url: Option<String>,
 }
 
 impl ServeArgs {
     fn bind(&self) -> String {
-        self.bind.clone().or_else(|| var("ZSQL_BIND")).unwrap_or_else(|| DEFAULT_BIND.into())
+        self.bind.clone()
     }
 
+    /// `--accounts` and `--no-accounts` each win over the variable.
     fn accounts(&self) -> bool {
-        self.accounts || on("ZSQL_ACCOUNTS")
+        if self.no_accounts {
+            false
+        } else {
+            self.accounts || on("ZSQL_ACCOUNTS")
+        }
     }
 
     /// Where deployed models live.
     fn data_dir(&self) -> Result<PathBuf> {
-        match self.data_dir.clone().or_else(|| var("ZSQL_DATA_DIR").map(PathBuf::from)) {
-            Some(d) => Ok(d),
+        match &self.data_dir {
+            Some(d) => Ok(d.clone()),
             None => Ok(home()?.join("data")),
         }
     }
@@ -72,7 +80,7 @@ impl ServeArgs {
         let mut cfg = Config::local(self.data_dir()?, self.bind());
         cfg.accounts = accounts;
         cfg.signup_open = !matches!(var("ZSQL_SIGNUP").as_deref(), Some("closed" | "off" | "0"));
-        cfg.public_url = self.public_url.clone().or_else(|| var("ZSQL_PUBLIC_URL"));
+        cfg.public_url = self.public_url.clone();
         // The limits are about sharing one server between tenants, so
         // they start with the accounts.
         cfg.limits.mode = if accounts { Mode::On } else { Mode::Off };
@@ -97,7 +105,11 @@ impl ServeArgs {
             rate(name, slot)?;
         }
         if let Some(v) = var("ZSQL_LIMIT_EMAIL_FAILURES") {
-            l.email_failures = if v.eq_ignore_ascii_case("off") { 0 } else { number(&v, "ZSQL_LIMIT_EMAIL_FAILURES")? as u32 };
+            l.email_failures = if v.eq_ignore_ascii_case("off") {
+                0
+            } else {
+                v.parse().with_context(|| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))?
+            };
         }
         if let Some(v) = var("ZSQL_LIMIT_EMAIL_WINDOW") {
             l.email_window = Duration::from_secs(number(&v, "ZSQL_LIMIT_EMAIL_WINDOW")? as u64);
@@ -132,6 +144,9 @@ impl ServeArgs {
             cfg.mail.timeout = Duration::from_secs(number(&v, "ZSQL_MAIL_TIMEOUT")? as u64);
         }
 
+        if let Some(v) = var("ZSQL_AUTH_CACHE_TTL") {
+            cfg.auth_cache_ttl = Duration::from_secs(number(&v, "ZSQL_AUTH_CACHE_TTL")? as u64);
+        }
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -142,15 +157,15 @@ impl ServeArgs {
     /// background form to hand on; kept next to the fields so a new
     /// flag cannot be forgotten here.
     fn to_argv(&self, project: Option<&Path>) -> Vec<OsString> {
-        let mut argv: Vec<OsString> = vec!["serve".into()];
-        if let Some(b) = &self.bind {
-            argv.extend(["--bind".into(), b.clone().into()]);
-        }
+        let mut argv: Vec<OsString> = vec!["serve".into(), "--bind".into(), self.bind.clone().into()];
         if let Some(d) = &self.data_dir {
             argv.extend(["--data-dir".into(), d.clone().into()]);
         }
         if self.accounts {
             argv.push("--accounts".into());
+        }
+        if self.no_accounts {
+            argv.push("--no-accounts".into());
         }
         if self.open {
             argv.push("--open".into());
@@ -215,7 +230,7 @@ fn file(name: &str) -> Result<Option<String>> {
     match var(name) {
         Some(path) => {
             let text = std::fs::read_to_string(&path).with_context(|| format!("{name}: cannot read {path}"))?;
-            eprintln!("zsql: mcp: {name} read from {path}");
+            eprintln!("zsqld: mcp: {name} read from {path}");
             Ok(Some(text))
         }
         None => Ok(None),

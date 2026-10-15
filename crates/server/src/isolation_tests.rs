@@ -577,7 +577,6 @@ async fn query_keys_read_exactly_what_they_are_granted() {
     assert_eq!(s.deploy(CS, "main", &qk, archive(CS, "qk")).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.delete(&format!("/projects/{CS}/branches/main"), Some(&qk)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.post(&format!("/projects/{CS}/branches/main/test"), Some(&qk), json!({})).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(s.get(&format!("/projects/{CS}/branches/main/sampling-plan?dims=Category"), Some(&qk)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.get("/account/keys", Some(&qk)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.get("/account/members", Some(&qk)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.get(&format!("/projects/{CS}/access"), Some(&qk)).await.status, StatusCode::FORBIDDEN);

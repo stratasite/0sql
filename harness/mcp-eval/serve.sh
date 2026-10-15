@@ -11,7 +11,7 @@ BIN=${ZSQL:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/zsql}
 sleep 0.5
 ZSQL_DATA_DIR=$S/data ZSQL_BIND=127.0.0.1:3699 ZSQL_ACCOUNTS=on ZSQL_PUBLIC_URL=http://127.0.0.1:3699 ZSQL_LIMITS=off \
 ZSQL_MCP_PROMPTS=$V/mcp_prompts.json ZSQL_MCP_SPEC_SCHEMA=$V/mcp_spec_schema.json \
-nohup "$BIN" serve --no-project > "$S/log" 2>&1 &
+nohup "$BIN" serve > "$S/log" 2>&1 &
 echo $! > "$S/pid"
 sleep 1
 curl -sf 127.0.0.1:3699/healthz >/dev/null && echo "serving $1 (pid $(cat "$S/pid"))"

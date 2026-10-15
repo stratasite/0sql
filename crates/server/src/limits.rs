@@ -32,7 +32,7 @@ pub enum Class {
     /// explore and the fields search: a walk or a scoring pass over
     /// every visible field, milliseconds, and retriggered on keystrokes.
     Explore,
-    /// deploy, validate, test, sampling-plan: seconds of CPU.
+    /// deploy, validate, test: seconds of CPU.
     Heavy,
     /// the account endpoints: cheap, but not for applications to hammer.
     Manage,
@@ -83,7 +83,7 @@ pub fn classify(method: &str, path: &str) -> Class {
         // the explore-class tools take an explore token too, in mcp.rs.
         ("POST", ["mcp"]) => Class::Plan,
         (_, ["projects", _, "branches", _, verb]) => match *verb {
-            "deploy" | "validate" | "test" | "sampling-plan" => Class::Heavy,
+            "deploy" | "validate" | "test" => Class::Heavy,
             "sql" | "explain" => Class::Plan,
             "explore" | "fields" => Class::Explore,
             _ => Class::Plan,
@@ -748,7 +748,6 @@ mod tests {
             ("POST", "/projects/a/branches/main/deploy", Heavy),
             ("POST", "/projects/a/branches/main/validate", Heavy),
             ("POST", "/projects/a/branches/main/test", Heavy),
-            ("GET", "/projects/a/branches/main/sampling-plan", Heavy),
             ("GET", "/projects/a/branches/main/values/dim", Plan),
             ("GET", "/projects/a/branches/main", Plan),
             ("DELETE", "/projects/a/branches/main", Manage),

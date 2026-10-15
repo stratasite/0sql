@@ -104,7 +104,7 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 
 | class | routes | permits | wait before 503 |
 |---|---|---|---|
-| heavy | deploy, validate, test, sampling-plan | 2 | 5 s |
+| heavy | deploy, validate, test | 2 | 5 s |
 | password | login, signup, invites/accept, account/password, the reset and verification routes | 2 | 2 s |
 | explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
 | plan | sql, explain, tables, values, branch summary, projects, `POST /mcp` | cores × 4 | 1 s |

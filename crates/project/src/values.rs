@@ -10,11 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use zsql_semantic::{DataType, FieldKind, Universe, ValueSampling};
+use zsql_semantic::ValueSampling;
 
 pub const FILE_NAME: &str = "values.jsonl.gz";
 /// A `full` sample above this many distinct values is refused.
-pub const FULL_CEILING: i64 = 100_000;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ValueCatalog {
@@ -92,144 +91,5 @@ impl ValueCatalog {
         self.dimensions.retain(|x| x.uid != d.uid);
         self.dimensions.push(d);
         self.dimensions.sort_by(|a, b| a.uid.cmp(&b.uid));
-    }
-}
-
-/// What to run for one dimension: the SQL for its values or range, on
-/// which table, in which datasource.
-#[derive(Debug, Clone)]
-pub struct SampleJob {
-    pub uid: String,
-    pub name: String,
-    pub table_uid: String,
-    pub datasource_uid: String,
-    pub adapter: String,
-    pub mode: ValueSampling,
-    /// `SELECT count(DISTINCT expr)`.
-    pub distinct_sql: String,
-    /// For text: `SELECT expr, count(*) ... LIMIT cap`. Empty for ranges.
-    pub values_sql: Option<String>,
-    /// The cap the values query carries (absent for `full`).
-    pub cap: Option<i64>,
-    /// For numbers and dates: `SELECT min(expr), max(expr)`.
-    pub range_sql: Option<String>,
-}
-
-/// Why a dimension is not sampled.
-pub fn skip_reason(universe: &Universe, uid: &str) -> Option<String> {
-    let Some(f) = universe.field_by_uid(uid, Some(FieldKind::Dimension)) else { return Some("not a dimension".into()) };
-    if f.hidden {
-        return Some("hidden".into());
-    }
-    if f.disable_listing {
-        return Some("listing disabled".into());
-    }
-    if f.value_sampling == ValueSampling::None {
-        return Some("values: none".into());
-    }
-    for p in universe.policies() {
-        if p.trigger_field_uids.contains(&f.uid) || f.tags.iter().any(|t| p.trigger_tags.contains(t)) {
-            return Some(format!("named by security policy '{}'", p.name));
-        }
-    }
-    if f.data_type.is_none() {
-        return Some("no data type".into());
-    }
-    None
-}
-
-/// The sampling plan for the listable dimensions (or the given uids), one
-/// job each, reading from the cheapest table that holds the dimension.
-/// `qualify` rewrites an expression's column references with a table alias.
-pub fn plan(
-    universe: &Universe,
-    only: &[String],
-    full: bool,
-    qualify: &dyn Fn(&str, &[String], &str, &str) -> String,
-) -> (Vec<SampleJob>, Vec<(String, String)>) {
-    let mut jobs = Vec::new();
-    let mut skipped = Vec::new();
-    let wanted: Vec<&zsql_semantic::Field> = if only.is_empty() {
-        universe.fields().iter().filter(|f| f.kind == FieldKind::Dimension).collect()
-    } else {
-        only.iter()
-            .filter_map(|u| {
-                universe.field_by_uid(u, Some(FieldKind::Dimension)).or_else(|| universe.field_by_name(u, FieldKind::Dimension))
-            })
-            .collect()
-    };
-    for f in wanted {
-        if let Some(why) = skip_reason(universe, &f.uid) {
-            skipped.push((f.uid.clone(), why));
-            continue;
-        }
-        // The cheapest table with an expression for the dimension.
-        let mut candidates: Vec<_> = universe
-            .snapshot()
-            .expressions
-            .iter()
-            .filter(|e| e.field_id == f.id)
-            .filter_map(|e| universe.table(e.table_id).map(|t| (t, e)))
-            .collect();
-        candidates.sort_by_key(|(t, _)| (t.cost, t.uid.clone()));
-        let Some((table, exp)) = candidates.first() else {
-            skipped.push((f.uid.clone(), "no expression".into()));
-            continue;
-        };
-        let Some(ds) = universe.datasource(table.datasource_id) else { continue };
-        let expr = qualify(exp.sql.as_deref().unwrap_or_default(), &exp.column_refs, &ds.adapter, "T0");
-        let from = format!("{} T0", table.physical_name);
-        let mode = if full { ValueSampling::Full } else { f.value_sampling };
-        let distinct_sql = format!("SELECT count(DISTINCT {expr}) AS \"n\" FROM {from}");
-        let (values_sql, cap, range_sql) = match f.data_type {
-            Some(DataType::String | DataType::Boolean) => {
-                let cap = (mode == ValueSampling::Sample).then_some(f.value_list_size.max(1));
-                let limit = cap.map(|c| format!("\nLIMIT {c}")).unwrap_or_default();
-                (Some(format!("SELECT {expr} AS \"value\", count(*) AS \"n\" FROM {from}\nWHERE {expr} IS NOT NULL\nGROUP BY {expr}\nORDER BY count(*) DESC, {expr}{limit}")), cap, None)
-            }
-            _ => (None, None, Some(format!("SELECT min({expr}) AS \"lo\", max({expr}) AS \"hi\" FROM {from}"))),
-        };
-        jobs.push(SampleJob {
-            uid: f.uid.clone(),
-            name: f.name.clone(),
-            table_uid: table.uid.clone(),
-            datasource_uid: ds.uid.clone(),
-            adapter: ds.adapter.clone(),
-            mode,
-            distinct_sql,
-            values_sql,
-            cap,
-            range_sql,
-        });
-    }
-    (jobs, skipped)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn catalog_round_trips_through_the_file() {
-        let dir = std::env::temp_dir().join(format!("zsql-values-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut c = ValueCatalog::default();
-        c.put(DimensionValues {
-            uid: "category".into(),
-            name: "Category".into(),
-            table: "item".into(),
-            sampled_at: "2026-09-30T00:00:00Z".into(),
-            mode: ValueSampling::Sample,
-            distinct: Some(3),
-            values: vec![ValueCount { v: "Books".into(), n: 10 }, ValueCount { v: "Music".into(), n: 4 }],
-            range: None,
-        });
-        let path = dir.join(FILE_NAME);
-        c.write(&path).unwrap();
-        let back = ValueCatalog::read(&path).unwrap().unwrap();
-        assert_eq!(back.dimensions.len(), 1);
-        assert_eq!(back.get("category").unwrap().values[0].v, "Books");
-        assert!(ValueCatalog::read(&dir.join("missing.gz")).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

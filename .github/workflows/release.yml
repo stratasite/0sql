@@ -18,7 +18,24 @@ permissions:
   contents: write
 
 jobs:
+  # A tag says what version it is; the manifest has to agree, and that
+  # is checked before four builds are spent on finding out.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          test "$manifest" = "$tag" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          }
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -71,8 +88,7 @@ jobs:
             | sudo tar -xz -C /usr/local/bin cross
           cross --version
 
-      # The default build: the CLI with the server, no warehouse
-      # drivers. `zsql values sample` is the `warehouse` build.
+      # The default build: the CLI with the server.
       - name: Build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -119,7 +135,7 @@ jobs:
       - name: The server really starts
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
         run: |
-          ZSQL_HOME=$(mktemp -d) ./dist/${{ matrix.asset }} serve --no-project --bind 127.0.0.1:3699 &
+          ZSQL_HOME=$(mktemp -d) ./dist/${{ matrix.asset }} serve --bind 127.0.0.1:3699 &
           pid=$!
           for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:3699/healthz >/dev/null 2>&1 && break || sleep 0.5; done
           curl -fsS http://127.0.0.1:3699/healthz
@@ -145,18 +161,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      # A tag says what version it is; the manifest has to agree.
-      - name: Tag matches the crate version
-        run: |
-          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          tag="${GITHUB_REF_NAME#v}"
-          test "$manifest" = "$tag" || {
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
-            exit 1
-          }
-
       - uses: actions/download-artifact@v4
         with:
           path: dist

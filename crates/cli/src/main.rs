@@ -23,7 +23,6 @@ use config::Project;
 use local::Local;
 use remote::Client;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -49,7 +48,7 @@ struct Where {
     /// Branch on the server; defaults to the checked-out git branch. Implies nothing here: the files are what they are.
     #[arg(long, global = true)]
     branch: Option<String>,
-    /// The zsqld server (implies -r); defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
+    /// The server (implies -r); defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
     #[arg(long, global = true)]
     server: Option<String>,
     /// Project uid on the server (implies -r), when there is no project directory at hand.
@@ -123,7 +122,7 @@ impl Where {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a project here (or in DIR): project.yml, datasources.yml, models/, tests/, samples/, security.yml.
+    /// Start a project here (or in DIR): project.yml, datasources.yml, models/, tests/, security.yml.
     Init {
         dir: Option<PathBuf>,
         #[arg(long)]
@@ -143,7 +142,7 @@ enum Command {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Deploy the checked-out branch: the model files, tests and samples (never secrets).
+    /// Deploy the checked-out branch: the model files, tests and sampled values (never secrets).
     Deploy {
         /// Validate only; the server keeps nothing.
         #[arg(long)]
@@ -205,11 +204,8 @@ enum Command {
     },
     /// Tables of the model.
     Tables,
-    /// Sampled values of a dimension.
-    Values {
-        #[command(subcommand)]
-        what: ValuesCommand,
-    },
+    /// Sampled values of a dimension, from samples/values.jsonl.gz.
+    Values { dim: String },
     /// Summary of the deployed branch.
     Status,
     /// Every deployment on the server.
@@ -280,31 +276,6 @@ enum NewCommand {
         name: String,
         #[arg(long)]
         project: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum ValuesCommand {
-    /// Show a dimension's sampled values.
-    Show { dim: String },
-    /// Sample the listable dimensions from the project's warehouses into samples/values.jsonl.gz.
-    /// The model says what to run; the SQL runs here, where the credentials are.
-    Sample {
-        /// Only these dimensions (uids or names).
-        #[arg(long, value_delimiter = ',')]
-        dims: Vec<String>,
-        /// Every distinct value, not the top value_list_size (refused above the ceiling).
-        #[arg(long)]
-        full: bool,
-        /// Resample only dimensions sampled more than this many days ago, or never.
-        #[arg(long)]
-        older_than: Option<i64>,
-        /// Print the SQL that would run and stop.
-        #[arg(long)]
-        dry_run: bool,
-        /// Deploy the project afterwards so the server has the new values.
-        #[arg(long)]
-        deploy: bool,
     },
 }
 
@@ -429,7 +400,14 @@ fn run(command: Command, at: Where) -> Result<()> {
             show::print_tables(&v);
             Ok(())
         }
-        Command::Values { what } => values(at, what),
+        Command::Values { dim } => {
+            let v = match at.mode()? {
+                Mode::Local(l) => local::values_for(&l.model()?, &dim)?,
+                Mode::Remote(t) => remote::values_for(&t.client, &t.uid, &t.branch, &dim)?,
+            };
+            show::print_values(&v);
+            Ok(())
+        }
         Command::Status => {
             let t = at.target()?;
             show::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
@@ -582,7 +560,6 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     write("security.yml", templates::SECURITY_YML)?;
     write("models/.keep", "")?;
     write("tests/.keep", "")?;
-    write("samples/README.md", templates::SAMPLES_README)?;
     let gi = dir.join(".gitignore");
     let existing = std::fs::read_to_string(&gi).unwrap_or_default();
     if !existing.contains(".zsql") {
@@ -801,202 +778,6 @@ fn walk_yaml(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             out.push(path);
         }
     }
-    Ok(())
-}
-
-// ----------------------------------------------------------------- values
-
-fn values(at: Where, what: ValuesCommand) -> Result<()> {
-    match what {
-        ValuesCommand::Show { dim } => {
-            let v = match at.mode()? {
-                Mode::Local(l) => local::values_for(&l.model()?, &dim)?,
-                Mode::Remote(t) => remote::values_for(&t.client, &t.uid, &t.branch, &dim)?,
-            };
-            show::print_values(&v);
-            Ok(())
-        }
-        ValuesCommand::Sample { dims, full, older_than, dry_run, deploy: deploy_after } => {
-            // The plan comes from the model, here or on the server; the
-            // SQL runs here either way, where the credentials are.
-            let (project, plan) = match at.mode()? {
-                Mode::Local(l) => {
-                    let plan = l.model()?.sampling_plan(&dims, full);
-                    (l.project, plan)
-                }
-                Mode::Remote(t) => {
-                    let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
-                    let plan = t.client.get(&format!(
-                        "{}/sampling-plan?dims={}&full={full}",
-                        remote::branch_path(&t.uid, &t.branch),
-                        remote::urlencode(&dims.join(","))
-                    ))?;
-                    (project, plan)
-                }
-            };
-            let jobs = plan["jobs"].as_array().cloned().unwrap_or_default();
-            let skipped = plan["skipped"].as_array().cloned().unwrap_or_default();
-            if !dims.is_empty() {
-                for s in &skipped {
-                    println!("skip {}: {}", s["uid"].as_str().unwrap_or(""), s["reason"].as_str().unwrap_or(""));
-                }
-            }
-            let now = chrono::Utc::now();
-            let cut = older_than.map(|days| now - chrono::Duration::days(days));
-            let todo: Vec<&Value> = jobs
-                .iter()
-                .filter(|j| match (cut, j["sampled_at"].as_str()) {
-                    (Some(cut), Some(at)) => chrono::DateTime::parse_from_rfc3339(at).map(|t| t < cut).unwrap_or(true),
-                    _ => true,
-                })
-                .collect();
-            if dry_run {
-                for j in &todo {
-                    println!(
-                        "-- {} ({}) on {} via {}\n{}\n{}\n",
-                        j["uid"].as_str().unwrap_or(""),
-                        j["name"].as_str().unwrap_or(""),
-                        j["table"].as_str().unwrap_or(""),
-                        j["datasource"].as_str().unwrap_or(""),
-                        j["distinct_sql"].as_str().unwrap_or(""),
-                        j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or("")
-                    );
-                }
-                println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
-                return Ok(());
-            }
-            let samples_dir = project.dir.join("samples");
-            std::fs::create_dir_all(&samples_dir)?;
-            let path = samples_dir.join("values.jsonl.gz");
-            let mut catalog = read_catalog(&path)?;
-            let ceiling = plan["full_ceiling"].as_i64().unwrap_or(100_000);
-            let (done, failed) = sample_jobs(&project.dir, &todo, ceiling, now, &mut catalog)?;
-            catalog.sort_by(|a, b| a["uid"].as_str().cmp(&b["uid"].as_str()));
-            write_catalog(&path, &catalog)?;
-            println!("{done} sampled, {failed} failed, {} skipped; wrote {}", skipped.len(), path.display());
-            if failed > 0 {
-                bail!("{failed} dimension(s) failed to sample");
-            }
-            if deploy_after {
-                deploy(at, false, false)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Without the warehouse drivers, sampling can plan (`--dry-run`) but not run.
-#[cfg(not(feature = "warehouse"))]
-fn sample_jobs(
-    _project_dir: &Path,
-    _todo: &[&Value],
-    _ceiling: i64,
-    _now: chrono::DateTime<chrono::Utc>,
-    _catalog: &mut Vec<Value>,
-) -> Result<(usize, usize)> {
-    bail!("this zsql build has no warehouse drivers; `zsql values sample --dry-run` shows the SQL, and the full build (cargo build --features warehouse) runs it")
-}
-
-/// Runs each sampling job against its datasource and folds the results
-/// into the catalog; answers with how many succeeded and failed.
-#[cfg(feature = "warehouse")]
-fn sample_jobs(
-    project_dir: &Path,
-    todo: &[&Value],
-    ceiling: i64,
-    now: chrono::DateTime<chrono::Utc>,
-    catalog: &mut Vec<Value>,
-) -> Result<(usize, usize)> {
-    let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
-    let (mut done, mut failed) = (0, 0);
-    for j in todo {
-        let ds = j["datasource"].as_str().unwrap_or("").to_string();
-        if !connections.contains_key(&ds) {
-            let settings = zsql_warehouse::settings_for(project_dir, &ds)?;
-            match zsql_warehouse::connect(&settings) {
-                Ok(c) => {
-                    connections.insert(ds.clone(), c);
-                }
-                Err(e) => bail!("datasource {ds}: {e}"),
-            }
-        }
-        let wh = connections.get_mut(&ds).unwrap();
-        let uid = j["uid"].as_str().unwrap_or("").to_string();
-        let outcome = (|| -> Result<Value> {
-            let distinct = wh
-                .query(j["distinct_sql"].as_str().unwrap_or(""))?
-                .first()
-                .and_then(|r| r.first().cloned())
-                .flatten()
-                .and_then(|n| n.parse::<i64>().ok());
-            let mut entry = json!({
-                "uid": uid, "name": j["name"], "table": j["table"],
-                "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "mode": j["mode"], "distinct": distinct,
-            });
-            if let Some(sql) = j["values_sql"].as_str() {
-                if j["cap"].is_null() && distinct.map(|n| n > ceiling).unwrap_or(false) {
-                    bail!("{uid} has {} distinct values; a full sample is refused above {ceiling}", distinct.unwrap());
-                }
-                let values: Vec<Value> = wh
-                    .query(sql)?
-                    .into_iter()
-                    .filter_map(|r| Some(json!({ "v": r.first().cloned().flatten()?, "n": r.get(1).cloned().flatten().and_then(|n| n.parse::<i64>().ok()).unwrap_or(0) })))
-                    .collect();
-                entry["values"] = Value::Array(values);
-            }
-            if let Some(sql) = j["range_sql"].as_str() {
-                let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
-                if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
-                    entry["range"] = json!({ "min": lo, "max": hi });
-                }
-            }
-            Ok(entry)
-        })();
-        match outcome {
-            Ok(entry) => {
-                let what = match (entry.get("range"), entry["values"].as_array().map(Vec::len)) {
-                    (Some(r), _) => format!("{} .. {}", r["min"].as_str().unwrap_or(""), r["max"].as_str().unwrap_or("")),
-                    (None, n) => format!("{} values", n.unwrap_or(0)),
-                };
-                println!("{:<40} {what}", uid);
-                catalog.retain(|e| e["uid"] != uid);
-                catalog.push(entry);
-                done += 1;
-            }
-            Err(e) => {
-                failed += 1;
-                eprintln!("{:<40} FAILED: {e}", uid);
-            }
-        }
-    }
-    Ok((done, failed))
-}
-
-fn read_catalog(path: &Path) -> Result<Vec<Value>> {
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
-    let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            out.push(serde_json::from_str(&line)?);
-        }
-    }
-    Ok(out)
-}
-
-fn write_catalog(path: &Path, entries: &[Value]) -> Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    for e in entries {
-        enc.write_all(serde_json::to_string(e)?.as_bytes())?;
-        enc.write_all(b"\n")?;
-    }
-    enc.finish()?;
     Ok(())
 }
 

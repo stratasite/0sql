@@ -1,7 +1,7 @@
 //! Where the CLI finds the project, the server and the API key.
 //!
 //! - `project.yml` in the project directory: `uid`, `name`, `production_branch`,
-//!   and optionally `server` (a self-hosted zsqld).
+//!   and optionally `server` (a self-hosted server).
 //! - `.zsql` in the project directory (or `.strata`, the strata CLI's file,
 //!   when `.zsql` is absent): `api_key`, `server`, and per-datasource secrets.
 //! - `~/.zsql/config`: the same keys, account-wide.
