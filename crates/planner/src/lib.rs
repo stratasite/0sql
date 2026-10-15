@@ -138,7 +138,8 @@ impl PlanError {
             PlanError::Resolution(_) => "Unresolvable",
             PlanError::SegmentDatasource(_) => "SegmentDatasource",
             PlanError::SecurityPolicy(_) => "SecurityPolicy",
-            PlanError::Unimplemented(_) | PlanError::Dialect(_) => "Unimplemented",
+            PlanError::Unimplemented(_) => "Unimplemented",
+            PlanError::Dialect(_) => "Dialect",
         }
     }
 }

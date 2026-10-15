@@ -17,6 +17,7 @@
 //! limits reset on restart. A limiter shared between instances belongs
 //! with the storage trait, not here. See `docs/rate-limiting.md`.
 
+use crate::lock;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// What a request costs, which decides both its bucket and its
 /// concurrency cap. One deploy is not one `sql`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Class {
+pub(crate) enum Class {
     /// sql, explain, tables, values, summaries: microseconds each.
     Plan,
     /// explore and the fields search: a walk or a scoring pass over
@@ -69,7 +70,7 @@ const SITE_FILES: &[&str] = &[
 ];
 
 /// A request's class, from its method and path alone.
-pub fn classify(method: &str, path: &str) -> Class {
+pub(crate) fn classify(method: &str, path: &str) -> Class {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method, p.as_slice()) {
         (_, []) | (_, ["healthz"]) | (_, ["app", ..]) | (_, [".well-known", ..]) => Class::Exempt,
@@ -102,7 +103,7 @@ pub fn classify(method: &str, path: &str) -> Class {
 ///
 /// `/account/verify-email` is not in this list: it sends the caller
 /// their own link, so it needs to know who the caller is.
-pub fn authenticates(path: &str) -> bool {
+pub(crate) fn authenticates(path: &str) -> bool {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // `.well-known` is where OAuth clients look for an authorization
     // server before they present anything; there is none here, and the
@@ -179,7 +180,7 @@ impl Bucket {
 
 /// What a check decided, and what to tell the caller.
 #[derive(Debug, Clone, Copy)]
-pub struct Decision {
+pub(crate) struct Decision {
     pub allowed: bool,
     /// Seconds to wait before retrying; 0 when allowed.
     pub retry_after: u64,
@@ -198,7 +199,7 @@ impl Decision {
 /// The routes an address is limited on separately. Each is its own
 /// bucket, because each has its own rate.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Gate {
+pub(crate) enum Gate {
     Login,
     Signup,
     /// Redeeming a one-time link: an invite, a reset, a verification.
@@ -336,7 +337,7 @@ impl Config {
 
 // ----------------------------------------------------------------- limiter
 
-pub struct Limiter {
+pub(crate) struct Limiter {
     pub cfg: Config,
     shards: [Mutex<HashMap<BKey, Bucket>>; SHARDS],
     /// Failed logins per email: how many, and when the window started.
@@ -452,7 +453,7 @@ impl Limiter {
         if self.cfg.mode == Mode::Off || self.cfg.email_failures == 0 {
             return false;
         }
-        let mut map = self.failures.lock().unwrap();
+        let mut map = lock(&self.failures);
         let e = map.entry(email.to_ascii_lowercase()).or_insert((0, now));
         if now.saturating_duration_since(e.1) > self.cfg.email_window {
             *e = (0, now);
@@ -471,7 +472,7 @@ impl Limiter {
             return None;
         }
         let over = {
-            let map = self.failures.lock().unwrap();
+            let map = lock(&self.failures);
             let (n, since) = map.get(&email.to_ascii_lowercase())?;
             let age = now.saturating_duration_since(*since);
             (*n > self.cfg.email_failures && age <= self.cfg.email_window).then(|| (self.cfg.email_window - age).as_secs().max(1))
@@ -487,7 +488,7 @@ impl Limiter {
 
     /// A good password clears the email's failures.
     pub fn login_ok(&self, email: &str) {
-        self.failures.lock().unwrap().remove(&email.to_ascii_lowercase());
+        lock(&self.failures).remove(&email.to_ascii_lowercase());
     }
 
     // ------------------------------------------------------------- upkeep
@@ -497,7 +498,7 @@ impl Limiter {
     pub fn sweep(&self) {
         let now = Instant::now();
         for shard in &self.shards {
-            let mut map = shard.lock().unwrap();
+            let mut map = lock(shard);
             map.retain(|_, b| {
                 let rate = b.rate;
                 b.refill(rate, now);
@@ -505,7 +506,7 @@ impl Limiter {
             });
         }
         let window = self.cfg.email_window;
-        self.failures.lock().unwrap().retain(|_, (_, since)| now.saturating_duration_since(*since) <= window);
+        lock(&self.failures).retain(|_, (_, since)| now.saturating_duration_since(*since) <= window);
     }
 }
 
@@ -514,7 +515,7 @@ impl Limiter {
 /// How many requests of each class may be inside the server at once.
 /// This is what keeps the process alive: past the cap a request waits a
 /// moment and is then refused rather than queueing without bound.
-pub struct Admission {
+pub(crate) struct Admission {
     plan: Arc<Semaphore>,
     explore: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
@@ -539,7 +540,7 @@ fn patience(class: Class) -> Duration {
 /// the CLI cannot act on it and the caller is left guessing about a
 /// deploy that may well have landed. Better that the server always gets
 /// to give its own answer first.
-pub fn deadline(class: Class) -> Duration {
+pub(crate) fn deadline(class: Class) -> Duration {
     match class {
         Class::Heavy => Duration::from_secs(90),
         _ => Duration::from_secs(30),
@@ -730,10 +731,10 @@ mod tests {
         let l = Limiter::new(cfg);
         let t0 = Instant::now();
         l.principal_at(1, None, Class::Plan, t0);
-        let before: usize = l.shards.iter().map(|s| s.lock().unwrap().len()).sum();
+        let before: usize = l.shards.iter().map(|s| lock(s).len()).sum();
         assert_eq!(before, 1);
         l.sweep();
-        let after: usize = l.shards.iter().map(|s| s.lock().unwrap().len()).sum();
+        let after: usize = l.shards.iter().map(|s| lock(s).len()).sum();
         assert_eq!(after, 1, "a bucket mid-refill is kept");
     }
 

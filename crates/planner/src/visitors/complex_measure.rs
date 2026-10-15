@@ -379,6 +379,3 @@ fn build_from_existing_agg<'a>(graph: &mut Graph<'a>, measure: &'a Field) -> Opt
     }
     Some(found)
 }
-
-#[allow(dead_code)]
-fn _keep(_: PlanError) {}

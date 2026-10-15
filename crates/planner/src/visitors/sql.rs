@@ -1,6 +1,6 @@
 //! Rails `SqlVisitor`: renders every node to SQL text, inputs first.
 
-use crate::dag::{AliasKey, Entity, Filtered, Graph, MultiExpr, Node, NodeId, NodeKind, Projected, RefKey, Reference};
+use crate::dag::{AliasKey, Entity, Filtered, Graph, Node, NodeId, Projected, RefKey, Reference};
 use crate::model::{FilledTree, RQuery};
 use crate::sql::dates::date_lit;
 use crate::sql::expr::{entity_gsub, qualify, ungroupable};
@@ -452,7 +452,7 @@ fn append_path_joins<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>,
         }
         let left = parent.table_alias(AliasKey::Table(jd.left_id), 'T');
         let right = parent.table_alias(AliasKey::Table(jd.right_id), 'T');
-        let cond = jd.sql.to_lowercase().replace("left.", &format!("{left}.")).replace("right.", &format!("{right}."));
+        let cond = replace_ci(&replace_ci(&jd.sql, "left.", &format!("{left}.")), "right.", &format!("{right}."));
         let right_table = cx.universe.table(jd.right_id).expect("join right table");
         sql.from(format!(
             "\n\t{} JOIN {} {}\n\t\tON {}",
@@ -715,7 +715,6 @@ fn ref_to_sql_on_multi<'a>(cx: &Ctx<'_, 'a>, r: &Reference<'a>, node: &Node<'a>,
                 // A projection reference uses the projection's true alias.
                 Reference::Proj { proj } => proj.alias(),
             };
-            let _ = MultiExpr::Calc; // keep the variant in scope for readers
             base_sql = entity_gsub(&base_sql, &name, &ref_sql);
         }
         Ok(base_sql)
@@ -983,22 +982,28 @@ fn filter_to_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Res
         }
         IsNull => format!("{} IS NULL", filter_expression_sql(cx, node, f)?),
         IsNotNull => format!("{} IS NOT NULL", filter_expression_sql(cx, node, f)?),
+        // A pattern is a string literal like any other value: the
+        // dialect quotes it, so a value holding a quote cannot end the
+        // literal and continue the WHERE clause.
         Keyword => {
             let sql = lower_sql(cx, &filter_expression_sql(cx, node, f)?, f.field())?;
-            let parts: Vec<String> = value.split(',').map(|v| format!("{} LIKE '%{}%'", sql, v.trim().to_lowercase())).collect();
+            let d = &cx.graph.dialect;
+            let parts: Vec<String> = value
+                .split(',')
+                .map(|v| Ok(format!("{sql} LIKE {}", d.string_lit(&format!("%{}%", v.trim().to_lowercase()))?)))
+                .collect::<Result<_>>()?;
             format!("({})", parts.join(" OR "))
         }
         StartsWith | Contains | EndsWith | DoesNotStartWith | DoesNotContain | DoesNotEndWith => {
             let sql = lower_sql(cx, &filter_expression_sql(cx, node, f)?, f.field())?;
             let val = value.trim().to_lowercase();
-            match f.predicate {
-                StartsWith => format!("{sql} LIKE '{val}%'"),
-                Contains => format!("{sql} LIKE '%{val}%'"),
-                EndsWith => format!("{sql} LIKE '%{val}'"),
-                DoesNotStartWith => format!("{sql} NOT LIKE '{val}%'"),
-                DoesNotContain => format!("{sql} NOT LIKE '%{val}%'"),
-                _ => format!("{sql} NOT LIKE '%{val}'"),
-            }
+            let pattern = match f.predicate {
+                StartsWith | DoesNotStartWith => format!("{val}%"),
+                EndsWith | DoesNotEndWith => format!("%{val}"),
+                _ => format!("%{val}%"),
+            };
+            let op = if matches!(f.predicate, StartsWith | Contains | EndsWith) { "LIKE" } else { "NOT LIKE" };
+            format!("{sql} {op} {}", cx.graph.dialect.string_lit(&pattern)?)
         }
     };
     Ok(Some(out))
@@ -1015,14 +1020,25 @@ fn lit<'a>(cx: &Ctx<'_, 'a>, f: &Filtered<'a>, value: &str, is_ending: bool) -> 
     if matches!(f.predicate, Predicate::InList | Predicate::ExcludeList) {
         let items: Vec<String> = split_list(value)
             .into_iter()
-            .map(|item| if is_string { d.string_lit(&item.trim().to_lowercase()).map_err(PlanError::from) } else { Ok(item) })
+            .map(|item| if is_string { d.string_lit(&item.trim().to_lowercase()).map_err(PlanError::from) } else { bare_lit(d, &item) })
             .collect::<Result<_>>()?;
         return Ok(items.join(", "));
     }
     if is_string {
         return Ok(d.string_lit(&value.trim().to_lowercase())?);
     }
-    Ok(value.to_string())
+    bare_lit(d, value)
+}
+
+/// A value for a field that is not a string: a number or a boolean goes
+/// into the SQL as it is, anything else goes in quoted, so no text ever
+/// reaches the statement bare.
+fn bare_lit(d: &zsql_dialect::Dialect, value: &str) -> Result<String> {
+    let v = value.trim();
+    if v.parse::<f64>().is_ok_and(f64::is_finite) || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
+        return Ok(v.to_string());
+    }
+    Ok(d.string_lit(v)?)
 }
 
 /// Commas outside quotes split the list; quoted items keep their quotes.
@@ -1052,7 +1068,9 @@ pub fn split_list(value: &str) -> Vec<String> {
 }
 
 fn lower_sql(cx: &Ctx, sql: &str, field: &Field) -> Result<String> {
-    if sql.to_lowercase().contains("lower") {
+    // Already lower-cased by its own expression: `lower(...)` at the
+    // front, not a column that happens to be called `follower`.
+    if sql.trim_start().get(..6).is_some_and(|head| head.eq_ignore_ascii_case("lower(")) {
         return Ok(sql.to_string());
     }
     if field.data_type == Some(DataType::String) {
@@ -1060,6 +1078,3 @@ fn lower_sql(cx: &Ctx, sql: &str, field: &Field) -> Result<String> {
     }
     Ok(sql.to_string())
 }
-
-#[allow(dead_code)]
-fn _unused(_: NodeKind) {}

@@ -1212,3 +1212,71 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
         "{text}"
     );
 }
+
+/// With accounts on, a request with no key reaches nothing: not the
+/// listing, not a read, not a write. The single-tenant "everyone may"
+/// branch exists only when accounts are off.
+#[tokio::test]
+async fn without_a_key_nothing_is_reached_when_accounts_are_on() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    assert_eq!(s.deploy(CS, "main", &ann, archive(CS, "acme")).await.status, StatusCode::OK);
+    assert_eq!(s.get("/projects", None).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(s.get(&format!("/projects/{CS}/branches/main/fields"), None).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        s.post(&format!("/projects/{CS}/branches/main/sql"), None, json!({ "spec": spec_of("Revenue") })).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(s.delete(&format!("/projects/{CS}/branches/main"), None).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// An archive entry that would land above the project is refused and
+/// named, rather than silently left out of the deploy.
+#[tokio::test]
+async fn an_entry_above_the_project_is_refused() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    // The tar crate refuses to write such a path itself, so the name
+    // goes into the header's bytes directly, as an attacker's tool would.
+    let files = fixture_files(CS, "acme");
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (path, text) in &files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, path, text.as_bytes()).unwrap();
+        }
+        let text = b"name: escape\n";
+        let mut h = tar::Header::new_gnu();
+        let name = b"../escape.yml";
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+        h.set_size(text.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append(&h, &text[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let a = s.validate(CS, "main", &ann, buf).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    assert!(a.error().contains("outside the project") || a.error().contains(".."), "{}", a.error());
+}
+
+/// A user who has a password must give it to set a new one, so a
+/// personal key alone cannot take the web app over.
+#[tokio::test]
+async fn a_password_change_proves_the_old_one() {
+    let s = server();
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let a = s.post("/account/password", Some(&ann), json!({ "password": "newpassword12" })).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.error());
+    let a = s.post("/account/password", Some(&ann), json!({ "password": "newpassword12", "current_password": "wrong" })).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.error());
+    let a = s.post("/account/password", Some(&ann), json!({ "password": "newpassword12", "current_password": "annpassword1" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.post("/login", None, json!({ "email": "ann@acme.test", "password": "newpassword12" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+}

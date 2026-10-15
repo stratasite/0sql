@@ -200,7 +200,7 @@ fn shortest_routes(
     let mut pending: HashMap<(Id, Vec<Id>), Route> = HashMap::new();
     pending.insert((root, vec![]), Route { cost: 0, joins: vec![], tables: vec![] });
 
-    while let Some(Reverse((cost, hops, sig, joins, table))) = heap.pop() {
+    while let Some(Reverse((cost, _hops, sig, joins, table))) = heap.pop() {
         let Some(route) = pending.remove(&(table, joins.clone())) else { continue };
         if table != root {
             if let Some(existing) = best.get(&table) {
@@ -218,7 +218,6 @@ fn shortest_routes(
             }
             best.insert(table, route.clone());
         }
-        let _ = hops;
         for e in edges.get(&table).into_iter().flatten() {
             if measures_only && !e.measures_ok {
                 continue;

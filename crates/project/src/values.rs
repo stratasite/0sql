@@ -13,6 +13,9 @@ use std::path::Path;
 use zsql_semantic::ValueSampling;
 
 pub const FILE_NAME: &str = "values.jsonl.gz";
+/// The most the file may hold once inflated: a thousand values for
+/// each of a few thousand dimensions is tens of megabytes.
+pub const INFLATED_LIMIT: u64 = 256 << 20;
 /// A `full` sample above this many distinct values is refused.
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -58,11 +61,23 @@ impl ValueCatalog {
         if !path.exists() {
             return Ok(None);
         }
+        use std::io::Read;
         let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
+        // The file is a second gzip layer inside a deploy, so the
+        // archive's own unpacked limit does not cover it: a small file
+        // of zeros could inflate without end. Read at most this much.
+        let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(file).take(INFLATED_LIMIT + 1));
         let mut dimensions = Vec::new();
+        let mut total = 0u64;
         for line in reader.lines() {
             let line = line?;
+            total += line.len() as u64 + 1;
+            if total > INFLATED_LIMIT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{FILE_NAME} inflates past {} MB", INFLATED_LIMIT >> 20),
+                ));
+            }
             if line.trim().is_empty() {
                 continue;
             }

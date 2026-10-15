@@ -1,7 +1,7 @@
 //! Date literals: parsing the values users type (fixed or relative like
 //! `28d`), and rendering them in the warehouse's own literal form.
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use regex::Regex;
 use std::sync::LazyLock;
 use zsql_dialect::Dialect;
@@ -24,7 +24,7 @@ pub fn dynamic_to_date(value: &str, is_ending: bool) -> Option<NaiveDateTime> {
     let n: i64 = caps[1].parse().ok()?;
     let unit = caps[2].to_string();
     let unit = unit.as_str();
-    let now = Local::now().naive_local();
+    let now = chrono::Utc::now().naive_utc();
     let dt = match unit {
         "h" => now - Duration::hours(n),
         "d" => now - Duration::days(n),

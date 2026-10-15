@@ -21,11 +21,20 @@
 
 use serde_json::{json, Map, Value};
 
-/// Splits on commas outside quotes, brackets and parentheses.
-pub fn split_items(line: &str) -> Vec<String> {
+/// Whether a quote at this point opens a quoted span: at the start of
+/// a token, never inside one, so `Men's` is a word with an apostrophe
+/// and `'Men''s'` is a quoted name.
+fn opens_quote(prev: Option<char>) -> bool {
+    matches!(prev, None | Some(' ' | '\t' | '(' | ',' | '='))
+}
+
+/// Splits on commas outside quotes, brackets and parentheses. A quote
+/// left open is an error rather than a swallowed line.
+pub fn split_items(line: &str) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     let mut cur = String::new();
     let (mut depth, mut quote): (i32, Option<char>) = (0, None);
+    let mut prev: Option<char> = None;
     for ch in line.chars() {
         match quote {
             Some(q) => {
@@ -35,7 +44,7 @@ pub fn split_items(line: &str) -> Vec<String> {
                 }
             }
             None => match ch {
-                '\'' | '"' => {
+                '\'' | '"' if opens_quote(prev) => {
                     quote = Some(ch);
                     cur.push(ch);
                 }
@@ -51,9 +60,13 @@ pub fn split_items(line: &str) -> Vec<String> {
                 _ => cur.push(ch),
             },
         }
+        prev = Some(ch);
+    }
+    if let Some(q) = quote {
+        return Err(format!("a {q} is opened and never closed in `{}`", line.trim()));
     }
     items.push(cur);
-    items.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    Ok(items.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +79,7 @@ pub enum Item {
 /// The line as a spec, with what each item was read as.
 pub fn parse_line(line: &str) -> Result<(Value, Vec<Item>), String> {
     let mut items = Vec::new();
-    for text in split_items(line) {
+    for text in split_items(line)? {
         items.push(parse_item(&text)?);
     }
     if items.is_empty() {
@@ -100,8 +113,8 @@ fn unquote(s: &str) -> String {
     }
 }
 
-fn list_values(inner: &str) -> String {
-    split_items(inner).iter().map(|v| unquote(v)).collect::<Vec<_>>().join(", ")
+fn list_values(inner: &str) -> Result<String, String> {
+    Ok(split_items(inner)?.iter().map(|v| unquote(v)).collect::<Vec<_>>().join(", "))
 }
 
 /// A field written as `[Name]`, `[Name]@m`, `"Name"` or `'Name'`.
@@ -128,10 +141,14 @@ fn field_text(s: &str) -> String {
 }
 
 /// Lower-cased with the inside of every bracketed or quoted span blanked,
-/// so keyword searches never look inside a field name.
+/// so keyword searches never look inside a field name. Byte for byte
+/// the same length as `text`, so an offset found here slices `text`:
+/// a letter whose lower case is longer (`İ`) or wider is kept as it is,
+/// which only means a keyword spelt with such a letter is not matched.
 fn masked(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut closer: Option<char> = None;
+    let mut prev: Option<char> = None;
     for ch in text.chars() {
         match closer {
             Some(c) if ch == c => {
@@ -142,19 +159,20 @@ fn masked(text: &str) -> String {
             None => {
                 closer = match ch {
                     '[' => Some(']'),
-                    '"' => Some('"'),
-                    '\'' => Some('\''),
+                    '"' | '\'' if opens_quote(prev) => Some(ch),
                     _ => None,
                 };
-                out.extend(ch.to_lowercase());
+                let mut lower = ch.to_lowercase();
+                match (lower.next(), lower.next()) {
+                    (Some(l), None) if l.len_utf8() == ch.len_utf8() => out.push(l),
+                    _ => out.push(ch),
+                }
             }
         }
+        prev = Some(ch);
     }
-    if out.len() == text.len() {
-        out
-    } else {
-        text.to_lowercase()
-    }
+    debug_assert_eq!(out.len(), text.len());
+    out
 }
 
 pub fn parse_item(text: &str) -> Result<Item, String> {
@@ -200,36 +218,8 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
     if let Some(field) = lower.strip_suffix(" is null") {
         return filter(&text[..field.len()], "is_null", None, None, None);
     }
-    for (kw, predicate) in [(" not in ", "exclude_list"), (" in ", "in_list")] {
-        if let Some(pos) = lower.find(kw) {
-            let rest = text[pos + kw.len()..].trim();
-            let inner = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).unwrap_or(rest);
-            return filter(&text[..pos], predicate, Some(list_values(inner)), None, None);
-        }
-        let paren = if kw == " not in " { " not in(" } else { " in(" };
-        if let Some(pos) = lower.find(paren) {
-            let inner = text[pos + paren.len() - 1..].trim().trim_start_matches('(').trim_end_matches(')');
-            return filter(&text[..pos], predicate, Some(list_values(inner)), None, None);
-        }
-    }
-    if let Some(pos) = lower.find(" between ") {
-        let rest = &text[pos + 9..];
-        let Some(and) = rest.to_lowercase().find(" and ") else {
-            return Err(format!("'{text}': between needs `a and b`"));
-        };
-        return filter(&text[..pos], "between", Some(unquote(&rest[..and])), Some(unquote(&rest[and + 5..])), None);
-    }
-    if let Some(pos) = lower.find(" top ") {
-        let rest = text[pos + 5..].trim();
-        let (n, measure) = match rest.to_lowercase().find(" by ") {
-            Some(by) => (rest[..by].trim(), Some(rest[by + 4..].trim().to_string())),
-            None => (rest, None),
-        };
-        if n.parse::<i64>().is_err() {
-            return Err(format!("'{text}': top needs a count, as in `category top 10 by revenue`"));
-        }
-        return filter(&text[..pos], "top_n", Some(n.to_string()), None, measure);
-    }
+    // The text predicates come before `in`, since a value may hold the
+    // word: `description contains made in china`.
     for (kw, yes, no) in [
         (" contains ", "contains", "does_not_contain"),
         (" starts with ", "starts_with", "does_not_start_with"),
@@ -238,12 +228,52 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
         if let Some(pos) = lower.find(kw) {
             let field = &text[..pos];
             let value = unquote(&text[pos + kw.len()..]);
-            let field_l = field.to_lowercase();
+            let field_l = masked(field);
             return match field_l.strip_suffix(" not").or_else(|| field_l.strip_suffix(" does not")) {
                 Some(f) => filter(&field[..f.len()], no, Some(value), None, None),
                 None => filter(field, yes, Some(value), None, None),
             };
         }
+    }
+    // The English negations without the `s`: `does not contain`.
+    for (kw, no) in [
+        (" does not contain ", "does_not_contain"),
+        (" does not start with ", "does_not_start_with"),
+        (" does not end with ", "does_not_end_with"),
+    ] {
+        if let Some(pos) = lower.find(kw) {
+            return filter(&text[..pos], no, Some(unquote(&text[pos + kw.len()..])), None, None);
+        }
+    }
+    for (kw, predicate) in [(" not in ", "exclude_list"), (" in ", "in_list")] {
+        if let Some(pos) = lower.find(kw) {
+            let rest = text[pos + kw.len()..].trim();
+            let inner = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).unwrap_or(rest);
+            return filter(&text[..pos], predicate, Some(list_values(inner)?), None, None);
+        }
+        let paren = if kw == " not in " { " not in(" } else { " in(" };
+        if let Some(pos) = lower.find(paren) {
+            let inner = text[pos + paren.len() - 1..].trim().trim_start_matches('(').trim_end_matches(')');
+            return filter(&text[..pos], predicate, Some(list_values(inner)?), None, None);
+        }
+    }
+    if let Some(pos) = lower.find(" between ") {
+        let rest = &text[pos + 9..];
+        let Some(and) = masked(rest).find(" and ") else {
+            return Err(format!("'{text}': between needs `a and b`"));
+        };
+        return filter(&text[..pos], "between", Some(unquote(&rest[..and])), Some(unquote(&rest[and + 5..])), None);
+    }
+    if let Some(pos) = lower.find(" top ") {
+        let rest = text[pos + 5..].trim();
+        let (n, measure) = match masked(rest).find(" by ") {
+            Some(by) => (rest[..by].trim(), Some(rest[by + 4..].trim().to_string())),
+            None => (rest, None),
+        };
+        if n.parse::<i64>().is_err() {
+            return Err(format!("'{text}': top needs a count, as in `category top 10 by revenue`"));
+        }
+        return filter(&text[..pos], "top_n", Some(n.to_string()), None, measure);
     }
     for (op, predicate) in [
         (">=", "greater_than_or_equal_to"),
@@ -261,12 +291,11 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
 
     match parse_projection(text) {
         Ok(item) => Ok(item),
-        Err(e) if text.contains('[') => {
+        Err(_) if text.contains('[') => {
             let (formula, alias) = match lower.find(" as ") {
                 Some(pos) => (text[..pos].trim(), field_text(&text[pos + 4..])),
                 None => (text, text.to_string()),
             };
-            let _ = e;
             Ok(Item::Calculation(json!({ "alias": alias, "sql": formula, "calculation": true })))
         }
         Err(e) => Err(e),
@@ -300,7 +329,7 @@ fn parse_projection(text: &str) -> Result<Item, String> {
         }
         let func = inner[..paren].trim().to_lowercase();
         let args = inner[paren + 1..inner.len() - 1].to_string();
-        let mut parts = split_items(&args);
+        let mut parts = split_items(&args)?;
         if parts.is_empty() {
             return Err(format!("'{text}': {func}() needs a field"));
         }
@@ -446,7 +475,7 @@ Type a comma-separated line. Each item is read from its shape:
                yoy qoq mom wow dod [+_pct] (period over period); pct(x) (share of total);
                running_sum(x) moving_avg(x, 7) and other running_/moving_ windows
   filter       item category = Books | store net paid > 100 | date between 2024-01-01 and 2024-12-31
-               category in (Books, Music) | category not in (Toys) | name contains foo | name not starts with x
+               category in (Books, Music) | category not in (Toys) | name contains foo | name does not start with x
                date is null | category top 10 by store net paid
   calculation  Share = sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m) | max([gross sales]@m) as Peak
                a formula with a [Name]@m, [Name]@d or [Alias] reference; unnamed, the formula is its alias
@@ -484,7 +513,49 @@ mod tests {
 
     #[test]
     fn items_split_outside_parens_and_quotes() {
-        assert_eq!(split_items("a, month(b), c in (x, y), 'p, q'"), vec!["a", "month(b)", "c in (x, y)", "'p, q'"]);
+        assert_eq!(split_items("a, month(b), c in (x, y), 'p, q'").unwrap(), vec!["a", "month(b)", "c in (x, y)", "'p, q'"]);
+    }
+
+    /// Letters whose lower case is longer, or wider, must never move a
+    /// byte offset: these inputs panicked before the mask kept length.
+    #[test]
+    fn names_in_any_script_are_sliced_on_char_boundaries() {
+        for line in
+            ["İİ€ as y", "aİİ€€ as y", "İİİ€€€ as y desc", "ẞ€ as y", "İ€€ = 1", "İ€€€ in (a, b)", "İ€ contains x", "Ärger between 1 and 2"]
+        {
+            let _ = parse_line(line);
+        }
+        assert!(matches!(parse_item("İ€€ = 1"), Ok(Item::Filter(f)) if f["field"] == "İ€€" && f["value"] == "1"));
+        assert!(matches!(parse_item("İ€€€ in (a, b)"), Ok(Item::Filter(f)) if f["field"] == "İ€€€" && f["value"] == "a, b"));
+        assert!(matches!(parse_item("İ€ contains x"), Ok(Item::Filter(f)) if f["field"] == "İ€" && f["value"] == "x"));
+        assert!(matches!(parse_item("Größe as Size"), Ok(Item::Projection(p)) if p["field"] == "Größe" && p["alias"] == "Size"));
+    }
+
+    /// An apostrophe inside a word is a letter; a quote left open is an
+    /// error, not a swallowed line.
+    #[test]
+    fn apostrophes_and_unclosed_quotes() {
+        let (spec, items) = parse_line("category = Men's, revenue").unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(spec["projections"].as_array().unwrap().len(), 1);
+        assert!(matches!(&items[0], Item::Filter(f) if f["value"] == "Men's"));
+        assert!(matches!(parse_item("name = O'Brien"), Ok(Item::Filter(f)) if f["value"] == "O'Brien"));
+        let err = parse_line("category in ('a, b), revenue").unwrap_err();
+        assert!(err.contains("never closed"), "{err}");
+    }
+
+    /// A value may hold a keyword: text predicates are read before `in`,
+    /// and the English negation is accepted.
+    #[test]
+    fn keywords_inside_values_do_not_win() {
+        assert!(
+            matches!(parse_item("description contains made in china"), Ok(Item::Filter(f)) if f["predicate"] == "contains" && f["value"] == "made in china")
+        );
+        assert!(
+            matches!(parse_item("name does not contain test"), Ok(Item::Filter(f)) if f["predicate"] == "does_not_contain" && f["field"] == "name")
+        );
+        assert!(matches!(parse_item("name not starts with x"), Ok(Item::Filter(f)) if f["predicate"] == "does_not_start_with"));
+        assert!(matches!(parse_item("region in (a, b)"), Ok(Item::Filter(f)) if f["predicate"] == "in_list"));
     }
 
     /// A name in brackets or quotes is a field whatever it says, with

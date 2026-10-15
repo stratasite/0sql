@@ -250,7 +250,7 @@ const CATALOGUE_BYTES: usize = 48 * 1024;
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
 fn catalogue(app: &App, who: &Option<Principal>) -> String {
-    let models = app.models.read().unwrap();
+    let models = read(&app.models);
     let mut readable: Vec<Arc<Model>> =
         in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
     drop(models);
@@ -467,7 +467,7 @@ fn branch_for(app: &App, who: &Option<Principal>, uid: &str, branch: Option<Stri
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}")))?;
         return Ok(project.production_branch);
     }
-    let models = app.models.read().unwrap();
+    let models = read(&app.models);
     let mut branches: Vec<String> = models.values().filter(|d| d.uid == uid).map(|d| d.branch.clone()).collect();
     match branches.len() {
         1 => Ok(branches.remove(0)),

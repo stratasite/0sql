@@ -11,7 +11,9 @@
 //! ```text
 //! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
 //! POST /projects/{uid}/branches/{branch}/validate      the same, keeping nothing
-//! POST /projects/{uid}/branches/{branch}/plan          {"spec": {...}, "context": {...}}
+//! POST /projects/{uid}/branches/{branch}/sql           {"spec": {...}, "context": {...}} or {"expr": "..."}
+//! POST /projects/{uid}/branches/{branch}/explain       the same, with the node graph and timings
+//! POST /projects/{uid}/branches/{branch}/explore       what the query can add
 //! POST /projects/{uid}/branches/{branch}/test          run the deployed tests/*.yml again
 //! GET  /projects/{uid}/branches/{branch}               summary and warnings
 //! GET  /projects/{uid}/branches/{branch}/fields        ?q=text&hidden=true
@@ -28,6 +30,22 @@ pub mod mail;
 mod mcp;
 
 pub use mcp::Settings as McpSettings;
+
+// A lock is never poisoned here on purpose: a panic in one request
+// must not take the lock, and with it every later request, down with
+// it. The data behind these locks is a connection, a cache or a map
+// that a half-finished request leaves consistent.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Query, State};
@@ -159,7 +177,7 @@ fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError>
             return Ok(Some(p));
         }
     }
-    Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into()))
+    Err(key_required())
 }
 
 impl FromRequestParts<Shared> for Auth {
@@ -424,8 +442,11 @@ fn scope_of(who: &Option<Principal>) -> String {
     who.as_ref().map(|p| format!("{}/", p.account().uid)).unwrap_or_default()
 }
 
+/// A failure of the store itself: logged here, answered with a fixed
+/// line, since what SQLite has to say is about this box.
 fn internal(e: zsql_accounts::Error) -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", e.to_string())
+    eprintln!("zsqld: accounts: {e}");
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", "the accounts store failed; see the server's log".into())
 }
 
 fn accounts_error(e: zsql_accounts::Error) -> ApiError {
@@ -433,7 +454,7 @@ fn accounts_error(e: zsql_accounts::Error) -> ApiError {
         zsql_accounts::Error::NotFound(m) => ApiError(StatusCode::NOT_FOUND, "NotFound", m),
         zsql_accounts::Error::Denied(m) => ApiError(StatusCode::FORBIDDEN, "Forbidden", m),
         zsql_accounts::Error::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, "Invalid", m),
-        zsql_accounts::Error::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", e.to_string()),
+        zsql_accounts::Error::Db(e) => internal(zsql_accounts::Error::Db(e)),
     }
 }
 
@@ -447,10 +468,21 @@ fn gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, verb: Verb)
         check_branch(branch)?;
     }
     let scope = scope_of(who);
-    let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
+    let (store, p) = match (&app.accounts, who) {
+        (None, _) => return Ok(Tenant { scope, project: None }),
+        (Some(_), None) => return Err(key_required()),
+        (Some(store), Some(p)) => (store, p),
+    };
     let project = store.project(p.account().id, uid).map_err(internal)?.ok_or_else(|| not_found(uid, branch))?;
     store.authorize(p, &project, branch, verb).map_err(accounts_error)?;
     Ok(Tenant { scope, project: Some(project) })
+}
+
+/// With accounts on, every read and write names a key; the one caller
+/// without one, the MCP handshake, is answered by `mcp.rs` before it
+/// reaches a gate.
+fn key_required() -> ApiError {
+    ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into())
 }
 
 /// The security context a plan runs under.
@@ -565,7 +597,7 @@ fn not_found(uid: &str, branch: &str) -> ApiError {
 }
 
 fn model(app: &App, t: &Tenant, uid: &str, branch: &str) -> Result<Arc<Model>, ApiError> {
-    app.models.read().unwrap().get(&t.key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
+    read(&app.models).get(&t.key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
 }
 
 // ------------------------------------------------------------------ deploy
@@ -610,7 +642,7 @@ async fn validate(
 /// project records, because memory is what is being protected: a branch
 /// that is not loaded is not holding anything.
 fn check_caps(app: &App, who: &Option<Principal>, uid: &str, branch: &str) -> Result<(), ApiError> {
-    let models = app.models.read().unwrap();
+    let models = read(&app.models);
     caps_allow(app, &models, &scope_of(who), uid, branch)
 }
 
@@ -677,7 +709,11 @@ fn deploy_gate(
     check_uid(uid)?;
     check_branch(branch)?;
     let scope = scope_of(who);
-    let (Some(store), Some(p)) = (&app.accounts, who) else { return Ok(Tenant { scope, project: None }) };
+    let (store, p) = match (&app.accounts, who) {
+        (None, _) => return Ok(Tenant { scope, project: None }),
+        (Some(_), None) => return Err(key_required()),
+        (Some(store), Some(p)) => (store, p),
+    };
     match store.project(p.account().id, uid).map_err(internal)? {
         Some(project) => {
             store.authorize(p, &project, branch, Verb::Write).map_err(accounts_error)?;
@@ -717,6 +753,14 @@ fn deploy_or_validate(
     if keep {
         check_caps(&app, &who, &uid, &branch)?;
     }
+    // A project that already exists says now whether the caller may
+    // write it, before the archive is unpacked, loaded and tested on
+    // their behalf. A new project is gated once project.yml is read.
+    if let (Some(store), Some(p)) = (&app.accounts, &who) {
+        if let Some(project) = store.project(p.account().id, &uid).map_err(internal)? {
+            store.authorize(p, &project, &branch, Verb::Write).map_err(accounts_error)?;
+        }
+    }
     let work = std::env::temp_dir().join(format!("zsqld-deploy-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&work).map_err(|e| bad(e.to_string()))?;
     // Paths in what the loader says are inside the work directory; the
@@ -736,14 +780,14 @@ fn deploy_or_validate(
         if keep {
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
-            let _writing = app.deploying.lock().unwrap();
+            let _writing = lock(&app.deploying);
             let live = t.dir(&app, &uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
             deployed.write(&staged).and_then(|()| swap_in(&staged, &live)).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&staged);
                 bad(e.to_string())
             })?;
-            let mut models = app.models.write().unwrap();
+            let mut models = write(&app.models);
             caps_allow(&app, &models, &t.scope, &uid, &branch)?;
             models.insert(t.key(&uid, &branch), deployed);
             drop(models);
@@ -820,7 +864,10 @@ fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<(), String> {
             let path = entry.path().map(|p| p.display().to_string()).unwrap_or_default();
             return Err(format!("the archive holds {path}, which is not a file or a directory ({kind:?}); only those are deployed"));
         }
-        entry.unpack_in(work).map_err(|e| failed("unpacking", e))?;
+        if !entry.unpack_in(work).map_err(|e| failed("unpacking", e))? {
+            let path = entry.path().map(|p| p.display().to_string()).unwrap_or_default();
+            return Err(format!("the archive holds {path}, which would land outside the project; only paths inside it are deployed"));
+        }
     }
     Ok(())
 }
@@ -1097,15 +1144,22 @@ async fn test(
 
 async fn remove(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
-    let removed = app.models.write().unwrap().remove(&t.key(&uid, &branch)).is_some();
-    if !removed {
-        return Err(not_found(&uid, &branch));
-    }
-    let _ = std::fs::remove_dir_all(t.dir(&app, &uid, &branch));
-    if let (Some(store), Some(p)) = (&app.accounts, &who) {
-        let _ = store.record(p.account().id, &p.describe(), "branch_removed", &format!("{uid}/{branch}"));
-    }
-    Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
+    blocking(move || {
+        // Under the deploy lock: a deploy of the same branch in flight
+        // would otherwise swap its directory in between the removal of
+        // the model and of the files.
+        let _writing = lock(&app.deploying);
+        let removed = write(&app.models).remove(&t.key(&uid, &branch)).is_some();
+        if !removed {
+            return Err(not_found(&uid, &branch));
+        }
+        let _ = std::fs::remove_dir_all(t.dir(&app, &uid, &branch));
+        if let (Some(store), Some(p)) = (&app.accounts, &who) {
+            let _ = store.record(p.account().id, &p.describe(), "branch_removed", &format!("{uid}/{branch}"));
+        }
+        Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
+    })
+    .await
 }
 
 async fn branch_summary(
@@ -1139,8 +1193,11 @@ async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Val
 }
 
 fn projects_of(app: &Shared, who: &Option<Principal>) -> Result<Value, ApiError> {
+    if app.accounts.is_some() && who.is_none() {
+        return Err(key_required());
+    }
     let mut out = Vec::new();
-    for d in in_scope(&app.models.read().unwrap(), &scope_of(who)) {
+    for d in in_scope(&read(&app.models), &scope_of(who)) {
         if gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok() {
             out.push(d.summary());
         }
@@ -1258,6 +1315,9 @@ async fn logout(State(app): State<Shared>, parts: axum::http::request::Parts) ->
 #[derive(Deserialize)]
 struct PasswordRequest {
     password: String,
+    /// The password as it is; needed when the user has one.
+    #[serde(default)]
+    current_password: Option<String>,
 }
 
 async fn set_password(
@@ -1271,10 +1331,10 @@ async fn set_password(
     // The session this change is made from survives it; any other is
     // ended, which is the point of changing a password.
     let keep = cookie_in(&headers, SESSION_COOKIE);
-    let (user, account_id, password) = (user.clone(), account.id, req.password);
+    let (user, account_id, password, current) = (user.clone(), account.id, req.password, req.current_password);
     let app = app.clone();
     blocking(move || {
-        store_of(&app)?.set_password(account_id, &user, &password, keep.as_deref()).map_err(accounts_error)?;
+        store_of(&app)?.set_password(account_id, &user, &password, current.as_deref(), keep.as_deref()).map_err(accounts_error)?;
         Ok(Json(json!({ "ok": true })))
     })
     .await
@@ -1775,15 +1835,20 @@ async fn update_project(
 
 /// Deletes the project record and every deployment of it.
 async fn delete_project(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>) -> Result<Json<Value>, ApiError> {
-    let store = store_of(&app)?;
-    let (user, _, _) = user_of(&who)?;
+    store_of(&app)?;
     let t = gate(&app, &who, &uid, "", Verb::Owner)?;
-    let project = t.project.expect("accounts on");
-    let prefix = format!("{}{uid}/", t.scope);
-    app.models.write().unwrap().retain(|k, _| !k.starts_with(&prefix));
-    let _ = std::fs::remove_dir_all(app.data_dir.join(&t.scope).join(&uid));
-    store.delete_project(user, &project).map_err(accounts_error)?;
-    Ok(Json(json!({ "deleted": uid })))
+    blocking(move || {
+        let store = store_of(&app)?;
+        let (user, _, _) = user_of(&who)?;
+        let project = t.project.expect("accounts on");
+        let prefix = format!("{}{uid}/", t.scope);
+        let _writing = lock(&app.deploying);
+        write(&app.models).retain(|k, _| !k.starts_with(&prefix));
+        let _ = std::fs::remove_dir_all(app.data_dir.join(&t.scope).join(&uid));
+        store.delete_project(user, &project).map_err(accounts_error)?;
+        Ok(Json(json!({ "deleted": uid })))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1822,7 +1887,8 @@ fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
         let Ok(projects) = std::fs::read_dir(&root) else { continue };
         for p in projects.flatten().filter(|e| e.path().is_dir()) {
             let uid = p.file_name().to_string_lossy().to_string();
-            for b in std::fs::read_dir(p.path())?.flatten().filter(|e| e.path().is_dir()) {
+            let Ok(branches) = std::fs::read_dir(p.path()) else { continue };
+            for b in branches.flatten().filter(|e| e.path().is_dir()) {
                 let branch = b.file_name().to_string_lossy().to_string();
                 // A branch name never starts with a dot. A deploy's own
                 // staging or previous copy, left by a crash between two
@@ -1848,7 +1914,7 @@ fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
                 let key = format!("{scope}{uid}/{branch}");
                 match Model::from_stored(&b.path(), &uid, &branch, app.dialects) {
                     Ok(m) => {
-                        app.models.write().unwrap().insert(key, Arc::new(m));
+                        write(&app.models).insert(key, Arc::new(m));
                         n += 1;
                     }
                     Err(e) => {
