@@ -59,6 +59,11 @@ pub struct Loaded {
     pub tests: Vec<ProjectTest>,
     /// Sampled dimension values (`values.jsonl.gz`), when the project has them.
     pub values: Option<values::ValueCatalog>,
+    /// Every file the load read, imports included, in the order they
+    /// were read: what a watcher stats to know the model moved, and
+    /// what a cache would key on. A values file is listed whether or
+    /// not it exists, since its appearing is a change too.
+    pub sources: Vec<PathBuf>,
 }
 
 /// One `tests/*.yml` entry: fields to project by name and what the SQL
@@ -266,6 +271,7 @@ struct Builder<'d> {
     pending_expressions: Vec<PendingExpression>,
     pending_tables: Vec<PendingTable>,
     pending_rules: Vec<PendingRule>,
+    sources: Vec<PathBuf>,
 }
 
 const TABLE_KEYS: &[&str] = &["datasource", "name", "physical_name", "cost", "description", "tags", "metadata", "snapshot", "snapshot_date", "partition", "partitions", "imports", "fields"];
@@ -302,7 +308,14 @@ impl<'d> Builder<'d> {
             pending_expressions: vec![],
             pending_tables: vec![],
             pending_rules: vec![],
+            sources: vec![],
         }
+    }
+
+    /// Reads a YAML file and remembers that it did.
+    fn read(&mut self, path: &Path) -> Result<Yaml> {
+        self.sources.push(path.to_path_buf());
+        read_yaml(path)
     }
 
     fn warn(&mut self, file: &Path, message: impl Into<String>) {
@@ -362,7 +375,7 @@ impl<'d> Builder<'d> {
     fn project(&mut self) -> Result<()> {
         let file = self.dir.join("project.yml");
         let (name, uid, branch) = if file.exists() {
-            let v = read_yaml(&file)?;
+            let v = self.read(&file)?;
             let m = as_map(&v).ok_or_else(|| invalid(&file, "project.yml must be a mapping"))?;
             let name = str_of(m, "name").ok_or_else(|| invalid(&file, "Cannot create project: name is required in project.yml"))?;
             let uid = str_of(m, "uid").map(|u| u.to_lowercase()).unwrap_or_else(|| parameterize(&name));
@@ -384,7 +397,7 @@ impl<'d> Builder<'d> {
         if !file.exists() {
             return Err(invalid(&file, "datasources.yml is required"));
         }
-        let v = read_yaml(&file)?;
+        let v = self.read(&file)?;
         let m = as_map(&v).ok_or_else(|| invalid(&file, "datasources.yml must map each datasource key to its settings"))?;
         for (key, def) in m {
             let Some(uid) = key.as_str() else { continue };
@@ -452,7 +465,7 @@ impl<'d> Builder<'d> {
             return Err(invalid(file, format!("Circular import detected: {}", cycle.join(" -> "))));
         }
         visiting.push(abs);
-        let v = read_yaml(file)?;
+        let v = self.read(file)?;
         let mut m = as_map(&v).cloned().ok_or_else(|| invalid(file, "Empty file detected."))?;
         let imports = strs_of(&m, "imports");
         m.remove(Yaml::String("imports".into()));
@@ -788,7 +801,7 @@ impl<'d> Builder<'d> {
     fn relationships(&mut self) -> Result<()> {
         let files = self.files("models", "rel.")?;
         for file in files {
-            let v = read_yaml(&file)?;
+            let v = self.read(&file)?;
             let m = as_map(&v).cloned().ok_or_else(|| invalid(&file, "Empty file detected."))?;
             let ds = self.datasource_for(&file, &m, "relationship")?;
             let mut seen_pairs: Vec<(Id, Id)> = Vec::new();
@@ -1224,7 +1237,7 @@ impl<'d> Builder<'d> {
         if !file.exists() {
             return Ok(());
         }
-        let v = read_yaml(&file)?;
+        let v = self.read(&file)?;
         let m = as_map(&v).ok_or_else(|| invalid(&file, "security.yml must have a 'policies' key."))?;
         let policies = match get(m, "policies") {
             Some(Yaml::Sequence(items)) => items.clone(),
@@ -1311,7 +1324,7 @@ impl<'d> Builder<'d> {
             if self.confined && !self.inside(&file) {
                 return Err(invalid(&file, "this file is a link to somewhere outside the project"));
             }
-            let v = read_yaml(&file)?;
+            let v = self.read(&file)?;
             let Some(m) = as_map(&v) else { continue };
             let name = str_of(m, "name").ok_or_else(|| invalid(&file, "Test must have a name"))?;
             let projections = strs_of(m, "projections");
@@ -1328,18 +1341,19 @@ impl<'d> Builder<'d> {
         Ok(())
     }
 
-    fn finish(self) -> Loaded {
+    fn finish(mut self) -> Loaded {
         let snapshot = self.snapshot();
         let values_path = [self.dir.join("samples").join(values::FILE_NAME), self.dir.join(values::FILE_NAME)].into_iter().find(|p| p.exists()).unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
+        self.sources.push(values_path.clone());
         let values = match values::ValueCatalog::read(&values_path) {
             Ok(v) => v,
             Err(e) => {
                 let mut warnings = self.warnings;
                 warnings.push(format!("{}: {e}", values::FILE_NAME));
-                return Loaded { snapshot, warnings, tests: self.tests, values: None };
+                return Loaded { snapshot, warnings, tests: self.tests, values: None, sources: self.sources };
             }
         };
-        Loaded { snapshot, warnings: self.warnings, tests: self.tests, values }
+        Loaded { snapshot, warnings: self.warnings, tests: self.tests, values, sources: self.sources }
     }
 }
 

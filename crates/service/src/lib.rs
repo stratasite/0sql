@@ -154,6 +154,9 @@ pub struct Model {
     /// When it was loaded, as `humantime` writes it; the summary calls
     /// it `deployed_at`, which is what it is on a server.
     pub loaded_at: String,
+    /// The files a load from a directory read, for whoever wants to
+    /// know when they move. Empty for a model built any other way.
+    pub sources: Vec<PathBuf>,
 }
 
 /// What the files on disk are called under a model's directory.
@@ -167,7 +170,7 @@ impl Model {
         let universe = Universe::build(snapshot)?;
         let warnings = universe.warnings().to_vec();
         let engine = Engine::new(universe, |u| Planner::new(u, dialects, None));
-        Ok(Model { uid: uid.to_string(), branch: branch.to_string(), engine, dialects, values: None, tests: vec![], warnings, loaded_at: now() })
+        Ok(Model { uid: uid.to_string(), branch: branch.to_string(), engine, dialects, values: None, tests: vec![], warnings, loaded_at: now(), sources: vec![] })
     }
 
     /// Over what the loader read: its warnings first, then the universe's.
@@ -178,6 +181,7 @@ impl Model {
         m.warnings = warnings;
         m.values = loaded.values;
         m.tests = loaded.tests;
+        m.sources = loaded.sources;
         Ok(m)
     }
 

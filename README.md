@@ -80,7 +80,7 @@ zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strat
 zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
 zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
 zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
-zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
+zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
 ```
 
 A refusal is reported the same way from either side: `class: message`
@@ -112,8 +112,12 @@ calculation (`Alias = formula` or `formula as Alias`), anything else is a
 projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
 field. Commands start with a dot: `.fields`, `.tables`, `.values`,
-`.explore <line> [? term]`, `.json {...}`, `.spec <line>`, `.branch`, `.help`, `.quit`. Inside a project,
-`zsql` with no command opens the repl.
+`.explore <line> [? term]`, `.json {...}`, `.spec <line>`, `.reload`, `.branch`, `.help`, `.quit`. Inside a project,
+`zsql` with no command opens the repl. The repl holds the model it
+loaded and, before each line, checks the files that load read, imports
+included; when one moved it loads again and says so, and when the new
+files will not load it says that and keeps answering from the model it
+had. With `-r` it asks the server, and `.branch` switches branches there.
 
 `zsql-dev` (the devtool crate) is the engine on the command line for its
 own developers: the golden scoreboard, the bench, formation checks and

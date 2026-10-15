@@ -11,6 +11,7 @@ mod config;
 mod failure;
 mod local;
 mod remote;
+mod repl;
 mod show;
 mod templates;
 
@@ -20,7 +21,7 @@ use config::Project;
 use local::Local;
 use remote::Client;
 use serde_json::{json, Value};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -189,7 +190,7 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         line: Vec<String>,
     },
-    /// Plan interactively against the server.
+    /// Plan interactively: the model here, reloaded as its files change; with -r, the server's copy.
     Repl {
         #[arg(long)]
         context: Option<PathBuf>,
@@ -380,7 +381,13 @@ fn run(command: Command, at: Where) -> Result<()> {
             }
             Ok(())
         }
-        Command::Repl { context } => repl(at.target()?, read_json(context)?),
+        Command::Repl { context } => {
+            let context = read_json(context)?;
+            match at.mode()? {
+                Mode::Local(l) => repl::run(repl::Session::open(l)?, context),
+                Mode::Remote(t) => repl::run(t, context),
+            }
+        }
         Command::Fields { q, hidden } => {
             let q = q.unwrap_or_default();
             let v = match at.mode()? {
@@ -881,150 +888,6 @@ fn write_catalog(path: &Path, entries: &[Value]) -> Result<()> {
         enc.write_all(b"\n")?;
     }
     enc.finish()?;
-    Ok(())
-}
-
-// ------------------------------------------------------------------- repl
-
-fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
-    let tty = std::io::stdout().is_terminal();
-    let dim = |s: &str| if tty { format!("\x1b[2m{s}\x1b[0m") } else { s.to_string() };
-    let bold = |s: &str| if tty { format!("\x1b[1m{s}\x1b[0m") } else { s.to_string() };
-    let mut field_names: Vec<String> = Vec::new();
-    let announce = |t: &Target, field_names: &mut Vec<String>| -> Result<()> {
-        let summary = t.client.get(&remote::branch_path(&t.uid, &t.branch))?;
-        println!("{}", dim(&format!("{}/{} on {}: {} tables, {} fields, {} joins, {} policies", t.uid, t.branch, t.client.server, summary["tables"], summary["fields"], summary["joins"], summary["policies"])));
-        *field_names = t
-            .client
-            .get(&format!("{}/fields?hidden=true", remote::branch_path(&t.uid, &t.branch)))?["fields"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|f| [f["uid"].as_str().unwrap_or("").to_lowercase(), f["name"].as_str().unwrap_or("").to_lowercase()])
-            .collect();
-        Ok(())
-    };
-    announce(&t, &mut field_names)?;
-    println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
-
-    let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
-    let history = config::home().map(|h| h.join("history"));
-    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-        let _ = std::fs::create_dir_all(h.parent().unwrap());
-        let _ = ed.load_history(h);
-    }
-    let stdin = std::io::stdin();
-    loop {
-        let line = match editor.as_mut() {
-            Some(ed) => match ed.readline("zsql> ") {
-                Ok(l) => {
-                    let _ = ed.add_history_entry(l.as_str());
-                    l
-                }
-                Err(rustyline::error::ReadlineError::Interrupted) => continue,
-                Err(_) => break,
-            },
-            None => {
-                print!("zsql> ");
-                std::io::stdout().flush()?;
-                let mut l = String::new();
-                if stdin.lock().read_line(&mut l)? == 0 {
-                    break;
-                }
-                l
-            }
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
-        let names_a_field = |w: &str| field_names.iter().any(|n| n == &w.to_lowercase());
-        let cmd = match word.strip_prefix('.') {
-            Some(c) => c,
-            None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
-            None => "",
-        };
-        if matches!(cmd, "quit" | "exit" | "q") {
-            break;
-        }
-        let outcome: Result<()> = (|| {
-            match cmd {
-                "help" | "?" => println!("{}", zsql_shorthand::HELP),
-                "tables" => show::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?),
-                "fields" => show::print_fields(&t.client.get(&format!("{}/fields?q={}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(rest)))?),
-                "values" => {
-                    if rest.is_empty() {
-                        println!("usage: .values <dimension>");
-                    } else {
-                        show::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, rest)?);
-                    }
-                }
-                "branch" => {
-                    if rest.is_empty() {
-                        println!("{}", t.branch);
-                    } else {
-                        t.branch = rest.to_string();
-                        announce(&t, &mut field_names)?;
-                    }
-                }
-                "spec" => match zsql_service::spec_of(None, Some(rest), &zsql_service::unlimited) {
-                    Ok((spec, _, items)) => {
-                        for d in items {
-                            println!("{}", dim(&d));
-                        }
-                        println!("{}", serde_json::to_string_pretty(&spec)?);
-                    }
-                    Err(e) => println!("error: {e}"),
-                },
-                "" | "json" | "explain" | "explore" => {
-                    // A query: the shorthand, or a JSON spec after .json or
-                    // starting with a brace. .explain and .explore take
-                    // either; .explore narrows by a term after ` ? `.
-                    let text = if cmd.is_empty() { line } else { rest };
-                    let (text, term) = match cmd {
-                        "explore" => text.rsplit_once(" ? ").map(|(l, q)| (l.trim(), Some(q.trim()))).unwrap_or((text, None)),
-                        _ => (text, None),
-                    };
-                    let (spec, expr): (Option<Value>, Option<&str>) = if cmd == "json" || text.starts_with('{') {
-                        match serde_json::from_str(text) {
-                            Ok(v) => (Some(v), None),
-                            Err(e) => {
-                                println!("error: {e}");
-                                return Ok(());
-                            }
-                        }
-                    } else {
-                        (None, Some(text))
-                    };
-                    if cmd == "explore" {
-                        match remote::explore(&t.client, &t.uid, &t.branch, spec.as_ref(), expr, context.as_ref(), term) {
-                            Ok(v) => show::print_explore(&v, &dim, "server"),
-                            Err(e) => println!("error: {e}"),
-                        }
-                        return Ok(());
-                    }
-                    let t0 = Instant::now();
-                    match remote::sql(&t.client, &t.uid, &t.branch, spec.as_ref(), expr, context.as_ref(), cmd == "explain") {
-                        Ok(v) if cmd == "explain" => show::print_explain(&v, &dim, "server"),
-                        Ok(v) => {
-                            show::print_sql(&v, &dim, &bold);
-                            println!("{}", dim(&format!("-- round trip {:.2} ms", t0.elapsed().as_secs_f64() * 1e3)));
-                        }
-                        Err(e) => println!("error: {e}"),
-                    }
-                }
-                other => println!("unknown command .{other}; .help lists them"),
-            }
-            Ok(())
-        })();
-        if let Err(e) = outcome {
-            println!("error: {e}");
-        }
-    }
-    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-        let _ = ed.save_history(h);
-    }
     Ok(())
 }
 

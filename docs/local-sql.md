@@ -205,4 +205,4 @@ history for secrets, and confirm the licence covers every crate.
 
 ## Progress
 
-- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Repl still on the server until phase 3.
+- 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).
