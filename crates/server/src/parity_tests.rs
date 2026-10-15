@@ -31,9 +31,10 @@ fn single_tenant(data_dir: &std::path::Path) -> Shared {
         signup_open: false,
         secure_cookies: false,
         limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
-        admission: Admission::from_env().unwrap(),
+        admission: Admission::new(&limits::AdmissionCounts::default()),
         caps: Caps { per_project: usize::MAX, per_account: usize::MAX },
-        mailer: mail::Mailer::from_env("http://test".into()).unwrap(),
+        mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
+        mcp: mcp::Settings::builtin(),
     })
 }
 

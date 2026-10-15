@@ -48,4 +48,5 @@ zsql-warehouse = { path = "crates/warehouse" }
 zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
 zsql-service = { path = "crates/service" }
+zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }

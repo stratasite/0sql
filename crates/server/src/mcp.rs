@@ -43,7 +43,6 @@
 
 use super::*;
 use axum::http::HeaderMap;
-use std::sync::OnceLock;
 
 pub const PATH: &str = "/mcp";
 
@@ -55,34 +54,40 @@ struct Prompts {
     tools: HashMap<String, String>,
 }
 
-/// The compiled-in file, unless `ZSQL_MCP_PROMPTS` names one to read
-/// instead: the eval that tunes these restarts the server per variant,
-/// and an operator may want their own wording. A file that does not
-/// parse is a startup failure, not a silent fallback.
-fn prompts() -> &'static Prompts {
-    static P: OnceLock<Prompts> = OnceLock::new();
-    P.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_PROMPTS", include_str!("mcp_prompts.json"))).expect("the MCP prompts parse"))
+/// What MCP clients are told and may call: the prompts, the spec's
+/// schema, and which tools are exposed. Compiled in by default; the
+/// binary may read other texts (the eval that tunes the wording
+/// restarts the server per variant, and an operator may want their
+/// own) and an operator may expose a subset of the tools.
+pub struct Settings {
+    prompts: Prompts,
+    schema: Value,
+    tools: Option<Vec<String>>,
 }
 
-/// The query spec's JSON schema, as the sql, explain and explore tools
-/// declare their `spec` argument. Its `$defs` are hoisted to the root of
-/// each tool's input schema, where the `$ref`s point. `ZSQL_MCP_SPEC_SCHEMA`
-/// names a file to read instead of the compiled-in one.
-fn spec_schema() -> &'static Value {
-    static S: OnceLock<Value> = OnceLock::new();
-    S.get_or_init(|| {
-        serde_json::from_str(&file_or("ZSQL_MCP_SPEC_SCHEMA", include_str!("mcp_spec_schema.json"))).expect("the MCP spec schema parses")
-    })
-}
+impl Settings {
+    /// The compiled-in prompts and schema, every tool exposed.
+    pub fn builtin() -> Settings {
+        Settings::new(None, None, None).expect("the compiled-in MCP texts parse")
+    }
 
-fn file_or(var: &str, compiled: &str) -> String {
-    match std::env::var(var) {
-        Ok(path) if !path.trim().is_empty() => {
-            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{var}: cannot read {path}: {e}"));
-            eprintln!("zsqld: mcp: {var} read from {path}");
-            text
+    /// `prompts` and `schema` are JSON texts in place of the compiled-in
+    /// ones; `tools` names the tools to expose, or every tool.
+    pub fn new(prompts: Option<&str>, schema: Option<&str>, tools: Option<Vec<String>>) -> Result<Settings, String> {
+        let prompts: Prompts = serde_json::from_str(prompts.unwrap_or(include_str!("mcp_prompts.json")))
+            .map_err(|e| format!("the MCP prompts do not parse: {e}"))?;
+        let schema: Value = serde_json::from_str(schema.unwrap_or(include_str!("mcp_spec_schema.json")))
+            .map_err(|e| format!("the MCP spec schema does not parse: {e}"))?;
+        Ok(Settings { prompts, schema, tools })
+    }
+
+    /// Whether a tool is exposed. A call to one that is not is refused
+    /// like an unknown tool.
+    fn exposed(&self, name: &str) -> bool {
+        match &self.tools {
+            Some(list) => list.iter().any(|t| t == name),
+            None => true,
         }
-        _ => compiled.to_string(),
     }
 }
 
@@ -214,11 +219,11 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", prompts().instructions, if keyed(app, who) { catalogue(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalogue of the branches a key may read follows the instructions once one is.".into() }),
+                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, if keyed(app, who) { catalogue(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalogue of the branches a key may read follows the instructions once one is.".into() }),
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/list" => Ok(json!({ "tools": tools(&app.mcp) })),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -345,28 +350,15 @@ fn branch_catalogue(d: &Model) -> String {
 /// The tools, as the client lists them. Every schema refuses unknown
 /// properties, so a `context` can be reported for what it is rather
 /// than silently dropped.
-/// The tools an operator chose to expose, `ZSQL_MCP_TOOLS` as a comma
-/// list, or every tool. A call to a tool not exposed is refused like
-/// an unknown one.
-fn exposed(name: &str) -> bool {
-    static E: OnceLock<Option<Vec<String>>> = OnceLock::new();
-    match E.get_or_init(|| {
-        std::env::var("ZSQL_MCP_TOOLS").ok().filter(|v| !v.trim().is_empty()).map(|v| v.split(',').map(|t| t.trim().to_string()).collect())
-    }) {
-        Some(list) => list.iter().any(|t| t == name),
-        None => true,
-    }
-}
-
-fn tools() -> Vec<Value> {
+fn tools(settings: &Settings) -> Vec<Value> {
     let target = json!({
         "project": { "type": "string", "description": "the project uid" },
         "branch": { "type": "string", "description": "a deployed branch; the project's production branch when omitted" },
     });
-    let mut spec = spec_schema().clone();
+    let mut spec = settings.schema.clone();
     let defs = spec.as_object_mut().and_then(|m| m.remove("$defs")).unwrap_or(Value::Null);
     let spec_arg = json!({ "spec": spec });
-    let describe = |name: &str| prompts().tools.get(name).cloned().unwrap_or_default();
+    let describe = |name: &str| settings.prompts.tools.get(name).cloned().unwrap_or_default();
     let schema = |props: &[&Value], required: &[&str], description: &str, with_defs: bool| {
         let mut p = serde_json::Map::new();
         for v in props {
@@ -391,7 +383,7 @@ fn tools() -> Vec<Value> {
         json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
         json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
     ];
-    all.into_iter().filter(|t| exposed(t["name"].as_str().unwrap_or(""))).collect()
+    all.into_iter().filter(|t| settings.exposed(t["name"].as_str().unwrap_or(""))).collect()
 }
 
 #[derive(Deserialize)]
@@ -541,7 +533,7 @@ fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &st
 }
 
 async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
-    if !exposed(name) {
+    if !app.mcp.exposed(name) {
         return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
     }
     if !keyed(app, who) {

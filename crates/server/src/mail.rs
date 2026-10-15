@@ -42,25 +42,21 @@ pub enum Sent {
 }
 
 impl Mailer {
-    /// Reads the environment. `public_url` is where links point, which
-    /// is `ZSQL_PUBLIC_URL` when set and the bind address otherwise.
+    /// `command` is fed each message on stdin, or `None` for no mail;
+    /// `public_url` is where links point.
     ///
     /// A command without a `From` is refused at start-up rather than at
     /// the first reset: the message would be rejected by any relay, and
     /// the first reset is exactly when nobody is watching.
-    pub fn from_env(public_url: String) -> Result<Mailer, String> {
-        let command = std::env::var("ZSQL_MAIL_COMMAND").ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-        let from = std::env::var("ZSQL_MAIL_FROM").unwrap_or_default().trim().to_string();
+    pub fn new(command: Option<String>, from: &str, timeout: Duration, public_url: &str) -> Result<Mailer, String> {
+        let command = command.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+        let from = from.trim().to_string();
         if command.is_some() && from.is_empty() {
-            return Err("ZSQL_MAIL_COMMAND is set but ZSQL_MAIL_FROM is not: a message needs a sender".into());
+            return Err("a mail command is set but no sender is: a message needs a From".into());
         }
         if header_unsafe(&from) {
-            return Err("ZSQL_MAIL_FROM holds a line break".into());
+            return Err("the mail sender holds a line break".into());
         }
-        let timeout = match std::env::var("ZSQL_MAIL_TIMEOUT") {
-            Ok(v) => Duration::from_secs(v.trim().parse().map_err(|_| format!("ZSQL_MAIL_TIMEOUT: {v:?} is not a number of seconds"))?),
-            Err(_) => Duration::from_secs(20),
-        };
         Ok(Mailer { command, from, public_url: public_url.trim_end_matches('/').to_string(), timeout })
     }
 

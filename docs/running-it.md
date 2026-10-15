@@ -12,7 +12,7 @@ host".
 
 | | |
 |---|---|
-| binary | `/usr/local/bin/zsqld` |
+| binary | `/usr/local/bin/zsqld` (the same server as `zsql serve`, configured from the environment) |
 | settings | `/etc/zsqld.env`, mode 0600 |
 | unit | `/etc/systemd/system/zsqld.service` |
 | data | `/var/lib/zsqld`, owned by the `zsqld` system user |

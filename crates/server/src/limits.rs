@@ -250,7 +250,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn parse(s: &str) -> Mode {
+    pub fn parse(s: &str) -> Mode {
         match s.trim().to_ascii_lowercase().as_str() {
             "on" | "1" | "true" => Mode::On,
             "shadow" | "log" | "dry-run" => Mode::Shadow,
@@ -314,49 +314,7 @@ impl Default for Config {
     }
 }
 
-fn env_rate(name: &str, slot: &mut Rate) -> Result<(), String> {
-    if let Ok(v) = std::env::var(name) {
-        *slot = Rate::parse(&v).map_err(|e| format!("{name}: {e}"))?;
-    }
-    Ok(())
-}
-
 impl Config {
-    /// Reads the environment. `accounts_on` picks the default mode: the
-    /// limits are about sharing one server between tenants, so a
-    /// single-tenant self-hosted server starts with them off.
-    pub fn from_env(accounts_on: bool) -> Result<Config, String> {
-        let mut c = Config { mode: if accounts_on { Mode::On } else { Mode::Off }, ..Config::default() };
-        if let Ok(v) = std::env::var("ZSQL_LIMITS") {
-            c.mode = Mode::parse(&v);
-        }
-        env_rate("ZSQL_LIMIT_PLAN", &mut c.plan)?;
-        env_rate("ZSQL_LIMIT_EXPLORE", &mut c.explore)?;
-        env_rate("ZSQL_LIMIT_HEAVY", &mut c.heavy)?;
-        env_rate("ZSQL_LIMIT_MANAGE", &mut c.manage)?;
-        env_rate("ZSQL_LIMIT_KEY_PLAN", &mut c.key_plan)?;
-        env_rate("ZSQL_LIMIT_KEY_EXPLORE", &mut c.key_explore)?;
-        env_rate("ZSQL_LIMIT_LOGIN", &mut c.login)?;
-        env_rate("ZSQL_LIMIT_SIGNUP", &mut c.signup)?;
-        env_rate("ZSQL_LIMIT_INVITE", &mut c.invite)?;
-        env_rate("ZSQL_LIMIT_RESET", &mut c.reset)?;
-        env_rate("ZSQL_LIMIT_BAD_KEY", &mut c.bad_key)?;
-        env_rate("ZSQL_LIMIT_HANDSHAKE", &mut c.handshake)?;
-        if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_FAILURES") {
-            c.email_failures = if v.trim().eq_ignore_ascii_case("off") {
-                0
-            } else {
-                v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))?
-            };
-        }
-        if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_WINDOW") {
-            c.email_window =
-                Duration::from_secs(v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_WINDOW: {v:?} is not a number of seconds"))?);
-        }
-        c.trusted_proxy = matches!(std::env::var("ZSQL_TRUSTED_PROXY").as_deref(), Ok("1") | Ok("on") | Ok("true"));
-        Ok(c)
-    }
-
     fn account_rate(&self, class: Class) -> Rate {
         match class {
             Class::Plan => self.plan,
@@ -588,22 +546,34 @@ pub fn deadline(class: Class) -> Duration {
     }
 }
 
-impl Admission {
-    pub fn from_env() -> Result<Admission, String> {
+/// How many of each class may be in the server at once.
+#[derive(Debug, Clone)]
+pub struct AdmissionCounts {
+    pub plan: usize,
+    pub explore: usize,
+    pub heavy: usize,
+    pub manage: usize,
+    pub password: usize,
+}
+
+impl Default for AdmissionCounts {
+    /// Sized from the cores: planning is quick and parallel, heavy work
+    /// and password hashing are neither.
+    fn default() -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let n = |name: &str, default: usize| -> Result<usize, String> {
-            match std::env::var(name) {
-                Ok(v) => v.trim().parse().map_err(|_| format!("{name}: {v:?} is not a number")),
-                Err(_) => Ok(default),
-            }
-        };
-        Ok(Admission {
-            plan: Arc::new(Semaphore::new(n("ZSQL_ADMIT_PLAN", cores * 4)?)),
-            explore: Arc::new(Semaphore::new(n("ZSQL_ADMIT_EXPLORE", cores)?)),
-            heavy: Arc::new(Semaphore::new(n("ZSQL_ADMIT_HEAVY", 2)?)),
-            manage: Arc::new(Semaphore::new(n("ZSQL_ADMIT_MANAGE", cores * 2)?)),
-            password: Arc::new(Semaphore::new(n("ZSQL_ADMIT_PASSWORD", 2)?)),
-        })
+        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, manage: cores * 2, password: 2 }
+    }
+}
+
+impl Admission {
+    pub fn new(counts: &AdmissionCounts) -> Admission {
+        Admission {
+            plan: Arc::new(Semaphore::new(counts.plan)),
+            explore: Arc::new(Semaphore::new(counts.explore)),
+            heavy: Arc::new(Semaphore::new(counts.heavy)),
+            manage: Arc::new(Semaphore::new(counts.manage)),
+            password: Arc::new(Semaphore::new(counts.password)),
+        }
     }
 
     fn semaphore(&self, class: Class) -> Option<&Arc<Semaphore>> {
@@ -812,9 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_refuses_when_there_is_no_room() {
-        std::env::set_var("ZSQL_ADMIT_HEAVY", "1");
-        let a = Admission::from_env().unwrap();
-        std::env::remove_var("ZSQL_ADMIT_HEAVY");
+        let a = Admission::new(&AdmissionCounts { heavy: 1, ..AdmissionCounts::default() });
         let held = a.admit(Class::Heavy).await.expect("the first one gets in");
         // The second waits its patience out and is told to come back.
         let t0 = Instant::now();
@@ -827,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn exempt_requests_need_no_permit() {
-        let a = Admission::from_env().unwrap();
+        let a = Admission::new(&AdmissionCounts::default());
         assert!(a.admit(Class::Exempt).await.unwrap().is_none());
     }
 }
