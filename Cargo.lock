@@ -3150,7 +3150,6 @@ dependencies = [
  "flate2",
  "http-body-util",
  "regex",
- "self_cell",
  "serde",
  "serde_json",
  "tar",
@@ -3158,6 +3157,24 @@ dependencies = [
  "tower",
  "zsql-accounts",
  "zsql-dialect",
+ "zsql-semantic",
+ "zsql-service",
+ "zsql-shorthand",
+ "zsql-spec",
+]
+
+[[package]]
+name = "zsql-service"
+version = "0.5.4"
+dependencies = [
+ "flate2",
+ "regex",
+ "self_cell",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zsql-dialect",
+ "zsql-golden",
  "zsql-planner",
  "zsql-project",
  "zsql-semantic",

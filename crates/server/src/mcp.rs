@@ -227,7 +227,7 @@ const CATALOGUE_BYTES: usize = 48 * 1024;
 /// prompt cache can hold it.
 fn catalogue(app: &App, who: &Option<Principal>) -> String {
     let models = app.models.read().unwrap();
-    let mut readable: Vec<Arc<Deployed>> = in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
+    let mut readable: Vec<Arc<Model>> = in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
     drop(models);
     readable.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
     if readable.is_empty() {
@@ -249,7 +249,7 @@ fn catalogue(app: &App, who: &Option<Principal>) -> String {
     short
 }
 
-fn branch_catalogue(d: &Deployed) -> String {
+fn branch_catalogue(d: &Model) -> String {
     let u = d.universe();
     let s = u.snapshot();
     // Field id to the uids of the tables carrying it, sorted.

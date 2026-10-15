@@ -16,6 +16,7 @@ crates/golden     golden cases and the scoreboard
 crates/cli        zsql: init, deploy, and every server endpoint; no engine inside
 crates/devtool    zsql-dev: the engine on the command line (local plan, goldens, bench)
 crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
+crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by zsql and zsqld
 crates/accounts   accounts, users, keys and project access (SQLite)
 crates/server     zsqld: deploy a project, plan specs
 crates/warehouse  duckdb and postgres drivers for value sampling

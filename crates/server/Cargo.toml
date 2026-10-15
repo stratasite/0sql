@@ -13,10 +13,7 @@ path = "src/main.rs"
 zsql-semantic.workspace = true
 zsql-dialect.workspace = true
 zsql-spec.workspace = true
-zsql-planner.workspace = true
-zsql-project.workspace = true
 zsql-accounts.workspace = true
-zsql-shorthand.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde.workspace = true
@@ -24,9 +21,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 flate2.workspace = true
 tar = "0.4"
-regex = "1"
-self_cell = "1"
+zsql-service.workspace = true
 
 [dev-dependencies]
+zsql-shorthand.workspace = true
+regex = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
