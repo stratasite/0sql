@@ -51,7 +51,8 @@ lifted out of `server/src/main.rs` without behaviour change:
   process in each binary, and live on `Model` so the functions do not
   take them separately.
 - `ServiceError { class, message, kind }` where `kind` is `Invalid`,
-  `TooLarge`, `Unprocessable`, `NotFound` or `Internal`. The server maps
+  `Unprocessable`, `NotFound` or `Internal` (the server's request-shape
+  limits make their own `TooLarge`). The server maps
   the kind to a status; the CLI prints `class: message`, which is what it
   already prints for a server refusal. The `ContextRequired` rule lives
   here so local planning enforces it. The request shape limits stay in

@@ -69,7 +69,7 @@ tools; `docs/mcp.md`.
 ```
 POST   /signup                                 {account, email, name?, password?} → account, user, key, secret (once; an email that is already a user's needs that user's password)
 GET    /me
-GET    /account/members                        POST {email, name?, role}  (admin; a member without a key also gets an invite token, once)
+GET    /account/members                        any member may list; POST {email, name?, role} is admin (a member without a key also gets an invite token, once)
 DELETE /account/members/{email}                                           (admin)
 POST   /account/members/{email}/invite         a fresh invite token        (admin)
 POST   /invites/accept                         {token, name?, key_name?, password?} → account, user, key, secret (no auth; the token is the credential; newcomers only, 7 days)

@@ -29,19 +29,47 @@ impl Universe {
         let mut problems = Vec::new();
         let mut warnings = Vec::new();
 
-        let datasources_by_id: HashMap<Id, usize> = snap.datasources.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
-        let tables_by_id: HashMap<Id, usize> = snap.tables.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
-        let tables_by_uid: HashMap<String, usize> = snap.tables.iter().enumerate().map(|(i, t)| (t.uid.clone(), i)).collect();
-        let fields_by_id: HashMap<Id, usize> = snap.fields.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+        // Every id is unique, or the index would keep whichever came
+        // last and silently answer for both.
+        fn by_id<T>(items: &[T], id: impl Fn(&T) -> Id, what: &str, problems: &mut Vec<String>) -> HashMap<Id, usize> {
+            let mut out = HashMap::new();
+            for (i, item) in items.iter().enumerate() {
+                if out.insert(id(item), i).is_some() {
+                    problems.push(format!("duplicate {what} id {}", id(item)));
+                }
+            }
+            out
+        }
+        let datasources_by_id = by_id(&snap.datasources, |d| d.id, "datasource", &mut problems);
+        let tables_by_id = by_id(&snap.tables, |t| t.id, "table", &mut problems);
+        let fields_by_id = by_id(&snap.fields, |f| f.id, "field", &mut problems);
+        let joins_by_id = by_id(&snap.join_defs, |j| j.id, "join", &mut problems);
+        // Uids are looked up trimmed and lower-cased, so they are kept
+        // that way.
+        let mut tables_by_uid = HashMap::new();
+        for (i, t) in snap.tables.iter().enumerate() {
+            if tables_by_uid.insert(t.uid.trim().to_lowercase(), i).is_some() {
+                problems.push(format!("duplicate table uid {}", t.uid));
+            }
+            if t.cost < 0 {
+                problems.push(format!("table {} has a negative cost ({}); costs rank routes and must not be negative", t.uid, t.cost));
+            }
+        }
         let mut fields_by_uid = HashMap::new();
         let mut fields_by_name = HashMap::new();
         for (i, f) in snap.fields.iter().enumerate() {
-            if fields_by_uid.insert((f.kind, f.uid.clone()), i).is_some() {
+            if fields_by_uid.insert((f.kind, f.uid.trim().to_lowercase()), i).is_some() {
                 problems.push(format!("duplicate {:?} uid {}", f.kind, f.uid));
             }
-            fields_by_name.entry((f.kind, f.name.trim().to_lowercase())).or_insert(i);
+            if fields_by_name.insert((f.kind, f.name.trim().to_lowercase()), i).is_some() {
+                problems.push(format!("duplicate {:?} name {}", f.kind, f.name));
+            }
         }
-        let joins_by_id: HashMap<Id, usize> = snap.join_defs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
+        for j in &snap.join_defs {
+            if j.cost < 0 {
+                problems.push(format!("join {} has a negative cost ({})", j.id, j.cost));
+            }
+        }
 
         for t in &snap.tables {
             if !datasources_by_id.contains_key(&t.datasource_id) {
@@ -110,7 +138,7 @@ impl Universe {
 
         // Rails skips a policy whose context dimension does not resolve; so do we.
         for pol in &snap.security_policies {
-            if !fields_by_uid.contains_key(&(FieldKind::Dimension, pol.context_dimension_uid.clone())) {
+            if !fields_by_uid.contains_key(&(FieldKind::Dimension, pol.context_dimension_uid.trim().to_lowercase())) {
                 warnings.push(format!("policy {} context dimension {} not found; policy is inert", pol.uid, pol.context_dimension_uid));
             }
         }
@@ -151,7 +179,7 @@ impl Universe {
     }
 
     pub fn table_by_uid(&self, uid: &str) -> Option<&Table> {
-        self.tables_by_uid.get(uid).map(|&i| &self.snap.tables[i])
+        self.tables_by_uid.get(&uid.trim().to_lowercase()).map(|&i| &self.snap.tables[i])
     }
 
     pub fn field(&self, id: Id) -> Option<&Field> {

@@ -1,11 +1,12 @@
-//! Sampled dimension values: what a dimension's column actually holds, so a
-//! question like "shoes" can be matched to a value before any warehouse
-//! probe. Written by `zsql values sample` to `samples/values.jsonl.gz` in
-//! the project directory, one line per dimension, and shipped with the model.
+//! Sampled dimension values: what a dimension's column actually holds,
+//! so a question like "shoes" can be matched to a value before any
+//! warehouse probe. Written by the project's own tooling to
+//! `samples/values.jsonl.gz`, one JSON object per line, gzipped, and
+//! shipped with the model; 0sql never runs SQL to make it.
 //!
-//! The file is customer data: gitignored by default, regenerable, and
-//! only ever holds dimensions that are listable (not hidden, listing not
-//! disabled, not named by a security policy's triggers).
+//! The file is customer data: gitignored by default, and best kept to
+//! dimensions that are listable (not hidden, listing not disabled, not
+//! named by a security policy's triggers).
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -16,7 +17,6 @@ pub const FILE_NAME: &str = "values.jsonl.gz";
 /// The most the file may hold once inflated: a thousand values for
 /// each of a few thousand dimensions is tens of megabytes.
 pub const INFLATED_LIMIT: u64 = 256 << 20;
-/// A `full` sample above this many distinct values is refused.
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ValueCatalog {

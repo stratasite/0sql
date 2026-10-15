@@ -261,11 +261,11 @@ impl Side for Session {
     }
 
     fn check(&mut self) -> Result<Value> {
-        Ok(local::check(&self.model))
+        local::check(&self.model)
     }
 
     fn test(&mut self) -> Result<Value> {
-        Ok(self.model.run_tests())
+        Ok(self.model.run_tests().map_err(Refusal::from)?)
     }
 }
 

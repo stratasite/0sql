@@ -74,9 +74,9 @@ pub fn explore(m: &Model, query: &Query, context: Option<&Value>, q: Option<&str
 
 /// What a validate answers with: the summary, the test results, and
 /// that nothing was kept.
-pub fn check(m: &Model) -> Value {
+pub fn check(m: &Model) -> Result<Value> {
     let mut out = m.summary();
-    out["test_results"] = m.run_tests();
+    out["test_results"] = m.run_tests().map_err(Refusal::from)?;
     out["validated_only"] = json!(true);
-    out
+    Ok(out)
 }

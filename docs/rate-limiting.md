@@ -111,7 +111,9 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 | manage | the account endpoints | cores × 2 | 1 s |
 
 The heavy and password classes also run on `tokio::task::spawn_blocking`,
-so a deploy or an argon2 hash never holds a runtime worker. Measured: 508
+so a deploy or an argon2 hash never holds a runtime worker, and a hash
+is checked with the store's lock released, so a login in progress does
+not stall every other authentication behind it. Measured: 508
 deploys running flat out during a load test cost plan throughput 20% and
 left its p99 at 5.7 ms. Before, deploys stalled the runtime.
 

@@ -156,7 +156,7 @@ async fn local_and_server_answer_alike() {
         let base = format!("/projects/{uid}/branches/main");
         let (status, body) = call(&router, Method::POST, &format!("{base}/deploy"), Some(archive_of_dir(dir)), "application/gzip").await;
         assert_eq!(status, StatusCode::OK, "{uid}: {body}");
-        assert_eq!(body["test_results"], local.run_tests(), "{uid}: test results");
+        assert_eq!(body["test_results"], local.run_tests().unwrap(), "{uid}: test results");
         assert_eq!(body["fields"], local.summary()["fields"], "{uid}: field count");
 
         for spec in specs_over(&local) {

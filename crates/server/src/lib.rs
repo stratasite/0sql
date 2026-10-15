@@ -785,7 +785,7 @@ fn deploy_or_validate(
         let deployed =
             Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
         let mut out = deployed.summary();
-        out["test_results"] = deployed.run_tests();
+        out["test_results"] = deployed.run_tests()?;
         out["validated_only"] = Value::Bool(!keep);
         if keep {
             // Keep the compiled model on disk so a restart reloads it:
@@ -1147,7 +1147,7 @@ async fn test(
     let d = model(&app, &t, &uid, &branch)?;
     blocking(move || {
         let _held = held;
-        Ok(Json(d.run_tests()))
+        Ok(Json(d.run_tests()?))
     })
     .await
 }
