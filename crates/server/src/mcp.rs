@@ -118,7 +118,7 @@ pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
     };
     let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
     let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    eprintln!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
+    say!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
 }
 
 /// Whether the caller may read anything: with accounts on, a key must
@@ -207,7 +207,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
             )
             .trim()
             .to_string();
-            eprintln!(
+            say!(
                 "zsqld: mcp: {} connected: {client}",
                 who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() {
                     "no key".into()

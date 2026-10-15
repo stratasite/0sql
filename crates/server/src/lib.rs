@@ -25,6 +25,16 @@
 //! GET  /healthz
 //! ```
 
+/// A line to the log. Never a panic: a server whose stderr has gone
+/// away (a pipe its reader closed) keeps serving, which `eprintln!`
+/// would not allow.
+macro_rules! say {
+    ($($t:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 pub mod limits;
 pub mod mail;
 mod mcp;
@@ -445,7 +455,7 @@ fn scope_of(who: &Option<Principal>) -> String {
 /// A failure of the store itself: logged here, answered with a fixed
 /// line, since what SQLite has to say is about this box.
 fn internal(e: zsql_accounts::Error) -> ApiError {
-    eprintln!("zsqld: accounts: {e}");
+    say!("zsqld: accounts: {e}");
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", "the accounts store failed; see the server's log".into())
 }
 
@@ -1354,11 +1364,11 @@ fn deliver(app: &App, to: &str, subject: &str, body: &str, link: &str, what: &st
     match app.mailer.send(to, subject, body) {
         Ok(mail::Sent::Delivered) => true,
         Ok(mail::Sent::NotConfigured) => {
-            eprintln!("zsqld: no ZSQL_MAIL_COMMAND is set, so the {what} link for {to} was not sent: {link}");
+            say!("zsqld: no ZSQL_MAIL_COMMAND is set, so the {what} link for {to} was not sent: {link}");
             false
         }
         Err(e) => {
-            eprintln!("zsqld: sending the {what} link to {to} failed: {e}");
+            say!("zsqld: sending the {what} link to {to} failed: {e}");
             false
         }
     }
@@ -1918,7 +1928,7 @@ fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
                         n += 1;
                     }
                     Err(e) => {
-                        eprintln!("zsqld: {key} was not loaded: {e}");
+                        say!("zsqld: {key} was not loaded: {e}");
                         skipped.push(key);
                     }
                 }
@@ -2098,7 +2108,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         deploying: std::sync::Mutex::new(()),
     });
     let (n, skipped) = reload(&app)?;
-    eprintln!(
+    say!(
         "zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}",
         app.data_dir.display(),
         if accounts_on {
@@ -2114,11 +2124,11 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     if !skipped.is_empty() {
         // Said again, together, after the per-branch lines above: the
         // one line someone watching a restart will actually read.
-        eprintln!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
+        say!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
     }
     if accounts_on {
         let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
-        eprintln!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
+        say!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
     }
 
     let router = router(app.clone());
@@ -2143,11 +2153,11 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // The address actually bound, so a port of 0 is answered with the
     // port it got.
     let addr = listener.local_addr()?;
-    eprintln!("zsqld: listening on http://{addr}");
+    say!("zsqld: listening on http://{addr}");
     listening(addr);
     // Connect info: the per-address limits need the peer's address.
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await?;
-    eprintln!("zsqld: stopped");
+    say!("zsqld: stopped");
     Ok(())
 }
 
@@ -2194,7 +2204,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        eprintln!("zsqld: stopping");
+        say!("zsqld: stopping");
     }
 }
 
@@ -2207,7 +2217,15 @@ fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // A `zsql server status` probes the lock by taking it for a
+        // moment; one short retry keeps that from refusing a server.
+        let taken = (0..2).any(|i| {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        });
+        if !taken {
             let mut other = String::new();
             let _ = file.read_to_string(&mut other);
             anyhow::bail!(

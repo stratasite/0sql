@@ -11,7 +11,7 @@ description: \n\
 # branch, so this is the branch to merge into when a change is ready.\n\
 production_branch: main\n\
 \n\
-# A self-hosted server, if any. The hosted service is used otherwise; the\n\
+# The server `zsql deploy` sends to, when it is not the local one; the\n\
 # api key lives in .zsql, never here.\n\
 # server: http://127.0.0.1:3699\n"
     )

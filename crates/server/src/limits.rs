@@ -435,7 +435,7 @@ impl Limiter {
             return false;
         }
         if self.cfg.mode == Mode::Shadow {
-            eprintln!("zsqld: rate limit (shadow) would refuse {what}: retry after {}s", d.retry_after);
+            say!("zsqld: rate limit (shadow) would refuse {what}: retry after {}s", d.retry_after);
             return false;
         }
         true
@@ -479,7 +479,7 @@ impl Limiter {
         };
         match (over, self.cfg.mode) {
             (Some(secs), Mode::Shadow) => {
-                eprintln!("zsqld: rate limit (shadow) would refuse logins for this email for {secs}s");
+                say!("zsqld: rate limit (shadow) would refuse logins for this email for {secs}s");
                 None
             }
             (other, _) => other,

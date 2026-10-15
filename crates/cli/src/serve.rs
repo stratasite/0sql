@@ -12,7 +12,7 @@
 //! with flags overriding what they name; this is the one place in the
 //! product a `ZSQL_*` variable is read.
 
-use crate::{config, project_archive, remote, show, Where};
+use crate::{config, project, remote, show, Where};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::ffi::OsString;
@@ -65,12 +65,15 @@ impl ServeArgs {
         }
     }
 
-    /// Where deployed models live.
+    /// Where deployed models live, as an absolute path: the background
+    /// form records it, and `status` and `stop` read it from wherever
+    /// they are run.
     fn data_dir(&self) -> Result<PathBuf> {
-        match &self.data_dir {
-            Some(d) => Ok(d.clone()),
-            None => Ok(home()?.join("data")),
-        }
+        let dir = match &self.data_dir {
+            Some(d) => d.clone(),
+            None => home()?.join("data"),
+        };
+        Ok(std::path::absolute(&dir).unwrap_or(dir))
     }
 
     /// The whole configuration: the environment's settings, with the
@@ -156,11 +159,9 @@ impl ServeArgs {
     /// These arguments as `zsql serve` would take them, for the
     /// background form to hand on; kept next to the fields so a new
     /// flag cannot be forgotten here.
-    fn to_argv(&self, project: Option<&Path>) -> Vec<OsString> {
+    fn to_argv(&self, project: Option<&Path>) -> Result<Vec<OsString>> {
         let mut argv: Vec<OsString> = vec!["serve".into(), "--bind".into(), self.bind.clone().into()];
-        if let Some(d) = &self.data_dir {
-            argv.extend(["--data-dir".into(), d.clone().into()]);
-        }
+        argv.extend(["--data-dir".into(), self.data_dir()?.into()]);
         if self.accounts {
             argv.push("--accounts".into());
         }
@@ -178,7 +179,7 @@ impl ServeArgs {
         if let Some(u) = &self.public_url {
             argv.extend(["--public-url".into(), u.clone().into()]);
         }
-        argv
+        Ok(argv)
     }
 }
 
@@ -288,7 +289,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
             let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
             eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
             let deploy = || -> Result<()> {
-                let archive = project_archive(&p.dir)?;
+                let archive = project::archive(&p.dir)?;
                 let v = client.post_bytes(&format!("{}/deploy", remote::branch_path(&p.uid, &branch)), "application/gzip", &archive)?;
                 show::print_deploy(&v);
                 Ok(())
@@ -296,7 +297,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
             if let Err(e) = deploy() {
                 eprintln!("error: {e}");
             }
-            crate::watch_files(
+            project::watch(
                 &p.dir,
                 || server.is_finished(),
                 || {
@@ -312,15 +313,8 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
                 "zsql: accounts are on, so {} is not deployed by itself; sign up, make a key, and `zsql deploy --server http://{addr}`",
                 p.dir.display()
             );
-            while !server.is_finished() {
-                std::thread::sleep(Duration::from_millis(500));
-            }
         }
-        (None, _) => {
-            while !server.is_finished() {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
+        (None, _) => {}
     }
     finish(server)
 }
@@ -351,39 +345,56 @@ fn log_file() -> Result<PathBuf> {
     Ok(home()?.join("server.log"))
 }
 
-/// The pid holding a data directory's lock, if any: the server itself
-/// writes its pid there under the lock, so this is the one answer that
-/// a stale pidfile or a reused pid cannot fake.
+/// Who holds a data directory's lock: the server itself writes its pid
+/// there under the lock, so this is the one answer that a stale pidfile
+/// or a reused pid cannot fake.
+enum Lock {
+    /// Nobody: the file could be opened and locked.
+    Free,
+    /// A process, by the pid it wrote.
+    Held(Option<u32>),
+    /// The file could not be opened, so nothing can be said.
+    Unreachable,
+}
+
 #[cfg(unix)]
-fn lock_holder(data_dir: &Path) -> Option<u32> {
+fn lock_holder(data_dir: &Path) -> Lock {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(data_dir.join("lock")).ok()?;
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(data_dir.join("lock")) else { return Lock::Unreachable };
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return None;
+        return Lock::Free;
     }
     let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    text.trim().parse().ok()
+    let _ = file.read_to_string(&mut text);
+    Lock::Held(text.trim().parse().ok())
 }
 
 #[cfg(not(unix))]
-fn lock_holder(_data_dir: &Path) -> Option<u32> {
-    None
+fn lock_holder(_data_dir: &Path) -> Lock {
+    Lock::Unreachable
 }
 
 /// The server `start` recorded, when it is the one holding its data
-/// directory's lock.
+/// directory's lock. When the lock cannot be reached, the recorded pid
+/// is believed only while that process exists.
 fn running() -> Result<Option<Started>> {
     let Ok(text) = std::fs::read_to_string(pid_file()?) else { return Ok(None) };
     let Ok(s) = serde_json::from_str::<Started>(&text) else { return Ok(None) };
-    Ok((lock_holder(&s.data_dir) == Some(s.pid)).then_some(s))
+    let yes = match lock_holder(&s.data_dir) {
+        Lock::Held(pid) => pid == Some(s.pid),
+        Lock::Free => false,
+        Lock::Unreachable => alive(s.pid),
+    };
+    Ok(yes.then_some(s))
 }
 
+/// Whether a process exists. Not being allowed to signal it still means
+/// it exists; only "no such process" means it does not.
 #[cfg(unix)]
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__errno_location() != libc::ESRCH }
 }
 
 #[cfg(not(unix))]
@@ -432,9 +443,12 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         (false, true) => Some(at.project_dir()?.dir),
         (false, false) => at.project_dir().ok().map(|p| p.dir),
     };
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_file()?)?;
+    let project = project.map(|p| std::path::absolute(&p).unwrap_or(p));
+    let log_path = log_file()?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let log_len = log.metadata().map(|m| m.len()).unwrap_or(0);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(args.to_argv(project.as_deref()));
+    cmd.args(args.to_argv(project.as_deref())?);
     cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     {
@@ -448,20 +462,34 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         }
     }
     let mut child = cmd.spawn().context("starting zsql serve")?;
-    let started = Started { pid: child.id(), bind: args.bind(), data_dir };
+    let mut started = Started { pid: child.id(), bind: args.bind(), data_dir };
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
-    // Give it a moment to refuse, so a bad bind or a held data
-    // directory is reported here and not only in the log. The child is
-    // reaped here, not just signalled: an exited child answers a signal
-    // until it is.
-    std::thread::sleep(Duration::from_millis(700));
-    if let Some(status) = child.try_wait()? {
-        let _ = std::fs::remove_file(pid_file()?);
-        let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
-        let last = text.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        bail!("the server stopped at once ({status}); the log ends:\n{last}");
+    // Wait for it to say where it listens, which is also when a bad
+    // bind or a held data directory has been refused. The child is
+    // reaped here, not just signalled, since an exited child answers a
+    // signal until it is.
+    let t0 = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let _ = std::fs::remove_file(pid_file()?);
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let last = text.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            bail!("the server stopped at once ({status}); the log ends:\n{last}");
+        }
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let since = text.get(log_len as usize..).unwrap_or("");
+        if let Some(addr) = since.lines().find_map(|l| l.trim().strip_prefix("zsqld: listening on http://")) {
+            // The address actually bound, which a bind of port 0 does not say.
+            started.bind = addr.to_string();
+            std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
+            break;
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    println!("started process {} on {}; log at {}", started.pid, started.bind, log_file()?.display());
+    println!("started process {} on {}; log at {}", started.pid, started.bind, log_path.display());
     Ok(())
 }
 

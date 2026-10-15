@@ -85,6 +85,21 @@ fn the_local_repl_holds_the_model_and_reloads_it() {
     let answer = read_until(&mut out, "-- planned here in");
     assert!(answer.contains("reloaded in"), "{answer}");
 
+    // A new file that does not load: the error is said once, and when
+    // that file is fixed the model loads again, although the old model
+    // never read it.
+    std::fs::write(project.join("tests/broken.yml"), "name: broken\nprojections: [\n").unwrap();
+    writeln!(stdin, "department, sales value").unwrap();
+    let answer = read_until(&mut out, "-- planned here in");
+    assert!(answer.contains("error:") && answer.contains("still on the model loaded before"), "{answer}");
+    writeln!(stdin, "department, sales value").unwrap();
+    let answer = read_until(&mut out, "-- planned here in");
+    assert!(!answer.contains("error:"), "said again: {answer}");
+    std::fs::write(project.join("tests/broken.yml"), "name: fixed\nprojections:\n  - Department\nassert_regex: SELECT\n").unwrap();
+    writeln!(stdin, "department, sales value").unwrap();
+    let answer = read_until(&mut out, "-- planned here in");
+    assert!(answer.contains("reloaded in"), "the fixed file was not noticed: {answer}");
+
     // Break the file: the error is said once, and the model from before
     // keeps answering.
     std::fs::write(&table, "name: Transactions\nfields: [\n").unwrap();

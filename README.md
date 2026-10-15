@@ -78,7 +78,7 @@ zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's 
 zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
 zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
 zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
-zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts] [--open]   # the server, here; inside a project, serving that project
+zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts | --no-accounts] [--open] [--no-project]   # the server, here; inside a project, serving that project
 zsql server start | stop | status | logs   # the same, kept running in the background
 ```
 
@@ -133,8 +133,10 @@ own developers: the golden scoreboard, the benches (`bench` over the
 goldens, `load-bench` over a project directory), formation checks and
 export. It is not part of the CLI release.
 
-`ZSQL_HOME` moves `~/.zsql` (the account-wide config and the repl
-history) somewhere else, which is how tests keep out of the real one.
+`ZSQL_HOME` moves `~/.zsql` somewhere else: the account-wide config, the
+repl history, the default data directory of `zsql serve`, and the
+background server's pidfile and log (`server.log`, which grows until
+you trim it). It is how tests keep out of the real one.
 
 ## The server
 

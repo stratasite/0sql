@@ -1,26 +1,37 @@
-//! The HTTP client for zsqld. What it answers is printed by `show.rs`,
-//! which prints a local answer the same way.
+//! The HTTP client for a server. What it answers is printed by
+//! `show.rs`, which prints a local answer the same way.
 
 use crate::failure::Refusal;
+use crate::side::Query;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub struct Client {
     pub server: String,
     pub api_key: Option<String>,
+    /// For every call but a deploy: a server that accepts and never
+    /// answers must not hang the command.
+    agent: ureq::Agent,
+    /// For a deploy, which unpacks, loads and tests a whole model.
+    slow: ureq::Agent,
 }
 
 impl Client {
     pub fn new(server: &str, api_key: Option<String>) -> Self {
-        Client { server: server.trim_end_matches('/').to_string(), api_key }
+        let agent = |whole: u64| {
+            ureq::Agent::new_with_config(
+                ureq::config::Config::builder()
+                    .http_status_as_error(false)
+                    .timeout_connect(Some(std::time::Duration::from_secs(10)))
+                    .timeout_global(Some(std::time::Duration::from_secs(whole)))
+                    .build(),
+            )
+        };
+        Client { server: server.trim_end_matches('/').to_string(), api_key, agent: agent(60), slow: agent(600) }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.server, path)
-    }
-
-    fn agent(&self) -> ureq::Agent {
-        ureq::Agent::new_with_config(ureq::config::Config::builder().http_status_as_error(false).build())
     }
 
     fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
@@ -50,22 +61,22 @@ impl Client {
 
     pub fn get(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("GET {url}"), || self.auth(self.agent().get(&url)).call())
+        self.send(&format!("GET {url}"), || self.auth(self.agent.get(&url)).call())
     }
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.agent().post(&url)).send_json(body))
+        self.send(&format!("POST {url}"), || self.auth(self.agent.post(&url)).send_json(body))
     }
 
     pub fn post_bytes(&self, path: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.agent().post(&url)).header("content-type", content_type).send(bytes))
+        self.send(&format!("POST {url}"), || self.auth(self.slow.post(&url)).header("content-type", content_type).send(bytes))
     }
 
     pub fn delete(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("DELETE {url}"), || self.auth(self.agent().delete(&url)).call())
+        self.send(&format!("DELETE {url}"), || self.auth(self.agent.delete(&url)).call())
     }
 }
 
@@ -127,14 +138,11 @@ pub fn urlencode(s: &str) -> String {
 
 /// The body of a planning request: the spec, or the shorthand line
 /// for the server to read, and the context.
-fn query_body(spec: Option<&Value>, expr: Option<&str>, context: Option<&Value>) -> Value {
-    let mut body = json!({});
-    if let Some(s) = spec {
-        body["spec"] = s.clone();
-    }
-    if let Some(e) = expr {
-        body["expr"] = json!(e);
-    }
+fn query_body(query: &Query, context: Option<&Value>) -> Value {
+    let mut body = match query {
+        Query::Spec(s) => json!({ "spec": s }),
+        Query::Expr(e) => json!({ "expr": e }),
+    };
     if let Some(c) = context {
         body["context"] = c.clone();
     }
@@ -142,30 +150,14 @@ fn query_body(spec: Option<&Value>, expr: Option<&str>, context: Option<&Value>)
 }
 
 /// `/sql`: `{sql, adapter}`; `/explain`: that plus timings, phases and the node graph.
-pub fn sql(
-    client: &Client,
-    uid: &str,
-    branch: &str,
-    spec: Option<&Value>,
-    expr: Option<&str>,
-    context: Option<&Value>,
-    explain: bool,
-) -> Result<Value> {
-    client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &query_body(spec, expr, context))
+pub fn sql(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
+    client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &query_body(query, context))
 }
 
 /// `/explore`: the dimensions and measures the query can take on, narrowed
 /// by a search term.
-pub fn explore(
-    client: &Client,
-    uid: &str,
-    branch: &str,
-    spec: Option<&Value>,
-    expr: Option<&str>,
-    context: Option<&Value>,
-    q: Option<&str>,
-) -> Result<Value> {
-    let mut body = query_body(spec, expr, context);
+pub fn explore(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
+    let mut body = query_body(query, context);
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
         body["q"] = json!(q);
     }
