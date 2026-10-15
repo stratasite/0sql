@@ -271,9 +271,7 @@ enum NewCommand {
 #[derive(Subcommand)]
 enum ValuesCommand {
     /// Show a dimension's sampled values.
-    Show {
-        dim: String,
-    },
+    Show { dim: String },
     /// Sample the listable dimensions from the project's warehouses into samples/values.jsonl.gz.
     /// The model says what to run; the SQL runs here, where the credentials are.
     Sample {
@@ -323,7 +321,8 @@ fn main() {
 fn run(command: Command, at: Where) -> Result<()> {
     match command {
         Command::Spec { line } => {
-            let (spec, _, items) = zsql_service::spec_of(None, Some(&line.join(" ")), &zsql_service::unlimited).map_err(failure::Refusal::from)?;
+            let (spec, _, items) =
+                zsql_service::spec_of(None, Some(&line.join(" ")), &zsql_service::unlimited).map_err(failure::Refusal::from)?;
             for d in items {
                 eprintln!("{d}");
             }
@@ -372,7 +371,10 @@ fn run(command: Command, at: Where) -> Result<()> {
             let (mode, Query { spec, expr, context }) = query.resolve(at)?;
             let (v, origin) = match &mode {
                 Mode::Local(l) => (local::explore(&l.model()?, spec, expr.as_deref(), context.as_ref(), q.as_deref())?, "local"),
-                Mode::Remote(t) => (remote::explore(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), q.as_deref())?, "server"),
+                Mode::Remote(t) => (
+                    remote::explore(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), q.as_deref())?,
+                    "server",
+                ),
             };
             if json {
                 show::print_json(&v)?;
@@ -392,7 +394,11 @@ fn run(command: Command, at: Where) -> Result<()> {
             let q = q.unwrap_or_default();
             let v = match at.mode()? {
                 Mode::Local(l) => l.model()?.fields(&q, hidden),
-                Mode::Remote(t) => t.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&q)))?,
+                Mode::Remote(t) => t.client.get(&format!(
+                    "{}/fields?q={}&hidden={hidden}",
+                    remote::branch_path(&t.uid, &t.branch),
+                    remote::urlencode(&q)
+                ))?,
             };
             show::print_fields(&v);
             Ok(())
@@ -415,7 +421,16 @@ fn run(command: Command, at: Where) -> Result<()> {
             let client = Client::new(&server, config::api_key(None));
             let v = client.get("/projects")?;
             for d in v["deployments"].as_array().into_iter().flatten() {
-                println!("{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests", d["project"].as_str().unwrap_or(""), d["branch"].as_str().unwrap_or(""), d["tables"], d["fields"], d["policies"], d["values"], d["tests"]);
+                println!(
+                    "{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests",
+                    d["project"].as_str().unwrap_or(""),
+                    d["branch"].as_str().unwrap_or(""),
+                    d["tables"],
+                    d["fields"],
+                    d["policies"],
+                    d["values"],
+                    d["tests"]
+                );
             }
             Ok(())
         }
@@ -483,7 +498,9 @@ impl QueryArgs {
         let t0 = Instant::now();
         let (v, origin) = match &mode {
             Mode::Local(l) => (local::sql(&l.model()?, spec, expr.as_deref(), context.as_ref(), explain)?, "local"),
-            Mode::Remote(t) => (remote::sql(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), explain)?, "server"),
+            Mode::Remote(t) => {
+                (remote::sql(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), explain)?, "server")
+            }
         };
         if json {
             show::print_json(&v)?;
@@ -521,7 +538,9 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     if dir.join("project.yml").exists() {
         bail!("{} already holds a project", dir.display());
     }
-    let name = name.unwrap_or_else(|| dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into()));
+    let name = name.unwrap_or_else(|| {
+        dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into())
+    });
     let uid = uid.map(|u| u.to_lowercase()).unwrap_or_else(|| config::slug(&name));
     let write = |rel: &str, text: &str| -> Result<()> {
         let path = dir.join(rel);
@@ -545,11 +564,19 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     let gi = dir.join(".gitignore");
     let existing = std::fs::read_to_string(&gi).unwrap_or_default();
     if !existing.contains(".zsql") {
-        std::fs::write(&gi, format!("{existing}{}{}", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }, templates::GITIGNORE))?;
+        std::fs::write(
+            &gi,
+            format!("{existing}{}{}", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }, templates::GITIGNORE),
+        )?;
         println!("update .gitignore");
     }
     if !dir.join(".git").exists() {
-        let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&dir).status().map(|s| s.success()).unwrap_or(false);
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if ok {
             // Deploying reads the checked-out branch, so an uncommitted
             // project cannot be deployed. Say so here, where it is a step on
@@ -566,7 +593,11 @@ fn new_file(what: NewCommand) -> Result<()> {
         NewCommand::Table { name, datasource, physical_name, domain, project } => {
             let p = project_of(project)?;
             let file = config::slug(&name).replace('-', "_");
-            (p.dir, format!("models/{domain}/tbl.{file}.yml"), templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource))
+            (
+                p.dir,
+                format!("models/{domain}/tbl.{file}.yml"),
+                templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource),
+            )
         }
         NewCommand::Relation { datasource, domain, project } => {
             let p = project_of(project)?;
@@ -660,7 +691,16 @@ fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
 /// with its secrets removed, and samples/values.jsonl.gz. Never .zsql,
 /// .strata, .git or data files.
 fn project_archive(project: &Path) -> Result<Vec<u8>> {
-    const SECRET_KEYS: [&str; 8] = ["password", "private_key", "personal_access_token", "secret_access_key", "access_key_id", "oauth_client_secret", "oauth_client_id", "api_key"];
+    const SECRET_KEYS: [&str; 8] = [
+        "password",
+        "private_key",
+        "personal_access_token",
+        "secret_access_key",
+        "access_key_id",
+        "oauth_client_secret",
+        "oauth_client_id",
+        "api_key",
+    ];
     let mut buf = Vec::new();
     {
         let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -746,7 +786,11 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
                 }
                 Mode::Remote(t) => {
                     let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
-                    let plan = t.client.get(&format!("{}/sampling-plan?dims={}&full={full}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&dims.join(","))))?;
+                    let plan = t.client.get(&format!(
+                        "{}/sampling-plan?dims={}&full={full}",
+                        remote::branch_path(&t.uid, &t.branch),
+                        remote::urlencode(&dims.join(","))
+                    ))?;
                     (project, plan)
                 }
             };
@@ -768,7 +812,15 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
                 .collect();
             if dry_run {
                 for j in &todo {
-                    println!("-- {} ({}) on {} via {}\n{}\n{}\n", j["uid"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or(""), j["table"].as_str().unwrap_or(""), j["datasource"].as_str().unwrap_or(""), j["distinct_sql"].as_str().unwrap_or(""), j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or(""));
+                    println!(
+                        "-- {} ({}) on {} via {}\n{}\n{}\n",
+                        j["uid"].as_str().unwrap_or(""),
+                        j["name"].as_str().unwrap_or(""),
+                        j["table"].as_str().unwrap_or(""),
+                        j["datasource"].as_str().unwrap_or(""),
+                        j["distinct_sql"].as_str().unwrap_or(""),
+                        j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or("")
+                    );
                 }
                 println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
                 return Ok(());
@@ -795,14 +847,26 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
 
 /// Without the warehouse drivers, sampling can plan (`--dry-run`) but not run.
 #[cfg(not(feature = "warehouse"))]
-fn sample_jobs(_project_dir: &Path, _todo: &[&Value], _ceiling: i64, _now: chrono::DateTime<chrono::Utc>, _catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
+fn sample_jobs(
+    _project_dir: &Path,
+    _todo: &[&Value],
+    _ceiling: i64,
+    _now: chrono::DateTime<chrono::Utc>,
+    _catalog: &mut Vec<Value>,
+) -> Result<(usize, usize)> {
     bail!("this zsql build has no warehouse drivers; `zsql values sample --dry-run` shows the SQL, and the full build (cargo build --features warehouse) runs it")
 }
 
 /// Runs each sampling job against its datasource and folds the results
 /// into the catalog; answers with how many succeeded and failed.
 #[cfg(feature = "warehouse")]
-fn sample_jobs(project_dir: &Path, todo: &[&Value], ceiling: i64, now: chrono::DateTime<chrono::Utc>, catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
+fn sample_jobs(
+    project_dir: &Path,
+    todo: &[&Value],
+    ceiling: i64,
+    now: chrono::DateTime<chrono::Utc>,
+    catalog: &mut Vec<Value>,
+) -> Result<(usize, usize)> {
     let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
     let (mut done, mut failed) = (0, 0);
     for j in todo {
@@ -819,7 +883,12 @@ fn sample_jobs(project_dir: &Path, todo: &[&Value], ceiling: i64, now: chrono::D
         let wh = connections.get_mut(&ds).unwrap();
         let uid = j["uid"].as_str().unwrap_or("").to_string();
         let outcome = (|| -> Result<Value> {
-            let distinct = wh.query(j["distinct_sql"].as_str().unwrap_or(""))?.first().and_then(|r| r.first().cloned()).flatten().and_then(|n| n.parse::<i64>().ok());
+            let distinct = wh
+                .query(j["distinct_sql"].as_str().unwrap_or(""))?
+                .first()
+                .and_then(|r| r.first().cloned())
+                .flatten()
+                .and_then(|n| n.parse::<i64>().ok());
             let mut entry = json!({
                 "uid": uid, "name": j["name"], "table": j["table"],
                 "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -911,10 +980,16 @@ mod tests {
         let dir = project_in(&root);
         let here = Where { project: Some(dir.clone()), ..Default::default() };
         assert!(matches!(here.mode().unwrap(), Mode::Local(l) if l.project.uid == "proj"));
-        assert!(matches!(Where { remote: true, branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.branch == "dev"));
-        assert!(matches!(Where { server: Some("http://x".into()), branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.client.server == "http://x"));
+        assert!(
+            matches!(Where { remote: true, branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.branch == "dev")
+        );
+        assert!(
+            matches!(Where { server: Some("http://x".into()), branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.client.server == "http://x")
+        );
         // --uid alone, with no project directory anywhere near, is a server's copy.
-        assert!(matches!(Where { project: None, uid: Some("other".into()), ..Default::default() }.mode().unwrap(), Mode::Remote(t) if t.uid == "other" && t.branch == "main"));
+        assert!(
+            matches!(Where { project: None, uid: Some("other".into()), ..Default::default() }.mode().unwrap(), Mode::Remote(t) if t.uid == "other" && t.branch == "main")
+        );
         let err = match (Where { branch: Some("dev".into()), ..here.clone() }).mode() {
             Err(e) => e.to_string(),
             Ok(_) => panic!("--branch without -r was accepted"),
@@ -927,7 +1002,8 @@ mod tests {
 
     #[test]
     fn json_and_serving_commands() {
-        assert!(Command::Sql { query: QueryArgs { spec: None, expr: Some("a".into()), context: None }, explain: false, json: true }.wants_json());
+        assert!(Command::Sql { query: QueryArgs { spec: None, expr: Some("a".into()), context: None }, explain: false, json: true }
+            .wants_json());
         assert!(!Command::Tables.wants_json());
         assert!(!Command::Tables.serves());
     }

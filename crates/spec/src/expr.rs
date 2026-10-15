@@ -60,7 +60,6 @@ pub fn ungroupable(sql: &str, aggregates: &[&str]) -> bool {
     FUNCTION_CALL.captures_iter(&body).any(|c| aggregates.contains(&&c[1]))
 }
 
-
 // ------------------------------------------------------------ full parser
 
 /// The opening and closing identifier quote characters an adapter's quote
@@ -77,7 +76,11 @@ pub fn quote_pair(template: &str) -> (String, String) {
 /// String literals: single-quoted always, double-quoted too on a warehouse
 /// whose identifier quote is something else (MySQL, BigQuery).
 pub fn literal_pattern(open: &str) -> &'static str {
-    if open == "\"" { r#"'(?:[^']|'')*'"# } else { r#"'(?:[^']|'')*'|"(?:[^"]|"")*""# }
+    if open == "\"" {
+        r#"'(?:[^']|'')*'"#
+    } else {
+        r#"'(?:[^']|'')*'|"(?:[^"]|"")*""#
+    }
 }
 
 /// Rails `Sql::ExpressionParser`: what a field expression or calculation
@@ -207,7 +210,8 @@ fn scrub(expr: &str, open: &str, close: &str, on_ident: &mut dyn FnMut(String)) 
 }
 
 fn scrub_regex(open: &str, close: &str) -> std::sync::Arc<Regex> {
-    static CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), std::sync::Arc<Regex>>>> = LazyLock::new(Default::default);
+    static CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), std::sync::Arc<Regex>>>> =
+        LazyLock::new(Default::default);
     let key = (open.to_string(), close.to_string());
     if let Some(re) = CACHE.lock().unwrap().get(&key) {
         return re.clone();
@@ -224,8 +228,34 @@ mod parser_tests {
     use super::*;
 
     fn parse(sql: &str) -> ParsedExpression {
-        let reserved: Vec<String> = ["__str__", "as", "cast", "case", "when", "then", "else", "end", "and", "or", "not", "null", "from", "in", "is", "over", "partition", "by", "order", "day", "month", "year", "date"]
-            .iter().map(|s| s.to_string()).collect();
+        let reserved: Vec<String> = [
+            "__str__",
+            "as",
+            "cast",
+            "case",
+            "when",
+            "then",
+            "else",
+            "end",
+            "and",
+            "or",
+            "not",
+            "null",
+            "from",
+            "in",
+            "is",
+            "over",
+            "partition",
+            "by",
+            "order",
+            "day",
+            "month",
+            "year",
+            "date",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let aggregates: Vec<String> = ["sum", "count", "avg", "min", "max"].iter().map(|s| s.to_string()).collect();
         ParsedExpression::parse(sql, &reserved, &aggregates, "\"@exp\"")
     }

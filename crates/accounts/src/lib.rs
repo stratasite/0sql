@@ -397,11 +397,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// Whether a database holds nothing of ours. Step 1 creates every table
 /// the service started with, so it can only run on an empty file.
 fn is_empty(conn: &Connection) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'",
-        [],
-        |r| r.get(0),
-    )?;
+    let n: i64 =
+        conn.query_row("SELECT count(*) FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'", [], |r| {
+            r.get(0)
+        })?;
     Ok(n == 0)
 }
 
@@ -639,7 +638,10 @@ impl Store {
     /// forgotten. Called while the connection is held, so a read that
     /// overlapped it sees the generation move.
     fn audit(&self, conn: &Connection, account_id: i64, actor: &str, action: &str, subject: &str) -> rusqlite::Result<()> {
-        conn.execute("INSERT INTO audit (account_id, actor, action, subject) VALUES (?1, ?2, ?3, ?4)", params![account_id, actor, action, subject])?;
+        conn.execute(
+            "INSERT INTO audit (account_id, actor, action, subject) VALUES (?1, ?2, ?3, ?4)",
+            params![account_id, actor, action, subject],
+        )?;
         self.bump();
         Ok(())
     }
@@ -667,7 +669,12 @@ impl Store {
         }
         tx.execute("INSERT INTO accounts (uid, name) VALUES (?1, ?2)", params![uid, name])?;
         let account = Account { id: tx.last_insert_rowid(), uid, name: name.to_string() };
-        let user = match tx.query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get::<_, Option<String>>(4)?))).optional()? {
+        let user = match tx
+            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| {
+                Ok((user_row(r)?, r.get::<_, Option<String>>(4)?))
+            })
+            .optional()?
+        {
             // The address is already someone's. Sign-up is open to the
             // world, so whoever typed it has to show they are that
             // someone: the user's own password. Nothing about the user
@@ -684,7 +691,10 @@ impl Store {
                 }
             },
             None => {
-                tx.execute("INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)", params![email, user_name.trim(), password_hash])?;
+                tx.execute(
+                    "INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)",
+                    params![email, user_name.trim(), password_hash],
+                )?;
                 User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string(), email_verified: false }
             }
         };
@@ -773,7 +783,9 @@ impl Store {
                 .optional()?;
             let Some(key) = row else { return Ok((None, generation)) };
             touch(&conn, "query_keys", key.id, key.last_used_at.as_deref())?;
-            let account = conn.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![key.account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
+            let account = conn.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![key.account_id], |r| {
+                Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? })
+            })?;
             let grants = Self::grants_in(&conn, key.id)?;
             return Ok((Some(Principal::QueryKey { key, account, grants }), generation));
         }
@@ -803,7 +815,13 @@ impl Store {
                         "deploying to the protected production branch '{branch}' of {} needs an owner",
                         project.uid
                     ))),
-                    Some(l) => Err(Error::Denied(format!("{} has {} access to {}; this needs {}", user.email, level_name(l), project.uid, level_name(needed)))),
+                    Some(l) => Err(Error::Denied(format!(
+                        "{} has {} access to {}; this needs {}",
+                        user.email,
+                        level_name(l),
+                        project.uid,
+                        level_name(needed)
+                    ))),
                     None => Err(Error::Denied(format!("{} has no access to {}", user.email, project.uid))),
                 }
             }
@@ -839,7 +857,9 @@ impl Store {
             let conn = self.conn.lock().unwrap();
             let generation = self.generation.load(Ordering::Acquire);
             let granted: Option<String> = conn
-                .query_row("SELECT level FROM project_access WHERE project_id = ?1 AND user_id = ?2", params![project.id, user_id], |r| r.get(0))
+                .query_row("SELECT level FROM project_access WHERE project_id = ?1 AND user_id = ?2", params![project.id, user_id], |r| {
+                    r.get(0)
+                })
                 .optional()?;
             (granted, generation)
         };
@@ -907,7 +927,10 @@ impl Store {
         // Their keys stop working; their project access goes; projects they
         // owned alone fall to the admins, who own everything anyway.
         tx.execute("UPDATE user_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id = ?1 AND account_id = ?2 AND revoked_at IS NULL", params![user.id, account_id])?;
-        tx.execute("DELETE FROM project_access WHERE user_id = ?1 AND project_id IN (SELECT id FROM projects WHERE account_id = ?2)", params![user.id, account_id])?;
+        tx.execute(
+            "DELETE FROM project_access WHERE user_id = ?1 AND project_id IN (SELECT id FROM projects WHERE account_id = ?2)",
+            params![user.id, account_id],
+        )?;
         self.audit(&tx, account_id, actor, "member_removed", &user.email)?;
         tx.commit()?;
         Ok(())
@@ -927,7 +950,10 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("{email} is not a member")))?;
         let token = new_secret("zin");
-        conn.execute("INSERT INTO invites (account_id, user_id, hash, created_by) VALUES (?1, ?2, ?3, ?4)", params![account_id, user.id, hash(&token), actor])?;
+        conn.execute(
+            "INSERT INTO invites (account_id, user_id, hash, created_by) VALUES (?1, ?2, ?3, ?4)",
+            params![account_id, user.id, hash(&token), actor],
+        )?;
         self.audit(&conn, account_id, actor, "invite", &user.email)?;
         Ok(token)
     }
@@ -940,7 +966,13 @@ impl Store {
     /// so for a user who can already sign in it proves nothing, and it
     /// is refused rather than let whoever holds it set that user's
     /// password. Such a member is already in the account; they sign in.
-    pub fn accept_invite(&self, token: &str, name: &str, key_name: &str, password: Option<&str>) -> Result<(Account, User, UserKey, String)> {
+    pub fn accept_invite(
+        &self,
+        token: &str,
+        name: &str,
+        key_name: &str,
+        password: Option<&str>,
+    ) -> Result<(Account, User, UserKey, String)> {
         let password_hash = password.map(hash_password).transpose()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -953,7 +985,10 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound("this invite is not valid, was already used, or has expired".into()))?;
         if Self::has_credentials(&tx, user_id)? {
-            return Err(Error::Denied("this invite is for someone who can already sign in; the membership is in place, so sign in with your own password or key".into()));
+            return Err(Error::Denied(
+                "this invite is for someone who can already sign in; the membership is in place, so sign in with your own password or key"
+                    .into(),
+            ));
         }
         tx.execute("UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![invite_id])?;
         if !name.trim().is_empty() {
@@ -964,10 +999,15 @@ impl Store {
         }
         tx.execute("UPDATE users SET home_account_id = ?1 WHERE id = ?2 AND home_account_id IS NULL", params![account_id, user_id])?;
         let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
-        let account = tx.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![account_id], |r| Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? }))?;
+        let account = tx.query_row("SELECT id, uid, name FROM accounts WHERE id = ?1", params![account_id], |r| {
+            Ok(Account { id: r.get(0)?, uid: r.get(1)?, name: r.get(2)? })
+        })?;
         let key_name = if key_name.trim().is_empty() { "default" } else { key_name.trim() };
         let secret = new_secret("zsk");
-        tx.execute("INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)", params![user.id, account_id, key_name, prefix_of(&secret), hash(&secret)])?;
+        tx.execute(
+            "INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user.id, account_id, key_name, prefix_of(&secret), hash(&secret)],
+        )?;
         let key = Self::user_key_in(&tx, tx.last_insert_rowid())?;
         self.audit(&tx, account.id, &user.email, "invite_accepted", &account.uid)?;
         tx.commit()?;
@@ -984,7 +1024,17 @@ impl Store {
         Ok(conn.query_row(
             "SELECT id, user_id, account_id, name, prefix, created_at, last_used_at FROM user_keys WHERE id = ?1",
             params![id],
-            |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, account_id: r.get(2)?, name: r.get(3)?, prefix: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }),
+            |r| {
+                Ok(UserKey {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    account_id: r.get(2)?,
+                    name: r.get(3)?,
+                    prefix: r.get(4)?,
+                    created_at: r.get(5)?,
+                    last_used_at: r.get(6)?,
+                })
+            },
         )?)
     }
 
@@ -997,7 +1047,17 @@ impl Store {
     pub fn user_keys(&self, account_id: i64, user_id: i64) -> Result<Vec<UserKey>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare("SELECT id, user_id, account_id, name, prefix, created_at, last_used_at FROM user_keys WHERE user_id = ?1 AND account_id = ?2 AND revoked_at IS NULL ORDER BY id")?;
-        let rows = st.query_map(params![user_id, account_id], |r| Ok(UserKey { id: r.get(0)?, user_id: r.get(1)?, account_id: r.get(2)?, name: r.get(3)?, prefix: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }))?;
+        let rows = st.query_map(params![user_id, account_id], |r| {
+            Ok(UserKey {
+                id: r.get(0)?,
+                user_id: r.get(1)?,
+                account_id: r.get(2)?,
+                name: r.get(3)?,
+                prefix: r.get(4)?,
+                created_at: r.get(5)?,
+                last_used_at: r.get(6)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1025,7 +1085,10 @@ impl Store {
         }
         let secret = new_secret("zsk");
         let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)", params![user.id, account_id, name, prefix_of(&secret), hash(&secret)])?;
+        conn.execute(
+            "INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user.id, account_id, name, prefix_of(&secret), hash(&secret)],
+        )?;
         let id = conn.last_insert_rowid();
         self.audit(&conn, account_id, &user.email, "user_key_created", &format!("{name} {}", prefix_of(&secret)))?;
         Ok((Self::user_key_in(&conn, id)?, secret))
@@ -1064,7 +1127,17 @@ impl Store {
     pub fn query_keys(&self, account_id: i64) -> Result<Vec<QueryKey>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare("SELECT id, account_id, name, prefix, created_by, created_at, last_used_at FROM query_keys WHERE account_id = ?1 AND revoked_at IS NULL ORDER BY id")?;
-        let rows = st.query_map(params![account_id], |r| Ok(QueryKey { id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_by: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? }))?;
+        let rows = st.query_map(params![account_id], |r| {
+            Ok(QueryKey {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                name: r.get(2)?,
+                prefix: r.get(3)?,
+                created_by: r.get(4)?,
+                created_at: r.get(5)?,
+                last_used_at: r.get(6)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1105,7 +1178,14 @@ impl Store {
 
     fn grants_in(conn: &Connection, key_id: i64) -> rusqlite::Result<Vec<Grant>> {
         let mut st = conn.prepare("SELECT g.project_id, p.uid, g.branch, g.context FROM query_key_grants g JOIN projects p ON p.id = g.project_id WHERE g.query_key_id = ?1 ORDER BY p.uid")?;
-        let rows = st.query_map(params![key_id], |r| Ok(Grant { project_id: r.get(0)?, project_uid: r.get(1)?, branch: r.get(2)?, context: context_of(r.get::<_, Option<String>>(3)?) }))?;
+        let rows = st.query_map(params![key_id], |r| {
+            Ok(Grant {
+                project_id: r.get(0)?,
+                project_uid: r.get(1)?,
+                branch: r.get(2)?,
+                context: context_of(r.get::<_, Option<String>>(3)?),
+            })
+        })?;
         rows.collect()
     }
 
@@ -1121,7 +1201,15 @@ impl Store {
     /// and nothing the caller sends can change it; without one the
     /// grant is unbound, which also clears a context set earlier, so a
     /// grant is always exactly what its last call said.
-    pub fn grant(&self, account_id: i64, actor: &User, key_id: i64, project: &Project, branch: Option<&str>, context: Option<&serde_json::Value>) -> Result<Grant> {
+    pub fn grant(
+        &self,
+        account_id: i64,
+        actor: &User,
+        key_id: i64,
+        project: &Project,
+        branch: Option<&str>,
+        context: Option<&serde_json::Value>,
+    ) -> Result<Grant> {
         let conn = self.conn.lock().unwrap();
         let key = Self::query_key_in(&conn, account_id, key_id)?;
         let branch = branch.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
@@ -1131,7 +1219,13 @@ impl Store {
             params![key.id, project.id, branch, context_text],
         )?;
         let bound = if context.is_some() { " with a bound context" } else { "" };
-        self.audit(&conn, account_id, &actor.email, "grant", &format!("{} on {}/{}{bound}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)))?;
+        self.audit(
+            &conn,
+            account_id,
+            &actor.email,
+            "grant",
+            &format!("{} on {}/{}{bound}", key.name, project.uid, branch.as_deref().unwrap_or(&project.production_branch)),
+        )?;
         Ok(Grant { project_id: project.id, project_uid: project.uid.clone(), branch, context: context.cloned() })
     }
 
@@ -1154,8 +1248,21 @@ impl Store {
         )?;
         let rows = st.query_map(params![project.id], |r| {
             Ok((
-                QueryKey { id: r.get(0)?, account_id: r.get(1)?, name: r.get(2)?, prefix: r.get(3)?, created_by: r.get(4)?, created_at: r.get(5)?, last_used_at: r.get(6)? },
-                Grant { project_id: project.id, project_uid: project.uid.clone(), branch: r.get(7)?, context: context_of(r.get::<_, Option<String>>(8)?) },
+                QueryKey {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    name: r.get(2)?,
+                    prefix: r.get(3)?,
+                    created_by: r.get(4)?,
+                    created_at: r.get(5)?,
+                    last_used_at: r.get(6)?,
+                },
+                Grant {
+                    project_id: project.id,
+                    project_uid: project.uid.clone(),
+                    branch: r.get(7)?,
+                    context: context_of(r.get::<_, Option<String>>(8)?),
+                },
             ))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1173,7 +1280,11 @@ impl Store {
             let conn = self.conn.lock().unwrap();
             let generation = self.generation.load(Ordering::Acquire);
             let found = conn
-                .query_row(&format!("SELECT {PROJECT_COLS} FROM projects WHERE account_id = ?1 AND uid = ?2"), params![key.0, key.1], project_row)
+                .query_row(
+                    &format!("SELECT {PROJECT_COLS} FROM projects WHERE account_id = ?1 AND uid = ?2"),
+                    params![key.0, key.1],
+                    project_row,
+                )
                 .optional()?;
             (found, generation)
         };
@@ -1216,7 +1327,15 @@ impl Store {
         Ok(p)
     }
 
-    pub fn update_project(&self, actor: &User, project: &Project, name: Option<&str>, production_branch: Option<&str>, visibility: Option<&str>, protected_production: Option<bool>) -> Result<Project> {
+    pub fn update_project(
+        &self,
+        actor: &User,
+        project: &Project,
+        name: Option<&str>,
+        production_branch: Option<&str>,
+        visibility: Option<&str>,
+        protected_production: Option<bool>,
+    ) -> Result<Project> {
         if let Some(v) = visibility {
             if !matches!(v, "account" | "restricted") {
                 return Err(Error::Invalid(format!("'{v}' is not a visibility (account, restricted)")));
@@ -1279,7 +1398,10 @@ impl Store {
         let email = email_of(email)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let n = tx.execute("DELETE FROM project_access WHERE project_id = ?1 AND user_id = (SELECT id FROM users WHERE email = ?2)", params![project.id, email])?;
+        let n = tx.execute(
+            "DELETE FROM project_access WHERE project_id = ?1 AND user_id = (SELECT id FROM users WHERE email = ?2)",
+            params![project.id, email],
+        )?;
         if n == 0 {
             return Err(Error::NotFound(format!("{email} has no granted access to {}", project.uid)));
         }
@@ -1304,7 +1426,10 @@ impl Store {
         let h = hash_password(password)?;
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user.id])?;
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1 AND hash != ?2", params![user.id, keep.map(|t| hash(t.trim())).unwrap_or_default()])?;
+        conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND hash != ?2",
+            params![user.id, keep.map(|t| hash(t.trim())).unwrap_or_default()],
+        )?;
         self.audit(&conn, account_id, &user.email, "password_set", "")?;
         Ok(())
     }
@@ -1315,7 +1440,9 @@ impl Store {
         let Ok(email) = email_of(email) else { return Ok(None) };
         let conn = self.conn.lock().unwrap();
         let row: Option<(User, Option<String>)> = conn
-            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| Ok((user_row(r)?, r.get(4)?)))
+            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| {
+                Ok((user_row(r)?, r.get(4)?))
+            })
             .optional()?;
         // An unknown address, or one with no password, is answered in
         // the time a wrong password takes, so the clock does not say
@@ -1486,7 +1613,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (user_id, account_id, _) = Self::take_token(&tx, TokenKind::Verify, token)?;
-        tx.execute("UPDATE users SET email_verified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1 AND email_verified_at IS NULL", params![user_id])?;
+        tx.execute(
+            "UPDATE users SET email_verified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1 AND email_verified_at IS NULL",
+            params![user_id],
+        )?;
         let user = tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![user_id], user_row)?;
         let account = Self::first_account(&tx, user_id)?;
         self.audit(&tx, account_id, &user.email, "email_verified", &user.email)?;
@@ -1503,7 +1633,8 @@ impl Store {
     pub fn start_reset(&self, email: &str) -> Result<Option<(Account, User, String)>> {
         let Ok(email) = email_of(email) else { return Ok(None) };
         let conn = self.conn.lock().unwrap();
-        let Some(user) = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()? else {
+        let Some(user) = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()?
+        else {
             return Ok(None);
         };
         let Ok(account) = Self::first_account(&conn, user.id) else { return Ok(None) };
@@ -1979,7 +2110,11 @@ mod tests {
 
         // Past the cooldown, so the second ask is allowed. Reaching into
         // the row is the only way to age it without sleeping a minute.
-        s.conn.lock().unwrap().execute("UPDATE email_tokens SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-5 minutes')", []).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE email_tokens SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-5 minutes')", [])
+            .unwrap();
         let second = s.start_verification(su.account.id, &su.user).unwrap().expect("a fresh link");
         assert_ne!(first, second);
 
@@ -1993,7 +2128,11 @@ mod tests {
         let s = Store::in_memory().unwrap();
         s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
         let (_, _, token) = s.start_reset("ann@acme.test").unwrap().expect("a link");
-        s.conn.lock().unwrap().execute("UPDATE email_tokens SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 minute')", []).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE email_tokens SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 minute')", [])
+            .unwrap();
         assert!(matches!(s.reset_password(&token, "correcthorse"), Err(Error::NotFound(_))));
     }
 
@@ -2046,9 +2185,8 @@ mod tests {
     /// something a reviewer sees rather than something they infer.
     fn schema_of(path: &std::path::Path) -> Vec<String> {
         let conn = Connection::open(path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name")
-            .unwrap();
+        let mut stmt =
+            conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.map(|r| r.unwrap()).collect()
     }

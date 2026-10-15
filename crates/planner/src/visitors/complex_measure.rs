@@ -26,7 +26,13 @@ impl<'a> Component<'a> {
     }
 }
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+) -> Result<()> {
     let mut registry: HashMap<i64, Signature> = HashMap::new();
     for id in graph.post_order() {
         visit(graph, id, universe, universes, dialects, q, &mut registry)?;
@@ -38,7 +44,14 @@ use crate::visitors::segmentation::{component_links, node_signature, signature, 
 use std::collections::HashMap;
 
 /// One field must never aggregate under two segment signatures.
-fn register_reference_signatures<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, component: &Component<'a>, registry: &mut HashMap<i64, Signature>) -> Result<()> {
+fn register_reference_signatures<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    component: &Component<'a>,
+    registry: &mut HashMap<i64, Signature>,
+) -> Result<()> {
     let sig = match component {
         Component::Proj(p) => signature(p),
         Component::Filter(_) => vec![],
@@ -52,7 +65,9 @@ fn register_reference_signatures<'a>(graph: &mut Graph<'a>, id: NodeId, universe
             }
         }
         registry.insert(field.id, sig.clone());
-        if let Some(plain) = q.projections.iter().find(|p| !p.is_calculation() && p.persisted && p.field.map(|f| f.id == field.id).unwrap_or(false)) {
+        if let Some(plain) =
+            q.projections.iter().find(|p| !p.is_calculation() && p.persisted && p.field.map(|f| f.id == field.id).unwrap_or(false))
+        {
             if signature(plain) != sig {
                 return Err(conflict(component, field, q));
             }
@@ -67,7 +82,11 @@ fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Pla
         Component::Filter(_) => vec![],
     };
     let segments: Vec<String> = links.iter().filter_map(|(s, _)| q.segment(*s)).map(|s| s.name()).collect();
-    let subject = if segments.is_empty() { "A segment conflicts with".to_string() } else { format!("Segment {} cannot be applied to", segments.join(", ")) };
+    let subject = if segments.is_empty() {
+        "A segment conflicts with".to_string()
+    } else {
+        format!("Segment {} cannot be applied to", segments.join(", "))
+    };
     PlanError::Resolution(format!(
         "{} {}: it references {}, which aggregates under a different segment. Apply the same segment to every use of {}, or remove the reference.",
         subject,
@@ -77,7 +96,15 @@ fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Pla
     ))
 }
 
-fn visit<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>, registry: &mut HashMap<i64, Signature>) -> Result<()> {
+fn visit<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+    registry: &mut HashMap<i64, Signature>,
+) -> Result<()> {
     if graph.nodes[id].removed || graph.nodes[id].kind == NodeKind::Merge {
         return Ok(());
     }
@@ -109,7 +136,11 @@ fn visit<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, universe
 }
 
 /// Measure components whose expression names measures the node's universe lacks.
-fn non_local_measure_references<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe) -> Result<Vec<(Component<'a>, Vec<&'a Field>)>> {
+fn non_local_measure_references<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+) -> Result<Vec<(Component<'a>, Vec<&'a Field>)>> {
     let base = graph.nodes[id].universe.clone().expect("query node universe");
     let mut components: Vec<Component<'a>> = Vec::new();
     for p in &graph.nodes[id].projections {
@@ -125,7 +156,8 @@ fn non_local_measure_references<'a>(graph: &mut Graph<'a>, id: NodeId, universe:
     let mut out = Vec::new();
     for c in components {
         let exp = graph.nodes[id].expression(universe, c.field())?;
-        let non_local: Vec<&Field> = exp.measure_ref_ids.iter().filter(|m| !base.has_measure(**m)).filter_map(|m| universe.field(*m)).collect();
+        let non_local: Vec<&Field> =
+            exp.measure_ref_ids.iter().filter(|m| !base.has_measure(**m)).filter_map(|m| universe.field(*m)).collect();
         if !exp.measure_ref_ids.is_empty() && !non_local.is_empty() {
             out.push((c, non_local));
         }
@@ -136,7 +168,13 @@ fn non_local_measure_references<'a>(graph: &mut Graph<'a>, id: NodeId, universe:
 /// The merge the lifted measure computes in: the root when it already is
 /// one, else a new merge fed by this node. Seeds its reference so the
 /// reference visitor wires the components as node columns.
-fn setup_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, component: &Component<'a>, q: &RQuery<'a>) -> Result<NodeId> {
+fn setup_merge_node<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    component: &Component<'a>,
+    q: &RQuery<'a>,
+) -> Result<NodeId> {
     let root = graph.root();
     let merge = if graph.nodes[root].is_merge() {
         root
@@ -149,7 +187,10 @@ fn setup_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
     };
     if let Component::Filter(f) = component {
         let same = graph.nodes[merge].filters.iter().any(|x| {
-            x.field().id == f.field.id && x.predicate == f.def.predicate && x.filter_value == f.def.filter_value && x.filter_value_end == f.def.filter_value_end
+            x.field().id == f.field.id
+                && x.predicate == f.def.predicate
+                && x.filter_value == f.def.filter_value
+                && x.filter_value_end == f.def.filter_value_end
         });
         if !same {
             graph.nodes[merge].filters.push(crate::dag::Filtered::new(f.clone()));
@@ -319,14 +360,19 @@ fn create_segmented_component_graph<'a>(
 /// planning a new sub-graph. Never a segment-constrained node.
 fn build_from_existing_agg<'a>(graph: &mut Graph<'a>, measure: &'a Field) -> Option<NodeId> {
     let root = graph.root();
-    let found = graph.live().find(|n| {
-        !(n.id == root && n.is_merge())
-            && node_signature(n).is_empty()
-            && (n.projections.iter().any(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false) && p.decorators().is_empty())
-                || (n.is_agg() && n.universe.as_ref().map(|u| u.has_measure(measure.id)).unwrap_or(false)))
-    })?.id;
+    let found = graph
+        .live()
+        .find(|n| {
+            !(n.id == root && n.is_merge())
+                && node_signature(n).is_empty()
+                && (n.projections.iter().any(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false) && p.decorators().is_empty())
+                    || (n.is_agg() && n.universe.as_ref().map(|u| u.has_measure(measure.id)).unwrap_or(false)))
+        })?
+        .id;
     let node = &mut graph.nodes[found];
-    if node.is_agg() && !node.projections.iter().any(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false) && p.decorators().is_empty()) {
+    if node.is_agg()
+        && !node.projections.iter().any(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false) && p.decorators().is_empty())
+    {
         let mut rp = RProjection::for_field(measure);
         rp.def.ordinal = Some(node.projections.len() as i64);
         node.add_projection(Rc::new(rp));

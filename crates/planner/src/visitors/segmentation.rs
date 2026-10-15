@@ -5,8 +5,8 @@
 use crate::dag::Node;
 use crate::model::{RProjection, RQuery};
 use std::rc::Rc;
-use zsql_spec::LinkMode;
 use zsql_semantic::Field;
+use zsql_spec::LinkMode;
 
 pub type Signature = Vec<(usize, LinkMode)>;
 

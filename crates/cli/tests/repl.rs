@@ -110,16 +110,31 @@ fn the_local_repl_holds_the_model_and_reloads_it() {
 /// a server.
 #[test]
 fn refusals_and_usage_errors_exit_as_promised() {
-    let out = Command::new(env!("CARGO_BIN_EXE_zsql")).args(["sql", "--json", "--expr", "no such field"]).current_dir(fixture()).env_remove("ZSQL_SERVER").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["sql", "--json", "--expr", "no such field"])
+        .current_dir(fixture())
+        .env_remove("ZSQL_SERVER")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
     assert_eq!(v["error"]["class"], "FieldNotFound");
-    let out = Command::new(env!("CARGO_BIN_EXE_zsql")).args(["sql", "--expr", "no such field"]).current_dir(fixture()).env_remove("ZSQL_SERVER").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["sql", "--expr", "no such field"])
+        .current_dir(fixture())
+        .env_remove("ZSQL_SERVER")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("FieldNotFound: "));
     let out = Command::new(env!("CARGO_BIN_EXE_zsql")).args(["sql"]).current_dir(fixture()).env_remove("ZSQL_SERVER").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    let out = Command::new(env!("CARGO_BIN_EXE_zsql")).args(["sql", "--branch", "dev", "--expr", "sales value"]).current_dir(fixture()).env_remove("ZSQL_SERVER").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["sql", "--branch", "dev", "--expr", "sales value"])
+        .current_dir(fixture())
+        .env_remove("ZSQL_SERVER")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("add -r"));
 }

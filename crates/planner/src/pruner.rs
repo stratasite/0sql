@@ -29,16 +29,7 @@ pub fn sort_for_max_hints_and_dims<M: Model>(
         let dim_count = m.dimension_count(&dimension_ids) as i64;
         let measure_count = m.measure_count(&measure_ids) as i64;
         let local = all_field_ids.intersection(m.local_field_ids()).count() as i64;
-        (
-            -hint_count,
-            -dim_count,
-            -partition_score(m.root(), filters, universe),
-            m.tier(),
-            -measure_count,
-            m.cost(),
-            -local,
-            m.to_s(),
-        )
+        (-hint_count, -dim_count, -partition_score(m.root(), filters, universe), m.tier(), -measure_count, m.cost(), -local, m.to_s())
     };
     models.sort_by_cached_key(key);
     models
@@ -54,15 +45,19 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
         pruned.push(first);
     } else {
         for m in measures.iter().rev() {
-            let u = models.iter().find(|u| u.has_field(m.id)).cloned().ok_or_else(|| {
-                PlanError::Resolution(format!("Could not find Universe for measure: {}, id: {}", m.name, m.id))
-            })?;
+            let u = models
+                .iter()
+                .find(|u| u.has_field(m.id))
+                .cloned()
+                .ok_or_else(|| PlanError::Resolution(format!("Could not find Universe for measure: {}, id: {}", m.name, m.id)))?;
             pruned.push(u);
         }
         for d in dimensions.iter().rev() {
-            let u = models.iter().find(|u| u.has_field(d.id)).cloned().ok_or_else(|| {
-                PlanError::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id))
-            })?;
+            let u = models
+                .iter()
+                .find(|u| u.has_field(d.id))
+                .cloned()
+                .ok_or_else(|| PlanError::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id)))?;
             pruned.push(u);
         }
     }
@@ -127,9 +122,10 @@ fn within_partition(part: &zsql_semantic::Partition, f: &RFilter) -> bool {
         };
         return !wanted.is_empty() && wanted.iter().all(|v| listed.contains(v));
     }
-    let numeric = f.field.data_type.map(|d| {
-        matches!(d, zsql_semantic::DataType::Integer | zsql_semantic::DataType::Decimal | zsql_semantic::DataType::Bigint)
-    });
+    let numeric = f
+        .field
+        .data_type
+        .map(|d| matches!(d, zsql_semantic::DataType::Integer | zsql_semantic::DataType::Decimal | zsql_semantic::DataType::Bigint));
     let to_num = |v: &Option<String>| -> Option<f64> {
         let v = v.as_deref()?;
         if numeric == Some(true) {
@@ -203,7 +199,14 @@ mod tests {
     }
 
     fn partition(predicate: Predicate, value: &str, end: Option<&str>) -> Partition {
-        Partition { id: 1, table_id: 1, dimension_id: 1, predicate, filter_value: Some(value.into()), filter_value_end: end.map(str::to_string) }
+        Partition {
+            id: 1,
+            table_id: 1,
+            dimension_id: 1,
+            predicate,
+            filter_value: Some(value.into()),
+            filter_value_end: end.map(str::to_string),
+        }
     }
 
     #[test]

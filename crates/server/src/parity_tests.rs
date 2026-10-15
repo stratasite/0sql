@@ -107,7 +107,9 @@ fn as_server(r: Result<Value, zsql_service::ServiceError>) -> (StatusCode, Value
 /// near-miss name and an unknown one.
 fn specs_over(model: &Model) -> Vec<Value> {
     let u = model.universe();
-    let names = |kind: zsql_semantic::FieldKind, n: usize| -> Vec<String> { u.fields().iter().filter(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone()).take(n).collect() };
+    let names = |kind: zsql_semantic::FieldKind, n: usize| -> Vec<String> {
+        u.fields().iter().filter(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone()).take(n).collect()
+    };
     let dims = names(zsql_semantic::FieldKind::Dimension, 6);
     let msrs = names(zsql_semantic::FieldKind::Measure, 6);
     let proj = |fields: &[&str]| json!({ "projections": fields.iter().map(|f| json!({ "field": f })).collect::<Vec<_>>() });
@@ -133,7 +135,12 @@ fn specs_over(model: &Model) -> Vec<Value> {
 #[tokio::test]
 async fn local_and_server_answer_alike() {
     let root = fixtures_root();
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root).expect("fixtures/projects").flatten().map(|e| e.path()).filter(|p| p.join("project.yml").exists()).collect();
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .expect("fixtures/projects")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("project.yml").exists())
+        .collect();
     dirs.sort();
     assert!(!dirs.is_empty(), "no fixture projects under {}", root.display());
     let data_dir = std::env::temp_dir().join(format!("zsqld-parity-{}", std::process::id()));
@@ -162,9 +169,20 @@ async fn local_and_server_answer_alike() {
             for key in ["sql", "datasource", "adapter", "nodes", "corrections", "error"] {
                 assert_eq!(sv[key], hv[key], "{uid} explain {key} over {spec}");
             }
-            assert_eq!(sv["phases"].as_array().map(|p| p.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()), hv["phases"].as_array().map(|p| p.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()), "{uid} explain phases over {spec}");
+            assert_eq!(
+                sv["phases"].as_array().map(|p| p.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()),
+                hv["phases"].as_array().map(|p| p.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()),
+                "{uid} explain phases over {spec}"
+            );
             let (ss, sv) = post_json(&router, &format!("{base}/explore"), &json!({ "spec": spec, "q": "a" })).await;
-            let (hs, hv) = as_server(local.explore(zsql_service::ExploreRequest { spec: Some(spec.clone()), expr: None, context: None, q: Some("a".into()) }, &unlimited).map(|r| serde_json::to_value(r).unwrap()));
+            let (hs, hv) = as_server(
+                local
+                    .explore(
+                        zsql_service::ExploreRequest { spec: Some(spec.clone()), expr: None, context: None, q: Some("a".into()) },
+                        &unlimited,
+                    )
+                    .map(|r| serde_json::to_value(r).unwrap()),
+            );
             assert_eq!(ss, hs, "{uid} explore status over {spec}");
             for key in ["dimensions", "measures", "error"] {
                 assert_eq!(sv[key], hv[key], "{uid} explore {key} over {spec}");
@@ -173,16 +191,29 @@ async fn local_and_server_answer_alike() {
         }
 
         // The shorthand, read by whoever plans it.
-        for line in ["sales, quantity", "department, sales value, department = PRODUCE", "item brand id, store quantity desc", "nothing here at all"] {
+        for line in [
+            "sales, quantity",
+            "department, sales value, department = PRODUCE",
+            "item brand id, store quantity desc",
+            "nothing here at all",
+        ] {
             let server = post_json(&router, &format!("{base}/sql"), &json!({ "expr": line })).await;
-            let here = as_server(local.sql(zsql_service::SqlRequest { spec: None, expr: Some(line.into()), context: None }, &unlimited).map(|r| serde_json::to_value(r).unwrap()));
+            let here = as_server(
+                local
+                    .sql(zsql_service::SqlRequest { spec: None, expr: Some(line.into()), context: None }, &unlimited)
+                    .map(|r| serde_json::to_value(r).unwrap()),
+            );
             assert_eq!(server, here, "{uid} expr {line}");
         }
 
         // The catalogue and the search.
         assert_eq!(get(&router, &format!("{base}/tables")).await, (StatusCode::OK, local.tables()), "{uid} tables");
         for (q, hidden) in [("", false), ("", true), ("date", false), ("disc", true), ("zzzz", false)] {
-            assert_eq!(get(&router, &format!("{base}/fields?q={q}&hidden={hidden}")).await, (StatusCode::OK, local.fields(q, hidden)), "{uid} fields {q:?} hidden {hidden}");
+            assert_eq!(
+                get(&router, &format!("{base}/fields?q={q}&hidden={hidden}")).await,
+                (StatusCode::OK, local.fields(q, hidden)),
+                "{uid} fields {q:?} hidden {hidden}"
+            );
         }
         assert_eq!(get(&router, &format!("{base}/values/department")).await, as_server(local.values_of("department")), "{uid} values");
     }

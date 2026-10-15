@@ -16,11 +16,8 @@ fn load(name: &str, fields: &str) -> Result<Loaded, String> {
     std::fs::create_dir_all(dir.join("models")).unwrap();
     std::fs::write(dir.join("project.yml"), "name: T\nuid: t\nproduction_branch: main\n").unwrap();
     std::fs::write(dir.join("datasources.yml"), "wh:\n  name: W\n  adapter: duckdb\n  tier: hot\n").unwrap();
-    std::fs::write(
-        dir.join("models/tbl.t.yml"),
-        format!("name: T\nphysical_name: loan\ndatasource: wh\ncost: 100\nfields:\n{fields}"),
-    )
-    .unwrap();
+    std::fs::write(dir.join("models/tbl.t.yml"), format!("name: T\nphysical_name: loan\ndatasource: wh\ncost: 100\nfields:\n{fields}"))
+        .unwrap();
     let dialects = Dialects::builtin();
     let out = zsql_project::load(&dir, &dialects).map_err(|e| e.to_string());
     let _ = std::fs::remove_dir_all(&dir);

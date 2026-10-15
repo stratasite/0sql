@@ -28,7 +28,11 @@ fn mask_policy_masks_everything_when_nothing_resolves() {
     // (the universe of "mask mode wraps triggered projection in CASE expression").
     let hash = "d0a3fb66df4f9a0c";
     let spec = serde_json::json!({ "projections": [{ "field": "Country" }] });
-    let stranger = SecurityContext { email: Some("nobody@example.com".into()), groups: vec![Group { name: Some("Guests".into()), tags: vec!["region:emea".into()] }], ..Default::default() };
+    let stranger = SecurityContext {
+        email: Some("nobody@example.com".into()),
+        groups: vec![Group { name: Some("Guests".into()), tags: vec!["region:emea".into()] }],
+        ..Default::default()
+    };
 
     let deny = universe_with(&fx, hash, Unresolved::Deny);
     let sql = plan(&deny, &fx, spec.clone(), &stranger);
@@ -41,7 +45,10 @@ fn mask_policy_masks_everything_when_nothing_resolves() {
     assert!(sql.contains("country\" AS \"Country\"") && !sql.contains("#######"), "policy skipped: {sql}");
 
     // A user the policy resolves is masked per row, on either setting.
-    let member = SecurityContext { groups: vec![Group { name: Some("CC-TMNT".into()), tags: vec!["call_center_id:TMNT".into()] }], ..Default::default() };
+    let member = SecurityContext {
+        groups: vec![Group { name: Some("CC-TMNT".into()), tags: vec!["call_center_id:TMNT".into()] }],
+        ..Default::default()
+    };
     let sql = plan(&deny, &fx, spec.clone(), &member);
     assert!(sql.contains("CASE WHEN LOWER(") && sql.contains("IN ('tmnt')"), "{sql}");
 

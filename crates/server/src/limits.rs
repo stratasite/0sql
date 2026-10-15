@@ -57,8 +57,16 @@ impl Class {
 }
 
 /// The files served at the site root; they take no limit.
-const SITE_FILES: &[&str] =
-    &["favicon.ico", "favicon.svg", "apple-touch-icon.png", "site.webmanifest", "icon-192.png", "icon-512.png", "icon-maskable-192.png", "icon-maskable-512.png"];
+const SITE_FILES: &[&str] = &[
+    "favicon.ico",
+    "favicon.svg",
+    "apple-touch-icon.png",
+    "site.webmanifest",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-192.png",
+    "icon-maskable-512.png",
+];
 
 /// A request's class, from its method and path alone.
 pub fn classify(method: &str, path: &str) -> Class {
@@ -67,7 +75,10 @@ pub fn classify(method: &str, path: &str) -> Class {
         (_, []) | (_, ["healthz"]) | (_, ["app", ..]) | (_, [".well-known", ..]) => Class::Exempt,
         (_, [one]) if SITE_FILES.contains(one) => Class::Exempt,
         ("POST", ["login"]) | ("POST", ["signup"]) | ("POST", ["invites", "accept"]) | ("POST", ["account", "password"]) => Class::Password,
-        ("POST", ["password-reset"]) | ("POST", ["password-reset", "accept"]) | ("POST", ["verify-email"]) | ("POST", ["account", "verify-email"]) => Class::Password,
+        ("POST", ["password-reset"])
+        | ("POST", ["password-reset", "accept"])
+        | ("POST", ["verify-email"])
+        | ("POST", ["account", "verify-email"]) => Class::Password,
         // One HTTP request carries one tool call, charged here as a plan;
         // the explore-class tools take an explore token too, in mcp.rs.
         ("POST", ["mcp"]) => Class::Plan,
@@ -98,7 +109,16 @@ pub fn authenticates(path: &str) -> bool {
     // answer must be a plain 404, not a 401 asking for the key.
     !matches!(
         p.as_slice(),
-        [] | ["healthz"] | ["app", ..] | [".well-known", ..] | ["login"] | ["signup"] | ["logout"] | ["invites", "accept"] | ["password-reset"] | ["password-reset", "accept"] | ["verify-email"]
+        [] | ["healthz"]
+            | ["app", ..]
+            | [".well-known", ..]
+            | ["login"]
+            | ["signup"]
+            | ["logout"]
+            | ["invites", "accept"]
+            | ["password-reset"]
+            | ["password-reset", "accept"]
+            | ["verify-email"]
     ) && !matches!(p.as_slice(), [one] if SITE_FILES.contains(one))
 }
 
@@ -323,10 +343,15 @@ impl Config {
         env_rate("ZSQL_LIMIT_BAD_KEY", &mut c.bad_key)?;
         env_rate("ZSQL_LIMIT_HANDSHAKE", &mut c.handshake)?;
         if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_FAILURES") {
-            c.email_failures = if v.trim().eq_ignore_ascii_case("off") { 0 } else { v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))? };
+            c.email_failures = if v.trim().eq_ignore_ascii_case("off") {
+                0
+            } else {
+                v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))?
+            };
         }
         if let Ok(v) = std::env::var("ZSQL_LIMIT_EMAIL_WINDOW") {
-            c.email_window = Duration::from_secs(v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_WINDOW: {v:?} is not a number of seconds"))?);
+            c.email_window =
+                Duration::from_secs(v.trim().parse().map_err(|_| format!("ZSQL_LIMIT_EMAIL_WINDOW: {v:?} is not a number of seconds"))?);
         }
         c.trusted_proxy = matches!(std::env::var("ZSQL_TRUSTED_PROXY").as_deref(), Ok("1") | Ok("on") | Ok("true"));
         Ok(c)
@@ -813,7 +838,12 @@ mod address_tests {
 
     #[test]
     fn each_gate_counts_separately_per_address() {
-        let cfg = Config { mode: Mode::On, login: Rate { per_sec: 0.01, burst: 2.0 }, signup: Rate { per_sec: 0.01, burst: 1.0 }, ..Config::default() };
+        let cfg = Config {
+            mode: Mode::On,
+            login: Rate { per_sec: 0.01, burst: 2.0 },
+            signup: Rate { per_sec: 0.01, burst: 1.0 },
+            ..Config::default()
+        };
         let l = Limiter::new(cfg);
         let a: IpAddr = "203.0.113.7".parse().unwrap();
         let b: IpAddr = "203.0.113.8".parse().unwrap();

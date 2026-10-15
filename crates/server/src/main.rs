@@ -31,20 +31,20 @@ mod mcp;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use zsql_accounts::{Level, Principal, Project, Role, Store, Verb};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use limits::{Admission, Class, Limiter};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use limits::{Admission, Class, Limiter};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use tokio::sync::OwnedSemaphorePermit;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
+use zsql_accounts::{Level, Principal, Project, Role, Store, Verb};
 use zsql_dialect::Dialects;
 use zsql_semantic::FieldKind;
 use zsql_service::{ExplainResponse, ExploreRequest, ExploreResponse, Kind, Model, ServiceError, SqlRequest, SqlResponse, Trust};
@@ -142,7 +142,11 @@ fn authenticate(app: &App, parts: &Parts) -> Result<Option<Principal>, ApiError>
     // is never read there, so a signed-in browser cannot be made to
     // speak MCP as its user, whatever page it is on.
     if mcp::is_endpoint(parts.uri.path()) {
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "the MCP endpoint takes an API key: Authorization: Bearer <key>".into()));
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "the MCP endpoint takes an API key: Authorization: Bearer <key>".into(),
+        ));
     }
     // The web app: a session cookie. Anything but a read must also
     // carry the header the app's own scripts send, which a cross-site
@@ -179,7 +183,12 @@ impl FromRequestParts<Shared> for Auth {
 /// caller may ask for, the cap on how much of its kind of work may run
 /// at once, and a deadline. Authentication happens here, once, and
 /// travels on the request. See `docs/rate-limiting.md`.
-async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn guard(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let class = limits::classify(req.method().as_str(), req.uri().path());
     if class == Class::Exempt {
         return next.run(req).await;
@@ -257,7 +266,12 @@ async fn guard(State(app): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketA
     let req = axum::extract::Request::from_parts(parts, body);
     let mut response = match tokio::time::timeout(limits::deadline(class), next.run(req)).await {
         Ok(r) => r,
-        Err(_) => retry_later(StatusCode::SERVICE_UNAVAILABLE, "Timeout", format!("this request passed its {}s deadline", limits::deadline(class).as_secs()), 0),
+        Err(_) => retry_later(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Timeout",
+            format!("this request passed its {}s deadline", limits::deadline(class).as_secs()),
+            0,
+        ),
     };
     drop(held);
     if let Some(d) = allowance {
@@ -348,7 +362,8 @@ fn rate_headers(res: &mut Response, d: &limits::Decision) {
 }
 
 fn too_many(d: &limits::Decision) -> Response {
-    let mut res = retry_later(StatusCode::TOO_MANY_REQUESTS, "RateLimited", format!("too many requests: retry in {}s", d.retry_after), d.retry_after);
+    let mut res =
+        retry_later(StatusCode::TOO_MANY_REQUESTS, "RateLimited", format!("too many requests: retry in {}s", d.retry_after), d.retry_after);
     rate_headers(&mut res, d);
     res
 }
@@ -451,9 +466,15 @@ fn effective_context(t: &Tenant, who: &Option<Principal>, sent: Option<SecurityC
     let (Some(Principal::QueryKey { grants, .. }), Some(project)) = (who, &t.project) else { return Ok(sent) };
     let Some(bound) = grants.iter().find(|g| g.project_id == project.id).and_then(|g| g.context.as_ref()) else { return Ok(sent) };
     if sent.is_some() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "ContextBound", format!("this key's context on {} is bound by the project's owner; do not send one", project.uid)));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "ContextBound",
+            format!("this key's context on {} is bound by the project's owner; do not send one", project.uid),
+        ));
     }
-    let ctx: SecurityContext = serde_json::from_value(bound.clone()).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", format!("the context bound on {} does not parse: {e}", project.uid)))?;
+    let ctx: SecurityContext = serde_json::from_value(bound.clone()).map_err(|e| {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", format!("the context bound on {} does not parse: {e}", project.uid))
+    })?;
     Ok(Some(ctx))
 }
 
@@ -461,7 +482,9 @@ fn effective_context(t: &Tenant, who: &Option<Principal>, sent: Option<SecurityC
 fn user_of(who: &Option<Principal>) -> Result<(&zsql_accounts::User, &zsql_accounts::Account, Role), ApiError> {
     match who {
         Some(Principal::User { user, account, role, .. }) => Ok((user, account, *role)),
-        Some(Principal::QueryKey { .. }) => Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "a query key cannot do this; use your personal key".into())),
+        Some(Principal::QueryKey { .. }) => {
+            Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "a query key cannot do this; use your personal key".into()))
+        }
         None => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", "accounts are off on this server".into())),
     }
 }
@@ -502,11 +525,17 @@ const NAME_LIMIT: usize = 100;
 /// `Customer-Service` by lower-casing it, but the directory and the key
 /// would not be the canonical ones.
 fn check_uid(uid: &str) -> Result<(), ApiError> {
-    let ok = !uid.is_empty() && uid.len() <= NAME_LIMIT && uid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    let ok = !uid.is_empty()
+        && uid.len() <= NAME_LIMIT
+        && uid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if ok {
         Ok(())
     } else {
-        Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{uid}' is not a project uid (lower-case letters, digits, - and _, at most {NAME_LIMIT} characters)")))
+        Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            format!("'{uid}' is not a project uid (lower-case letters, digits, - and _, at most {NAME_LIMIT} characters)"),
+        ))
     }
 }
 
@@ -542,7 +571,13 @@ fn model(app: &App, t: &Tenant, uid: &str, branch: &str) -> Result<Arc<Model>, A
 
 // ------------------------------------------------------------------ deploy
 
-async fn deploy(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+async fn deploy(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    held: Option<Extension<Held>>,
+    Path((uid, branch)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
         deploy_or_validate(app, who, uid, branch, body, true)
@@ -550,7 +585,13 @@ async fn deploy(State(app): State<Shared>, Auth(who): Auth, held: Option<Extensi
     .await
 }
 
-async fn validate(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>, body: Bytes) -> Result<Json<Value>, ApiError> {
+async fn validate(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    held: Option<Extension<Held>>,
+    Path((uid, branch)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
         deploy_or_validate(app, who, uid, branch, body, false)
@@ -625,7 +666,15 @@ fn branch_counts<'a>(keys: impl Iterator<Item = &'a str>, scope: &str, project_p
 
 /// A user deploying to a project the account does not have yet creates
 /// it and owns it; validating needs no project. Query keys cannot deploy.
-fn deploy_gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, keep: bool, production_branch: &str, name: &str) -> Result<Tenant, ApiError> {
+fn deploy_gate(
+    app: &App,
+    who: &Option<Principal>,
+    uid: &str,
+    branch: &str,
+    keep: bool,
+    production_branch: &str,
+    name: &str,
+) -> Result<Tenant, ApiError> {
     check_uid(uid)?;
     check_branch(branch)?;
     let scope = scope_of(who);
@@ -646,7 +695,14 @@ fn deploy_gate(app: &App, who: &Option<Principal>, uid: &str, branch: &str, keep
     }
 }
 
-fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
+fn deploy_or_validate(
+    app: Shared,
+    who: Option<Principal>,
+    uid: String,
+    branch: String,
+    body: Bytes,
+    keep: bool,
+) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
@@ -673,7 +729,8 @@ fn deploy_or_validate(app: Shared, who: Option<Principal>, uid: String, branch: 
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_service::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let t = deploy_gate(&app, &who, &uid, &branch, keep, &loaded.snapshot.branch.uid, &loaded.snapshot.project.name)?;
-        let deployed = Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
+        let deployed =
+            Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
         let mut out = deployed.summary();
         out["test_results"] = deployed.run_tests();
         out["validated_only"] = Value::Bool(!keep);
@@ -737,7 +794,13 @@ fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<(), String> {
     let mut archive = tar::Archive::new(decoder);
     archive.set_overwrite(false);
     let too_big = || format!("the archive is larger than {} MiB when decompressed", UNPACKED_LIMIT / (1024 * 1024));
-    let failed = |what: &str, e: std::io::Error| if tripped.load(std::sync::atomic::Ordering::Relaxed) { too_big() } else { format!("{what} the archive: {e}") };
+    let failed = |what: &str, e: std::io::Error| {
+        if tripped.load(std::sync::atomic::Ordering::Relaxed) {
+            too_big()
+        } else {
+            format!("{what} the archive: {e}")
+        }
+    };
     let entries = archive.entries().map_err(|e| failed("reading", e))?;
     let mut n = 0usize;
     for entry in entries {
@@ -895,7 +958,12 @@ impl From<ServiceError> for ApiError {
 // The work itself is the service's: the server adds who may read the
 // branch, the context a key is bound to, and the bounds on a request.
 
-async fn sql(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<SqlResponse>, ApiError> {
+async fn sql(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<SqlResponse>, ApiError> {
     Ok(Json(sql_of(&app, &who, &uid, &branch, req)?))
 }
 
@@ -907,7 +975,12 @@ fn sql_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, mut re
     Ok(d.sql(req, &shape_check)?)
 }
 
-async fn explain(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<SqlRequest>) -> Result<Json<ExplainResponse>, ApiError> {
+async fn explain(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<ExplainResponse>, ApiError> {
     Ok(Json(explain_of(&app, &who, &uid, &branch, req)?))
 }
 
@@ -919,14 +992,25 @@ fn explain_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, mu
     Ok(d.explain(req, &shape_check)?)
 }
 
-async fn explore(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Json(req): Json<ExploreRequest>) -> Result<Json<ExploreResponse>, ApiError> {
+async fn explore(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+    Json(req): Json<ExploreRequest>,
+) -> Result<Json<ExploreResponse>, ApiError> {
     Ok(Json(explore_of(&app, &who, &uid, &branch, req)?))
 }
 
 /// Exploring resolves universes only, so no policy applies yet; the
 /// context is still held to the bound-context rule, so a key behaves
 /// the same on every read.
-fn explore_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, mut req: ExploreRequest) -> Result<ExploreResponse, ApiError> {
+fn explore_of(
+    app: &Shared,
+    who: &Option<Principal>,
+    uid: &str,
+    branch: &str,
+    mut req: ExploreRequest,
+) -> Result<ExploreResponse, ApiError> {
     let t = gate(app, who, uid, branch, Verb::Read)?;
     let d = model(app, &t, uid, branch)?;
     req.context = effective_context(&t, who, req.context)?;
@@ -936,7 +1020,6 @@ fn explore_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, mu
     }
     Ok(d.explore(req, &shape_check)?)
 }
-
 
 // --------------------------------------------------------------- discovery
 
@@ -951,7 +1034,12 @@ struct FieldsQuery {
 /// Field discovery. With `q`, fields containing the text come first in
 /// model order, then near matches by trigram similarity, each with its
 /// `score` (1 for a containing match).
-async fn fields(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<FieldsQuery>) -> Result<Json<Value>, ApiError> {
+async fn fields(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+    Query(q): Query<FieldsQuery>,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(fields_of(&app, &who, &uid, &branch, q)?))
 }
 
@@ -972,7 +1060,11 @@ fn tables_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str) -> 
     Ok(d.tables())
 }
 
-async fn values(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch, dim)): Path<(String, String, String)>) -> Result<Json<Value>, ApiError> {
+async fn values(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch, dim)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(values_of(&app, &who, &uid, &branch, &dim)?))
 }
 
@@ -982,8 +1074,12 @@ fn values_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, dim
     Ok(d.values_of(dim)?)
 }
 
-
-async fn test(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension<Held>>, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+async fn test(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    held: Option<Extension<Held>>,
+    Path((uid, branch)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let d = model(&app, &t, &uid, &branch)?;
     blocking(move || {
@@ -993,7 +1089,12 @@ async fn test(State(app): State<Shared>, Auth(who): Auth, held: Option<Extension
     .await
 }
 
-async fn sampling_plan(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>, Query(q): Query<SamplingQuery>) -> Result<Json<Value>, ApiError> {
+async fn sampling_plan(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+    Query(q): Query<SamplingQuery>,
+) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
     let d = model(&app, &t, &uid, &branch)?;
     let dims: Vec<String> = q.dims.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -1021,7 +1122,11 @@ async fn remove(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)):
     Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
 }
 
-async fn branch_summary(State(app): State<Shared>, Auth(who): Auth, Path((uid, branch)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+async fn branch_summary(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, branch)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
     let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
     let d = model(&app, &t, &uid, &branch)?;
     Ok(Json(d.summary()))
@@ -1129,7 +1234,12 @@ async fn login(State(app): State<Shared>, Json(req): Json<LoginRequest>) -> Resu
     // while, whichever address they come from: that is what someone
     // working through a password list looks like.
     if let Some(secs) = app.limits.login_blocked(&req.email) {
-        return Ok(retry_later(StatusCode::TOO_MANY_REQUESTS, "RateLimited", format!("too many failed sign-ins for this email: retry in {secs}s"), secs));
+        return Ok(retry_later(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RateLimited",
+            format!("too many failed sign-ins for this email: retry in {secs}s"),
+            secs,
+        ));
     }
     let found = {
         let (app, email, password) = (app.clone(), req.email.clone(), req.password);
@@ -1164,7 +1274,12 @@ struct PasswordRequest {
     password: String,
 }
 
-async fn set_password(State(app): State<Shared>, Auth(who): Auth, headers: axum::http::HeaderMap, Json(req): Json<PasswordRequest>) -> Result<Json<Value>, ApiError> {
+async fn set_password(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PasswordRequest>,
+) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
     // The session this change is made from survives it; any other is
@@ -1296,8 +1411,12 @@ async fn resend_verification(State(app): State<Shared>, Auth(who): Auth) -> Resu
 async fn me(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
     store_of(&app)?;
     Ok(Json(match &who {
-        Some(Principal::User { user, account, role, key_id }) => json!({ "kind": "user", "user": user, "account": account, "role": role, "key_id": key_id }),
-        Some(Principal::QueryKey { key, account, grants }) => json!({ "kind": "query_key", "key": key, "account": account, "grants": grants }),
+        Some(Principal::User { user, account, role, key_id }) => {
+            json!({ "kind": "user", "user": user, "account": account, "role": role, "key_id": key_id })
+        }
+        Some(Principal::QueryKey { key, account, grants }) => {
+            json!({ "kind": "query_key", "key": key, "account": account, "grants": grants })
+        }
         None => json!({}),
     }))
 }
@@ -1388,7 +1507,16 @@ async fn ui_root() -> Response {
 
 /// The files browsers and manifests expect at the site root: favicons,
 /// the touch icon, the Android icons and the manifest that names them.
-const SITE_FILES: &[&str] = &["favicon.ico", "favicon.svg", "apple-touch-icon.png", "site.webmanifest", "icon-192.png", "icon-512.png", "icon-maskable-192.png", "icon-maskable-512.png"];
+const SITE_FILES: &[&str] = &[
+    "favicon.ico",
+    "favicon.svg",
+    "apple-touch-icon.png",
+    "site.webmanifest",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-192.png",
+    "icon-maskable-512.png",
+];
 
 async fn site_file(uri: axum::http::Uri) -> Response {
     ui_file(uri.path().trim_start_matches('/'))
@@ -1497,7 +1625,11 @@ async fn create_query_key(State(app): State<Shared>, Auth(who): Auth, Json(req):
 }
 
 /// Admins and the key's creator manage it.
-fn may_manage_key(store: &Store, who: &Option<Principal>, id: i64) -> Result<(zsql_accounts::User, zsql_accounts::Account, zsql_accounts::QueryKey), ApiError> {
+fn may_manage_key(
+    store: &Store,
+    who: &Option<Principal>,
+    id: i64,
+) -> Result<(zsql_accounts::User, zsql_accounts::Account, zsql_accounts::QueryKey), ApiError> {
     let (user, account, role) = user_of(who)?;
     let key = store.query_key(account.id, id).map_err(accounts_error)?;
     if role != Role::Admin && key.created_by != Some(user.id) {
@@ -1535,7 +1667,12 @@ struct GrantRequest {
 /// admin's), and so is binding the context it plans with there: that
 /// context can assert claims that bypass the model's policies, which is
 /// the owner's to decide and nobody else's.
-async fn grant(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>, Json(req): Json<GrantRequest>) -> Result<Json<Value>, ApiError> {
+async fn grant(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path(id): Path<i64>,
+    Json(req): Json<GrantRequest>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
     let key = store.query_key(account.id, id).map_err(accounts_error)?;
@@ -1550,7 +1687,8 @@ async fn grant(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>, 
             }
             // Stored in its canonical shape, so what the owner sees back
             // is exactly what the planner will be given.
-            let ctx: SecurityContext = serde_json::from_value(v).map_err(|e| ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("this is not a security context: {e}")))?;
+            let ctx: SecurityContext = serde_json::from_value(v)
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("this is not a security context: {e}")))?;
             Some(serde_json::to_value(ctx).expect("a context serializes"))
         }
     };
@@ -1558,7 +1696,11 @@ async fn grant(State(app): State<Shared>, Auth(who): Auth, Path(id): Path<i64>, 
     Ok(Json(json!({ "key": key, "grant": g })))
 }
 
-async fn revoke_grant(State(app): State<Shared>, Auth(who): Auth, Path((id, project_uid)): Path<(i64, String)>) -> Result<Json<Value>, ApiError> {
+async fn revoke_grant(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((id, project_uid)): Path<(i64, String)>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, account, _) = user_of(&who)?;
     let t = gate(&app, &who, &project_uid, "", Verb::Owner)?;
@@ -1573,8 +1715,10 @@ async fn project_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): P
     user_of(&who)?;
     let t = gate(&app, &who, &uid, "", Verb::Read)?;
     let project = t.project.expect("accounts on");
-    let access: Vec<Value> = store.project_access(&project).map_err(accounts_error)?.into_iter().map(|(u, l)| json!({ "user": u, "level": l })).collect();
-    let keys: Vec<Value> = store.keys_granted_on(&project).map_err(accounts_error)?.into_iter().map(|(k, g)| json!({ "key": k, "grant": g })).collect();
+    let access: Vec<Value> =
+        store.project_access(&project).map_err(accounts_error)?.into_iter().map(|(u, l)| json!({ "user": u, "level": l })).collect();
+    let keys: Vec<Value> =
+        store.keys_granted_on(&project).map_err(accounts_error)?.into_iter().map(|(k, g)| json!({ "key": k, "grant": g })).collect();
     Ok(Json(json!({ "project": project, "access": access, "query_keys": keys })))
 }
 
@@ -1584,7 +1728,12 @@ struct AccessRequest {
     level: String,
 }
 
-async fn set_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>, Json(req): Json<AccessRequest>) -> Result<Json<Value>, ApiError> {
+async fn set_access(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path(uid): Path<String>,
+    Json(req): Json<AccessRequest>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
     let t = gate(&app, &who, &uid, "", Verb::Owner)?;
@@ -1594,7 +1743,11 @@ async fn set_access(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<
     Ok(Json(json!({ "user": u, "level": l })))
 }
 
-async fn remove_access(State(app): State<Shared>, Auth(who): Auth, Path((uid, email)): Path<(String, String)>) -> Result<Json<Value>, ApiError> {
+async fn remove_access(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path((uid, email)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
     let t = gate(&app, &who, &uid, "", Verb::Owner)?;
@@ -1611,12 +1764,26 @@ struct ProjectPatch {
     protected_production: Option<bool>,
 }
 
-async fn update_project(State(app): State<Shared>, Auth(who): Auth, Path(uid): Path<String>, Json(req): Json<ProjectPatch>) -> Result<Json<Value>, ApiError> {
+async fn update_project(
+    State(app): State<Shared>,
+    Auth(who): Auth,
+    Path(uid): Path<String>,
+    Json(req): Json<ProjectPatch>,
+) -> Result<Json<Value>, ApiError> {
     let store = store_of(&app)?;
     let (user, _, _) = user_of(&who)?;
     let t = gate(&app, &who, &uid, "", Verb::Owner)?;
     let project = t.project.expect("accounts on");
-    let p = store.update_project(user, &project, req.name.as_deref(), req.production_branch.as_deref(), req.visibility.as_deref(), req.protected_production).map_err(accounts_error)?;
+    let p = store
+        .update_project(
+            user,
+            &project,
+            req.name.as_deref(),
+            req.production_branch.as_deref(),
+            req.visibility.as_deref(),
+            req.protected_production,
+        )
+        .map_err(accounts_error)?;
     Ok(Json(json!(p)))
 }
 
@@ -1648,7 +1815,6 @@ async fn audit(State(app): State<Shared>, Auth(who): Auth, Query(q): Query<Audit
     let (_, account) = admin_of(&who)?;
     Ok(Json(json!({ "events": store.audit_log(account.id, q.limit.min(1000)).map_err(accounts_error)? })))
 }
-
 
 async fn healthz() -> &'static str {
     "ok"
@@ -1776,11 +1942,42 @@ async fn main() -> anyhow::Result<()> {
     let caps = Caps::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     let public_url = std::env::var("ZSQL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
     let mailer = mail::Mailer::from_env(public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let limits_mode = if limits.on() { if limits.cfg.mode == limits::Mode::Shadow { "shadow" } else { "on" } } else { "off" };
+    let limits_mode = if limits.on() {
+        if limits.cfg.mode == limits::Mode::Shadow {
+            "shadow"
+        } else {
+            "on"
+        }
+    } else {
+        "off"
+    };
     let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
-    let app: Shared = Arc::new(App { dialects, data_dir, models: RwLock::new(HashMap::new()), accounts, signup_open, secure_cookies, limits, admission, caps, mailer });
+    let app: Shared = Arc::new(App {
+        dialects,
+        data_dir,
+        models: RwLock::new(HashMap::new()),
+        accounts,
+        signup_open,
+        secure_cookies,
+        limits,
+        admission,
+        caps,
+        mailer,
+    });
     let (n, skipped) = reload(&app)?;
-    eprintln!("zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}", app.data_dir.display(), if accounts_on { if signup_open { "on, sign-up open" } else { "on, sign-up closed" } } else { "off" });
+    eprintln!(
+        "zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}",
+        app.data_dir.display(),
+        if accounts_on {
+            if signup_open {
+                "on, sign-up open"
+            } else {
+                "on, sign-up closed"
+            }
+        } else {
+            "off"
+        }
+    );
     if !skipped.is_empty() {
         // Said again, together, after the per-branch lines above: the
         // one line someone watching a restart will actually read.
@@ -1848,14 +2045,8 @@ mod tests {
     /// as an account mysteriously unable to deploy.
     #[test]
     fn branches_are_counted_against_the_right_project_and_account() {
-        let keys = [
-            "acme/sales/main",
-            "acme/sales/feature-x",
-            "acme/sales-eu/main",
-            "acme/web/main",
-            "acme-2/sales/main",
-            "acme-2/sales/staging",
-        ];
+        let keys =
+            ["acme/sales/main", "acme/sales/feature-x", "acme/sales-eu/main", "acme/web/main", "acme-2/sales/main", "acme-2/sales/staging"];
         let it = || keys.iter().copied();
 
         // Four branches in acme, two of them in acme/sales.
@@ -1887,13 +2078,35 @@ mod tests {
         for uid in ["customer-service", "tpcds", "bird_financial", "a1"] {
             assert!(check_uid(uid).is_ok(), "{uid}");
         }
-        for uid in ["", "Customer-Service", " customer-service", "../newco/customer-service", "a/b", "a\\b", "a.b", "a b", &"x".repeat(NAME_LIMIT + 1)] {
+        for uid in [
+            "",
+            "Customer-Service",
+            " customer-service",
+            "../newco/customer-service",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "a b",
+            &"x".repeat(NAME_LIMIT + 1),
+        ] {
             assert!(check_uid(uid).is_err(), "{uid:?}");
         }
         for branch in ["main", "master", "probe-holder-loan", "release_1.2", "v1.2.3", "RC1"] {
             assert!(check_branch(branch).is_ok(), "{branch}");
         }
-        for branch in ["", ".", "..", ".hidden", "../../newco/customer-service/main", "feature/x", "a\\b", "a b", "a\0b", "main\n", &"x".repeat(NAME_LIMIT + 1)] {
+        for branch in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "../../newco/customer-service/main",
+            "feature/x",
+            "a\\b",
+            "a b",
+            "a\0b",
+            "main\n",
+            &"x".repeat(NAME_LIMIT + 1),
+        ] {
             assert!(check_branch(branch).is_err(), "{branch:?}");
         }
     }

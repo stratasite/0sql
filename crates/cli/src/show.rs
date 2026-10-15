@@ -23,7 +23,12 @@ pub fn items(v: &Value) -> Vec<String> {
 
 /// One line per reference that resolved by near match.
 pub fn corrections(v: &Value) -> Vec<String> {
-    v["corrections"].as_array().into_iter().flatten().map(|c| format!("{} → {} (~{})", c["term"].as_str().unwrap_or(""), c["field_name"].as_str().unwrap_or(""), c["score"])).collect()
+    v["corrections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| format!("{} → {} (~{})", c["term"].as_str().unwrap_or(""), c["field_name"].as_str().unwrap_or(""), c["score"]))
+        .collect()
 }
 
 /// The SQL answer as text: how the items were read, the corrections,
@@ -106,9 +111,16 @@ pub fn print_explain(v: &Value, style: &dyn Fn(&str) -> String, origin: &str) {
     if let Some(root) = nodes.iter().find(|n| n["root"].as_bool() == Some(true)) {
         walk(root, 0, "", &nodes, style);
     }
-    let phases: Vec<String> = v["phases"].as_array().into_iter().flatten().map(|p| format!("{} {}", p["name"].as_str().unwrap_or(""), p["us"])).collect();
+    let phases: Vec<String> =
+        v["phases"].as_array().into_iter().flatten().map(|p| format!("{} {}", p["name"].as_str().unwrap_or(""), p["us"])).collect();
     println!();
-    println!("{}", style(&format!("-- {origin} {} us: parser {} us, plan {} us", v["timings"]["total_us"], v["timings"]["parser_us"], v["timings"]["plan_us"])));
+    println!(
+        "{}",
+        style(&format!(
+            "-- {origin} {} us: parser {} us, plan {} us",
+            v["timings"]["total_us"], v["timings"]["parser_us"], v["timings"]["plan_us"]
+        ))
+    );
     println!("{}", style(&format!("-- phases (us): {}", phases.join(", "))));
 }
 
@@ -122,7 +134,13 @@ pub fn print_explore(v: &Value, style: &dyn Fn(&str) -> String, origin: &str) {
                 Some(s) if s < 1.0 => format!(" ~{s:.2}"),
                 _ => String::new(),
             };
-            println!("{:<40} {} {:<32} {}{near}", f["uid"].as_str().unwrap_or(""), label, f["name"].as_str().unwrap_or(""), style(&tables.join(", ")));
+            println!(
+                "{:<40} {} {:<32} {}{near}",
+                f["uid"].as_str().unwrap_or(""),
+                label,
+                f["name"].as_str().unwrap_or(""),
+                style(&tables.join(", "))
+            );
         }
         counts.push(format!("{} {key}", fields.len()));
     }
@@ -140,19 +158,37 @@ pub fn print_fields(v: &Value) {
             Some(s) if s < 1.0 => format!(" ~{s:.2}"),
             _ => String::new(),
         };
-        println!("{:<40} {} {}{}{near}", f["uid"].as_str().unwrap_or(""), kind, f["name"].as_str().unwrap_or(""), if f["hidden"].as_bool().unwrap_or(false) { " (hidden)" } else { "" });
+        println!(
+            "{:<40} {} {}{}{near}",
+            f["uid"].as_str().unwrap_or(""),
+            kind,
+            f["name"].as_str().unwrap_or(""),
+            if f["hidden"].as_bool().unwrap_or(false) { " (hidden)" } else { "" }
+        );
     }
 }
 
 pub fn print_tables(v: &Value) {
     for t in v["tables"].as_array().into_iter().flatten() {
-        println!("{:<32} {:<32} {} cost {}", t["uid"].as_str().unwrap_or(""), t["physical_name"].as_str().unwrap_or(""), t["datasource"].as_str().unwrap_or("?"), t["cost"]);
+        println!(
+            "{:<32} {:<32} {} cost {}",
+            t["uid"].as_str().unwrap_or(""),
+            t["physical_name"].as_str().unwrap_or(""),
+            t["datasource"].as_str().unwrap_or("?"),
+            t["cost"]
+        );
     }
 }
 
 pub fn print_values(v: &Value) {
     if let Some(r) = v.get("range") {
-        println!("{:<40} {} .. {}  (distinct {})", v["uid"].as_str().unwrap_or(""), r["min"].as_str().unwrap_or(""), r["max"].as_str().unwrap_or(""), v["distinct"]);
+        println!(
+            "{:<40} {} .. {}  (distinct {})",
+            v["uid"].as_str().unwrap_or(""),
+            r["min"].as_str().unwrap_or(""),
+            r["max"].as_str().unwrap_or(""),
+            v["distinct"]
+        );
         return;
     }
     let values = v["values"].as_array().cloned().unwrap_or_default();

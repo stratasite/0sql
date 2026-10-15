@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as Json;
 use serde_yaml::Value as Yaml;
 use zsql_dialect::Dialects;
-use zsql_spec::expr::ParsedExpression;
 use zsql_semantic::*;
+use zsql_spec::expr::ParsedExpression;
 
 pub mod values;
 
@@ -300,10 +300,43 @@ struct Builder<'d> {
     prefetched: HashMap<PathBuf, Result<Yaml>>,
 }
 
-const TABLE_KEYS: &[&str] = &["datasource", "name", "physical_name", "cost", "description", "tags", "metadata", "snapshot", "snapshot_date", "partition", "partitions", "imports", "fields"];
+const TABLE_KEYS: &[&str] = &[
+    "datasource",
+    "name",
+    "physical_name",
+    "cost",
+    "description",
+    "tags",
+    "metadata",
+    "snapshot",
+    "snapshot_date",
+    "partition",
+    "partitions",
+    "imports",
+    "fields",
+];
 const FIELD_KEYS: &[&str] = &[
-    "type", "name", "description", "hidden", "grains", "data_type", "display_type", "format", "secure", "disable_listing", "disable_value_listing", "value_list_size", "snapshot",
-    "exclusion_type", "exclusions", "inclusions", "extended_blend_group", "synonyms", "tags", "expression", "values",
+    "type",
+    "name",
+    "description",
+    "hidden",
+    "grains",
+    "data_type",
+    "display_type",
+    "format",
+    "secure",
+    "disable_listing",
+    "disable_value_listing",
+    "value_list_size",
+    "snapshot",
+    "exclusion_type",
+    "exclusions",
+    "inclusions",
+    "extended_blend_group",
+    "synonyms",
+    "tags",
+    "expression",
+    "values",
 ];
 const EXPRESSION_KEYS: &[&str] = &["sql", "array", "lookup", "primary_key"];
 const JOIN_KEYS: &[&str] = &["left", "right", "sql", "cardinality", "join", "allow_measure_expansion", "description"];
@@ -353,7 +386,10 @@ impl<'d> Builder<'d> {
         }
         let parsed: Vec<(PathBuf, Result<Yaml>)> = std::thread::scope(|scope| {
             let chunks: Vec<_> = files.chunks(files.len().div_ceil(workers)).collect();
-            let handles: Vec<_> = chunks.into_iter().map(|chunk| scope.spawn(move || chunk.iter().map(|f| (f.clone(), read_yaml(f))).collect::<Vec<_>>())).collect();
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| scope.spawn(move || chunk.iter().map(|f| (f.clone(), read_yaml(f))).collect::<Vec<_>>()))
+                .collect();
             handles.into_iter().flat_map(|h| h.join().expect("a parsing thread")).collect()
         });
         self.prefetched.extend(parsed);
@@ -470,14 +506,17 @@ impl<'d> Builder<'d> {
                 return Err(invalid(&file, format!("datasource {uid} must be a mapping")));
             };
             let name = str_of(d, "name").unwrap_or_else(|| uid.clone());
-            let adapter = str_of(d, "adapter").ok_or_else(|| invalid(&file, format!("Datasource errors: {name} needs an adapter")))?.to_lowercase();
+            let adapter =
+                str_of(d, "adapter").ok_or_else(|| invalid(&file, format!("Datasource errors: {name} needs an adapter")))?.to_lowercase();
             self.dialects.get(&adapter).map_err(|_| invalid(&file, format!("Datasource errors: adapter '{adapter}' is not supported")))?;
             let tier = match str_of(d, "tier").map(|t| t.to_lowercase()).as_deref() {
                 None => None,
                 Some("hot") => Some(Tier::Hot),
                 Some("warm") => Some(Tier::Warm),
                 Some("cold") => Some(Tier::Cold),
-                Some(other) => return Err(invalid(&file, format!("Datasource errors: tier '{other}' should be hot, warm or cold ({name})"))),
+                Some(other) => {
+                    return Err(invalid(&file, format!("Datasource errors: tier '{other}' should be hot, warm or cold ({name})")))
+                }
             };
             if self.datasources.iter().any(|x| x.uid == uid) {
                 return Err(invalid(&file, format!("datasource key {uid} is repeated")));
@@ -501,7 +540,8 @@ impl<'d> Builder<'d> {
     }
 
     fn datasource_for(&self, file: &Path, m: &serde_yaml::Mapping, what: &str) -> Result<usize> {
-        let val = str_of(m, "datasource").ok_or_else(|| invalid(file, format!("datasource key is required in {what} file.")))?.to_lowercase();
+        let val =
+            str_of(m, "datasource").ok_or_else(|| invalid(file, format!("datasource key is required in {what} file.")))?.to_lowercase();
         self.datasources
             .iter()
             .position(|d| d.uid == val || d.name.to_lowercase() == val)
@@ -535,7 +575,11 @@ impl<'d> Builder<'d> {
     fn resolve_imports(&mut self, file: &Path, visiting: &mut Vec<PathBuf>) -> Result<serde_yaml::Mapping> {
         let abs = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
         if visiting.contains(&abs) {
-            let cycle: Vec<String> = visiting.iter().chain(std::iter::once(&abs)).map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect();
+            let cycle: Vec<String> = visiting
+                .iter()
+                .chain(std::iter::once(&abs))
+                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+                .collect();
             return Err(invalid(file, format!("Circular import detected: {}", cycle.join(" -> "))));
         }
         visiting.push(abs);
@@ -607,7 +651,8 @@ impl<'d> Builder<'d> {
         self.unknown_keys(file, "table", m, TABLE_KEYS);
         let ds = self.datasource_for(file, m, "table")?;
         let name = str_of(m, "name").ok_or_else(|| invalid(file, "Table errors: Name can't be blank"))?;
-        let physical_name = str_of(m, "physical_name").ok_or_else(|| invalid(file, format!("Table errors: Physical name can't be blank ({name})")))?;
+        let physical_name =
+            str_of(m, "physical_name").ok_or_else(|| invalid(file, format!("Table errors: Physical name can't be blank ({name})")))?;
         if self.tables.iter().any(|t| t.datasource_id == self.datasources[ds].id && t.name.to_lowercase() == name.to_lowercase()) {
             return Err(invalid(file, format!("Table errors: Name has already been taken ({name})")));
         }
@@ -673,7 +718,8 @@ impl<'d> Builder<'d> {
             _ => return Err(invalid(file, format!("Field {name} errors: type should either be a dimension or measure"))),
         };
         let data_type: DataType = match str_of(fm, "data_type") {
-            Some(d) => serde_json::from_value(Json::String(d.to_lowercase())).map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list")))?,
+            Some(d) => serde_json::from_value(Json::String(d.to_lowercase()))
+                .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list")))?,
             None => return Err(invalid(file, format!("Field {name} errors: Data type can't be blank"))),
         };
         let display_type = str_of(fm, "display_type").map(|d| d.to_lowercase()).unwrap_or_else(|| "default".into());
@@ -786,7 +832,12 @@ impl<'d> Builder<'d> {
             Some(Yaml::Mapping(em)) => {
                 self.unknown_keys(file, &format!("expression of {name}"), em, EXPRESSION_KEYS);
                 let sql = str_of(em, "sql").ok_or_else(|| invalid(file, format!("Expression errors for {name}: Sql can't be blank")))?;
-                (sql, bool_of(em, "array").unwrap_or(false), bool_of(em, "lookup").unwrap_or(false), bool_of(em, "primary_key").unwrap_or(false))
+                (
+                    sql,
+                    bool_of(em, "array").unwrap_or(false),
+                    bool_of(em, "lookup").unwrap_or(false),
+                    bool_of(em, "primary_key").unwrap_or(false),
+                )
             }
             Some(_) => return Err(invalid(file, "Field expression must be a string or mapping.")),
             None => return Err(invalid(file, format!("Field '{name}' is missing an expression node."))),
@@ -844,9 +895,16 @@ impl<'d> Builder<'d> {
                 Some("dimension") => ExclusionScope::Dimension,
                 Some("table") => ExclusionScope::Table,
                 Some("universe") => ExclusionScope::Universe,
-                _ => return Err(invalid(file, format!("Field {field} errors: Exclusion rule Type should be one of: dimension, table, universe"))),
+                _ => {
+                    return Err(invalid(
+                        file,
+                        format!("Field {field} errors: Exclusion rule Type should be one of: dimension, table, universe"),
+                    ))
+                }
             };
-            let filter = parse_filter_mode(str_of(em, "filter")).ok_or_else(|| invalid(file, format!("Field {field} errors: Exclusion rule Filter should be one of: ignore, apply, only")))?;
+            let filter = parse_filter_mode(str_of(em, "filter")).ok_or_else(|| {
+                invalid(file, format!("Field {field} errors: Exclusion rule Filter should be one of: ignore, apply, only"))
+            })?;
             let entities = strs_of(em, "entities");
             if entities.is_empty() {
                 return Err(invalid(file, format!("Field {field} errors: Exclusion rule Entities can't be blank")));
@@ -861,8 +919,10 @@ impl<'d> Builder<'d> {
         let Some(im) = as_map(v) else {
             return Err(invalid(file, format!("Field {field} errors: inclusions must be a mapping")));
         };
-        let filter = parse_filter_mode(str_of(im, "filter")).ok_or_else(|| invalid(file, format!("Field {field} errors: Inclusions Filter should be one of: ignore, apply, only")))?;
-        let aggregation = str_of(im, "aggregation").ok_or_else(|| invalid(file, format!("Field {field} errors: Inclusions Aggregation can't be blank")))?;
+        let filter = parse_filter_mode(str_of(im, "filter"))
+            .ok_or_else(|| invalid(file, format!("Field {field} errors: Inclusions Filter should be one of: ignore, apply, only")))?;
+        let aggregation = str_of(im, "aggregation")
+            .ok_or_else(|| invalid(file, format!("Field {field} errors: Inclusions Aggregation can't be blank")))?;
         let dimensions = strs_of(im, "dimensions");
         if dimensions.is_empty() {
             return Err(invalid(file, format!("Field {field} errors: Inclusions Dimensions can't be blank")));
@@ -902,11 +962,18 @@ impl<'d> Builder<'d> {
         };
         let left_name = str_of(jm, "left").unwrap_or_default();
         let right_name = str_of(jm, "right").unwrap_or_default();
-        let left = find(Some(left_name.clone())).ok_or_else(|| invalid(file, format!("Left table '{left_name}' not found in datasource {}", self.datasources[ds].name)))?;
-        let right = find(Some(right_name.clone())).ok_or_else(|| invalid(file, format!("Right table '{right_name}' not found in datasource {}", self.datasources[ds].name)))?;
+        let left = find(Some(left_name.clone()))
+            .ok_or_else(|| invalid(file, format!("Left table '{left_name}' not found in datasource {}", self.datasources[ds].name)))?;
+        let right = find(Some(right_name.clone()))
+            .ok_or_else(|| invalid(file, format!("Right table '{right_name}' not found in datasource {}", self.datasources[ds].name)))?;
         let (mut left_id, mut right_id) = (self.tables[left].id, self.tables[right].id);
         let pair = (left_id.min(right_id), left_id.max(right_id));
-        if seen.contains(&pair) || self.join_defs.iter().any(|j| (j.left_id == left_id && j.right_id == right_id) || (j.left_id == right_id && j.right_id == left_id)) {
+        if seen.contains(&pair)
+            || self
+                .join_defs
+                .iter()
+                .any(|j| (j.left_id == left_id && j.right_id == right_id) || (j.left_id == right_id && j.right_id == left_id))
+        {
             return Err(invalid(file, format!("Join: <{left_name}-{right_name}>, already exists.")));
         }
         seen.push(pair);
@@ -921,12 +988,18 @@ impl<'d> Builder<'d> {
             Some("one_to_many") => Cardinality::OneToMany,
             Some("many_to_one") => Cardinality::ManyToOne,
             Some("one_to_one") => Cardinality::OneToOne,
-            Some(other) => return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality '{other}' is not included in the list"))),
+            Some(other) => {
+                return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality '{other}' is not included in the list")))
+            }
             None => return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality can't be blank"))),
         };
-        let mut sql = str_of(jm, "sql").ok_or_else(|| invalid(file, format!("JoinDef errors for {key}: Sql can't be blank")))?.to_lowercase();
+        let mut sql =
+            str_of(jm, "sql").ok_or_else(|| invalid(file, format!("JoinDef errors for {key}: Sql can't be blank")))?.to_lowercase();
         if !sql.contains("left.") || !sql.contains("right.") {
-            return Err(invalid(file, format!("JoinDef errors for {key}: Sql join sql should be of the format left.column = right.column")));
+            return Err(invalid(
+                file,
+                format!("JoinDef errors for {key}: Sql join sql should be of the format left.column = right.column"),
+            ));
         }
         // Paths run from the many side to the one side: a one_to_many join is
         // stored reversed, as `JoinDef#align_join_direction` does.
@@ -1011,24 +1084,41 @@ impl<'d> Builder<'d> {
         let pending_tables = std::mem::take(&mut self.pending_tables);
         for pt in pending_tables {
             if let Some(dim_name) = &pt.snapshot {
-                let dim = self.dimension_by_name(dim_name).ok_or_else(|| invalid(&pt.file, format!("could not find snapshot dimension {dim_name} in branch.")))?;
+                let dim = self
+                    .dimension_by_name(dim_name)
+                    .ok_or_else(|| invalid(&pt.file, format!("could not find snapshot dimension {dim_name} in branch.")))?;
                 self.tables[pt.table_index].snapshot_date_id = Some(self.fields[dim].id);
             }
             for pm in &pt.partitions {
                 let dim_name = str_of(pm, "dimension").ok_or_else(|| invalid(&pt.file, "Partition errors: Dimension must exist"))?;
-                let dim = self.dimension_by_name(&dim_name).ok_or_else(|| invalid(&pt.file, format!("Partition errors: Dimension must exist ({dim_name})")))?;
+                let dim = self
+                    .dimension_by_name(&dim_name)
+                    .ok_or_else(|| invalid(&pt.file, format!("Partition errors: Dimension must exist ({dim_name})")))?;
                 let predicate: Predicate = str_of(pm, "predicate")
                     .and_then(|p| serde_json::from_value(Json::String(p.to_lowercase())).ok())
                     .ok_or_else(|| invalid(&pt.file, format!("Partition errors: Predicate is not included in the list ({dim_name})")))?;
                 // Ranges need a number or date dimension to compare on; a
                 // list partition works on any type.
-                let ranged = matches!(predicate, Predicate::Between | Predicate::GreaterThan | Predicate::GreaterThanOrEqualTo | Predicate::LessThan | Predicate::LessThanOrEqualTo);
+                let ranged = matches!(
+                    predicate,
+                    Predicate::Between
+                        | Predicate::GreaterThan
+                        | Predicate::GreaterThanOrEqualTo
+                        | Predicate::LessThan
+                        | Predicate::LessThanOrEqualTo
+                );
                 if !ranged && predicate != Predicate::InList {
                     self.warn(&pt.file, format!("partition on {dim_name}: predicate {} is not supported (between, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, in_list); the partition will not rank the table", predicate.name()));
                 }
-                let numeric_or_date = matches!(self.fields[dim].data_type, Some(DataType::Integer | DataType::Decimal | DataType::Bigint | DataType::Date | DataType::DateTime));
+                let numeric_or_date = matches!(
+                    self.fields[dim].data_type,
+                    Some(DataType::Integer | DataType::Decimal | DataType::Bigint | DataType::Date | DataType::DateTime)
+                );
                 if ranged && !numeric_or_date {
-                    self.warn(&pt.file, format!("partition on {dim_name}: a {} partition needs a number or date dimension", predicate.name()));
+                    self.warn(
+                        &pt.file,
+                        format!("partition on {dim_name}: a {} partition needs a number or date dimension", predicate.name()),
+                    );
                 }
                 let id = self.partitions.len() as Id + 1;
                 self.partitions.push(Partition {
@@ -1051,12 +1141,16 @@ impl<'d> Builder<'d> {
         for pe in pending {
             let mut measure_ids = Vec::new();
             for m in &pe.measure_refs {
-                let i = self.field_by_name(FieldKind::Measure, m).ok_or_else(|| invalid(&pe.file, format!("[{}]: could not find measure named: {m}", pe.field_name)))?;
+                let i = self
+                    .field_by_name(FieldKind::Measure, m)
+                    .ok_or_else(|| invalid(&pe.file, format!("[{}]: could not find measure named: {m}", pe.field_name)))?;
                 measure_ids.push(self.fields[i].id);
             }
             let mut dimension_ids = Vec::new();
             for d in &pe.dimension_refs {
-                let i = self.field_by_name(FieldKind::Dimension, d).ok_or_else(|| invalid(&pe.file, format!("[{}]: could not find dimension named: {d}", pe.field_name)))?;
+                let i = self
+                    .field_by_name(FieldKind::Dimension, d)
+                    .ok_or_else(|| invalid(&pe.file, format!("[{}]: could not find dimension named: {d}", pe.field_name)))?;
                 dimension_ids.push(self.fields[i].id);
             }
             // `[Name]` with no suffix. A name belongs to at most one
@@ -1098,7 +1192,13 @@ impl<'d> Builder<'d> {
                 let mut fields = vec![own];
                 fields.extend(dimension_ids.iter().copied());
                 if !self.some_universe_has_all(&fields) {
-                    return Err(invalid(&pe.file, format!("[{}] on {table_name}: Sql Referenced dimensions in the formula could not be located in a single Universe.", pe.field_name)));
+                    return Err(invalid(
+                        &pe.file,
+                        format!(
+                            "[{}] on {table_name}: Sql Referenced dimensions in the formula could not be located in a single Universe.",
+                            pe.field_name
+                        ),
+                    ));
                 }
             }
             if !measure_ids.is_empty() && dimension_ids.is_empty() && !has_columns {
@@ -1113,7 +1213,13 @@ impl<'d> Builder<'d> {
                 fields.extend(measure_ids.iter().copied());
                 fields.extend(dimension_ids.iter().copied());
                 if !self.some_universe_has_all(&fields) {
-                    return Err(invalid(&pe.file, format!("[{}] on {table_name}: Sql Mixed measure and dimension references must all be reachable from one universe.", pe.field_name)));
+                    return Err(invalid(
+                        &pe.file,
+                        format!(
+                            "[{}] on {table_name}: Sql Mixed measure and dimension references must all be reachable from one universe.",
+                            pe.field_name
+                        ),
+                    ));
                 }
             }
             ref_files.entry(own).or_insert_with(|| pe.file.clone());
@@ -1135,7 +1241,10 @@ impl<'d> Builder<'d> {
                 let (found, dims): (Vec<String>, Vec<Id>) = match ex.scope {
                     ExclusionScope::Dimension => {
                         let hits: Vec<usize> = names.iter().filter_map(|n| self.field_by_name(FieldKind::Dimension, n)).collect();
-                        (hits.iter().map(|&i| self.fields[i].name.to_lowercase()).collect(), hits.iter().map(|&i| self.fields[i].id).collect())
+                        (
+                            hits.iter().map(|&i| self.fields[i].name.to_lowercase()).collect(),
+                            hits.iter().map(|&i| self.fields[i].id).collect(),
+                        )
                     }
                     ExclusionScope::Table => {
                         let tables: Vec<Id> = self.tables.iter().filter(|t| names.contains(&t.name.to_lowercase())).map(|t| t.id).collect();
@@ -1152,7 +1261,12 @@ impl<'d> Builder<'d> {
                     }
                     ExclusionScope::Universe => {
                         let tables: Vec<Id> = self.tables.iter().filter(|t| names.contains(&t.name.to_lowercase())).map(|t| t.id).collect();
-                        let mut dims: Vec<Id> = self.paths.iter().filter(|p| tables.contains(&p.root_table_id) && p.field_type == FieldKind::Dimension).map(|p| p.field_id).collect();
+                        let mut dims: Vec<Id> = self
+                            .paths
+                            .iter()
+                            .filter(|p| tables.contains(&p.root_table_id) && p.field_type == FieldKind::Dimension)
+                            .map(|p| p.field_id)
+                            .collect();
                         dims.sort();
                         dims.dedup();
                         (self.tables.iter().filter(|t| tables.contains(&t.id)).map(|t| t.name.to_lowercase()).collect(), dims)
@@ -1165,7 +1279,13 @@ impl<'d> Builder<'d> {
                         ExclusionScope::Table => "tables",
                         ExclusionScope::Universe => "universes",
                     };
-                    return Err(invalid(&pr.file, format!("[{field_name}]: Exclusion rule Entities Could not find these {what}: {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))));
+                    return Err(invalid(
+                        &pr.file,
+                        format!(
+                            "[{field_name}]: Exclusion rule Entities Could not find these {what}: {}",
+                            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
                 }
                 ex.dimension_ids = Some(dims);
                 resolved.push(ex);
@@ -1182,12 +1302,21 @@ impl<'d> Builder<'d> {
                     }
                 }
                 if !missing.is_empty() {
-                    return Err(invalid(&pr.file, format!("[{field_name}]: Inclusions Dimensions {} could not be found", missing.join(", "))));
+                    return Err(invalid(
+                        &pr.file,
+                        format!("[{field_name}]: Inclusions Dimensions {} could not be found", missing.join(", ")),
+                    ));
                 }
                 let mut all = vec![measure_id];
                 all.extend(ids.iter().copied());
                 if !self.some_universe_has_all(&all) {
-                    return Err(invalid(&pr.file, format!("[{field_name}]: Inclusions Dimensions {:?} could not be found in a universe with this measure.", inc.dimensions)));
+                    return Err(invalid(
+                        &pr.file,
+                        format!(
+                            "[{field_name}]: Inclusions Dimensions {:?} could not be found in a universe with this measure.",
+                            inc.dimensions
+                        ),
+                    ));
                 }
                 inc.dimension_ids = Some(ids);
                 self.fields[pr.field_index].inclusions = Some(inc);
@@ -1328,7 +1457,8 @@ impl<'d> Builder<'d> {
                 Some("filter") | Some("filter_data") => PolicyMode::FilterData,
                 other => return Err(invalid(&file, format!("Unknown mode '{}'. Use mask_data or filter_data.", other.unwrap_or("")))),
             };
-            let context = str_of(pm, "context_dimension").ok_or_else(|| invalid(&file, format!("Policy '{name}' is missing context_dimension.")))?;
+            let context =
+                str_of(pm, "context_dimension").ok_or_else(|| invalid(&file, format!("Policy '{name}' is missing context_dimension.")))?;
             let context_uid = self
                 .dimension_by_name(&context)
                 .map(|i| self.fields[i].uid.clone())
@@ -1347,13 +1477,20 @@ impl<'d> Builder<'d> {
             let permission_source = match str_of(&resolution, "source").map(|s| s.to_lowercase()).as_deref() {
                 None | Some("groups") => PermissionSource::Groups,
                 Some("user") => PermissionSource::User,
-                Some(other) => return Err(invalid(&file, format!("Policy '{name}' errors: Permission source '{other}' is not included in the list"))),
+                Some(other) => {
+                    return Err(invalid(&file, format!("Policy '{name}' errors: Permission source '{other}' is not included in the list")))
+                }
             };
             let permission_value_from = match str_of(&resolution, "value_from").map(|s| s.to_lowercase()).as_deref() {
                 Some("name") | Some("from_name") => PermissionValueFrom::FromName,
                 Some("tag") | Some("from_tag") => PermissionValueFrom::FromTag,
                 Some("email") | Some("from_email") => PermissionValueFrom::FromEmail,
-                other => return Err(invalid(&file, format!("Policy '{name}' errors: Permission value from '{}' is not included in the list", other.unwrap_or("")))),
+                other => {
+                    return Err(invalid(
+                        &file,
+                        format!("Policy '{name}' errors: Permission value from '{}' is not included in the list", other.unwrap_or("")),
+                    ))
+                }
             };
             let unresolved = match str_of(&resolution, "unresolved").map(|s| s.to_lowercase()).as_deref() {
                 None | Some("deny") => Unresolved::Deny,
@@ -1420,7 +1557,10 @@ impl<'d> Builder<'d> {
         let snapshot = self.snapshot();
         self.phases.push(("snapshot", t.elapsed().as_micros()));
         let t = std::time::Instant::now();
-        let values_path = [self.dir.join("samples").join(values::FILE_NAME), self.dir.join(values::FILE_NAME)].into_iter().find(|p| p.exists()).unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
+        let values_path = [self.dir.join("samples").join(values::FILE_NAME), self.dir.join(values::FILE_NAME)]
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| self.dir.join("samples").join(values::FILE_NAME));
         self.sources.push(values_path.clone());
         let values = match values::ValueCatalog::read(&values_path) {
             Ok(v) => v,
@@ -1608,7 +1748,10 @@ mod tests {
     #[test]
     fn format_shortcuts() {
         assert_eq!(parse_format_syntax("currency:2"), Some(serde_json::json!({"type": "currency", "precision": 2})));
-        assert_eq!(parse_format_syntax("number:2:abbreviate"), Some(serde_json::json!({"type": "number", "precision": 2, "abbreviate": true})));
+        assert_eq!(
+            parse_format_syntax("number:2:abbreviate"),
+            Some(serde_json::json!({"type": "number", "precision": 2, "abbreviate": true}))
+        );
         assert_eq!(parse_format_syntax("date:short"), Some(serde_json::json!({"type": "date", "pattern": "%b %d, %Y"})));
         assert_eq!(parse_format_syntax("nope"), None);
     }

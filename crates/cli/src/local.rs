@@ -33,7 +33,8 @@ pub struct Local {
 impl Local {
     /// The project's files, loaded. Said as `uid/working-tree`.
     pub fn model(&self) -> Result<Model> {
-        let mut m = Model::from_dir(&self.project.dir, Trust::Owned, dialects()).map_err(|e| Refusal { class: "Project".into(), message: e.to_string() })?;
+        let mut m = Model::from_dir(&self.project.dir, Trust::Owned, dialects())
+            .map_err(|e| Refusal { class: "Project".into(), message: e.to_string() })?;
         m.uid = self.project.uid.clone();
         m.branch = BRANCH.into();
         Ok(m)
@@ -61,7 +62,12 @@ pub fn sql(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Option<&
 
 /// `/explore`, planned here.
 pub fn explore(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
-    let req = ExploreRequest { spec, expr: expr.map(str::to_string), context: context_of(context)?, q: q.map(str::trim).filter(|q| !q.is_empty()).map(str::to_string) };
+    let req = ExploreRequest {
+        spec,
+        expr: expr.map(str::to_string),
+        context: context_of(context)?,
+        q: q.map(str::trim).filter(|q| !q.is_empty()).map(str::to_string),
+    };
     Ok(serde_json::to_value(m.explore(req, &unlimited).map_err(Refusal::from)?)?)
 }
 
@@ -72,11 +78,19 @@ pub fn values_for(m: &Model, dim: &str) -> Result<Value> {
         return Ok(v);
     }
     let found = m.fields(dim, true);
-    let dims: Vec<String> = found["fields"].as_array().into_iter().flatten().filter(|f| f["kind"] == "dimension").filter_map(|f| f["uid"].as_str().map(str::to_string)).collect();
+    let dims: Vec<String> = found["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["kind"] == "dimension")
+        .filter_map(|f| f["uid"].as_str().map(str::to_string))
+        .collect();
     match dims.as_slice() {
         [one] => Ok(m.values_of(one).map_err(Refusal::from)?),
         [] => Err(Refusal { class: "NotFound".into(), message: format!("no dimension matches '{dim}'") }.into()),
-        many => Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into()),
+        many => {
+            Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into())
+        }
     }
 }
 

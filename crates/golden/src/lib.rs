@@ -251,10 +251,14 @@ fn fnv(s: &str) -> u64 {
 }
 
 fn canonical_lines(body: &str, canonical: &HashMap<String, String>) -> String {
-    static CTE_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?:[A-Za-z0-9_]+\.)?\b(?:ag|qr|mg|seg)[0-9a-f]{32}\b").unwrap());
-    static BIND_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"((?:[A-Za-z0-9_]+\.)?\b(?:ag|qr|mg|seg)[0-9a-f]{32}|cte<[0-9a-f]+>) (?:AS )?([AQM]\d+)\b").unwrap());
+    static CTE_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?:[A-Za-z0-9_]+\.)?\b(?:ag|qr|mg|seg)[0-9a-f]{32}\b").unwrap());
+    static BIND_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"((?:[A-Za-z0-9_]+\.)?\b(?:ag|qr|mg|seg)[0-9a-f]{32}|cte<[0-9a-f]+>) (?:AS )?([AQM]\d+)\b").unwrap()
+    });
     let (cte_re, bind_re) = (&*CTE_RE, &*BIND_RE);
-    let mut text = cte_re.replace_all(body, |c: &regex::Captures| canonical.get(&c[0]).cloned().unwrap_or_else(|| c[0].to_string())).into_owned();
+    let mut text =
+        cte_re.replace_all(body, |c: &regex::Captures| canonical.get(&c[0]).cloned().unwrap_or_else(|| c[0].to_string())).into_owned();
     // Node aliases become the CTE they bind to.
     let mut aliases: Vec<(String, String)> = Vec::new();
     for c in bind_re.captures_iter(&text) {
@@ -271,11 +275,13 @@ fn canonical_lines(body: &str, canonical: &HashMap<String, String>) -> String {
     while i < raw.len() {
         if raw[i] == "FROM" {
             let mut j = i + 1;
-            while j < raw.len() && !matches!(raw[j].as_str(), "WHERE" | "GROUP BY" | "HAVING" | "ORDER BY") && !raw[j].starts_with("LIMIT") {
+            while j < raw.len() && !matches!(raw[j].as_str(), "WHERE" | "GROUP BY" | "HAVING" | "ORDER BY") && !raw[j].starts_with("LIMIT")
+            {
                 j += 1;
             }
             let block = &raw[i + 1..j];
-            let node_line = |l: &str| l.contains(" @cte<") || l.contains(" @ag") || l.contains(" @qr") || l.contains(" @mg") || l.contains(" @seg");
+            let node_line =
+                |l: &str| l.contains(" @cte<") || l.contains(" @ag") || l.contains(" @qr") || l.contains(" @mg") || l.contains(" @seg");
             let joins: Vec<&String> = block.iter().filter(|l| l.contains(" JOIN ") && node_line(l)).collect();
             let symmetric = !joins.is_empty() && joins.iter().all(|l| l.starts_with("FULL OUTER JOIN ") || l.starts_with("CROSS JOIN "));
             rewritten.push("FROM".into());
@@ -372,11 +378,17 @@ pub enum Outcome {
     /// Structurally identical: same nodes and lines, nodes ordered differently.
     PassReordered,
     /// Planner produced SQL that differs from the golden.
-    SqlMismatch { got: String },
+    SqlMismatch {
+        got: String,
+    },
     /// Planner failed where SQL was expected, or with the wrong class.
-    WrongError { got: String },
+    WrongError {
+        got: String,
+    },
     /// Planner produced SQL where an error was expected.
-    NoError { got: String },
+    NoError {
+        got: String,
+    },
     /// Planner has not reached this feature yet.
     Unimplemented(String),
 }
@@ -477,7 +489,8 @@ pub fn score(fixtures: &Fixtures, filter: &str, source: PathSource) -> Result<BT
         let mut hashes: Vec<&str> = cases.iter().map(|c| c.universe.as_str()).collect();
         hashes.sort();
         hashes.dedup();
-        let universes: Vec<(Arc<Universe>, Option<Arc<Vec<JoinPath>>>)> = hashes.iter().map(|h| fixtures.planner_for(h, source)).collect::<Result<_>>()?;
+        let universes: Vec<(Arc<Universe>, Option<Arc<Vec<JoinPath>>>)> =
+            hashes.iter().map(|h| fixtures.planner_for(h, source)).collect::<Result<_>>()?;
         let planners: HashMap<&str, Planner<'_>> = hashes
             .iter()
             .zip(universes.iter())
@@ -510,7 +523,16 @@ pub fn print_scoreboard(report: &BTreeMap<String, FileScore>) -> (usize, usize) 
     let (mut total, mut passed) = (0, 0);
     println!("{:<36} {:>6} {:>6} {:>8} {:>10} {:>8} {:>6}", "file", "cases", "pass", "renamed", "reordered", "unimpl", "fail");
     for (file, fs) in report {
-        println!("{:<36} {:>6} {:>6} {:>8} {:>10} {:>8} {:>6}", file, fs.total, fs.passed, fs.renamed, fs.reordered, fs.unimplemented, fs.failed.len());
+        println!(
+            "{:<36} {:>6} {:>6} {:>8} {:>10} {:>8} {:>6}",
+            file,
+            fs.total,
+            fs.passed,
+            fs.renamed,
+            fs.reordered,
+            fs.unimplemented,
+            fs.failed.len()
+        );
         total += fs.total;
         passed += fs.passed;
     }

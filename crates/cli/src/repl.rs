@@ -49,7 +49,13 @@ impl Side for Target {
 
     fn announce(&mut self) -> Result<Vec<String>> {
         let summary = self.client.get(&remote::branch_path(&self.uid, &self.branch))?;
-        println!("{}", dim(&format!("{}/{} on {}: {} tables, {} fields, {} joins, {} policies", self.uid, self.branch, self.client.server, summary["tables"], summary["fields"], summary["joins"], summary["policies"])));
+        println!(
+            "{}",
+            dim(&format!(
+                "{}/{} on {}: {} tables, {} fields, {} joins, {} policies",
+                self.uid, self.branch, self.client.server, summary["tables"], summary["fields"], summary["joins"], summary["policies"]
+            ))
+        );
         Ok(names_in(&self.client.get(&format!("{}/fields?hidden=true", remote::branch_path(&self.uid, &self.branch)))?))
     }
 
@@ -122,7 +128,19 @@ impl Session {
         let model = local.model()?;
         let seen = stamps(&model.sources);
         let s = model.summary();
-        println!("{}", dim(&format!("{}/{} here: {} tables, {} fields, {} joins, {} policies, loaded in {:.0} ms", model.uid, model.branch, s["tables"], s["fields"], s["joins"], s["policies"], t0.elapsed().as_secs_f64() * 1e3)));
+        println!(
+            "{}",
+            dim(&format!(
+                "{}/{} here: {} tables, {} fields, {} joins, {} policies, loaded in {:.0} ms",
+                model.uid,
+                model.branch,
+                s["tables"],
+                s["fields"],
+                s["joins"],
+                s["policies"],
+                t0.elapsed().as_secs_f64() * 1e3
+            ))
+        );
         for w in &model.warnings {
             println!("{}", dim(&format!("warning: {w}")));
         }
@@ -170,7 +188,12 @@ impl Side for Session {
     fn branch(&mut self, to: Option<&str>) -> Result<bool> {
         match to {
             None => println!("{} (the files in {})", self.model.branch, self.local.project.dir.display()),
-            Some(b) => println!("{}", dim(&format!("the files here are what they are; check out {b} to plan it, or `zsql -r repl --branch {b}` for the server's copy"))),
+            Some(b) => println!(
+                "{}",
+                dim(&format!(
+                    "the files here are what they are; check out {b} to plan it, or `zsql -r repl --branch {b}` for the server's copy"
+                ))
+            ),
         }
         Ok(false)
     }
@@ -197,7 +220,12 @@ impl Side for Session {
 }
 
 fn names_in(fields: &Value) -> Vec<String> {
-    fields["fields"].as_array().into_iter().flatten().flat_map(|f| [f["uid"].as_str().unwrap_or("").to_lowercase(), f["name"].as_str().unwrap_or("").to_lowercase()]).collect()
+    fields["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|f| [f["uid"].as_str().unwrap_or("").to_lowercase(), f["name"].as_str().unwrap_or("").to_lowercase()])
+        .collect()
 }
 
 fn tty() -> bool {
@@ -226,7 +254,8 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
     let mut field_names = side.announce()?;
     println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
 
-    let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
+    let mut editor: Option<rustyline::DefaultEditor> =
+        if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
     let history = config::home().map(|h| h.join("history"));
     if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
         let _ = std::fs::create_dir_all(h.parent().unwrap());
@@ -334,7 +363,14 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
                         Ok(v) => {
                             show::print_sql(&v, &dim, &bold);
                             let took = t0.elapsed().as_secs_f64() * 1e3;
-                            println!("{}", dim(&if origin == "server" { format!("-- round trip {took:.2} ms") } else { format!("-- planned here in {took:.2} ms") }));
+                            println!(
+                                "{}",
+                                dim(&if origin == "server" {
+                                    format!("-- round trip {took:.2} ms")
+                                } else {
+                                    format!("-- planned here in {took:.2} ms")
+                                })
+                            );
                         }
                         Err(e) => println!("error: {e}"),
                     }

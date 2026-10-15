@@ -57,14 +57,26 @@ impl Decorator {
         self.attrs.get(key).and_then(Value::as_i64)
     }
     pub fn strs(&self, key: &str) -> Vec<String> {
-        self.attrs.get(key).and_then(Value::as_array).map(|a| a.iter().map(|v| match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        }).collect()).unwrap_or_default()
+        self.attrs
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     /// A map attribute such as a window's order_by (`{"-1": "asc"}`).
     pub fn map(&self, key: &str) -> Vec<(String, String)> {
-        self.attrs.get(key).and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default()
+        self.attrs
+            .get(key)
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+            .unwrap_or_default()
     }
     pub fn custom(kind: DecoratorKind, attrs: Attrs) -> Decorator {
         Decorator { kind, attrs }
@@ -96,9 +108,19 @@ impl Decorator {
             },
             DecoratorKind::Extract => self.str("extract").map(|e| {
                 let label = match e {
-                    "minute" => "min", "hour" => "hr", "day_of_month" => "dom", "day_of_week" => "dow", "day_of_year" => "doy",
-                    "week_of_year" => "woy", "month" => "mon", "quarter" => "qtr", "year" => "yr", "day_name" => "day",
-                    "month_name" => "month", "year_month" => "ym", other => other,
+                    "minute" => "min",
+                    "hour" => "hr",
+                    "day_of_month" => "dom",
+                    "day_of_week" => "dow",
+                    "day_of_year" => "doy",
+                    "week_of_year" => "woy",
+                    "month" => "mon",
+                    "quarter" => "qtr",
+                    "year" => "yr",
+                    "day_name" => "day",
+                    "month_name" => "month",
+                    "year_month" => "ym",
+                    other => other,
                 };
                 format!("{}({})", label, field_name)
             }),
@@ -108,7 +130,9 @@ impl Decorator {
                 capitalize(self.str("function").unwrap_or("")),
                 field_name
             )),
-            DecoratorKind::Contribute => Some(if field_name.contains('%') { format!("{field_name} of Total") } else { format!("% {field_name} of Total") }),
+            DecoratorKind::Contribute => {
+                Some(if field_name.contains('%') { format!("{field_name} of Total") } else { format!("% {field_name} of Total") })
+            }
             DecoratorKind::Temporalize => Some(format!("{}({})", self.transform_label(), field_name)),
             DecoratorKind::Customize => Some(format!("Custom({field_name})")),
         }
@@ -120,7 +144,11 @@ impl Decorator {
             return "ERROR".into();
         }
         let label = if t == "day_over_day" { "D/D".to_string() } else { format!("L{}", t.chars().next().unwrap().to_ascii_uppercase()) };
-        if self.bool("percent_change", false) { format!("%{label}") } else { label }
+        if self.bool("percent_change", false) {
+            format!("%{label}")
+        } else {
+            label
+        }
     }
 
     /// Everything except bookkeeping; part of a projection's column identity.

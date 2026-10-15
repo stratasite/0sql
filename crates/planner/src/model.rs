@@ -4,10 +4,10 @@
 
 use crate::{PlanError, Result};
 use std::cell::Cell;
-use std::rc::Rc;
 use std::cell::RefCell;
-use zsql_spec::{Decorator, DecoratorKind, Filter, LinkMode, LinkTarget, Projection, Query, SecurityContext, Tree};
+use std::rc::Rc;
 use zsql_semantic::{Field, FieldKind, Id, Table, Universe};
+use zsql_spec::{Decorator, DecoratorKind, Filter, LinkMode, LinkTarget, Projection, Query, SecurityContext, Tree};
 
 thread_local! {
     static NEXT_PID: Cell<usize> = const { Cell::new(0) };
@@ -65,19 +65,43 @@ impl<'a> RProjection<'a> {
             is_static: false,
             source_ref: None,
         };
-        RProjection { pid: next_pid(), def, field: Some(field), field_refs: vec![], is_static: false, source: RefCell::new(None), persisted: false, links: vec![], carried_from: None }
+        RProjection {
+            pid: next_pid(),
+            def,
+            field: Some(field),
+            field_refs: vec![],
+            is_static: false,
+            source: RefCell::new(None),
+            persisted: false,
+            links: vec![],
+            carried_from: None,
+        }
     }
 
     /// An engine-made calculation over a measure, as the inclusion visitor
     /// builds for its roll-up. Rails never validates it, so it classifies as
     /// neither measure nor dimension.
-    pub fn for_calc(sql: String, alias: String, ordinal: Option<i64>, measure_refs: Vec<&'a Field>, dimension_refs: Vec<&'a Field>) -> Self {
+    pub fn for_calc(
+        sql: String,
+        alias: String,
+        ordinal: Option<i64>,
+        measure_refs: Vec<&'a Field>,
+        dimension_refs: Vec<&'a Field>,
+    ) -> Self {
         Self::for_calc_typed(sql, alias, ordinal, measure_refs, dimension_refs, None, false)
     }
 
     /// Rails `Calculation.static`: an engine calculation with an explicit
     /// classification, hidden, never persisted.
-    pub fn for_calc_typed(sql: String, alias: String, ordinal: Option<i64>, measure_refs: Vec<&'a Field>, dimension_refs: Vec<&'a Field>, field_type: Option<&str>, is_static: bool) -> Self {
+    pub fn for_calc_typed(
+        sql: String,
+        alias: String,
+        ordinal: Option<i64>,
+        measure_refs: Vec<&'a Field>,
+        dimension_refs: Vec<&'a Field>,
+        field_type: Option<&str>,
+        is_static: bool,
+    ) -> Self {
         let mut def = Projection {
             reference: String::new(),
             kind: zsql_spec::ProjectionKind::Calculation,
@@ -103,7 +127,17 @@ impl<'a> RProjection<'a> {
         def.projection_refs = vec![];
         let mut field_refs = dimension_refs;
         field_refs.extend(measure_refs);
-        RProjection { pid: next_pid(), def, field: None, field_refs, is_static, source: RefCell::new(None), persisted: false, links: vec![], carried_from: None }
+        RProjection {
+            pid: next_pid(),
+            def,
+            field: None,
+            field_refs,
+            is_static,
+            source: RefCell::new(None),
+            persisted: false,
+            links: vec![],
+            carried_from: None,
+        }
     }
 
     pub fn source(&self) -> Option<Rc<RProjection<'a>>> {
@@ -172,8 +206,7 @@ impl<'a> RProjection<'a> {
             return a.clone();
         }
         let name = self.field.map(|f| f.name.as_str()).unwrap_or("");
-        let mut lent: Vec<(i32, String)> =
-            self.def.decorators.iter().filter_map(|d| d.alias(name).map(|a| (d.priority(), a))).collect();
+        let mut lent: Vec<(i32, String)> = self.def.decorators.iter().filter_map(|d| d.alias(name).map(|a| (d.priority(), a))).collect();
         if !lent.is_empty() {
             lent.sort_by_key(|(p, _)| *p);
             return lent.pop().unwrap().1;
@@ -292,7 +325,11 @@ impl<'a> RSegment<'a> {
     /// Rails `Segment#key_dimensions`: projected dimensions that are neither
     /// calculations nor expansions.
     pub fn key_dimensions(&self) -> Vec<&'a Field> {
-        self.projections.iter().filter(|p| p.is_dimension() && !p.is_calculation() && !p.def.is_expansion()).filter_map(|p| p.field).collect()
+        self.projections
+            .iter()
+            .filter(|p| p.is_dimension() && !p.is_calculation() && !p.def.is_expansion())
+            .filter_map(|p| p.field)
+            .collect()
     }
 
     /// The query this segment plans as, for its population.
@@ -354,7 +391,9 @@ impl<'a> RQuery<'a> {
         for p in &def.projections {
             let field = match (&p.field_uid, p.is_calculation()) {
                 (Some(uid), false) => Some(universe.field_by_uid(uid, p.field_kind).ok_or_else(|| {
-                    PlanError::Resolution(format!("Query is not valid: [\"Projections Field {uid} is no longer available in this branch\"]"))
+                    PlanError::Resolution(format!(
+                        "Query is not valid: [\"Projections Field {uid} is no longer available in this branch\"]"
+                    ))
                 })?),
                 _ => None,
             };
@@ -372,7 +411,8 @@ impl<'a> RQuery<'a> {
                     if let Some(g) = d.grain() {
                         if !grains.contains(&g) {
                             return Err(PlanError::Resolution(format!(
-                                "Query is not valid: Decorators has errors ({g} is not an enabled date grain for {})", f.name
+                                "Query is not valid: Decorators has errors ({g} is not an enabled date grain for {})",
+                                f.name
                             )));
                         }
                     }
@@ -390,13 +430,26 @@ impl<'a> RQuery<'a> {
                 }
             }
             let is_static = p.is_static;
-            projections.push(RProjection { pid: next_pid(), def: p.clone(), field, field_refs, is_static, source: RefCell::new(None), persisted: !is_static, links: vec![], carried_from: None });
+            projections.push(RProjection {
+                pid: next_pid(),
+                def: p.clone(),
+                field,
+                field_refs,
+                is_static,
+                source: RefCell::new(None),
+                persisted: !is_static,
+                links: vec![],
+                carried_from: None,
+            });
         }
         let mut filters = Vec::new();
         let mut by_ref = std::collections::HashMap::new();
         for (i, f) in def.filters.iter().enumerate() {
             let field = universe.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
-                PlanError::Resolution(format!("Query is not valid: [\"Filters Field {} is no longer available in this branch\"]", f.field_uid))
+                PlanError::Resolution(format!(
+                    "Query is not valid: [\"Filters Field {} is no longer available in this branch\"]",
+                    f.field_uid
+                ))
             })?;
             by_ref.insert(f.reference.as_str(), i);
             filters.push(Rc::new(RFilter { fid: i, def: f.clone(), field }));
@@ -429,7 +482,17 @@ impl<'a> RQuery<'a> {
                         field_refs.push(f);
                     }
                 }
-                sprojs.push(Rc::new(RProjection { pid: next_pid(), def: p.clone(), field, field_refs, is_static: false, source: RefCell::new(None), persisted: true, links: vec![], carried_from: None }));
+                sprojs.push(Rc::new(RProjection {
+                    pid: next_pid(),
+                    def: p.clone(),
+                    field,
+                    field_refs,
+                    is_static: false,
+                    source: RefCell::new(None),
+                    persisted: true,
+                    links: vec![],
+                    carried_from: None,
+                }));
             }
             let mut sfilters: Vec<Rc<RFilter<'a>>> = Vec::new();
             let mut sby_ref = std::collections::HashMap::new();
@@ -464,7 +527,16 @@ impl<'a> RQuery<'a> {
                 })
                 .collect();
             let hints = s.hints.iter().filter_map(|u| universe.table_by_uid(u)).collect();
-            segments.push(RSegment { sid, def: s.clone(), projections: sprojs, filters: sfilters, tree: stree, custom_tree: custom, links, hints });
+            segments.push(RSegment {
+                sid,
+                def: s.clone(),
+                projections: sprojs,
+                filters: sfilters,
+                tree: stree,
+                custom_tree: custom,
+                links,
+                hints,
+            });
         }
         // Measure-level links and carried columns onto the query's projections.
         for p in projections.iter_mut() {
@@ -546,7 +618,15 @@ impl<'a> RQuery<'a> {
         let (measures, dims, projs) = crate::sql::expr::parse_refs(sql);
         let measure_refs: Vec<&Field> = measures.iter().filter_map(|n| universe.field_by_name(n, FieldKind::Measure)).collect();
         let dimension_refs: Vec<&Field> = dims.iter().filter_map(|n| universe.field_by_name(n, FieldKind::Dimension)).collect();
-        let mut rp = RProjection::for_calc_typed(sql.to_string(), alias.to_string(), Some(self.next_ordinal()), measure_refs, dimension_refs, Some("measure"), true);
+        let mut rp = RProjection::for_calc_typed(
+            sql.to_string(),
+            alias.to_string(),
+            Some(self.next_ordinal()),
+            measure_refs,
+            dimension_refs,
+            Some("measure"),
+            true,
+        );
         rp.def.projection_refs = projs;
         let calc = Rc::new(rp);
         self.push_static(calc.clone());
@@ -575,7 +655,6 @@ impl<'a> RQuery<'a> {
 
 /// Refuses, as unimplemented, queries that need visitors not yet ported.
 pub fn check_supported(q: &RQuery, universe: &Universe, principal: Option<&SecurityContext>) -> Result<()> {
-
     for p in &q.projections {
         for d in &p.def.decorators {
             match d.kind {

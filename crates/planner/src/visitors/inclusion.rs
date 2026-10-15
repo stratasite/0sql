@@ -28,7 +28,14 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) ->
     Ok(())
 }
 
-fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field, visited: &mut Vec<NodeId>) -> Result<()> {
+fn process<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+    visited: &mut Vec<NodeId>,
+) -> Result<()> {
     let (dims, filters) = allowed_components(graph, id, universe, q, measure);
     if dimensionally_equivalent(&graph.nodes[id], &dims, &filters) {
         return Ok(());
@@ -37,7 +44,8 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
     if let Some(target) = find_equivalent_agg(graph, &dims, &filters, measure, &signature) {
         let root = graph.root();
         let (projs, _) = move_measure_components(graph, id, target, measure);
-        let out = graph.nodes[target].outputs.first().copied().ok_or_else(|| PlanError::Resolution("inclusion target has no output".into()))?;
+        let out =
+            graph.nodes[target].outputs.first().copied().ok_or_else(|| PlanError::Resolution("inclusion target has no output".into()))?;
         for p in projs {
             create_calculation(graph, &p, target, out, root, universe);
         }
@@ -48,13 +56,15 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
     }
 
     let mut root = graph.root();
-    let measure_projections: Vec<Projected<'a>> = graph.nodes[id].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
+    let measure_projections: Vec<Projected<'a>> =
+        graph.nodes[id].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
     let mut projections: Vec<Rc<RProjection<'a>>> = dims.iter().map(|d| d.proj.clone()).collect();
     projections.extend(measure_projections.iter().map(|p| p.proj.clone()));
 
     // The node at the extended dimensionality.
     let base = graph.nodes[id].universe.clone().expect("agg universe");
-    let all_local = projections.iter().all(|p| p.field.map(|f| base.has_field(f.id)).unwrap_or(true)) && filters.iter().all(|f| base.has_field(f.field().id));
+    let all_local = projections.iter().all(|p| p.field.map(|f| base.has_field(f.id)).unwrap_or(true))
+        && filters.iter().all(|f| base.has_field(f.field().id));
     if !all_local {
         return Err(PlanError::Unimplemented("inclusion sub-plan outside the node's universe"));
     }
@@ -109,11 +119,19 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
 
 /// Rails `create_calculation`: the roll-up formula on the merge, and the
 /// root reads the measure from that column.
-fn create_calculation<'a>(graph: &mut Graph<'a>, proj: &Projected<'a>, _target: NodeId, calc_node: NodeId, root: NodeId, _universe: &'a Universe) {
+fn create_calculation<'a>(
+    graph: &mut Graph<'a>,
+    proj: &Projected<'a>,
+    _target: NodeId,
+    calc_node: NodeId,
+    root: NodeId,
+    _universe: &'a Universe,
+) {
     let field = proj.field().expect("measure projection");
     let rule = field.inclusions.as_ref().expect("inclusion rule");
     let name = format!("[{}]@m", field.name);
-    let sql = if rule.aggregation.contains("@exp") { rule.aggregation.replace("@exp", &name) } else { format!("{}({})", rule.aggregation, name) };
+    let sql =
+        if rule.aggregation.contains("@exp") { rule.aggregation.replace("@exp", &name) } else { format!("{}({})", rule.aggregation, name) };
     let calc = Rc::new(RProjection::for_calc(sql, proj.proj.alias(), proj.proj.def.ordinal, vec![field], vec![]));
     graph.nodes[calc_node].add_projection(calc.clone());
     if root != calc_node && !graph.nodes[root].removed {
@@ -123,7 +141,13 @@ fn create_calculation<'a>(graph: &mut Graph<'a>, proj: &Projected<'a>, _target: 
 
 /// Rails `get_allowed_components`: the node's dimensions plus the rule's,
 /// with dimension filters per the rule's mode.
-fn allowed_components<'a>(graph: &Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
+fn allowed_components<'a>(
+    graph: &Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
     let node = &graph.nodes[id];
     let rule = measure.inclusions.as_ref().expect("inclusion rule");
     let rule_ids = inclusion_dimension_ids(universe, rule);

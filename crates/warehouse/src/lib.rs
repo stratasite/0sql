@@ -101,7 +101,8 @@ pub struct DuckDb {
 impl DuckDb {
     pub fn open(settings: &Settings) -> Result<Self> {
         let file = settings.need("file")?;
-        let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly).map_err(|e| WarehouseError::Connect(e.to_string()))?;
+        let config =
+            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly).map_err(|e| WarehouseError::Connect(e.to_string()))?;
         let conn = duckdb::Connection::open_with_flags(file, config).map_err(|e| WarehouseError::Connect(format!("{file}: {e}")))?;
         Ok(DuckDb { conn })
     }

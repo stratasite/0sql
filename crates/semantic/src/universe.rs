@@ -29,14 +29,10 @@ impl Universe {
         let mut problems = Vec::new();
         let mut warnings = Vec::new();
 
-        let datasources_by_id: HashMap<Id, usize> =
-            snap.datasources.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
-        let tables_by_id: HashMap<Id, usize> =
-            snap.tables.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
-        let tables_by_uid: HashMap<String, usize> =
-            snap.tables.iter().enumerate().map(|(i, t)| (t.uid.clone(), i)).collect();
-        let fields_by_id: HashMap<Id, usize> =
-            snap.fields.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+        let datasources_by_id: HashMap<Id, usize> = snap.datasources.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
+        let tables_by_id: HashMap<Id, usize> = snap.tables.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+        let tables_by_uid: HashMap<String, usize> = snap.tables.iter().enumerate().map(|(i, t)| (t.uid.clone(), i)).collect();
+        let fields_by_id: HashMap<Id, usize> = snap.fields.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
         let mut fields_by_uid = HashMap::new();
         let mut fields_by_name = HashMap::new();
         for (i, f) in snap.fields.iter().enumerate() {
@@ -45,8 +41,7 @@ impl Universe {
             }
             fields_by_name.entry((f.kind, f.name.trim().to_lowercase())).or_insert(i);
         }
-        let joins_by_id: HashMap<Id, usize> =
-            snap.join_defs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
+        let joins_by_id: HashMap<Id, usize> = snap.join_defs.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
 
         for t in &snap.tables {
             if !datasources_by_id.contains_key(&t.datasource_id) {
@@ -116,10 +111,7 @@ impl Universe {
         // Rails skips a policy whose context dimension does not resolve; so do we.
         for pol in &snap.security_policies {
             if !fields_by_uid.contains_key(&(FieldKind::Dimension, pol.context_dimension_uid.clone())) {
-                warnings.push(format!(
-                    "policy {} context dimension {} not found; policy is inert",
-                    pol.uid, pol.context_dimension_uid
-                ));
+                warnings.push(format!("policy {} context dimension {} not found; policy is inert", pol.uid, pol.context_dimension_uid));
             }
         }
 
@@ -187,11 +179,7 @@ impl Universe {
     }
 
     pub fn expressions_of(&self, table_id: Id) -> impl Iterator<Item = &Expression> {
-        self.expressions_by_table
-            .get(&table_id)
-            .into_iter()
-            .flatten()
-            .map(move |&i| &self.snap.expressions[i])
+        self.expressions_by_table.get(&table_id).into_iter().flatten().map(move |&i| &self.snap.expressions[i])
     }
 
     pub fn expression_for(&self, table_id: Id, field_id: Id) -> Option<&Expression> {

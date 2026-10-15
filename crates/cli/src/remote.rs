@@ -98,7 +98,11 @@ fn read(mut r: ureq::http::Response<ureq::Body>) -> Result<Value> {
     let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
     if !status.is_success() {
         if let Some(e) = value.get("error") {
-            return Err(Refusal { class: e["class"].as_str().unwrap_or("error").to_string(), message: e["message"].as_str().unwrap_or(&text).to_string() }.into());
+            return Err(Refusal {
+                class: e["class"].as_str().unwrap_or("error").to_string(),
+                message: e["message"].as_str().unwrap_or(&text).to_string(),
+            }
+            .into());
         }
         let brief: String = text.chars().take(200).collect::<String>().replace('\n', " ");
         bail!("server answered {status}: {brief}{}", if text.len() > 200 { "..." } else { "" });
@@ -138,13 +142,29 @@ fn query_body(spec: Option<&Value>, expr: Option<&str>, context: Option<&Value>)
 }
 
 /// `/sql`: `{sql, adapter}`; `/explain`: that plus timings, phases and the node graph.
-pub fn sql(client: &Client, uid: &str, branch: &str, spec: Option<&Value>, expr: Option<&str>, context: Option<&Value>, explain: bool) -> Result<Value> {
+pub fn sql(
+    client: &Client,
+    uid: &str,
+    branch: &str,
+    spec: Option<&Value>,
+    expr: Option<&str>,
+    context: Option<&Value>,
+    explain: bool,
+) -> Result<Value> {
     client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &query_body(spec, expr, context))
 }
 
 /// `/explore`: the dimensions and measures the query can take on, narrowed
 /// by a search term.
-pub fn explore(client: &Client, uid: &str, branch: &str, spec: Option<&Value>, expr: Option<&str>, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
+pub fn explore(
+    client: &Client,
+    uid: &str,
+    branch: &str,
+    spec: Option<&Value>,
+    expr: Option<&str>,
+    context: Option<&Value>,
+    q: Option<&str>,
+) -> Result<Value> {
     let mut body = query_body(spec, expr, context);
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
         body["q"] = json!(q);
@@ -159,10 +179,18 @@ pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result
         return Ok(v);
     }
     let fields = client.get(&format!("{}/fields?q={}&hidden=true", branch_path(uid, branch), urlencode(dim)))?;
-    let dims: Vec<String> = fields["fields"].as_array().into_iter().flatten().filter(|f| f["kind"] == "dimension").filter_map(|f| f["uid"].as_str().map(str::to_string)).collect();
+    let dims: Vec<String> = fields["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["kind"] == "dimension")
+        .filter_map(|f| f["uid"].as_str().map(str::to_string))
+        .collect();
     match dims.as_slice() {
         [one] => client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(one))),
         [] => Err(Refusal { class: "NotFound".into(), message: format!("no dimension matches '{dim}'") }.into()),
-        many => Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into()),
+        many => {
+            Err(Refusal { class: "Ambiguous".into(), message: format!("'{dim}' matches several dimensions: {}", many.join(", ")) }.into())
+        }
     }
 }

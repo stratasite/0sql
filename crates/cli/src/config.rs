@@ -46,7 +46,8 @@ pub fn read_project(dir: &Path) -> Result<Project> {
     let text = std::fs::read_to_string(&file).with_context(|| file.display().to_string())?;
     let v: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| file.display().to_string())?;
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-    let uid = v.get("uid").and_then(|u| u.as_str()).map(|u| u.trim().to_lowercase()).filter(|u| !u.is_empty()).unwrap_or_else(|| slug(&name));
+    let uid =
+        v.get("uid").and_then(|u| u.as_str()).map(|u| u.trim().to_lowercase()).filter(|u| !u.is_empty()).unwrap_or_else(|| slug(&name));
     if uid.is_empty() {
         anyhow::bail!("{}: name or uid is required", file.display());
     }

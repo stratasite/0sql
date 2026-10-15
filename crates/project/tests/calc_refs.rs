@@ -69,10 +69,13 @@ fn plan(name: &str, spec: serde_json::Value) -> Result<String, String> {
 /// to something this query projects.
 #[test]
 fn a_bare_reference_takes_a_projection_of_this_query() {
-    let sql = plan("bare-projection", serde_json::json!({
-        "projections": [{ "field": "M" }],
-        "calculations": [{ "alias": "D", "sql": "[M] * 2", "data_type": "integer" }]
-    }))
+    let sql = plan(
+        "bare-projection",
+        serde_json::json!({
+            "projections": [{ "field": "M" }],
+            "calculations": [{ "alias": "D", "sql": "[M] * 2", "data_type": "integer" }]
+        }),
+    )
     .expect("plans");
     // One aggregate, read twice: the calculation reuses the projection
     // rather than computing the measure again.
@@ -83,10 +86,13 @@ fn a_bare_reference_takes_a_projection_of_this_query() {
 /// reference means the field.
 #[test]
 fn a_bare_reference_falls_back_to_a_field() {
-    let sql = plan("bare-field", serde_json::json!({
-        "projections": [{ "field": "Amt" }],
-        "calculations": [{ "alias": "D", "sql": "[M] * 2", "data_type": "integer" }]
-    }))
+    let sql = plan(
+        "bare-field",
+        serde_json::json!({
+            "projections": [{ "field": "Amt" }],
+            "calculations": [{ "alias": "D", "sql": "[M] * 2", "data_type": "integer" }]
+        }),
+    )
     .expect("plans");
     assert!(sql.contains("sum("), "the measure was pulled in: {sql}");
     assert!(!sql.contains('['), "no bracket text survives: {sql}");
@@ -116,20 +122,26 @@ fn a_suffix_reaches_past_an_alias_to_the_field() {
 /// The one ambiguity a name can have, since each kind allows only one.
 #[test]
 fn a_bare_reference_to_both_a_dimension_and_a_measure_is_refused() {
-    let err = plan("ambiguous", serde_json::json!({
-        "projections": [{ "field": "Amt" }],
-        "calculations": [{ "alias": "D", "sql": "[Dual] * 2", "data_type": "integer" }]
-    }))
+    let err = plan(
+        "ambiguous",
+        serde_json::json!({
+            "projections": [{ "field": "Amt" }],
+            "calculations": [{ "alias": "D", "sql": "[Dual] * 2", "data_type": "integer" }]
+        }),
+    )
     .expect_err("ambiguous");
     assert!(err.contains("both a dimension and a measure"), "{err}");
 }
 
 #[test]
 fn a_suffix_resolves_that_ambiguity() {
-    plan("disambiguated", serde_json::json!({
-        "projections": [{ "field": "Amt" }],
-        "calculations": [{ "alias": "D", "sql": "[Dual]@m * 2", "data_type": "integer" }]
-    }))
+    plan(
+        "disambiguated",
+        serde_json::json!({
+            "projections": [{ "field": "Amt" }],
+            "calculations": [{ "alias": "D", "sql": "[Dual]@m * 2", "data_type": "integer" }]
+        }),
+    )
     .expect("plans");
 }
 
@@ -137,10 +149,13 @@ fn a_suffix_resolves_that_ambiguity() {
 /// was looked for too.
 #[test]
 fn a_bare_reference_to_nothing_is_refused() {
-    let err = plan("not-found", serde_json::json!({
-        "projections": [{ "field": "Amt" }],
-        "calculations": [{ "alias": "D", "sql": "[Nope] * 2", "data_type": "integer" }]
-    }))
+    let err = plan(
+        "not-found",
+        serde_json::json!({
+            "projections": [{ "field": "Amt" }],
+            "calculations": [{ "alias": "D", "sql": "[Nope] * 2", "data_type": "integer" }]
+        }),
+    )
     .expect_err("not found");
     assert!(err.contains("could not find a projection or a field"), "{err}");
 }

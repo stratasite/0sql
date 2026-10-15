@@ -166,15 +166,35 @@ pub const TESTS_FILE: &str = "tests.json";
 impl Model {
     /// Over a snapshot alone: no values, no tests, the universe's own
     /// warnings.
-    pub fn build(uid: &str, branch: &str, snapshot: Snapshot, dialects: &'static Dialects) -> std::result::Result<Model, zsql_semantic::BuildError> {
+    pub fn build(
+        uid: &str,
+        branch: &str,
+        snapshot: Snapshot,
+        dialects: &'static Dialects,
+    ) -> std::result::Result<Model, zsql_semantic::BuildError> {
         let universe = Universe::build(snapshot)?;
         let warnings = universe.warnings().to_vec();
         let engine = Engine::new(universe, |u| Planner::new(u, dialects, None));
-        Ok(Model { uid: uid.to_string(), branch: branch.to_string(), engine, dialects, values: None, tests: vec![], warnings, loaded_at: now(), sources: vec![] })
+        Ok(Model {
+            uid: uid.to_string(),
+            branch: branch.to_string(),
+            engine,
+            dialects,
+            values: None,
+            tests: vec![],
+            warnings,
+            loaded_at: now(),
+            sources: vec![],
+        })
     }
 
     /// Over what the loader read: its warnings first, then the universe's.
-    pub fn from_loaded(uid: &str, branch: &str, loaded: Loaded, dialects: &'static Dialects) -> std::result::Result<Model, zsql_semantic::BuildError> {
+    pub fn from_loaded(
+        uid: &str,
+        branch: &str,
+        loaded: Loaded,
+        dialects: &'static Dialects,
+    ) -> std::result::Result<Model, zsql_semantic::BuildError> {
         let mut m = Self::build(uid, branch, loaded.snapshot, dialects)?;
         let mut warnings = loaded.warnings;
         warnings.append(&mut m.warnings);
@@ -275,24 +295,38 @@ impl Model {
         let (mut passed, mut failed) = (0, 0);
         for t in &self.tests {
             let spec = zsql_spec::Spec {
-                projections: t.projections.iter().map(|f| zsql_spec::spec::ProjectionSpec { field: Some(Value::String(f.clone())), ..Default::default() }).collect(),
+                projections: t
+                    .projections
+                    .iter()
+                    .map(|f| zsql_spec::spec::ProjectionSpec { field: Some(Value::String(f.clone())), ..Default::default() })
+                    .collect(),
                 ..Default::default()
             };
-            let outcome = zsql_spec::lower(&spec, self.universe(), &base).map_err(|e| e.to_string()).and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
+            let outcome = zsql_spec::lower(&spec, self.universe(), &base)
+                .map_err(|e| e.to_string())
+                .and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
             let (status, detail) = match (&outcome, &t.assert_sql, &t.assert_regex) {
                 (Err(e), _, _) => ("error", json!({ "message": e })),
                 (Ok(sql), Some(expected), _) => {
                     if normalize(sql) == normalize(expected) {
                         ("passed", Value::Null)
                     } else {
-                        ("failed", json!({ "message": "Generated SQL does not match expected SQL", "expected_sql": expected, "generated_sql": sql }))
+                        (
+                            "failed",
+                            json!({ "message": "Generated SQL does not match expected SQL", "expected_sql": expected, "generated_sql": sql }),
+                        )
                     }
                 }
-                (Ok(sql), None, Some(pattern)) => match regex::RegexBuilder::new(pattern).case_insensitive(true).dot_matches_new_line(true).build() {
-                    Ok(re) if re.is_match(sql) => ("passed", Value::Null),
-                    Ok(_) => ("failed", json!({ "message": "Generated SQL does not match regex pattern", "pattern": pattern, "generated_sql": sql })),
-                    Err(e) => ("error", json!({ "message": format!("bad assert_regex: {e}") })),
-                },
+                (Ok(sql), None, Some(pattern)) => {
+                    match regex::RegexBuilder::new(pattern).case_insensitive(true).dot_matches_new_line(true).build() {
+                        Ok(re) if re.is_match(sql) => ("passed", Value::Null),
+                        Ok(_) => (
+                            "failed",
+                            json!({ "message": "Generated SQL does not match regex pattern", "pattern": pattern, "generated_sql": sql }),
+                        ),
+                        Err(e) => ("error", json!({ "message": format!("bad assert_regex: {e}") })),
+                    }
+                }
                 (Ok(_), None, None) => ("error", json!({ "message": "No assertion defined (assert_sql or assert_regex required)" })),
             };
             if status == "passed" {
@@ -331,12 +365,27 @@ impl Model {
         let t1 = Instant::now();
         let plan = self.planner().plan_query_explained(query, req.context.as_ref(), explain)?;
         let t2 = Instant::now();
-        Ok(Planned { plan, corrections, timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() }, spec: made_spec, items, limit })
+        Ok(Planned {
+            plan,
+            corrections,
+            timings: Timings { parser_us: (t1 - t0).as_micros(), plan_us: (t2 - t1).as_micros(), total_us: (t2 - t0).as_micros() },
+            spec: made_spec,
+            items,
+            limit,
+        })
     }
 
     pub fn sql(&self, req: SqlRequest, check: ShapeCheck) -> Result<SqlResponse> {
         let p = self.plan_request(req, false, check)?;
-        Ok(SqlResponse { sql: p.plan.sql_with_limit(p.limit), datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items })
+        Ok(SqlResponse {
+            sql: p.plan.sql_with_limit(p.limit),
+            datasource: p.plan.datasource,
+            datasource_uid: p.plan.datasource_uid,
+            adapter: p.plan.adapter,
+            corrections: p.corrections,
+            spec: p.spec,
+            items: p.items,
+        })
     }
 
     pub fn explain(&self, req: SqlRequest, check: ShapeCheck) -> Result<ExplainResponse> {
@@ -344,7 +393,18 @@ impl Model {
         // Before taking `explain` out of the plan, which moves part of it.
         let sql = p.plan.sql_with_limit(p.limit);
         let x = p.plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
-        Ok(ExplainResponse { sql, datasource: p.plan.datasource, datasource_uid: p.plan.datasource_uid, adapter: p.plan.adapter, corrections: p.corrections, spec: p.spec, items: p.items, timings: p.timings, phases: x.phases, nodes: x.nodes })
+        Ok(ExplainResponse {
+            sql,
+            datasource: p.plan.datasource,
+            datasource_uid: p.plan.datasource_uid,
+            adapter: p.plan.adapter,
+            corrections: p.corrections,
+            spec: p.spec,
+            items: p.items,
+            timings: p.timings,
+            phases: x.phases,
+            nodes: x.nodes,
+        })
     }
 
     /// What a query can take on: the visible dimensions and measures the
@@ -400,7 +460,13 @@ impl Model {
     /// The uids of the tables carrying a field, in model order.
     fn tables_of(&self, field_id: zsql_semantic::Id) -> Vec<String> {
         let u = self.universe();
-        u.snapshot().expressions.iter().filter(|e| e.field_id == field_id).filter_map(|e| u.table(e.table_id)).map(|t| t.uid.clone()).collect()
+        u.snapshot()
+            .expressions
+            .iter()
+            .filter(|e| e.field_id == field_id)
+            .filter_map(|e| u.table(e.table_id))
+            .map(|t| t.uid.clone())
+            .collect()
     }
 
     /// Field discovery. With `q`, fields containing the text come first in
@@ -429,7 +495,11 @@ impl Model {
             .fields()
             .iter()
             .filter(visible)
-            .filter(|f| f.uid.to_lowercase().contains(&needle) || f.name.to_lowercase().contains(&needle) || f.synonyms.iter().any(|s| s.to_lowercase().contains(&needle)))
+            .filter(|f| {
+                f.uid.to_lowercase().contains(&needle)
+                    || f.name.to_lowercase().contains(&needle)
+                    || f.synonyms.iter().any(|s| s.to_lowercase().contains(&needle))
+            })
             .map(|f| describe(f, Some(1.0)))
             .collect();
         let seen: std::collections::HashSet<String> = out.iter().filter_map(|v| v["uid"].as_str()).map(str::to_string).collect();
@@ -678,7 +748,9 @@ mod tests {
         let mut models: std::collections::HashMap<String, Model> = Default::default();
         for cases in fixtures.cases().expect("golden cases").into_values() {
             for case in cases {
-                let model = models.entry(case.universe.clone()).or_insert_with(|| Model::build("g", &case.universe, fixtures.snapshot(&case.universe).expect("snapshot"), dialects).expect("universe"));
+                let model = models.entry(case.universe.clone()).or_insert_with(|| {
+                    Model::build("g", &case.universe, fixtures.snapshot(&case.universe).expect("snapshot"), dialects).expect("universe")
+                });
                 let req = SqlRequest { spec: Some(case.spec.clone()), expr: None, context: case.context.clone() };
                 out.push(match model.sql(req, &unlimited) {
                     Ok(r) => format!("{}: {}", case.id, r.sql),
@@ -731,7 +803,10 @@ mod tests {
             .expect("child test process");
         let text = String::from_utf8_lossy(&out.stdout);
         // With --nocapture the harness has already printed `test name ...` on the line.
-        let there = text.lines().find_map(|l| l.find("DIGEST ").map(|i| l[i + 7..].trim())).unwrap_or_else(|| panic!("no digest from the child:\n{text}\n{}", String::from_utf8_lossy(&out.stderr)));
+        let there = text
+            .lines()
+            .find_map(|l| l.find("DIGEST ").map(|i| l[i + 7..].trim()))
+            .unwrap_or_else(|| panic!("no digest from the child:\n{text}\n{}", String::from_utf8_lossy(&out.stderr)));
         assert_eq!(here, there);
     }
 
@@ -770,7 +845,12 @@ mod tests {
         let d = dialects();
         // A universe with policies would refuse everything below for
         // the want of a context, which is its own test.
-        let (open, guarded) = fx.snapshot_hashes().expect("hashes").into_iter().map(|h| fx.snapshot(&h).expect("snapshot")).fold((None, None), |(o, g), s| if s.security_policies.is_empty() { (o.or(Some(s)), g) } else { (o, g.or(Some(s))) });
+        let (open, guarded) = fx
+            .snapshot_hashes()
+            .expect("hashes")
+            .into_iter()
+            .map(|h| fx.snapshot(&h).expect("snapshot"))
+            .fold((None, None), |(o, g), s| if s.security_policies.is_empty() { (o.or(Some(s)), g) } else { (o, g.or(Some(s))) });
         let model = Model::build("p", "b", open.expect("a universe without policies"), d).expect("universe");
         let e = model.sql(SqlRequest::default(), &unlimited).unwrap_err();
         assert_eq!((e.kind, e.class), (Kind::Invalid, "Invalid"));

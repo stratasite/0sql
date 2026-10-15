@@ -9,16 +9,23 @@ use crate::visitors::grain::create_agg_node;
 use crate::{PlanError, Result};
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_spec::OrderBy;
 use zsql_semantic::{FieldKind, Predicate, Universe};
+use zsql_spec::OrderBy;
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+) -> Result<()> {
     for id in graph.post_order() {
         let n = &graph.nodes[id];
         if n.removed || n.kind == NodeKind::Merge || !n.filters.iter().any(|f| f.predicate == Predicate::TopN) {
             continue;
         }
-        let top_filters: Vec<Rc<RFilter<'a>>> = graph.nodes[id].filters.iter().filter(|f| f.predicate == Predicate::TopN).map(|f| f.filter.clone()).collect();
+        let top_filters: Vec<Rc<RFilter<'a>>> =
+            graph.nodes[id].filters.iter().filter(|f| f.predicate == Predicate::TopN).map(|f| f.filter.clone()).collect();
         for f in top_filters {
             create_top_n_segmentation(graph, id, universe, universes, dialects, q, &f)?;
         }
@@ -26,8 +33,17 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Univer
     Ok(())
 }
 
-fn create_top_n_segmentation<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>, top: &Rc<RFilter<'a>>) -> Result<()> {
-    let filters: Vec<Rc<RFilter<'a>>> = graph.nodes[id].filters.iter().filter(|f| f.predicate != Predicate::TopN).map(|f| f.filter.clone()).collect();
+fn create_top_n_segmentation<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+    top: &Rc<RFilter<'a>>,
+) -> Result<()> {
+    let filters: Vec<Rc<RFilter<'a>>> =
+        graph.nodes[id].filters.iter().filter(|f| f.predicate != Predicate::TopN).map(|f| f.filter.clone()).collect();
     let filter_fids: Vec<usize> = filters.iter().map(|f| f.fid).collect();
     let measure = top.def.top_n_measure.as_ref().and_then(|u| universe.field_by_uid(u, Some(FieldKind::Measure)));
     let dimension = top.field;
@@ -37,7 +53,13 @@ fn create_top_n_segmentation<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'
         .find(|n| {
             n.purpose == Some("strategy")
                 && n.projections.iter().find(|p| p.is_dimension()).and_then(|p| p.field()).map(|f| f.id == dimension.id).unwrap_or(false)
-                && (measure.is_none() || n.projections.iter().find(|p| p.is_measure()).and_then(|p| p.field()).map(|f| Some(f.id) == measure.map(|m| m.id)).unwrap_or(false))
+                && (measure.is_none()
+                    || n.projections
+                        .iter()
+                        .find(|p| p.is_measure())
+                        .and_then(|p| p.field())
+                        .map(|f| Some(f.id) == measure.map(|m| m.id))
+                        .unwrap_or(false))
                 && n.filters.len() == filters.len()
                 && n.filters.iter().all(|f| filter_fids.contains(&f.fid()))
         })
@@ -58,13 +80,22 @@ fn create_top_n_segmentation<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'
 }
 
 /// The ranking as a sub-plan, so the resolver picks the measure's fact table.
-fn build_via_sub_graph<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>, dimension: &'a zsql_semantic::Field, measure: &'a zsql_semantic::Field) -> Result<NodeId> {
+fn build_via_sub_graph<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+    dimension: &'a zsql_semantic::Field,
+    measure: &'a zsql_semantic::Field,
+) -> Result<NodeId> {
     let mut dim = RProjection::for_field(dimension);
     dim.def.ordinal = Some(0);
     let mut msr = RProjection::for_field(measure);
     msr.def.ordinal = Some(1);
     msr.def.order_by = Some(OrderBy::Desc);
-    let filters: Vec<Rc<RFilter<'a>>> = q.filters.iter().filter(|f| f.def.predicate != Predicate::TopN && f.is_dimension()).cloned().collect();
+    let filters: Vec<Rc<RFilter<'a>>> =
+        q.filters.iter().filter(|f| f.def.predicate != Predicate::TopN && f.is_dimension()).cloned().collect();
     let sub = RQuery {
         def: zsql_spec::Query::planner_sub(format!("{}-top_n", q.def.name.clone().unwrap_or_default())),
         projections: vec![Rc::new(dim), Rc::new(msr)],
@@ -85,7 +116,14 @@ fn build_via_sub_graph<'a>(graph: &mut Graph<'a>, universe: &'a Universe, univer
 }
 
 /// Rank by row count when no measure is named.
-fn build_count_node<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, id: NodeId, dimension: &'a zsql_semantic::Field, filters: Vec<Rc<RFilter<'a>>>) -> Result<NodeId> {
+fn build_count_node<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    id: NodeId,
+    dimension: &'a zsql_semantic::Field,
+    filters: Vec<Rc<RFilter<'a>>>,
+) -> Result<NodeId> {
     let mut calc = (*q.static_calc(universe, "row_count_measure", "count(*)")).clone_shallow();
     calc.def.order_by = Some(OrderBy::Desc);
     calc.def.ordinal = Some(1);

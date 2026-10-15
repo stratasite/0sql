@@ -7,8 +7,8 @@ use crate::model::{RProjection, RQuery};
 use crate::visitors::grain::{create_agg_node, create_merge_node};
 use crate::{PlanError, Result};
 use std::rc::Rc;
-use zsql_spec::DecoratorKind;
 use zsql_semantic::{Field, SnapshotKind, Table, Universe};
+use zsql_spec::DecoratorKind;
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
@@ -28,7 +28,8 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) ->
 /// A snapshot measure that is only filtered still needs a projection so
 /// the as-of machinery sees it.
 fn materialize_filtered_snapshots<'a>(graph: &mut Graph<'a>, id: NodeId) {
-    let fields: Vec<&'a Field> = graph.nodes[id].filters.iter().filter(|f| f.is_measure() && f.field().snapshot.is_some()).map(|f| f.field()).collect();
+    let fields: Vec<&'a Field> =
+        graph.nodes[id].filters.iter().filter(|f| f.is_measure() && f.field().snapshot.is_some()).map(|f| f.field()).collect();
     for f in fields {
         let projected = graph.nodes[id].projections.iter().any(|p| p.field().map(|x| x.id == f.id).unwrap_or(false));
         if !projected {
@@ -60,7 +61,14 @@ fn group_by_snapshot_date<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a U
     let mut groups: Vec<(String, Vec<&'a Field>)> = Vec::new();
     for m in snapshot_measures(&graph.nodes[id]) {
         let exp = graph.nodes[id].expression(universe, m)?;
-        let key = format!("{}_{}", exp.table_id, match m.snapshot { Some(SnapshotKind::Beginning) => "beginning", _ => "ending" });
+        let key = format!(
+            "{}_{}",
+            exp.table_id,
+            match m.snapshot {
+                Some(SnapshotKind::Beginning) => "beginning",
+                _ => "ending",
+            }
+        );
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(m),
             None => groups.push((key, vec![m])),
@@ -69,14 +77,25 @@ fn group_by_snapshot_date<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a U
     Ok(groups)
 }
 
-fn create_snap_nodes<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, sets: Vec<(String, Vec<&'a Field>)>) -> Result<()> {
+fn create_snap_nodes<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    sets: Vec<(String, Vec<&'a Field>)>,
+) -> Result<()> {
     let mut root = graph.root();
     let mut snap_nodes = Vec::new();
     for (_, measures) in sets {
-        let mut projections: Vec<Rc<RProjection<'a>>> = graph.nodes[id].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
+        let mut projections: Vec<Rc<RProjection<'a>>> =
+            graph.nodes[id].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
         for m in &measures {
-            let existing: Vec<Rc<RProjection<'a>>> =
-                graph.nodes[id].projections.iter().filter(|p| p.field().map(|f| f.id == m.id).unwrap_or(false)).map(|p| p.proj.clone()).collect();
+            let existing: Vec<Rc<RProjection<'a>>> = graph.nodes[id]
+                .projections
+                .iter()
+                .filter(|p| p.field().map(|f| f.id == m.id).unwrap_or(false))
+                .map(|p| p.proj.clone())
+                .collect();
             if existing.is_empty() {
                 projections.push(Rc::new(RProjection::for_field(m)));
             } else {
@@ -121,7 +140,8 @@ fn create_snap_nodes<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univer
 }
 
 fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
-    let first_measure = graph.nodes[snap].measures().into_iter().next().ok_or_else(|| PlanError::Resolution("snapshot node without measure".into()))?;
+    let first_measure =
+        graph.nodes[snap].measures().into_iter().next().ok_or_else(|| PlanError::Resolution("snapshot node without measure".into()))?;
     let snap_point = first_measure.snapshot;
     let exp = graph.nodes[snap].expression(universe, first_measure)?;
     let snap_table: &'a Table = universe.table(exp.table_id).expect("snapshot table");
@@ -138,7 +158,15 @@ fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, universe: &'a 
 
     let agg = if snap_point == Some(SnapshotKind::Beginning) { "MIN" } else { "MAX" };
     let sql = format!("{agg}([{}]@d)", snap_date_dim.name);
-    let calc = Rc::new(RProjection::for_calc_typed(sql, "SnapshotJoinDate".into(), Some(q.next_ordinal()), vec![], vec![snap_date_dim], Some("measure"), true));
+    let calc = Rc::new(RProjection::for_calc_typed(
+        sql,
+        "SnapshotJoinDate".into(),
+        Some(q.next_ordinal()),
+        vec![],
+        vec![snap_date_dim],
+        Some("measure"),
+        true,
+    ));
     q.push_static(calc.clone());
 
     let mut projections: Vec<Rc<RProjection<'a>>> = Vec::new();
@@ -150,7 +178,10 @@ fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, universe: &'a 
     let base = graph.nodes[snap].universe.clone().expect("universe");
     let snap_query = create_agg_node(graph, universe, q, base, projections, filters)?;
     graph.nodes[snap_query].purpose = Some("snapshot");
-    let strategy = Strategy { node: snap_query, kind: StrategyKind::SegmentOnTable { table: snap_table, join_type: "inner".into(), map: vec![(snap_date_dim, calc.pid)] } };
+    let strategy = Strategy {
+        node: snap_query,
+        kind: StrategyKind::SegmentOnTable { table: snap_table, join_type: "inner".into(), map: vec![(snap_date_dim, calc.pid)] },
+    };
     graph.add_strategy_edge(strategy, snap);
     Ok(())
 }
@@ -173,7 +204,12 @@ fn snapshot_date_projection<'a>(node: &crate::dag::Node<'a>, expected: &Field, u
     node.projections.iter().find(|p| p.field().map(|f| f.is_date()).unwrap_or(false)).cloned()
 }
 
-fn snapshot_date_filter<'a>(node: &crate::dag::Node<'a>, expected: &Field, proj: Option<&Projected<'a>>, universe: &'a Universe) -> Option<crate::dag::Filtered<'a>> {
+fn snapshot_date_filter<'a>(
+    node: &crate::dag::Node<'a>,
+    expected: &Field,
+    proj: Option<&Projected<'a>>,
+    universe: &'a Universe,
+) -> Option<crate::dag::Filtered<'a>> {
     if let Some(p) = proj {
         let fid = p.field()?.id;
         return node.filters.iter().find(|f| f.field().id == fid).cloned();

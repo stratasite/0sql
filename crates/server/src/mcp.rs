@@ -70,7 +70,9 @@ fn prompts() -> &'static Prompts {
 /// names a file to read instead of the compiled-in one.
 fn spec_schema() -> &'static Value {
     static S: OnceLock<Value> = OnceLock::new();
-    S.get_or_init(|| serde_json::from_str(&file_or("ZSQL_MCP_SPEC_SCHEMA", include_str!("mcp_spec_schema.json"))).expect("the MCP spec schema parses"))
+    S.get_or_init(|| {
+        serde_json::from_str(&file_or("ZSQL_MCP_SPEC_SCHEMA", include_str!("mcp_spec_schema.json"))).expect("the MCP spec schema parses")
+    })
 }
 
 fn file_or(var: &str, compiled: &str) -> String {
@@ -123,7 +125,9 @@ fn keyed(app: &App, who: &Option<Principal>) -> bool {
 }
 
 fn needs_key() -> Response {
-    let mut r = ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required for tool calls: Authorization: Bearer <key>".into()).into_response();
+    let mut r =
+        ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required for tool calls: Authorization: Bearer <key>".into())
+            .into_response();
     challenge(&mut r);
     r
 }
@@ -179,7 +183,9 @@ pub async fn endpoint(State(app): State<Shared>, Auth(who): Auth, headers: Heade
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     match dispatch(&app, &who, &method, params).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
-        Err(Fail::Rpc(code, message)) => Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })).into_response(),
+        Err(Fail::Rpc(code, message)) => {
+            Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })).into_response()
+        }
         Err(Fail::Http(r)) => r,
     }
 }
@@ -189,8 +195,21 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
             let version = VERSIONS.iter().copied().find(|v| *v == asked).unwrap_or(VERSIONS[0]);
-            let client = format!("{} {}", params["clientInfo"]["name"].as_str().unwrap_or("a client"), params["clientInfo"]["version"].as_str().unwrap_or("")).trim().to_string();
-            eprintln!("zsqld: mcp: {} connected: {client}", who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() { "no key".into() } else { "single-tenant".into() }));
+            let client = format!(
+                "{} {}",
+                params["clientInfo"]["name"].as_str().unwrap_or("a client"),
+                params["clientInfo"]["version"].as_str().unwrap_or("")
+            )
+            .trim()
+            .to_string();
+            eprintln!(
+                "zsqld: mcp: {} connected: {client}",
+                who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() {
+                    "no key".into()
+                } else {
+                    "single-tenant".into()
+                })
+            );
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
@@ -227,7 +246,8 @@ const CATALOGUE_BYTES: usize = 48 * 1024;
 /// prompt cache can hold it.
 fn catalogue(app: &App, who: &Option<Principal>) -> String {
     let models = app.models.read().unwrap();
-    let mut readable: Vec<Arc<Model>> = in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
+    let mut readable: Vec<Arc<Model>> =
+        in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
     drop(models);
     readable.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
     if readable.is_empty() {
@@ -264,7 +284,14 @@ fn branch_catalogue(d: &Model) -> String {
         v.dedup();
     }
     let home = |f: &zsql_semantic::Field| tables_of.get(&f.id).and_then(|t| t.first().cloned()).unwrap_or_else(|| "?".into());
-    let mut out = format!("## Project {}, branch {}: {} tables, {} fields, {} policies\n", d.uid, d.branch, s.tables.len(), s.fields.len(), s.security_policies.len());
+    let mut out = format!(
+        "## Project {}, branch {}: {} tables, {} fields, {} policies\n",
+        d.uid,
+        d.branch,
+        s.tables.len(),
+        s.fields.len(),
+        s.security_policies.len()
+    );
     let mut measures: Vec<&zsql_semantic::Field> = u.fields().iter().filter(|f| !f.hidden && f.kind == FieldKind::Measure).collect();
     measures.sort_by(|a, b| (home(a), &a.name).cmp(&(home(b), &b.name)));
     out.push_str("### Measures, by table (uid: name (type), description [synonyms])\n");
@@ -323,7 +350,9 @@ fn branch_catalogue(d: &Model) -> String {
 /// an unknown one.
 fn exposed(name: &str) -> bool {
     static E: OnceLock<Option<Vec<String>>> = OnceLock::new();
-    match E.get_or_init(|| std::env::var("ZSQL_MCP_TOOLS").ok().filter(|v| !v.trim().is_empty()).map(|v| v.split(',').map(|t| t.trim().to_string()).collect())) {
+    match E.get_or_init(|| {
+        std::env::var("ZSQL_MCP_TOOLS").ok().filter(|v| !v.trim().is_empty()).map(|v| v.split(',').map(|t| t.trim().to_string()).collect())
+    }) {
         Some(list) => list.iter().any(|t| t == name),
         None => true,
     }
@@ -343,7 +372,8 @@ fn tools() -> Vec<Value> {
         for v in props {
             p.extend(v.as_object().unwrap().clone());
         }
-        let mut out = json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description });
+        let mut out =
+            json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false, "description": description });
         if with_defs && !defs.is_null() {
             out["$defs"] = defs.clone();
         }
@@ -413,7 +443,10 @@ struct QueryArgs {
 /// who it acts as, and should be told that is not its to choose.
 fn args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, Fail> {
     if v.get("context").is_some() {
-        return Err(Fail::Rpc(INVALID_PARAMS, "a security context is not accepted here: who a query is planned for is fixed by the key".into()));
+        return Err(Fail::Rpc(
+            INVALID_PARAMS,
+            "a security context is not accepted here: who a query is planned for is fixed by the key".into(),
+        ));
     }
     serde_json::from_value(v).map_err(|e| Fail::Rpc(INVALID_PARAMS, format!("arguments: {e}")))
 }
@@ -436,7 +469,10 @@ fn branch_for(app: &App, who: &Option<Principal>, uid: &str, branch: Option<Stri
     }
     check_uid(uid)?;
     if let (Some(store), Some(p)) = (&app.accounts, who) {
-        let project = store.project(p.account().id, uid).map_err(internal)?.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}")))?;
+        let project = store
+            .project(p.account().id, uid)
+            .map_err(internal)?
+            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}")))?;
         return Ok(project.production_branch);
     }
     let models = app.models.read().unwrap();
@@ -532,10 +568,13 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
                 });
                 return Ok(match text {
                     Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalogue": text } }),
-                    Err(ApiError(status, class, message)) => json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true }),
+                    Err(ApiError(status, class, message)) => {
+                        json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true })
+                    }
                 });
             }
-            branch_for(app, who, &a.project, a.branch).and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
+            branch_for(app, who, &a.project, a.branch)
+                .and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
@@ -549,7 +588,15 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             let a: QueryArgs = args(arguments)?;
             let _seat = admit_explore(app, who).await?;
             branch_for(app, who, &a.project, a.branch)
-                .and_then(|b| explore_of(app, who, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context: context_for(who), q: a.q }))
+                .and_then(|b| {
+                    explore_of(
+                        app,
+                        who,
+                        &a.project,
+                        &b,
+                        ExploreRequest { spec: Some(a.spec), expr: None, context: context_for(who), q: a.q },
+                    )
+                })
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -570,10 +617,14 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),
     };
     Ok(match answer {
-        Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }], "structuredContent": v }),
+        Ok(v) => {
+            json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }], "structuredContent": v })
+        }
         // What the REST route would have said, as the tool's own result,
         // so the model reads the refusal instead of a transport failure.
-        Err(ApiError(status, class, message)) => json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true }),
+        Err(ApiError(status, class, message)) => {
+            json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true })
+        }
     })
 }
 

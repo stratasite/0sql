@@ -141,13 +141,22 @@ pub fn skip_reason(universe: &Universe, uid: &str) -> Option<String> {
 /// The sampling plan for the listable dimensions (or the given uids), one
 /// job each, reading from the cheapest table that holds the dimension.
 /// `qualify` rewrites an expression's column references with a table alias.
-pub fn plan(universe: &Universe, only: &[String], full: bool, qualify: &dyn Fn(&str, &[String], &str, &str) -> String) -> (Vec<SampleJob>, Vec<(String, String)>) {
+pub fn plan(
+    universe: &Universe,
+    only: &[String],
+    full: bool,
+    qualify: &dyn Fn(&str, &[String], &str, &str) -> String,
+) -> (Vec<SampleJob>, Vec<(String, String)>) {
     let mut jobs = Vec::new();
     let mut skipped = Vec::new();
     let wanted: Vec<&zsql_semantic::Field> = if only.is_empty() {
         universe.fields().iter().filter(|f| f.kind == FieldKind::Dimension).collect()
     } else {
-        only.iter().filter_map(|u| universe.field_by_uid(u, Some(FieldKind::Dimension)).or_else(|| universe.field_by_name(u, FieldKind::Dimension))).collect()
+        only.iter()
+            .filter_map(|u| {
+                universe.field_by_uid(u, Some(FieldKind::Dimension)).or_else(|| universe.field_by_name(u, FieldKind::Dimension))
+            })
+            .collect()
     };
     for f in wanted {
         if let Some(why) = skip_reason(universe, &f.uid) {

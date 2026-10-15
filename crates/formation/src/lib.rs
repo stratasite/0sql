@@ -52,7 +52,8 @@ pub fn form(universe: &Universe) -> Formation {
             Tier::Cold => 2,
         })
     };
-    let fields_on = |table_id: Id| -> Vec<&Field> { universe.expressions_of(table_id).filter_map(|e| universe.field(e.field_id)).collect() };
+    let fields_on =
+        |table_id: Id| -> Vec<&Field> { universe.expressions_of(table_id).filter_map(|e| universe.field(e.field_id)).collect() };
 
     let mut paths: Vec<Path> = Vec::new();
     let mut next_id: Id = 1;
@@ -160,13 +161,15 @@ fn ambiguous_field_routes(universe: &Universe, paths: &[Path], warnings: &mut Ve
         let mut candidates = by_pair[key].clone();
         candidates.sort_by_key(|p| (p.cost, universe.path_signature(p)));
         let cheapest = candidates[0];
-        let tied: Vec<&Path> = candidates.iter().copied().filter(|p| p.cost == cheapest.cost && p.target_table_id != cheapest.target_table_id).collect();
+        let tied: Vec<&Path> =
+            candidates.iter().copied().filter(|p| p.cost == cheapest.cost && p.target_table_id != cheapest.target_table_id).collect();
         if tied.is_empty() {
             continue;
         }
         let name = |id: Id| universe.table(id).map(|t| t.uid.as_str()).unwrap_or("?");
         let field = universe.field(key.1).map(|f| f.name.as_str()).unwrap_or("?");
-        let mut tables: Vec<String> = std::iter::once(cheapest).chain(tied.iter().copied()).map(|p| name(p.target_table_id).to_string()).collect();
+        let mut tables: Vec<String> =
+            std::iter::once(cheapest).chain(tied.iter().copied()).map(|p| name(p.target_table_id).to_string()).collect();
         tables.sort();
         tables.dedup();
         warnings.push(format!(
@@ -183,7 +186,13 @@ fn ambiguous_field_routes(universe: &Universe, paths: &[Path], warnings: &mut Ve
 /// Dijkstra from `root` over the directed join graph. Equal-cost routes
 /// break on fewer hops, then on the route's table uids, so the choice is a
 /// property of the model rather than of row order.
-fn shortest_routes(root: Id, edges: &HashMap<Id, Vec<Edge>>, measures_only: bool, warnings: &mut Vec<String>, universe: &Universe) -> HashMap<Id, Route> {
+fn shortest_routes(
+    root: Id,
+    edges: &HashMap<Id, Vec<Edge>>,
+    measures_only: bool,
+    warnings: &mut Vec<String>,
+    universe: &Universe,
+) -> HashMap<Id, Route> {
     let uid = |id: Id| universe.table(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
     let mut best: HashMap<Id, Route> = HashMap::new();
     let mut heap: BinaryHeap<Reverse<(i64, usize, String, Vec<Id>, Id)>> = BinaryHeap::new();
@@ -264,7 +273,10 @@ fn extended_blend_paths(universe: &Universe, paths: &mut Vec<Path>, next_id: &mu
                 continue;
             }
             let local: Vec<Id> = dim_ids.iter().copied().filter(|d| reached.contains(d)).collect();
-            let mut candidates: Vec<&Path> = paths.iter().filter(|p| p.root_table_id == root && local.contains(&p.field_id) && p.extended_blend_group.is_none()).collect();
+            let mut candidates: Vec<&Path> = paths
+                .iter()
+                .filter(|p| p.root_table_id == root && local.contains(&p.field_id) && p.extended_blend_group.is_none())
+                .collect();
             candidates.sort_by_key(|p| (p.cost, p.id));
             let Some(local_path) = candidates.first().cloned().cloned() else { continue };
             for d in non_local {

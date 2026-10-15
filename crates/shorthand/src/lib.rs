@@ -150,7 +150,11 @@ fn masked(text: &str) -> String {
             }
         }
     }
-    if out.len() == text.len() { out } else { text.to_lowercase() }
+    if out.len() == text.len() {
+        out
+    } else {
+        text.to_lowercase()
+    }
 }
 
 pub fn parse_item(text: &str) -> Result<Item, String> {
@@ -168,7 +172,12 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
         }
     }
 
-    let filter = |field: &str, predicate: &str, value: Option<String>, value_end: Option<String>, top_n_measure: Option<String>| -> Result<Item, String> {
+    let filter = |field: &str,
+                  predicate: &str,
+                  value: Option<String>,
+                  value_end: Option<String>,
+                  top_n_measure: Option<String>|
+     -> Result<Item, String> {
         let field = field_text(field);
         if field.is_empty() {
             return Err(format!("'{text}': a filter needs a field before its predicate"));
@@ -221,7 +230,11 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
         }
         return filter(&text[..pos], "top_n", Some(n.to_string()), None, measure);
     }
-    for (kw, yes, no) in [(" contains ", "contains", "does_not_contain"), (" starts with ", "starts_with", "does_not_start_with"), (" ends with ", "ends_with", "does_not_end_with")] {
+    for (kw, yes, no) in [
+        (" contains ", "contains", "does_not_contain"),
+        (" starts with ", "starts_with", "does_not_start_with"),
+        (" ends with ", "ends_with", "does_not_end_with"),
+    ] {
         if let Some(pos) = lower.find(kw) {
             let field = &text[..pos];
             let value = unquote(&text[pos + kw.len()..]);
@@ -232,7 +245,15 @@ pub fn parse_item(text: &str) -> Result<Item, String> {
             };
         }
     }
-    for (op, predicate) in [(">=", "greater_than_or_equal_to"), ("<=", "less_than_or_equal_to"), ("!=", "does_not_equal"), ("<>", "does_not_equal"), ("=", "equals"), (">", "greater_than"), ("<", "less_than")] {
+    for (op, predicate) in [
+        (">=", "greater_than_or_equal_to"),
+        ("<=", "less_than_or_equal_to"),
+        ("!=", "does_not_equal"),
+        ("<>", "does_not_equal"),
+        ("=", "equals"),
+        (">", "greater_than"),
+        ("<", "less_than"),
+    ] {
         if let Some(pos) = lower.find(op) {
             return filter(&text[..pos], predicate, Some(unquote(&text[pos + op.len()..])), None, None);
         }
@@ -308,8 +329,11 @@ fn parse_projection(text: &str) -> Result<Item, String> {
 
 fn decorator(func: &str, args: &[String]) -> Option<Value> {
     let d = match func {
-        "raw" | "millisecond" | "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year" => json!({ "type": "truncate", "grain": func }),
-        "dow" | "dom" | "doy" | "woy" | "hr" | "min" | "mon" | "qtr" | "yr" | "day_name" | "month_name" | "year_month" | "day_of_week" | "day_of_month" | "day_of_year" | "week_of_year" => {
+        "raw" | "millisecond" | "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year" => {
+            json!({ "type": "truncate", "grain": func })
+        }
+        "dow" | "dom" | "doy" | "woy" | "hr" | "min" | "mon" | "qtr" | "yr" | "day_name" | "month_name" | "year_month" | "day_of_week"
+        | "day_of_month" | "day_of_year" | "week_of_year" => {
             let part = match func {
                 "dow" => "day_of_week",
                 "dom" => "day_of_month",
@@ -358,7 +382,8 @@ fn decorator(func: &str, args: &[String]) -> Option<Value> {
             if let Some(size) = args.first().and_then(|s| s.trim().parse::<i64>().ok()) {
                 d["size"] = Value::from(size);
             }
-            let partitions: Vec<Value> = args.iter().filter(|s| s.trim().parse::<i64>().is_err()).map(|s| Value::String(s.clone())).collect();
+            let partitions: Vec<Value> =
+                args.iter().filter(|s| s.trim().parse::<i64>().is_err()).map(|s| Value::String(s.clone())).collect();
             if !partitions.is_empty() {
                 d["partition_refs"] = Value::Array(partitions);
             }
@@ -377,8 +402,18 @@ pub fn describe(items: &[Item]) -> Vec<String> {
                 let field = p["field"].as_str().unwrap_or("?").to_string();
                 let decs = p["decorators"].as_array().cloned().unwrap_or_default();
                 let mut s = decs.iter().rev().fold(field, |acc, d| {
-                    let detail: Vec<String> = d.as_object().into_iter().flatten().filter(|(k, _)| *k != "type" && *k != "partition_refs").map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect();
-                    format!("{}({acc}{})", d["type"].as_str().unwrap_or("?"), if detail.is_empty() { String::new() } else { format!("; {}", detail.join(", ")) })
+                    let detail: Vec<String> = d
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, _)| *k != "type" && *k != "partition_refs")
+                        .map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+                        .collect();
+                    format!(
+                        "{}({acc}{})",
+                        d["type"].as_str().unwrap_or("?"),
+                        if detail.is_empty() { String::new() } else { format!("; {}", detail.join(", ")) }
+                    )
                 });
                 if let Some(a) = p["alias"].as_str() {
                     s.push_str(&format!(" as {a}"));
@@ -457,9 +492,15 @@ mod tests {
     /// own alias when unnamed.
     #[test]
     fn escaped_names_are_fields_whatever_they_say() {
-        assert!(matches!(parse_item("\"Sales in Store\" > 5"), Ok(Item::Filter(f)) if f["field"] == "Sales in Store" && f["predicate"] == "greater_than"));
-        assert!(matches!(parse_item("month([Date between])"), Ok(Item::Projection(p)) if p["field"] == "Date between" && p["decorators"].as_array().unwrap().len() == 1));
-        assert!(matches!(parse_item("[Net Paid] as \"Paid\" desc"), Ok(Item::Projection(p)) if p["alias"] == "Paid" && p["order_by"] == "desc"));
+        assert!(
+            matches!(parse_item("\"Sales in Store\" > 5"), Ok(Item::Filter(f)) if f["field"] == "Sales in Store" && f["predicate"] == "greater_than")
+        );
+        assert!(
+            matches!(parse_item("month([Date between])"), Ok(Item::Projection(p)) if p["field"] == "Date between" && p["decorators"].as_array().unwrap().len() == 1)
+        );
+        assert!(
+            matches!(parse_item("[Net Paid] as \"Paid\" desc"), Ok(Item::Projection(p)) if p["alias"] == "Paid" && p["order_by"] == "desc")
+        );
         assert!(matches!(parse_item("Share = [A]@m / [B]@m"), Ok(Item::Calculation(c)) if c["sql"] == "[A]@m / [B]@m"));
         assert!(matches!(parse_item("max([gross sales]@m)"), Ok(Item::Calculation(c)) if c["alias"] == "max([gross sales]@m)"));
         assert!(matches!(parse_item("[gross sales]@m > 100"), Ok(Item::Filter(f)) if f["field"] == "gross sales@m"));

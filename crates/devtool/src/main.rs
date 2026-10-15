@@ -47,7 +47,9 @@ impl Source {
             None => Dialects::builtin(),
         };
         match (&self.snapshot, &self.project) {
-            (Some(path), _) => Ok(Model { snapshot: Snapshot::from_path(path).with_context(|| path.display().to_string())?, warnings: vec![] }),
+            (Some(path), _) => {
+                Ok(Model { snapshot: Snapshot::from_path(path).with_context(|| path.display().to_string())?, warnings: vec![] })
+            }
             (None, Some(dir)) => {
                 let loaded = zsql_project::load(dir, &dialects)?;
                 Ok(Model { snapshot: loaded.snapshot, warnings: loaded.warnings })
@@ -122,7 +124,6 @@ enum Command {
         source: Source,
     },
 }
-
 
 fn main() -> Result<()> {
     // A closed pipe (`zsql ... | head`) ends the program quietly instead of panicking.
@@ -270,9 +271,24 @@ fn main() -> Result<()> {
             }
             let per = |d: Duration, n: usize| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
             println!("{:<28} {:>10} {:>12}", "phase", "total ms", "per item us");
-            println!("{:<28} {:>10.1} {:>12.1}", format!("load {} universes", hashes.len()), load.as_secs_f64() * 1e3, per(load, hashes.len()));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("form {} universes", hashes.len()), form.as_secs_f64() * 1e3, per(form, hashes.len()));
-            println!("{:<28} {:>10.1} {:>12.1}", format!("index {} universes", hashes.len()), index.as_secs_f64() * 1e3, per(index, hashes.len()));
+            println!(
+                "{:<28} {:>10.1} {:>12.1}",
+                format!("load {} universes", hashes.len()),
+                load.as_secs_f64() * 1e3,
+                per(load, hashes.len())
+            );
+            println!(
+                "{:<28} {:>10.1} {:>12.1}",
+                format!("form {} universes", hashes.len()),
+                form.as_secs_f64() * 1e3,
+                per(form, hashes.len())
+            );
+            println!(
+                "{:<28} {:>10.1} {:>12.1}",
+                format!("index {} universes", hashes.len()),
+                index.as_secs_f64() * 1e3,
+                per(index, hashes.len())
+            );
             println!("{:<28} {:>10.1} {:>12.1}", format!("lower spec x{n}"), lower_time.as_secs_f64() * 1e3, per(lower_time, n));
             println!("{:<28} {:>10.1} {:>12.1}", format!("plan x{n}"), plan_time.as_secs_f64() * 1e3, per(plan_time, n));
             println!("{:<28} {:>10.1} {:>12.1}", "structural compare", compare_time.as_secs_f64() * 1e3, per(compare_time, n));

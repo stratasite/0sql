@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use zsql_dialect::Dialect;
-use zsql_spec::Decorator;
 use zsql_semantic::{Datasource, Expression, Field, Id, Predicate, Table};
+use zsql_spec::Decorator;
 
 pub type NodeId = usize;
 
@@ -119,12 +119,7 @@ impl<'a> Filtered<'a> {
     }
     /// Rails `Filtered#to_s`; part of node identity.
     pub fn to_s(&self) -> String {
-        format!(
-            "<f:{}:{}:{}>",
-            field_to_s(self.field()),
-            self.predicate.name(),
-            self.filter_value.clone().unwrap_or_default()
-        )
+        format!("<f:{}:{}:{}>", field_to_s(self.field()), self.predicate.name(), self.filter_value.clone().unwrap_or_default())
     }
 }
 
@@ -294,7 +289,12 @@ pub struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    pub fn with_universe(kind: NodeKind, universe: Arc<Base<'a>>, projections: Vec<Rc<RProjection<'a>>>, filters: Vec<Rc<RFilter<'a>>>) -> Self {
+    pub fn with_universe(
+        kind: NodeKind,
+        universe: Arc<Base<'a>>,
+        projections: Vec<Rc<RProjection<'a>>>,
+        filters: Vec<Rc<RFilter<'a>>>,
+    ) -> Self {
         let mut n = Node::bare(kind, projections, filters);
         n.universe = Some(universe);
         n.should_group_by = Some(kind == NodeKind::Aggregation);
@@ -407,7 +407,11 @@ impl<'a> Node<'a> {
             }
         };
         universe.expression_for(path.target_table_id, field.id).ok_or_else(|| {
-            crate::PlanError::Resolution(format!("Could not find expression for {} in the the target table {}.", field_to_s(field), path.target_table_id))
+            crate::PlanError::Resolution(format!(
+                "Could not find expression for {} in the the target table {}.",
+                field_to_s(field),
+                path.target_table_id
+            ))
         })
     }
     pub fn is_merge(&self) -> bool {
@@ -513,7 +517,8 @@ impl<'a> Node<'a> {
         let projections: Vec<String> = self.projections.iter().map(|p| format!("{} -> {}", p.to_s(), p.alias)).collect();
         let mut filters: Vec<String> = self.filters.iter().map(|f| f.to_s()).collect();
         filters.sort();
-        let mut s = format!("{} \nprojections: \n\t{} \nfilters: \n\t{}", self.kind.class_name(), projections.join("\n\t"), filters.join("\n\t"));
+        let mut s =
+            format!("{} \nprojections: \n\t{} \nfilters: \n\t{}", self.kind.class_name(), projections.join("\n\t"), filters.join("\n\t"));
         if let Some(o) = &self.owner {
             s.push_str(&o.identity);
         }
@@ -553,13 +558,8 @@ impl<'a> Node<'a> {
         ins.sort_by_cached_key(|i| {
             let n = &graph.nodes[*i];
             let cost: i64 = -n.subtrees.iter().map(|s| s.cost()).sum::<i64>();
-            let first_measure = n
-                .projections
-                .iter()
-                .filter(|p| p.is_measure())
-                .filter_map(|p| p.proj.def.ordinal)
-                .min()
-                .unwrap_or(i64::MAX);
+            let first_measure =
+                n.projections.iter().filter(|p| p.is_measure()).filter_map(|p| p.proj.def.ordinal).min().unwrap_or(i64::MAX);
             (
                 -(n.projections.iter().filter(|p| p.is_dimension()).count() as i64),
                 -(n.projections.len() as i64),

@@ -100,7 +100,12 @@ impl Mailer {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("starting the mail command: {e}"))?;
-        child.stdin.take().ok_or("the mail command took no stdin")?.write_all(message.as_bytes()).map_err(|e| format!("writing the message: {e}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or("the mail command took no stdin")?
+            .write_all(message.as_bytes())
+            .map_err(|e| format!("writing the message: {e}"))?;
         // A wedged mail command must not hold a blocking thread for the
         // life of the process, so it is waited for with a deadline and
         // killed past it. `wait` has no timeout of its own.
@@ -108,7 +113,12 @@ impl Mailer {
         loop {
             match child.try_wait().map_err(|e| format!("waiting for the mail command: {e}"))? {
                 Some(status) if status.success() => return Ok(Sent::Delivered),
-                Some(status) => return Err(format!("the mail command exited {}", status.code().map(|c| c.to_string()).unwrap_or_else(|| "on a signal".into()))),
+                Some(status) => {
+                    return Err(format!(
+                        "the mail command exited {}",
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "on a signal".into())
+                    ))
+                }
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -214,7 +224,12 @@ mod tests {
         assert!(!header_unsafe("ann@acme.test"));
         assert!(!header_unsafe("0sql <support@acme.test>"));
 
-        let m = Mailer { command: Some("true".into()), from: "0sql <s@t.test>".into(), public_url: "https://x.test".into(), timeout: Duration::from_secs(5) };
+        let m = Mailer {
+            command: Some("true".into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_secs(5),
+        };
         assert!(m.send("ann@acme.test\r\nBcc: v@x.test", "hi", "body").is_err());
         assert!(m.send("ann@acme.test", "hi\r\nBcc: v@x.test", "body").is_err());
     }
@@ -231,7 +246,12 @@ mod tests {
     /// A command that hangs is killed rather than holding the thread.
     #[test]
     fn a_wedged_command_is_killed() {
-        let m = Mailer { command: Some("sleep 30".into()), from: "0sql <s@t.test>".into(), public_url: "https://x.test".into(), timeout: Duration::from_millis(100) };
+        let m = Mailer {
+            command: Some("sleep 30".into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_millis(100),
+        };
         let started = Instant::now();
         let err = m.send("ann@acme.test", "hi", "body").expect_err("the deadline passes");
         assert!(err.contains("did not finish"), "{err}");
@@ -242,7 +262,12 @@ mod tests {
     /// receives has to reach the journal.
     #[test]
     fn a_failing_command_is_an_error() {
-        let m = Mailer { command: Some("exit 78".into()), from: "0sql <s@t.test>".into(), public_url: "https://x.test".into(), timeout: Duration::from_secs(5) };
+        let m = Mailer {
+            command: Some("exit 78".into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_secs(5),
+        };
         let err = m.send("ann@acme.test", "hi", "body").expect_err("it exits non-zero");
         assert!(err.contains("78"), "{err}");
     }
