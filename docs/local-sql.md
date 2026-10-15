@@ -202,9 +202,11 @@ Each is one PR that leaves the tree releasable.
 | A (later) | Server library split with `Config`, env reads out of the library, `OnceLock` removed; `zsql serve`; data-dir lock; graceful shutdown; atomic deploy writes; bind refusal; log test; `server start/stop/status/logs` | an embedded server survives a client closing early, a SIGTERM mid-deploy, and a second instance on its data dir |
 | B (later) | `server install`; release workflows merged into one public release carrying both artefacts; any deploy rework | one tag publishes CLI and server together |
 
-Before the repo flips public, separately from these phases: scrub
-`docs/running-it.md` and `ops/` of hostnames and addresses, scan git
-history for secrets. Done on 2026-10-15: the MIT `LICENSE`, a format
+Done on 2026-10-15, ahead of the repo going public: `docs/running-it.md`,
+`docs/mcp.md` and `ops/` no longer name the host, its private address or
+anyone's mailbox; the tree and the git history were scanned for secret
+values and hold none (the history still names the host in old versions
+of the runbook, left as is). Also done: the MIT `LICENSE`, a format
 pass under `rustfmt.toml` (140 columns, the "Max" heuristic, so the
 dense style survives) checked in CI, `cargo deny` for advisories and
 licences, and Dependabot for crates and actions.

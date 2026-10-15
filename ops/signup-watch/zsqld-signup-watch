@@ -12,7 +12,7 @@ set -eu
 
 DB="${ZSQL_SIGNUP_WATCH_DB:-/var/lib/zsqld/accounts.db}"
 STATE_DIR="${ZSQL_SIGNUP_WATCH_STATE:-/var/lib/zsqld-signup-watch}"
-TO="${ZSQL_SIGNUP_WATCH_TO:-ajo@strata.do}"
+TO="${ZSQL_SIGNUP_WATCH_TO:?ZSQL_SIGNUP_WATCH_TO is not set; the address the report goes to}"
 STATE="$STATE_DIR/last"
 
 : "${ZSQL_MAIL_COMMAND:?ZSQL_MAIL_COMMAND is not set; load /etc/zsqld.env}"

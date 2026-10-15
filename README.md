@@ -22,7 +22,7 @@ crates/server     zsqld: deploy a project, plan specs
 crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
-harness/          import of goldens from a roundhouse/strata-rs capture
+harness/          import of the golden cases captured from strata
 ```
 
 ## The contract
@@ -233,17 +233,18 @@ and postgres are the drivers so far.
 
 ## Parity
 
-The planner is a port of strata's Rails planner, proven against goldens
-captured from that planner's own test suite (see `harness/`): every case
-that a spec can express, on the main branch and on a mutated clone. All
-385 pass, over paths formed here and over the paths Rails stored.
+The planner is its own implementation, written with strata's planner as
+the specification and proven against goldens captured from strata's test
+suite (see `harness/`): every case that a spec can express, on the main
+branch and on a mutated clone. All 385 pass, over paths formed here and
+over the paths strata stored.
 
 ```
 cargo test                     # contract, scoreboard, formation, spec round trips
 ZSQL_GOLDEN_STRICT=1 cargo test -p zsql-golden
 ```
 
-Where it improves on Rails, each covered by a test: a calculation that
+Where it goes beyond the specification, each covered by a test: a calculation that
 references another calculation is inlined before a temporal transform; a
 measure filter beside an inclusion measure stays on the node that computes
 that measure; equal-cost join routes and merge-input order follow names

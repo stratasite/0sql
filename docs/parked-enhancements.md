@@ -90,14 +90,14 @@ ranker (uid to score); without one behaviour is unchanged. A `hits` field
 on fields and explore entries, and a top-fields endpoint per project that
 doubles as a usage report.
 
-## Error messages still written in Rails' voice
+## Error messages still written in strata's voice
 
 Parked 2026-10-05, when the error *classes* were renamed to 0sql's own
 (`FieldNotFound`, `FieldAmbiguous`, `InvalidSpec`, `InvalidValue`,
 `Unresolvable`, `SegmentDatasource`, `SecurityPolicy`). The messages behind
-them were left alone and are still ActiveRecord validation strings, carried
-over so the port read the same as Rails: attribute name first, framework
-grammar, and a `Validation failed: ` prefix from `SpecError::RecordInvalid`.
+them were left alone and are still strata's validation strings, carried
+over so the two answer alike: attribute name first, framework grammar,
+and a `Validation failed: ` prefix from `SpecError::RecordInvalid`.
 
 About 28 of them, all in `crates/spec/src/spec.rs`:
 
@@ -114,8 +114,8 @@ About 28 of them, all in `crates/spec/src/spec.rs`:
 
 Three of them read as broken English (`Transform invalid transform type`,
 `Axis the tooltip holds measures only`, `Filter value values must be
-numeric`) because ActiveRecord prepends the attribute name to a message
-written to follow it.
+numeric`) because strata's framework prepends the attribute name to a
+message written to follow it.
 
 What a rewrite should do: say what was wrong with the request and what would
 be right, in 0sql's voice, and drop the `Validation failed: ` prefix with
@@ -127,8 +127,8 @@ Parked because it is a wide, shallow change that touches a published
 surface: `src/content/docs/query/errors.mdx` in 0sql-marketing quotes many of
 these verbatim, so the docs move with it. Nothing blocks it technically —
 the goldens compare the error *class* only, never the message
-(`crates/golden/src/lib.rs`), so Rails and 0sql may word things differently
-without breaking parity.
+(`crates/golden/src/lib.rs`), so strata and 0sql may word things
+differently without breaking parity.
 
 Worth doing in one pass rather than drifting message by message, so the
 surface stays consistent.

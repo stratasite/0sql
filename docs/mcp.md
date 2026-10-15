@@ -224,8 +224,8 @@ OAuth here, and the key is the credential. Under **Request headers**
 add `Authorization` with the value `Bearer zqk_...`, then Add. The bare
 key, `zqk_...` with no scheme, is taken too; any other scheme is not. The
 connector's tools appear in a new conversation once it is enabled
-there. The server's journal on buzz shows `mcp: ... connected:
-claude-ai` on success and `mcp: refused ...` with the reason on failure.
+there. The server's journal shows `mcp: ... connected: claude-ai` on
+success and `mcp: refused ...` with the reason on failure.
 
 claude.ai and Claude Desktop: a custom connector at the same URL with
 "fixed credentials", the key as the bearer token. The API's MCP

@@ -5,10 +5,10 @@ What is deployed, how it gets there, and what is left to do. Written
 
 ## Where it runs
 
-`buzz`, a Debian 13 VPS with 4 cores and 16 GB, reachable on the tailnet
-as `buzz` and publicly as **https://app.0sql.io**. It also runs the
-license server and several containers; zsqld is the only thing installed
-directly on the host.
+A Debian 13 VPS with 4 cores and 16 GB, reachable on a private network
+for administration and publicly as **https://app.0sql.io**. zsqld is the
+only thing installed directly on the host; this document calls it "the
+host".
 
 | | |
 |---|---|
@@ -97,17 +97,16 @@ not trigger it and a `v*` tag does not trigger the CLI's.
    the result is really static, with no dynamic dependencies, then starts
    it and waits for `/healthz`. If either fails there is no release, by
    design. It publishes `zsqld-x86_64-linux` and a `.sha256` beside it on
-   a release of that tag, with generated notes. The repository is
-   private, so the assets are too.
+   a release of that tag, with generated notes.
 
-6. **Install it on buzz, keeping the one it replaces.**
+6. **Install it on the host, keeping the one it replaces.**
 
    ```
    gh release download v0.2.2 -p 'zsqld-x86_64-linux*'
    sha256sum -c zsqld-x86_64-linux.sha256
-   ssh root@buzz 'cp /usr/local/bin/zsqld /usr/local/bin/zsqld.prev'
-   scp zsqld-x86_64-linux root@buzz:/tmp/zsqld
-   ssh root@buzz 'install -m755 /tmp/zsqld /usr/local/bin/zsqld && systemctl restart zsqld'
+   ssh root@<host> 'cp /usr/local/bin/zsqld /usr/local/bin/zsqld.prev'
+   scp zsqld-x86_64-linux root@<host>:/tmp/zsqld
+   ssh root@<host> 'install -m755 /tmp/zsqld /usr/local/bin/zsqld && systemctl restart zsqld'
    ```
 
 7. **Read the first lines it logs.** `journalctl -u zsqld -n 10`. The
@@ -136,11 +135,11 @@ something half-changed.
 ### Sign-up notifications
 
 `ops/signup-watch/` holds a script, a service and an hourly timer that
-are installed on buzz (`/usr/local/bin/zsqld-signup-watch`, units in
+are installed on the host (`/usr/local/bin/zsqld-signup-watch`, units in
 `/etc/systemd/system/`). Each hour the script opens the accounts
 database read-only, compares the highest user and account ids with
 what it reported last time (`/var/lib/zsqld-signup-watch/last`), and
-when either has moved mails the new rows to `ajo@strata.do` through
+when either has moved mails the new rows to `ZSQL_SIGNUP_WATCH_TO` through
 the same `ZSQL_MAIL_COMMAND` the service uses, loaded from
 `/etc/zsqld.env`. A quiet hour sends nothing; a failed send leaves the
 watermark alone so the next hour retries. The first run only records
@@ -151,13 +150,13 @@ zsqld-signup-watch.service` forces a full report as a test.
 
 ### Host monitoring
 
-Netdata runs on buzz for CPU, memory, disk, network and per-service
+Netdata runs on the host for CPU, memory, disk, network and per-service
 charts, installed 2026-10-07 from the stable channel with telemetry off
 and daily auto-updates. `/etc/netdata/netdata.conf` binds it to the
-Tailscale address only, so the dashboard is
-`http://100.116.106.53:19999` from the tailnet and nothing listens on
-the public interface or localhost. The stock alerts are on; email goes
-to `ajo@strata.do` through zsqld's msmtp account. `ops/netdata/` holds
+private network address only, so the dashboard is reachable on port
+19999 from there and nothing listens on the public interface or
+localhost. The stock alerts are on; email goes to the operator through
+zsqld's msmtp account. `ops/netdata/` holds
 the two pieces that make that work: `netdata-sendmail`, installed at
 `/usr/local/bin/`, runs msmtp as the zsqld user so the netdata user
 never reads `/etc/msmtprc`, and `sudoers-netdata-msmtp`, installed as
@@ -185,7 +184,7 @@ gh run download <run-id>
 
 Useful, and worth being careful with: a binary from a branch carries
 whatever version the manifest said, so two different builds can call
-themselves the same thing. Fine for trying something on buzz, wrong for
+themselves the same thing. Fine for trying something on the host, wrong for
 leaving installed there.
 
 ### The CLI's public half
@@ -345,7 +344,7 @@ nothing ever evicts them: they are inserted on deploy and at startup,
 and removed only when someone deletes a branch or a project.
 
 Measured: about 5 MB per model of the TPC-DS sample's size, 4.2 MB idle,
-against roughly 11 GB free on buzz. The deploy allowance is 10 a minute,
+against roughly 11 GB free on the host. The deploy allowance is 10 a minute,
 so one account could add around 600 models an hour, near 3 GB an hour.
 
 **The cap.** An account may keep 5 deployed branches per project and 20
@@ -375,13 +374,13 @@ Nothing about a provider is compiled in: no TLS stack in a binary built
 static against musl, no credential in this process's environment, and
 changing provider is a config file rather than a release.
 
-On buzz that command is msmtp against the Workspace account on
-`strata.do`:
+On the host that command is msmtp against a Google Workspace account on
+the operator's domain, written `<domain>` below:
 
 ```
 # /etc/zsqld.env
 ZSQL_MAIL_COMMAND=msmtp -t
-ZSQL_MAIL_FROM=0sql support <0sql-support@strata.do>
+ZSQL_MAIL_FROM=0sql support <support@<domain>>
 ZSQL_PUBLIC_URL=https://app.0sql.io
 ```
 
@@ -394,16 +393,16 @@ account gmail
 host smtp.gmail.com
 port 587
 auth on
-user <the workspace user>@strata.do
+user <the workspace user>@<domain>
 passwordeval cat /etc/zsqld/app-password
-from 0sql-support@strata.do
+from support@<domain>
 account default : gmail
 ```
 
 Four things about that account, each of which will bite if missed:
 
 - **An App Password authenticates as a user, never as an alias.** If
-  `0sql-support@strata.do` is an alias on an existing user, `user` is
+  `support@<domain>` is an alias on an existing user, `user` is
   that user's own address and `from` is the alias; Gmail allows a From
   that is a verified alias of the authenticated account and silently
   rewrites it to the authenticated address if it is not. A real user of
@@ -413,7 +412,7 @@ Four things about that account, each of which will bite if missed:
   the config.
 - **DKIM is not on by default.** Generate the key under Admin → Apps →
   Google Workspace → Gmail → Authenticate email and publish the TXT
-  record, or mail is not signed as `strata.do` and the alignment that
+  record, or mail is not signed as `<domain>` and the alignment that
   makes this better than a personal Gmail is not there. SPF should
   include `_spf.google.com`.
 - **The quota is about 2,000 messages a day**, and a reset endpoint is
@@ -421,8 +420,8 @@ Four things about that account, each of which will bite if missed:
   address, ten an hour) and the one-link-per-user-per-minute rule are
   what stand between a stranger and that allowance.
 
-Mail arrives from `strata.do` while the product is `0sql.com`. Fine for
-deliverability, since alignment is with the sending domain; a `0sql.io`
+Mail may arrive from a domain other than the product's. Fine for
+deliverability, since alignment is with the sending domain; changing the
 sender later is DNS and `msmtprc`, not a release.
 
 **With no command configured** the links are written to the journal
@@ -446,7 +445,7 @@ setting. Two things to know on the box:
   first, per the order above. Existing grants come up unbound, which is
   the behaviour they had.
 - **`ZSQL_PUBLIC_URL` is now also the one Origin a browser may speak
-  MCP from.** It is set on buzz. A server without it falls back to its
+  MCP from.** It is set on the host. A server without it falls back to its
   bind address, which refuses every browser origin but its own.
 
 Checking a release from the outside, with a query key granted one
