@@ -12,6 +12,8 @@ mod failure;
 mod local;
 mod remote;
 mod repl;
+#[cfg(feature = "server")]
+mod serve;
 mod show;
 mod templates;
 
@@ -219,6 +221,15 @@ enum Command {
     },
     /// Liveness of the server.
     Health,
+    /// Run the server here. Inside a project, serve that project and redeploy it as its files change.
+    #[cfg(feature = "server")]
+    Serve(serve::ServeArgs),
+    /// The server in the background: start, stop, status, logs.
+    #[cfg(feature = "server")]
+    Server {
+        #[command(subcommand)]
+        what: serve::ServerCommand,
+    },
 }
 
 impl Command {
@@ -226,6 +237,18 @@ impl Command {
     /// goes too.
     fn wants_json(&self) -> bool {
         matches!(self, Command::Sql { json: true, .. } | Command::Explain { json: true, .. } | Command::Explore { json: true, .. })
+    }
+
+    /// Whether the command runs the server in this process.
+    fn serves(&self) -> bool {
+        #[cfg(feature = "server")]
+        {
+            matches!(self, Command::Serve(_))
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            false
+        }
     }
 }
 
@@ -298,12 +321,13 @@ fn main() {
         }
     };
     // A closed pipe (`zsql ... | head`) ends the command quietly instead
-    // of panicking. A command that runs a server must not do this, since
-    // a client hanging up mid-answer would then kill it; when one
-    // exists, it decides here before the reset.
+    // of panicking. The server must keep Rust's default of ignoring
+    // SIGPIPE instead, or a client hanging up mid-answer would kill it.
     #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    if !command.serves() {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
     }
     let json = command.wants_json();
     if let Err(e) = run(command, at) {
@@ -441,6 +465,10 @@ fn run(command: Command, at: Where) -> Result<()> {
             println!("{} {}", server, v.as_str().unwrap_or("ok"));
             Ok(())
         }
+        #[cfg(feature = "server")]
+        Command::Serve(args) => serve::serve(args, at),
+        #[cfg(feature = "server")]
+        Command::Server { what } => serve::server(what, at),
     }
 }
 
@@ -643,23 +671,40 @@ fn deploy(at: Where, dry_run: bool, watch: bool) -> Result<()> {
     }
     let _ = once(&t);
     println!("watching {} for changes (ctrl-c to stop)", project.dir.display());
-    let mut last = newest_mtime(&project.dir);
-    loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let now = newest_mtime(&project.dir);
-        if now != last {
-            std::thread::sleep(Duration::from_millis(200));
+    watch_files(
+        &project.dir,
+        || false,
+        || {
             println!();
             if let Err(e) = once(&t) {
                 println!("error: {e}");
             }
-            last = newest_mtime(&project.dir);
+        },
+    );
+    Ok(())
+}
+
+/// Calls `on_change` whenever the project's files move, until `done`
+/// says so. The files are looked at twice a second; a change is given
+/// a moment to finish being written before it is acted on.
+pub(crate) fn watch_files(dir: &Path, done: impl Fn() -> bool, mut on_change: impl FnMut()) {
+    let mut last = fingerprint(dir);
+    while !done() {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = fingerprint(dir);
+        if now != last {
+            std::thread::sleep(Duration::from_millis(200));
+            on_change();
+            last = fingerprint(dir);
         }
     }
 }
 
-fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+/// The project's model files as a whole: the newest modification time
+/// and how many there are, so a file removed is a change too.
+fn fingerprint(dir: &Path) -> (Option<std::time::SystemTime>, usize) {
     let mut newest = None;
+    let mut count = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
@@ -672,13 +717,14 @@ fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
             if p.is_dir() {
                 stack.push(p);
             } else if matches!(p.extension().and_then(|x| x.to_str()), Some("yml") | Some("yaml") | Some("gz")) {
+                count += 1;
                 if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
                     newest = Some(newest.map_or(m, |n: std::time::SystemTime| n.max(m)));
                 }
             }
         }
     }
-    newest
+    (newest, count)
 }
 
 /// The project as a tar.gz: YAML models, tests, security, datasources.yml

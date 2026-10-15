@@ -53,9 +53,11 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         signup_open: true,
         secure_cookies: false,
         limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
-        admission: Admission::from_env().unwrap(),
+        admission: Admission::new(&limits::AdmissionCounts::default()),
         caps: Caps { per_project: 5, per_account: 20 },
-        mailer: mail::Mailer::from_env("http://test".into()).unwrap(),
+        mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
+        mcp: mcp::Settings::builtin(),
+        deploying: std::sync::Mutex::new(()),
     })
 }
 

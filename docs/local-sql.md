@@ -145,25 +145,39 @@ before). The cache is not built: the budget is met three times over.
 
 ### Server in the CLI, embedded
 
-`server` is a default-on feature of the CLI. `zsql serve` fills `Config`
-from flags: bind, data dir defaulting to `$ZSQL_HOME/data`, accounts off
-by default. A non-loopback bind with accounts off is refused unless
-`--open` is given, with a message saying why. `zsql server
-start|stop|status|logs` re-executes `zsql serve` detached with a pidfile
-and log under `ZSQL_HOME`; `stop` sends SIGTERM; `status` reads the
-pidfile and calls `/healthz`. The server takes a `flock` on
-`<data_dir>/lock` so two instances cannot share a directory, and the
-refusal names the other pid. SIGTERM and SIGINT trigger axum's graceful
-shutdown with a timeout. Deploy writes a branch into a temporary sibling
-directory and renames it over the old one, so a kill mid-deploy leaves
-the previous branch whole rather than a snapshot with no tests. The log
-carries the shape and length of a refused header, never its bytes, and
-a test asserts a bad key's bytes do not appear in stderr. `server
-install` writes a systemd user unit or launchd agent.
+Decided 2026-10-15, after the 0.6.0 PR: the embedded server is the
+whole server, accounts included. The tool exists so developers can
+deploy a service their own applications call, and that service needs
+keys, the MCP endpoint and mail; a single-tenant stand-in would be the
+thing everyone learns and then has to leave. So `zsql serve` is the
+server, `zsqld` is the same server configured from the environment for
+the existing deployment, and SQLite (the only C in the build) comes
+into the CLI, which the server's musl build already proves. An MCP
+server over stdio for Claude Code is parked: the apps talk HTTP, and
+the HTTP MCP endpoint is already there.
+
+`server` is a default-on feature of the CLI. `zsql serve` fills
+`Config` from flags: bind, data dir defaulting to `$ZSQL_HOME/data`,
+accounts off by default. Inside a project it serves that project: it
+deploys the directory once the server is up and redeploys as the files
+change, unless `--no-project` says otherwise; outside a project it
+serves what its data directory holds. A non-loopback bind with
+accounts off is refused unless `--open` is given, with a message saying
+why. `zsql server start|stop|status|logs` re-executes `zsql serve`
+detached with a pidfile and log under `ZSQL_HOME`; `stop` sends
+SIGTERM; `status` reads the pidfile and calls `/healthz`. The server
+takes a `flock` on `<data_dir>/lock` so two instances cannot share a
+directory, and the refusal names the other pid. SIGTERM and ctrl-c
+trigger axum's graceful shutdown. A deploy writes the branch beside
+the live one and swaps it in by rename, so a kill mid-deploy leaves the
+previous branch whole; what a crash leaves behind is swept at startup.
+The library reads no environment, enforced by a test; `zsqld`'s main
+is the one place a `ZSQL_*` variable is read. `server install` (a
+systemd user unit or a launchd agent) is parked until someone asks.
 
 Embedding beats downloading: one artefact, one version, one thing to
-test. The engine is already going into the CLI for local planning; the
-HTTP and accounts layer on top of it is the smaller addition.
+test. The engine is already in the CLI for local planning; the HTTP and
+accounts layer on top of it is the smaller addition.
 
 ### Build and CI
 
@@ -199,8 +213,8 @@ Each is one PR that leaves the tree releasable.
 | 3 | Local repl with the held model, `Loaded.sources`, mtime reload, `.reload` | reload after an edit, and a broken edit keeps the old model |
 | 4 | measure the loader step by step, fix what is slow, bench numbers in the PR; cache only if budgets missed | TPC-DS under 25 ms for `sql`, under 15 ms for reload |
 | 5 | CI workflow with the feature matrix, fmt, clippy, tests; README and docs rewritten for the local rule; devtool loses `plan`, `repl`, `test`, `deploy`, `remote`, `values` and its parser after the diff; `publish = false` everywhere; release 0.6.0 | CI green on the matrix; `cli-v0.6.0` tagged |
-| A (later) | Server library split with `Config`, env reads out of the library, `OnceLock` removed; `zsql serve`; data-dir lock; graceful shutdown; atomic deploy writes; bind refusal; log test; `server start/stop/status/logs` | an embedded server survives a client closing early, a SIGTERM mid-deploy, and a second instance on its data dir |
-| B (later) | `server install`; release workflows merged into one public release carrying both artefacts; any deploy rework | one tag publishes CLI and server together |
+| A | Server library split with `Config`, env reads out of the library, `OnceLock` removed; `zsql serve` serving the project at hand; data-dir lock; graceful shutdown; atomic deploy writes; bind refusal; `server start/stop/status/logs`; still 0.6.0 | an embedded server survives a client closing early, a SIGTERM, and a second instance on its data dir; then `cli-v0.6.0` |
+| B (later) | release workflows merged into one public release carrying the CLI (which is the server); `server install` if asked for; any deploy rework | one tag publishes everything |
 
 Done on 2026-10-15, ahead of the repo going public: `docs/running-it.md`,
 `docs/mcp.md` and `ops/` no longer name the host, its private address or
@@ -230,5 +244,7 @@ licences, and Dependabot for crates and actions.
 - Golden fixtures are read, never edited, without an explicit decision.
 
 ## Progress
+
+- 2026-10-15, phase A: the server crate is a library with one `Config` and `run`; `zsqld` is a thin binary and the one place a `ZSQL_*` variable is read, which a test enforces; the MCP settings live on the app; the data directory is locked with the holder's pid; shutdown is graceful; a deploy is staged beside the branch and swapped in; `zsql serve` serves the project at hand and `zsql server start|stop|status|logs` keeps it running; integration tests cover a client hanging up, a second instance, SIGTERM, the in-project deploy and the background form. Review taken: only a deploy's own `.<branch>.staging-N`/`.previous-N` leftovers are swept (never another dot directory under a mistyped data dir); `start` reaps a child that exits at once and reports the log's tail; whether a server is running is answered by its data directory's lock, not by a pidfile and a pid that may have been reused; `stop` escalates to SIGKILL after 15 s; `status` probes the bind `start` recorded; an explicit `--project` that is missing is an error; one watch loop serves `deploy --watch` and `serve`, and it sees a deleted file; deploys of one branch are serialised; an unspecified bind is reached over loopback.
 
 - 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 5 done (ci.yml: clippy with warnings denied, tests, goldens, the slim CLI check, the warehouse check in its own job; the devtool keeps check, export, golden, bench, load-bench and form, and its private parser's tests moved to the shorthand crate; every crate `publish = false`; two stylistic clippy lints allowed workspace-wide, the rest fixed; version 0.6.0; README and running-it updated). Phase 4 done (loader measured and sped up: TPC-DS load 9.6 to 5.0 ms, `zsql sql` 8 to 9 ms end to end; no cache). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).

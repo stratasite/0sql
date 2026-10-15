@@ -81,16 +81,29 @@ zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's 
 zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
 zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
 zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
+zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts] [--open]   # the server, here; inside a project, serving that project
+zsql server start | stop | status | logs   # the same, kept running in the background
 ```
+
+`zsql serve` is the whole server (deploy, plan, accounts, keys, MCP,
+mail), run in this process. Inside a project it deploys the directory
+once it is up and redeploys as the files change, so one command gives a
+teammate a live endpoint over the model they are editing; `--no-project`
+serves only the data directory. Accounts are off by default (one tenant,
+no auth), and listening beyond the loopback with them off is refused
+unless `--open` says you mean it. Two servers cannot share a data
+directory; the second is told which process has it. `zsqld` is the same
+server configured from `ZSQL_*` variables, for a deployment that reads an
+environment file.
 
 A refusal is reported the same way from either side: `class: message`
 on stderr and exit 1, or `{"error": {"class", "message"}}` on stdout
 under `--json`. A usage error is clap's and exits 2.
 
-The default build has no warehouse drivers: it plans here and talks to
-a server, builds in seconds on every platform, and is what the installer
-ships. `cargo build -p zsql-cli --features warehouse` adds DuckDB and
-Postgres for `zsql values sample`.
+The default build plans here, talks to a server, and is one. It needs
+a C compiler, for the SQLite behind accounts; `cargo build -p zsql-cli
+--no-default-features` is the slim build without the server. `--features
+warehouse` adds DuckDB and Postgres for `zsql values sample`.
 
 Every command takes `--project DIR`; the project is otherwise found from
 `project.yml` here or above. Against a server, `--branch NAME` names the
