@@ -1,0 +1,143 @@
+# Semantic Table Model
+#
+# Define the Measures and Dimensions that should be attached to this table.
+# Note: Relationships are managed separately and should not be defined in this file.
+
+# Required: The datasource this table belongs to. This should be
+# either the datasource key or datasource name.
+datasource: "tpcds"
+
+# Required: The logical name for this table in the semantic model. Must be unique
+# within this datasource. You can have mulitple tables point to the same physical table.
+name: "Web Returns Fact"
+
+# Required: The physical table name in the actual database. This can be prefixed
+# with catalog and schema as needed. Be sure to check whether your data wareshouse
+# supports cross schema/catalog queries.
+physical_name: "web_returns"
+
+# Required: Cost number influences how the table is preferentially
+# selected. If multiple tables can answer the same question,
+# the lowest cost table is selected..
+# Dimension tables should generally be lower cost and your
+# hot tier tables should be lower than cold tier.
+cost: 10
+
+# Optional: If this is a snapshot table like an inventory table, you can
+# set the snapshot date dimension here. This will allow the creation of
+# snapshot measures on this table.
+# snapshot_date: <snapshot dimension name>
+
+# Optional: Tag table for additional metadata.
+# tags:
+#   - marketing
+#   - ops
+
+# Optional: Define table partitioning constraints
+# This tells the semantic engine about data availability/constraints
+# Only **between** and **in_list** predicates are supported.
+# partition:
+#   # Example: Table only contains 2 years of data
+#   # *Must reference a dimension mapped to this table.
+#   - dimension: Region Date
+#     predicate: between
+#     filter_value: 2y
+#     filter_value_end: 1d
+#     description: "Table only has rolling 2 year data"
+#
+#   # Example: Table is partitioned by region
+#   - dimension: Region
+#     predicate: in_list
+#     filter_value: us-east, us-west, europe
+#     description: "Table only has 3 regions of 5"
+
+# Imports are processed first, then local field definitions are merged in
+# This allows you to inherit common field definitions and override or extend them
+# Paths should be relative to this file.
+# imports:
+#    - "path/to/other/table.yml"
+#    - "common/shared_fields.yml"
+
+# Define Measures and dimensions that should be mapped to this table
+# Description: Describes all the key facts related to online returns
+
+fields:
+  - type: dimension
+    name: Web Return Order Number
+    description: Order number associated with the web return transaction
+    data_type: bigint
+    synonyms:
+    - web return order
+    expression:
+      sql: wr_order_number
+      lookup: true
+  - type: measure
+    name: Web Return Quantity
+    description: Total quantity of items returned via web channel
+    data_type: integer
+    synonyms:
+    - web items returned
+    expression:
+      sql: sum(wr_return_quantity)
+  - type: measure
+    name: Web Return Amount
+    description: Total monetary amount of web returns
+    data_type: decimal
+    synonyms:
+    - web return value
+    expression:
+      sql: sum(wr_return_amt)
+  - type: measure
+    name: Web Return Tax
+    description: Total tax amount associated with web returns
+    data_type: decimal
+    expression:
+      sql: sum(wr_return_tax)
+  - type: measure
+    name: Web Return Amount Including Tax
+    description: Total web return amount including tax
+    data_type: decimal
+    expression:
+      sql: sum(wr_return_amt_inc_tax)
+  - type: measure
+    name: Web Return Fee
+    description: Total fees charged for web return processing
+    data_type: decimal
+    expression:
+      sql: sum(wr_fee)
+  - type: measure
+    name: Web Return Ship Cost
+    description: Total shipping cost associated with web returns
+    data_type: decimal
+    synonyms:
+    - web return shipping cost
+    expression:
+      sql: sum(wr_return_ship_cost)
+  - type: measure
+    name: Web Refunded Cash
+    description: Total cash refunded for web returns
+    data_type: decimal
+    synonyms:
+    - web cash refund
+    expression:
+      sql: sum(wr_refunded_cash)
+  - type: measure
+    name: Web Reversed Charge
+    description: Total reversed charges for web returns
+    data_type: decimal
+    expression:
+      sql: sum(wr_reversed_charge)
+  - type: measure
+    name: Web Account Credit
+    description: Total account credit issued for web returns
+    data_type: decimal
+    synonyms:
+    - web store credit
+    expression:
+      sql: sum(wr_account_credit)
+  - type: measure
+    name: Web Net Loss
+    description: Total net loss resulting from web returns
+    data_type: decimal
+    expression:
+      sql: sum(wr_net_loss)

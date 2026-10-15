@@ -1,0 +1,185 @@
+# Semantic Table Model
+#
+# Define the Measures and Dimensions that should be attached to this table.
+# Note: Relationships are managed separately and should not be defined in this file.
+
+# Required: The datasource this table belongs to. This should be
+# either the datasource key or datasource name.
+datasource: "tpcds"
+
+# Required: The logical name for this table in the semantic model. Must be unique
+# within this datasource. You can have mulitple tables point to the same physical table.
+name: "Web Sales Fact"
+
+# Required: The physical table name in the actual database. This can be prefixed 
+# with catalog and schema as needed. Be sure to check whether your data wareshouse
+# supports cross schema/catalog queries.
+physical_name: "web_sales"
+
+# Required: Cost number influences how the table is preferentially
+# selected. If multiple tables can answer the same question, 
+# the lowest cost table is selected..
+# Dimension tables should generally be lower cost and your 
+# hot tier tables should be lower than cold tier.
+cost: 10
+
+# Optional: If this is a snapshot table like an inventory table, you can 
+# set the snapshot date dimension here. This will allow the creation of 
+# snapshot measures on this table.
+# snapshot_date: <snapshot dimension name>
+
+# Optional: Tag table for additional metadata.
+# tags:
+#   - marketing
+#   - ops
+
+# Optional: Define table partitioning constraints
+# This tells the semantic engine about data availability/constraints
+# Only **between** and **in_list** predicates are supported.
+# partition:
+#   # Example: Table only contains 2 years of data
+#   # *Must reference a dimension mapped to this table. 
+#   - dimension: Region Date 
+#     predicate: between 
+#     filter_value: 2y
+#     filter_value_end: 1d
+#     description: "Table only has rolling 2 year data"
+#
+#   # Example: Table is partitioned by region
+#   - dimension: Region
+#     predicate: in_list
+#     filter_value: us-east, us-west, europe
+#     description: "Table only has 3 regions of 5"
+
+# Imports are processed first, then local field definitions are merged in
+# This allows you to inherit common field definitions and override or extend them
+# Paths should be relative to this file.
+# imports:
+#    - "path/to/other/table.yml"
+#    - "common/shared_fields.yml"
+
+# Define Measures and dimensions that should be mapped to this table
+# Description: Fact table that manages online sales transaction details
+
+fields:
+  - type: dimension
+    name: Web Order Number
+    description: Unique identifier for the web sales order
+    data_type: bigint
+    synonyms:
+    - web order id
+    - online order number
+    expression:
+      sql: ws_order_number
+      lookup: true
+  - type: measure
+    name: Web Quantity
+    description: Total quantity of items sold through web sales
+    data_type: integer
+    synonyms:
+    - web units sold
+    expression:
+      sql: sum(ws_quantity)
+  - type: measure
+    name: Web Wholesale Cost
+    description: Total wholesale cost for web sales items
+    data_type: decimal
+    expression:
+      sql: sum(ws_wholesale_cost)
+  - type: measure
+    name: Web List Price
+    description: Total list price for web sales items
+    data_type: decimal
+    expression:
+      sql: sum(ws_list_price)
+  - type: measure
+    name: Web Sales Price
+    description: Total sales price for web sales transactions
+    data_type: decimal
+    synonyms:
+    - web revenue
+    expression:
+      sql: sum(ws_sales_price)
+  - type: measure
+    name: Web Extended Discount Amount
+    description: Total extended discount amount for web sales
+    data_type: decimal
+    synonyms:
+    - web discount
+    expression:
+      sql: sum(ws_ext_discount_amt)
+  - type: measure
+    name: Web Extended Sales Price
+    description: Total extended sales price for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_ext_sales_price)
+  - type: measure
+    name: Web Extended Wholesale Cost
+    description: Total extended wholesale cost for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_ext_wholesale_cost)
+  - type: measure
+    name: Web Extended List Price
+    description: Total extended list price for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_ext_list_price)
+  - type: measure
+    name: Web Extended Tax
+    description: Total extended tax amount for web sales
+    data_type: decimal
+    synonyms:
+    - web tax
+    expression:
+      sql: sum(ws_ext_tax)
+  - type: measure
+    name: Web Coupon Amount
+    description: Total coupon discount amount applied to web sales
+    data_type: decimal
+    synonyms:
+    - web coupon discount
+    expression:
+      sql: sum(ws_coupon_amt)
+  - type: measure
+    name: Web Extended Ship Cost
+    description: Total extended shipping cost for web sales
+    data_type: decimal
+    synonyms:
+    - web shipping cost
+    expression:
+      sql: sum(ws_ext_ship_cost)
+  - type: measure
+    name: Web Net Paid
+    description: Total net paid amount for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_net_paid)
+  - type: measure
+    name: Web Net Paid Including Tax
+    description: Total net paid amount including tax for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_net_paid_inc_tax)
+  - type: measure
+    name: Web Net Paid Including Ship
+    description: Total net paid amount including shipping for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_net_paid_inc_ship)
+  - type: measure
+    name: Web Net Paid Including Ship and Tax
+    description: Total net paid amount including shipping and tax for web sales
+    data_type: decimal
+    expression:
+      sql: sum(ws_net_paid_inc_ship_tax)
+  - type: measure
+    name: Web Net Profit
+    description: Total net profit from web sales
+    data_type: decimal
+    synonyms:
+    - web profit
+    - online profit
+    expression:
+      sql: sum(ws_net_profit)

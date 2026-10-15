@@ -3,7 +3,11 @@ name = "zsql-shorthand"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The comma-separated query shorthand: projections, filters and calculations to a query spec"
 
 [dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

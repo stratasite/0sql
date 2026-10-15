@@ -1,0 +1,127 @@
+# Required: The datasource these relationships are valid for.
+# The chosen tables will be scoped to those within this datasource.
+# Strata does not support cross datasource sqls
+datasource: tpcds
+
+# Define relationships between tables for the store channel
+# Relationships connect fact tables (store_sales, store_returns) to dimension tables
+
+# Store Sales to Date Dimension
+store_sales_sold_date:
+  left: Store Sales
+  right: Date
+  sql: left.ss_sold_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Store Sales to Time Dimension
+store_sales_sold_time:
+  left: Store Sales
+  right: Time
+  sql: left.ss_sold_time_sk = right.t_time_sk
+  cardinality: many_to_one
+
+# Store Sales to Item Dimension
+store_sales_item:
+  left: Store Sales
+  right: Item
+  sql: left.ss_item_sk = right.i_item_sk
+  cardinality: many_to_one
+
+# Store Sales to Customer Dimension
+store_sales_customer:
+  left: Store Sales
+  right: Customer
+  sql: left.ss_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Store Sales to Store Dimension
+store_sales_store:
+  left: Store Sales
+  right: Store
+  sql: left.ss_store_sk = right.s_store_sk
+  cardinality: many_to_one
+
+# Store Sales to Customer Demographics
+store_sales_customer_demographics:
+  left: Store Sales
+  right: Customer Demographics
+  sql: left.ss_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Store Sales to Household Demographics
+store_sales_household_demographics:
+  left: Store Sales
+  right: Household Demographics
+  sql: left.ss_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Store Sales to Customer Address
+store_sales_customer_address:
+  left: Store Sales
+  right: Customer Address
+  sql: left.ss_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Store Returns to Store Return Date Dimension
+store_returns_returned_date:
+  left: Store Returns
+  right: Store Return Date
+  sql: left.sr_returned_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Store Returns to Time Dimension
+store_returns_return_time:
+  left: Store Returns
+  right: Time
+  sql: left.sr_return_time_sk = right.t_time_sk
+  cardinality: many_to_one
+
+# Store Returns to Item Dimension
+store_returns_item:
+  left: Store Returns
+  right: Item
+  sql: left.sr_item_sk = right.i_item_sk
+  cardinality: many_to_one
+
+# Store Returns to Customer Dimension
+store_returns_customer:
+  left: Store Returns
+  right: Customer
+  sql: left.sr_customer_sk = right.c_customer_sk
+  cardinality: many_to_one
+
+# Store Returns to Store Dimension
+store_returns_store:
+  left: Store Returns
+  right: Store
+  sql: left.sr_store_sk = right.s_store_sk
+  cardinality: many_to_one
+
+# Store Returns to Reason Dimension
+store_returns_reason:
+  left: Store Returns
+  right: Reason
+  join: left
+  sql: left.sr_reason_sk = right.r_reason_sk
+  cardinality: many_to_one
+
+# Store Returns to Customer Demographics
+store_returns_customer_demographics:
+  left: Store Returns
+  right: Customer Demographics
+  sql: left.sr_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Store Returns to Household Demographics
+store_returns_household_demographics:
+  left: Store Returns
+  right: Household Demographics
+  sql: left.sr_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Store Returns to Customer Address
+store_returns_customer_address:
+  left: Store Returns
+  right: Customer Address
+  sql: left.sr_addr_sk = right.ca_address_sk
+  cardinality: many_to_one

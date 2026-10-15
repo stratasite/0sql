@@ -10,6 +10,7 @@ members = [
   "crates/warehouse",
   "crates/accounts",
   "crates/shorthand",
+  "crates/service",
   "crates/server",
   "crates/golden",
   "crates/devtool",
@@ -17,9 +18,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
+
+# Two of clippy's stylistic lints are allowed across the workspace:
+# the planner's signatures are long because its types are, and the
+# server's error variants carry a response. Everything else clippy
+# says is an error in CI.
+[workspace.lints.clippy]
+type_complexity = "allow"
+result_large_err = "allow"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -38,4 +47,5 @@ zsql-project = { path = "crates/project" }
 zsql-warehouse = { path = "crates/warehouse" }
 zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
+zsql-service = { path = "crates/service" }
 zsql-golden = { path = "crates/golden" }

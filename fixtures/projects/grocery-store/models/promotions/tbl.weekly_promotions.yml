@@ -1,0 +1,71 @@
+# Weekly in-store promotional state: one row per (product, week) with
+# display and mailer exposure aggregated across stores. Week grain -
+# blends with day-grain facts via the "weeks" extended blend group.
+name: Weekly Promotions
+physical_name: fact_causal_weekly
+datasource: complete_journey
+cost: 100
+
+fields:
+
+  - type: dimension
+    name: Promo Week
+    description: Sequential week number of the promotional state (1-102)
+    data_type: integer
+    extended_blend_group: weeks
+    expression:
+      lookup: true
+      sql: WEEK_NO
+
+  - type: dimension
+    name: On Display
+    description: True if the product was on display in at least one store that week
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: OnDisplay_AnyStore
+
+  - type: dimension
+    name: In Mailer
+    description: True if the product was in the weekly mailer in at least one store that week
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: InMailer_AnyStore
+
+  - type: measure
+    name: Promoted Product Weeks
+    description: Number of product-week promotional state rows
+    data_type: integer
+    expression:
+      sql: count(*)
+
+  - type: measure
+    name: Stores On Display Total
+    description: Total store-weeks with the product on display
+    data_type: integer
+    expression:
+      sql: sum(Stores_OnDisplay)
+
+  - type: measure
+    name: Stores In Mailer Total
+    description: Total store-weeks with the product in the mailer
+    data_type: integer
+    expression:
+      sql: sum(Stores_InMailer)
+
+  - type: measure
+    name: Avg Display Share
+    description: Average share of stores with the product on display
+    data_type: decimal
+    format: percent:2
+    expression:
+      sql: avg(DisplayShare)
+
+  - type: measure
+    name: Avg Mailer Share
+    description: Average share of stores with the product in the mailer
+    data_type: decimal
+    format: percent:2
+    expression:
+      sql: avg(MailerShare)

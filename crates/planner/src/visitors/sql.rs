@@ -6,8 +6,8 @@ use crate::sql::dates::date_lit;
 use crate::sql::expr::{entity_gsub, qualify, ungroupable};
 use crate::sql::Builder;
 use crate::{PlanError, Result};
-use zsql_spec::DecoratorKind;
 use zsql_semantic::{DataType, Expression, Field, Predicate, Universe};
+use zsql_spec::DecoratorKind;
 
 pub fn run<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
@@ -68,7 +68,8 @@ fn node_to_sql<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, id
         };
         let Some(context_ref) = node.field_refs.get(&RefKey::Field(ctx_dim.id)) else { continue };
         let context_sql = ref_to_sql_any(&cx, context_ref, node)?;
-        let values: Vec<String> = allowed.iter().map(|v| graph.dialect.string_lit(&v.to_lowercase())).collect::<std::result::Result<_, _>>()?;
+        let values: Vec<String> =
+            allowed.iter().map(|v| graph.dialect.string_lit(&v.to_lowercase())).collect::<std::result::Result<_, _>>()?;
         sql.r#where(format!("LOWER({}) IN ({})", context_sql, values.join(", ")));
     }
 
@@ -243,7 +244,9 @@ fn apply_advanced_array_filter_handling<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder,
     let array_filters: Vec<&Filtered<'a>> = node
         .filters
         .iter()
-        .filter(|f| matches!(node.field_refs.get(&RefKey::Field(f.field().id)), Some(Reference::Table { expression, .. }) if expression.array))
+        .filter(
+            |f| matches!(node.field_refs.get(&RefKey::Field(f.field().id)), Some(Reference::Table { expression, .. }) if expression.array),
+        )
         .filter(|f| node.projections.iter().any(|p| p.field().map(|x| x.id == f.field().id).unwrap_or(false)))
         .collect();
     for f in array_filters {
@@ -271,8 +274,10 @@ fn unnest_array<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, exp_sql: &str, f: &Filt
     let table_alias = node.table_alias(AliasKey::Field(f.field().id), 'D');
     let exp = exp_sql.rsplit('.').next().unwrap_or(exp_sql).to_string();
     let unnest_from = cx.graph.dialect.array_unnest_join(exp_sql, &format!("{table_alias}({exp})"))?;
-    sql.from(format!("
-	{unnest_from}"));
+    sql.from(format!(
+        "
+	{unnest_from}"
+    ));
     let new_sql = format!("{table_alias}.{exp}");
     let projected = node.projections.iter().filter(|p| p.field().map(|x| x.id == f.field().id).unwrap_or(false)).count();
     for _ in 0..projected {
@@ -304,7 +309,13 @@ fn apply_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, st
                 let right = child.projected(*pid).map(|p| p.alias.clone()).unwrap_or_default();
                 conds.push(format!("{left} = {node_alias}.{right}"));
             }
-            let entry = format!("\n\t{} JOIN {} AS {}\n\t\tON {}", join_type.to_uppercase(), child.alias(cx.graph), node_alias, conds.join(" AND\n"));
+            let entry = format!(
+                "\n\t{} JOIN {} AS {}\n\t\tON {}",
+                join_type.to_uppercase(),
+                child.alias(cx.graph),
+                node_alias,
+                conds.join(" AND\n")
+            );
             sql.from(entry);
         }
         crate::dag::StrategyKind::SegmentByJoinKeys { limit } => {
@@ -315,7 +326,12 @@ fn apply_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, st
         }
         crate::dag::StrategyKind::ExcludeByJoinKeys => {
             let node_alias = join_keys_strategy(cx, sql, parent, strategy.node, "LEFT JOIN", &[])?;
-            let first_key = child.projections.iter().find(|p| p.is_dimension() && !p.proj.def.is_expansion()).map(|p| p.alias.clone()).unwrap_or_default();
+            let first_key = child
+                .projections
+                .iter()
+                .find(|p| p.is_dimension() && !p.proj.def.is_expansion())
+                .map(|p| p.alias.clone())
+                .unwrap_or_default();
             sql.r#where(format!("{node_alias}.{first_key} IS NULL"));
         }
         crate::dag::StrategyKind::ExpandByJoinKeys { sid, left } => {
@@ -328,7 +344,12 @@ fn apply_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, st
                 let node_alias = parent.table_alias(AliasKey::Node(strategy.node), child.kind.alias_letter());
                 for proj in child.projections.iter().filter(|p| p.proj.def.is_expansion()) {
                     let Some(field) = proj.field() else { continue };
-                    let plain = parent.projections.iter().any(|p| p.is_dimension() && !p.is_calculation() && !p.proj.is_carried() && p.field().map(|f| f.id == field.id).unwrap_or(false));
+                    let plain = parent.projections.iter().any(|p| {
+                        p.is_dimension()
+                            && !p.is_calculation()
+                            && !p.proj.is_carried()
+                            && p.field().map(|f| f.id == field.id).unwrap_or(false)
+                    });
                     if !plain {
                         continue;
                     }
@@ -343,7 +364,14 @@ fn apply_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, st
 
 /// Rails `Strategy::SegmentByJoinKeys#from_entry` and `#on`: join on every
 /// projected dimension, plus any extra predicates, returning the alias.
-fn join_keys_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, child_id: NodeId, keyword: &str, extra: &[(&Field, &str, String, String)]) -> Result<String> {
+fn join_keys_strategy<'a>(
+    cx: &Ctx<'_, 'a>,
+    sql: &mut Builder,
+    parent: &Node<'a>,
+    child_id: NodeId,
+    keyword: &str,
+    extra: &[(&Field, &str, String, String)],
+) -> Result<String> {
     let child = &cx.graph.nodes[child_id];
     let node_alias = parent.table_alias(AliasKey::Node(child_id), child.kind.alias_letter());
     let mut conds = Vec::new();
@@ -366,8 +394,17 @@ fn join_keys_strategy<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>
 /// Rails `Strategy::Base#resolve_expression`: the field's expression on the
 /// parent's side of the join, appending the path's joins when the parent
 /// does not walk it yet.
-fn resolve_expression<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, field: &Field, table: Option<&zsql_semantic::Table>) -> Result<&'a Expression> {
-    let subtree = parent.subtrees.iter().find(|t| t.paths.iter().any(|p| p.field_id == field.id) && table.map(|tb| t.paths.iter().any(|p| p.table_nodes.contains(&tb.id))).unwrap_or(true));
+fn resolve_expression<'a>(
+    cx: &Ctx<'_, 'a>,
+    sql: &mut Builder,
+    parent: &Node<'a>,
+    field: &Field,
+    table: Option<&zsql_semantic::Table>,
+) -> Result<&'a Expression> {
+    let subtree = parent.subtrees.iter().find(|t| {
+        t.paths.iter().any(|p| p.field_id == field.id)
+            && table.map(|tb| t.paths.iter().any(|p| p.table_nodes.contains(&tb.id))).unwrap_or(true)
+    });
     let path = match subtree {
         None => {
             let base = parent.universe.clone().expect("parent universe");
@@ -376,7 +413,13 @@ fn resolve_expression<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>
                 Some(tb) => paths.into_iter().find(|p| p.table_nodes.contains(&tb.id)),
                 None => paths.into_iter().next(),
             }
-            .ok_or_else(|| PlanError::Resolution(format!("Could not find table or path for {} with id: {}.", crate::model::field_to_s(field), field.id)))?;
+            .ok_or_else(|| {
+                PlanError::Resolution(format!(
+                    "Could not find table or path for {} with id: {}.",
+                    crate::model::field_to_s(field),
+                    field.id
+                ))
+            })?;
             append_path_joins(cx, sql, parent, path);
             path
         }
@@ -411,7 +454,13 @@ fn append_path_joins<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>,
         let right = parent.table_alias(AliasKey::Table(jd.right_id), 'T');
         let cond = jd.sql.to_lowercase().replace("left.", &format!("{left}.")).replace("right.", &format!("{right}."));
         let right_table = cx.universe.table(jd.right_id).expect("join right table");
-        sql.from(format!("\n\t{} JOIN {} {}\n\t\tON {}", join_type_name(jd.join_type).to_uppercase(), right_table.physical_name, right, cond));
+        sql.from(format!(
+            "\n\t{} JOIN {} {}\n\t\tON {}",
+            join_type_name(jd.join_type).to_uppercase(),
+            right_table.physical_name,
+            right,
+            cond
+        ));
     }
 }
 
@@ -426,9 +475,9 @@ fn projection_to_select_sql<'a>(cx: &Ctx<'_, 'a>, p: &Projected<'a>, node: &Node
 }
 
 fn projection_to_sql<'a>(cx: &Ctx<'_, 'a>, p: &Projected<'a>, node: &Node<'a>) -> Result<String> {
-    let r = node.get_ref(p.proj.pid, p.proj.field_id()).ok_or_else(|| {
-        PlanError::Resolution(format!("No field reference found for projection: {}", p.to_s()))
-    })?;
+    let r = node
+        .get_ref(p.proj.pid, p.proj.field_id())
+        .ok_or_else(|| PlanError::Resolution(format!("No field reference found for projection: {}", p.to_s())))?;
     let base = {
         let _t = crate::profile::span(match r {
             Reference::Table { .. } => "sql.select.table_ref",
@@ -529,7 +578,11 @@ fn window_sql<'a>(cx: &Ctx<'_, 'a>, d: &zsql_spec::Decorator, _p: &Projected<'a>
     let auto_partition = partition_refs.iter().any(|r| r == "-1");
     let mut partitions = Vec::new();
     if auto_partition {
-        for x in node.projections.iter().filter(|x| x.proj.def.axis == "row" && x.is_dimension() && !x.field().map(|f| f.is_date()).unwrap_or(false)) {
+        for x in node
+            .projections
+            .iter()
+            .filter(|x| x.proj.def.axis == "row" && x.is_dimension() && !x.field().map(|f| f.is_date()).unwrap_or(false))
+        {
             partitions.push(projection_to_sql(cx, x, node)?);
         }
     } else if !partition_refs.is_empty() {
@@ -751,6 +804,9 @@ fn insert_after(tree: &mut PTree, target: usize, clause: String) -> bool {
                     kids.insert(i + 1, PTree::Clause(clause));
                     return true;
                 }
+                // Not a match guard: the guard would borrow `kids` a
+                // second time while the arm holds it.
+                #[allow(clippy::collapsible_match)]
                 PTree::Group(..) => {
                     if insert_after(&mut kids[i], target, clause.clone()) {
                         return true;
@@ -824,11 +880,7 @@ fn render_tree<'a>(cx: &Ctx<'_, 'a>, tree: &PTree, filters: &[&Filtered<'a>], no
     if conditions.is_empty() {
         return Ok(None);
     }
-    let sep = if tree.depth() == 1 && depth == 1 {
-        format!("\n\t{operator} ")
-    } else {
-        format!("\n{}{operator} ", "\t".repeat(depth))
-    };
+    let sep = if tree.depth() == 1 && depth == 1 { format!("\n\t{operator} ") } else { format!("\n{}{operator} ", "\t".repeat(depth)) };
     Ok(Some(conditions.join(&sep)))
 }
 
@@ -863,7 +915,8 @@ fn expressed_filter_to_sql<'a>(cx: &Ctx<'_, 'a>, exp: &Expression, node: &Node<'
             lit(cx, f, f.filter_value_end.as_deref().unwrap_or(""), true)?
         ))
     } else {
-        let op = predicate_op(f.predicate).ok_or_else(|| PlanError::Resolution(format!("Unsupported filter predicate: {}", f.predicate.name())))?;
+        let op = predicate_op(f.predicate)
+            .ok_or_else(|| PlanError::Resolution(format!("Unsupported filter predicate: {}", f.predicate.name())))?;
         Ok(format!("{} {} {}", lower_sql(cx, &sql, f.field())?, op, lit(cx, f, f.filter_value.as_deref().unwrap_or(""), false)?))
     }
 }
@@ -888,9 +941,10 @@ fn predicate_op(p: Predicate) -> Option<&'static str> {
 }
 
 fn filter_expression_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Result<String> {
-    let r = node.field_refs.get(&RefKey::Field(f.field().id)).ok_or_else(|| {
-        PlanError::Resolution(format!("No field reference found for filter on {}", f.field().name))
-    })?;
+    let r = node
+        .field_refs
+        .get(&RefKey::Field(f.field().id))
+        .ok_or_else(|| PlanError::Resolution(format!("No field reference found for filter on {}", f.field().name)))?;
     let sql = ref_to_sql_any(cx, r, node)?;
     let wrap = node.is_merge() && node.group_by() && f.is_measure();
     Ok(if wrap { format!("max({sql})") } else { sql })
@@ -909,16 +963,12 @@ fn filter_to_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Res
         Between => {
             let sql = filter_expression_sql(cx, node, f)?;
             // Rails passes the node as is_ending for the start value: truthy.
-            format!(
-                "{} BETWEEN {} AND {}",
-                sql,
-                lit(cx, f, &value, true)?,
-                lit(cx, f, f.filter_value_end.as_deref().unwrap_or(""), true)?
-            )
+            format!("{} BETWEEN {} AND {}", sql, lit(cx, f, &value, true)?, lit(cx, f, f.filter_value_end.as_deref().unwrap_or(""), true)?)
         }
         InList | ExcludeList => {
             let sql = filter_expression_sql(cx, node, f)?;
-            let is_array = matches!(node.field_refs.get(&RefKey::Field(f.field().id)), Some(r) if r.expression().map(|e| e.array).unwrap_or(false));
+            let is_array =
+                matches!(node.field_refs.get(&RefKey::Field(f.field().id)), Some(r) if r.expression().map(|e| e.array).unwrap_or(false));
             let list = lit(cx, f, &value, false)?;
             if is_array {
                 if f.predicate == InList {
@@ -965,13 +1015,7 @@ fn lit<'a>(cx: &Ctx<'_, 'a>, f: &Filtered<'a>, value: &str, is_ending: bool) -> 
     if matches!(f.predicate, Predicate::InList | Predicate::ExcludeList) {
         let items: Vec<String> = split_list(value)
             .into_iter()
-            .map(|item| {
-                if is_string {
-                    d.string_lit(&item.trim().to_lowercase()).map_err(PlanError::from)
-                } else {
-                    Ok(item)
-                }
-            })
+            .map(|item| if is_string { d.string_lit(&item.trim().to_lowercase()).map_err(PlanError::from) } else { Ok(item) })
             .collect::<Result<_>>()?;
         return Ok(items.join(", "));
     }

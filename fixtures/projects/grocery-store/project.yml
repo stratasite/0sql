@@ -1,0 +1,5 @@
+# A grocery retailer's transactions, households and campaigns (the
+# "Complete Journey" sample). A fixture for the CLI and the parity tests.
+name: Grocery Store
+uid: grocery-store
+production_branch: main

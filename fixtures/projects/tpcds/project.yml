@@ -1,0 +1,6 @@
+# TPC-DS retail sample: store, catalog and inventory channels over the
+# shared date, item and customer dimensions. A public benchmark schema,
+# kept here as a fixture for the CLI and the parity tests.
+name: TPC-DS
+uid: tpcds
+production_branch: main

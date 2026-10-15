@@ -1,0 +1,19 @@
+# Dependency updates as pull requests, once a week, for the crates and
+# for the actions the workflows use. Grouped so a week's bumps arrive
+# as one PR each rather than one per crate.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

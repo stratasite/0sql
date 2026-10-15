@@ -1,0 +1,45 @@
+# Fact: one row per coupon redemption event.
+# 2,318 redemptions by 434 households across 30 campaigns.
+#
+# NOT SUPPORTED: redemption measures cannot be broken down by Product,
+# Commodity, Sub Commodity, Department, or Brand Type.
+#
+# A redemption event records (household, day, coupon) - no product. The only
+# path to Product is Coupon -> Coupon Product -> Product, and that crosses the
+# one_to_many "coupon_coupon_product" join away from the fact: one redemption
+# of a coupon covering N eligible products would be counted N times (see
+# Coupon Eligible Products - values run into the dozens). The planner refuses
+# this, correctly. There is no weighting column in the data to allocate a
+# redemption across a coupon's eligible products, so no YAML change can make
+# it correct - do not add a join, a bridge measure, or a compound to force it.
+#
+# Use instead:
+#   - Coupon dollars by commodity/date -> "Coupon Discount" on Transactions,
+#     which joins to both Product and Date at line-item grain.
+#   - Which categories coupons targeted -> "Coupon Product Links" on the
+#     Coupon Product bridge, which does group by Commodity.
+#
+# Supported here: Household attributes, Coupon attributes, Campaign attributes
+# (via Coupon -> Campaign), and Date (via coupon_redemption_date).
+name: Coupon Redemption
+physical_name: fact_coupon_redemption
+datasource: complete_journey
+cost: 50
+
+fields:
+
+  - type: measure
+    name: Coupon Redemptions
+    description: Number of coupon redemption events. Cannot be broken down by product or commodity - a redemption records no product, and the coupon-to-product path fans out. Use Coupon Discount on Transactions for coupon dollars by category.
+    data_type: integer
+    synonyms:
+      - redemption count
+    expression:
+      sql: count(*)
+
+  - type: measure
+    name: Redeeming Households
+    description: Number of distinct households that redeemed a coupon. Cannot be broken down by product or commodity (see Coupon Redemptions).
+    data_type: integer
+    expression:
+      sql: count(distinct household_key)

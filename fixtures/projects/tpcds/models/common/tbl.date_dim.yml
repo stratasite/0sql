@@ -1,0 +1,234 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Date
+
+# The actual table no the target datasource
+physical_name: date_dim
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Date ID
+    description: Business key for date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_date_id
+
+  - type: dimension
+    name: Date
+    description: Actual date value
+    data_type: date
+    extended_blend_group: common_dates
+    expression:
+      lookup: true
+      sql: d_date
+
+  - type: dimension
+    name: Month Sequence
+    description: Sequential month number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_month_seq
+
+  - type: dimension
+    name: Week Sequence
+    description: Sequential week number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_week_seq
+
+  - type: dimension
+    name: Quarter Sequence
+    description: Sequential quarter number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_quarter_seq
+
+  - type: dimension
+    name: Year
+    description: Year value
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_year
+
+  - type: dimension
+    name: Day of Week
+    description: Day of week (0-6)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dow
+
+  - type: dimension
+    name: Month of Year
+    description: Month of year (1-12)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_moy
+
+  - type: dimension
+    name: Day of Month
+    description: Day of month (1-31)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dom
+
+  - type: dimension
+    name: Quarter of Year
+    description: Quarter of year (1-4)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_qoy
+
+  - type: dimension
+    name: Fiscal Year
+    description: Fiscal year value
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_year
+
+  - type: dimension
+    name: Fiscal Quarter Sequence
+    description: Sequential fiscal quarter number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_quarter_seq
+
+  - type: dimension
+    name: Fiscal Week Sequence
+    description: Sequential fiscal week number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_fy_week_seq
+
+  - type: dimension
+    name: Day Name
+    description: Name of the day (Monday, Tuesday, etc.)
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_day_name
+
+  - type: dimension
+    name: Quarter Name
+    description: Name of the quarter
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_quarter_name
+
+  - type: dimension
+    name: Holiday
+    description: Holiday indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_holiday
+
+  - type: dimension
+    name: Weekend
+    description: Weekend indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_weekend
+
+  - type: dimension
+    name: Following Holiday
+    description: Following holiday indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_following_holiday
+
+  - type: dimension
+    name: First Day of Month
+    description: First day of month indicator
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_first_dom
+
+  - type: dimension
+    name: Last Day of Month
+    description: Last day of month indicator
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_last_dom
+
+  - type: dimension
+    name: Same Day Last Year
+    description: Same day last year indicator
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_same_day_ly
+
+  - type: dimension
+    name: Same Day Last Quarter
+    description: Same day last quarter indicator
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_same_day_lq
+
+  - type: dimension
+    name: Current Day
+    description: Current day indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_day
+
+  - type: dimension
+    name: Current Week
+    description: Current week indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_week
+
+  - type: dimension
+    name: Current Month
+    description: Current month indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_month
+
+  - type: dimension
+    name: Current Quarter
+    description: Current quarter indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_quarter
+
+  - type: dimension
+    name: Current Year
+    description: Current year indicator
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_current_year

@@ -81,7 +81,14 @@ impl Server {
         self.send_with(method, path, key, &[], body).await
     }
 
-    async fn send_with(&self, method: Method, path: &str, key: Option<&str>, headers: &[(&str, &str)], body: Option<(&str, Vec<u8>)>) -> Answer {
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        key: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<(&str, Vec<u8>)>,
+    ) -> Answer {
         let mut req = Request::builder().method(method).uri(path);
         if let Some(k) = key {
             req = req.header("authorization", format!("Bearer {k}"));
@@ -112,7 +119,8 @@ impl Server {
 
     /// A tool call; answers the JSON-RPC envelope.
     async fn tool(&self, key: Option<&str>, name: &str, args: Value) -> Answer {
-        self.mcp(key, &[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } })).await
+        self.mcp(key, &[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } }))
+            .await
     }
 
     /// The names a caller's `list_projects` tool answers, as `project/branch`.
@@ -121,7 +129,12 @@ impl Server {
         assert_eq!(a.status, StatusCode::OK, "{}", a.body);
         let r = &a.body["result"];
         assert!(r["isError"].is_null(), "{r}");
-        r["structuredContent"]["deployments"].as_array().unwrap().iter().map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap())).collect()
+        r["structuredContent"]["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap()))
+            .collect()
     }
 
     /// A session cookie for the web app, as a browser would hold it.
@@ -151,7 +164,8 @@ impl Server {
         self.send(Method::POST, &format!("/projects/{uid}/branches/{branch}/deploy"), Some(key), Some(("application/gzip", archive))).await
     }
     async fn validate(&self, uid: &str, branch: &str, key: &str, archive: Vec<u8>) -> Answer {
-        self.send(Method::POST, &format!("/projects/{uid}/branches/{branch}/validate"), Some(key), Some(("application/gzip", archive))).await
+        self.send(Method::POST, &format!("/projects/{uid}/branches/{branch}/validate"), Some(key), Some(("application/gzip", archive)))
+            .await
     }
 
     /// A new account; answers the admin's personal key.
@@ -191,7 +205,12 @@ impl Server {
     async fn listing(&self, key: &str) -> Vec<String> {
         let a = self.get("/projects", Some(key)).await;
         assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-        a.body["deployments"].as_array().unwrap().iter().map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap())).collect()
+        a.body["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap()))
+            .collect()
     }
 
     /// Deployment directories on disk, relative to the data directory.
@@ -201,7 +220,12 @@ impl Server {
             for project in std::fs::read_dir(account.path()).unwrap().flatten().filter(|e| e.path().is_dir()) {
                 for branch in std::fs::read_dir(project.path()).unwrap().flatten().filter(|e| e.path().is_dir()) {
                     if branch.path().join("snapshot.json.gz").exists() {
-                        out.push(format!("{}/{}/{}", account.file_name().to_string_lossy(), project.file_name().to_string_lossy(), branch.file_name().to_string_lossy()));
+                        out.push(format!(
+                            "{}/{}/{}",
+                            account.file_name().to_string_lossy(),
+                            project.file_name().to_string_lossy(),
+                            branch.file_name().to_string_lossy()
+                        ));
                     }
                 }
             }
@@ -468,19 +492,28 @@ async fn members_reach_only_what_their_level_allows() {
     assert_eq!(s.delete(b, Some(&bob)).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.post(&format!("{b}/test"), Some(&bob), json!({})).await.status, StatusCode::FORBIDDEN);
     assert_eq!(s.patch("/projects/sales", Some(&bob), json!({ "name": "Mine" })).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(s.put("/projects/sales/access", Some(&bob), json!({ "email": "bob@acme.test", "level": "owner" })).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        s.put("/projects/sales/access", Some(&bob), json!({ "email": "bob@acme.test", "level": "owner" })).await.status,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(s.delete("/projects/sales", Some(&bob)).await.status, StatusCode::FORBIDDEN);
 
     // Restricted: Bob sees nothing until granted, and the listing agrees.
     assert_eq!(s.patch("/projects/sales", Some(&ann), json!({ "visibility": "restricted" })).await.status, StatusCode::OK);
     assert_eq!(s.fields("sales", "main", Some(&bob)).await.unwrap_err().status, StatusCode::FORBIDDEN);
     assert!(s.listing(&bob).await.is_empty());
-    assert_eq!(s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "read" })).await.status, StatusCode::OK);
+    assert_eq!(
+        s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "read" })).await.status,
+        StatusCode::OK
+    );
     assert!(s.fields("sales", "main", Some(&bob)).await.is_ok());
     assert_eq!(s.listing(&bob).await, ["sales/main"]);
 
     // Write: a feature branch, yes; the protected production branch, no.
-    assert_eq!(s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "write" })).await.status, StatusCode::OK);
+    assert_eq!(
+        s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "write" })).await.status,
+        StatusCode::OK
+    );
     assert_eq!(s.patch("/projects/sales", Some(&ann), json!({ "protected_production": true })).await.status, StatusCode::OK);
     let a = s.deploy("sales", "feature", &bob, archive("sales", "bob")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
@@ -490,7 +523,10 @@ async fn members_reach_only_what_their_level_allows() {
     assert!(s.fields("sales", "main", Some(&ann)).await.unwrap().contains(&"Marker sales".to_string()), "production is as Ann left it");
 
     // Owner: production too, and access.
-    assert_eq!(s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "owner" })).await.status, StatusCode::OK);
+    assert_eq!(
+        s.put("/projects/sales/access", Some(&ann), json!({ "email": "bob@acme.test", "level": "owner" })).await.status,
+        StatusCode::OK
+    );
     assert_eq!(s.deploy("sales", "main", &bob, archive("sales", "bob")).await.status, StatusCode::OK);
 
     // Removed from the account, Bob's key is no key at all.
@@ -548,9 +584,16 @@ async fn query_keys_read_exactly_what_they_are_granted() {
     assert_eq!(s.post(&grants, Some(&ned), json!({ "project": CS })).await.status, StatusCode::NOT_FOUND);
     assert_eq!(s.delete(&format!("/account/query-keys/{id}"), Some(&ned)).await.status, StatusCode::NOT_FOUND);
     let (nid, nqk) = s.query_key(&ned).await;
-    assert_eq!(s.post(&format!("/account/query-keys/{nid}/grants"), Some(&ned), json!({ "project": CS, "branch": "*" })).await.status, StatusCode::OK);
+    assert_eq!(
+        s.post(&format!("/account/query-keys/{nid}/grants"), Some(&ned), json!({ "project": CS, "branch": "*" })).await.status,
+        StatusCode::OK
+    );
     assert!(s.fields(CS, "main", Some(&nqk)).await.unwrap().contains(&"Marker newco".to_string()));
-    assert_eq!(s.fields(CS, "staging", Some(&nqk)).await.unwrap_err().status, StatusCode::NOT_FOUND, "Ann's staging does not exist for Newco");
+    assert_eq!(
+        s.fields(CS, "staging", Some(&nqk)).await.unwrap_err().status,
+        StatusCode::NOT_FOUND,
+        "Ann's staging does not exist for Newco"
+    );
     assert_eq!(s.listing(&nqk).await, ["customer-service/main"]);
 
     // Revoked grant, rotated secret.
@@ -645,7 +688,11 @@ async fn an_archive_cannot_reach_outside_itself() {
     // Something on the host that must never be read: here, a file with
     // a marker, standing in for another account's data.
     let outside = s.data_dir.join("outside.yml");
-    std::fs::write(&outside, "fields:\n  - type: dimension\n    name: LEAKED_FROM_HOST\n    data_type: string\n    expression:\n      sql: x\n").unwrap();
+    std::fs::write(
+        &outside,
+        "fields:\n  - type: dimension\n    name: LEAKED_FROM_HOST\n    data_type: string\n    expression:\n      sql: x\n",
+    )
+    .unwrap();
 
     // A symbolic link entry.
     let a = s.validate(CS, "main", &ann, archive_with_link(CS, "tests/leak.yml", outside.to_str().unwrap())).await;
@@ -733,7 +780,13 @@ async fn mcp_takes_a_key_and_nothing_else() {
     let cookie = s.login_cookie("ann@acme.test", "annpassword1").await;
     let a = s.tool(None, "list_projects", json!({})).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
-    let a = s.mcp(None, &[("cookie", &cookie), ("x-requested-with", "zsql")], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } })).await;
+    let a = s
+        .mcp(
+            None,
+            &[("cookie", &cookie), ("x-requested-with", "zsql")],
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } }),
+        )
+        .await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.error());
     let a = s.get("/me", None).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
@@ -746,7 +799,13 @@ async fn mcp_takes_a_key_and_nothing_else() {
     assert!(a.headers.contains_key("www-authenticate"));
 
     // A bare key in the header, with no scheme, is taken; another scheme is not.
-    let a = s.mcp(None, &[("authorization", &ann)], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } })).await;
+    let a = s
+        .mcp(
+            None,
+            &[("authorization", &ann)],
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_projects", "arguments": {} } }),
+        )
+        .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     let a = s.mcp(None, &[("authorization", &format!("Basic {ann}"))], init.clone()).await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
@@ -758,14 +817,22 @@ async fn mcp_takes_a_key_and_nothing_else() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(a.body["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(a.body["result"]["serverInfo"]["name"], "0sql");
-    let a = s.mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } })).await;
+    let a = s
+        .mcp(Some(&ann), &[], json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } }))
+        .await;
     assert_eq!(a.body["result"]["protocolVersion"], "2025-11-25", "an unknown version gets the newest");
 
     // Origin is not read: a page from anywhere gets what its key allows,
     // and without one it gets the 401, because nothing here is a cookie.
     let a = s.mcp(Some(&ann), &[("origin", "https://claude.ai")], init.clone()).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let a = s.mcp(None, &[("origin", "https://evil.example")], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "fields", "arguments": { "project": CS } } })).await;
+    let a = s
+        .mcp(
+            None,
+            &[("origin", "https://evil.example")],
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "fields", "arguments": { "project": CS } } }),
+        )
+        .await;
     assert_eq!(a.status, StatusCode::UNAUTHORIZED);
 
     // OAuth discovery finds nothing, plainly: a 404, not a request for a key.
@@ -828,7 +895,8 @@ async fn mcp_tools_reach_what_the_key_may_read_and_nothing_else() {
 
     // The branch defaults to production; a named one is held to the grant.
     let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "hidden": true })).await;
-    let names: Vec<&str> = a.body["result"]["structuredContent"]["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> =
+        a.body["result"]["structuredContent"]["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"Marker acme") && !names.contains(&"Marker newco"), "{names:?}");
     let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "branch": "dev" })).await;
     assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
@@ -921,7 +989,12 @@ async fn a_bound_context_decides_who_a_query_key_plans_as() {
     let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
     assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextBound"), "{}", a.error());
     let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": apac })).await;
-    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextBound"), "the same context is still the caller's to send: {}", a.error());
+    assert_eq!(
+        (a.status, a.class()),
+        (StatusCode::BAD_REQUEST, "ContextBound"),
+        "the same context is still the caller's to send: {}",
+        a.error()
+    );
     let a = s.post(&sql_path, Some(&secret), json!({ "expr": "Revenue", "context": { "system_admin": true } })).await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
     let a = s.post(&format!("/projects/{CS}/branches/main/explore"), Some(&secret), json!({ "expr": "Revenue", "context": emea })).await;
@@ -969,7 +1042,9 @@ async fn a_personal_key_plans_as_its_user_over_mcp() {
     assert_eq!(a.body["error"]["code"], -32602, "{}", a.body);
 
     // REST is unchanged for a person.
-    let a = s.post(&format!("/projects/{CS}/branches/main/sql"), Some(&ann), json!({ "expr": "Revenue", "context": { "system_admin": true } })).await;
+    let a = s
+        .post(&format!("/projects/{CS}/branches/main/sql"), Some(&ann), json!({ "expr": "Revenue", "context": { "system_admin": true } }))
+        .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert!(!a.body["sql"].as_str().unwrap().contains("1 = 0"), "{}", a.body["sql"]);
 }
@@ -982,7 +1057,13 @@ async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     assert_eq!(s.deploy(CS, "main", &ann, archive_with_policies(CS, "acme")).await.status, StatusCode::OK);
     let (qk, secret) = s.query_key(&ann).await;
-    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } })).await;
+    let a = s
+        .post(
+            &format!("/account/query-keys/{qk}/grants"),
+            Some(&ann),
+            json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } }),
+        )
+        .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let mut failed = Vec::new();
     for expr in [
@@ -1001,7 +1082,12 @@ async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
         let sql = a.body["result"]["structuredContent"]["sql"].as_str().map(str::to_string).unwrap_or_else(|| format!("ERROR {}", a.body));
         let lower = sql.to_lowercase();
         let secured = lower.contains("in ('emea')") || lower.contains("1 = 0");
-        let user_filter_present = lower.contains("apac") || lower.contains("amer") || lower.contains("!= 'emea'") || lower.contains("<> 'emea'") || lower.contains("is not null") || lower.contains("not in");
+        let user_filter_present = lower.contains("apac")
+            || lower.contains("amer")
+            || lower.contains("!= 'emea'")
+            || lower.contains("<> 'emea'")
+            || lower.contains("is not null")
+            || lower.contains("not in");
         eprintln!("--- {expr}\n{sql}\n");
         if !secured || !user_filter_present {
             failed.push(format!("{expr}: secured={secured} user_filter={user_filter_present}"));
@@ -1022,13 +1108,22 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     assert_eq!(s.deploy(CS, "main", &ann, archive_with_exclusions(CS, "acme")).await.status, StatusCode::OK);
     let (qk, secret) = s.query_key(&ann).await;
-    let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } })).await;
+    let a = s
+        .post(
+            &format!("/account/query-keys/{qk}/grants"),
+            Some(&ann),
+            json!({ "project": CS, "context": { "groups": [{ "name": "emea" }] } }),
+        )
+        .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     for expr in ["Total Revenue, Region = apac", "Global Revenue, Region = apac", "Peak Region Revenue, Region = apac"] {
         let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": spec_of(expr) })).await;
         let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").to_lowercase();
         assert!(sql.contains("sum(t0.\"revenue\")"), "{expr}: {}", a.body);
-        assert!(!sql.contains("in ('emea')") && !sql.contains("apac"), "{expr}: the measure ignores both the caller's filter and the policy's: {sql}");
+        assert!(
+            !sql.contains("in ('emea')") && !sql.contains("apac"),
+            "{expr}: the measure ignores both the caller's filter and the policy's: {sql}"
+        );
     }
     // A caller whose context resolves nothing is still denied.
     let a = s.post(&format!("/account/query-keys/{qk}/grants"), Some(&ann), json!({ "project": CS, "context": {} })).await;
@@ -1079,22 +1174,40 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
     // A near miss with one clear winner is corrected silently and said
     // so under corrections; one the planner cannot settle between two
     // candidates is refused, and the refusal carries the nearest fields.
-    let a = s.tool(Some(&secret), "sql", json!({ "project": CS, "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Grand Total" }] } })).await;
+    let a = s
+        .tool(
+            Some(&secret),
+            "sql",
+            json!({ "project": CS, "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Grand Total" }] } }),
+        )
+        .await;
     assert_eq!(a.body["result"]["structuredContent"]["corrections"][0]["field_uid"], "revenue", "{}", a.body);
     // A model with two revenues and no plain one, so "Revenue Total" has
     // two candidates at the same distance and no containing match.
     let mut files = fixture_files("billing", "two-revenues");
-    files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap().1 = "name: Sales\nphysical_name: sales\ndatasource: dw\ncost: 10\nfields:\n\
+    files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap().1 =
+        "name: Sales\nphysical_name: sales\ndatasource: dw\ncost: 10\nfields:\n\
          \x20 - type: dimension\n    name: Category\n    data_type: string\n    expression:\n      sql: category\n\
          \x20 - type: measure\n    name: Revenue Net\n    data_type: decimal\n    expression:\n      sql: sum(net)\n\
          \x20 - type: measure\n    name: Revenue Gross\n    data_type: decimal\n    expression:\n      sql: sum(gross)\n"
-        .into();
+            .into();
     files.retain(|(p, _)| p != "tests/smoke.yml");
     assert_eq!(s.deploy("billing", "main", &ann, archive_of(&files)).await.status, StatusCode::OK);
-    let a = s.tool(Some(&ann), "sql", json!({ "project": "billing", "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Total" }] } })).await;
+    let a = s
+        .tool(
+            Some(&ann),
+            "sql",
+            json!({ "project": "billing", "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Total" }] } }),
+        )
+        .await;
     let r = &a.body["result"];
     assert_eq!(r["isError"], true, "{r}");
     let text = r["content"][0]["text"].as_str().unwrap();
     assert!(text.starts_with("FieldNotFound"), "{text}");
-    assert!(text.contains("Fields near 'Revenue Total'") && text.contains("- revenue-net: Revenue Net (measure, decimal)") && text.contains("- revenue-gross: Revenue Gross (measure, decimal)"), "{text}");
+    assert!(
+        text.contains("Fields near 'Revenue Total'")
+            && text.contains("- revenue-net: Revenue Net (measure, decimal)")
+            && text.contains("- revenue-gross: Revenue Gross (measure, decimal)"),
+        "{text}"
+    );
 }

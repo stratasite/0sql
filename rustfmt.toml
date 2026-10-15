@@ -1,0 +1,6 @@
+# rustfmt's defaults, widened. The code is written in long, dense
+# lines; at 100 columns most of it would wrap into chains several lines
+# tall, and at 140 with the "Max" heuristic a struct literal or a call
+# stays on one line whenever it fits. CI checks `cargo fmt --all --check`.
+max_width = 140
+use_small_heuristics = "Max"

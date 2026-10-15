@@ -1,0 +1,36 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Income Band
+
+# The actual table no the target datasource
+physical_name: income_band
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Income Band Lower Bound
+    description: Lower bound of income band
+    data_type: integer
+    tags: ["pii"]
+    expression:
+      lookup: true
+      sql: ib_lower_bound
+
+  - type: dimension
+    name: Income Band Upper Bound
+    tags:
+      - pii
+    description: Upper bound of income band
+    data_type: integer
+    expression:
+      lookup: true
+      sql: ib_upper_bound

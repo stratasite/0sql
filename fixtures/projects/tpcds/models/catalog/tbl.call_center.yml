@@ -1,0 +1,241 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Call Center
+
+# The actual table no the target datasource
+physical_name: call_center
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Call Center ID
+    description: Business key for call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_call_center_id
+
+  - type: dimension
+    name: Call Center Name
+    description: Name of the call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_name
+
+  - type: dimension
+    name: Call Center Class
+    description: Class of the call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_class
+
+  - type: dimension
+    name: Call Center Employees
+    description: Number of employees at call center
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cc_employees
+
+  - type: dimension
+    name: Call Center Square Feet
+    description: Square footage of call center
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cc_sq_ft
+
+  - type: dimension
+    name: Call Center Hours
+    description: Operating hours of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_hours
+
+  - type: dimension
+    name: Call Center Manager
+    description: Manager of the call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_manager
+
+  - type: dimension
+    name: Call Center Market ID
+    description: Market identifier for call center
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cc_mkt_id
+
+  - type: dimension
+    name: Call Center Market Class
+    description: Market class of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_mkt_class
+
+  - type: dimension
+    name: Call Center Market Description
+    description: Description of the market
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_mkt_desc
+
+  - type: dimension
+    name: Call Center Market Manager
+    description: Manager of the market
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_market_manager
+
+  - type: dimension
+    name: Call Center Division ID
+    description: Division identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cc_division
+
+  - type: dimension
+    name: Call Center Division Name
+    description: Name of the division
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_division_name
+
+  - type: dimension
+    name: Call Center Company ID
+    description: Company identifier
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cc_company
+
+  - type: dimension
+    name: Call Center Company Name
+    description: Name of the company
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_company_name
+
+  - type: dimension
+    name: Call Center Street Number
+    description: Street number of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_street_number
+
+  - type: dimension
+    name: Call Center Street Name
+    description: Street name of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_street_name
+
+  - type: dimension
+    name: Call Center Street Type
+    description: Street type (e.g., Ave, St, Blvd)
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_street_type
+
+  - type: dimension
+    name: Call Center Suite Number
+    description: Suite number of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_suite_number
+
+  - type: dimension
+    name: Call Center City
+    description: City where call center is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_city
+
+  - type: dimension
+    name: Call Center County
+    description: County where call center is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_county
+
+  - type: dimension
+    name: Call Center State
+    description: State where call center is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_state
+
+  - type: dimension
+    name: Call Center ZIP
+    description: ZIP code of call center
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_zip
+
+  - type: dimension
+    name: Call Center Country
+    description: Country where call center is located
+    data_type: string
+    expression:
+      lookup: true
+      sql: cc_country
+
+  - type: dimension
+    name: Call Center GMT Offset
+    description: GMT offset for call center location
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: cc_gmt_offset
+
+  - type: dimension
+    name: Call Center Tax Percentage
+    description: Tax percentage for call center
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: cc_tax_percentage
+
+  - type: dimension
+    name: Call Center Record Start Date
+    description: Start date of call center record
+    data_type: date
+    expression:
+      lookup: true
+      sql: cc_rec_start_date
+
+  - type: dimension
+    name: Call Center Record End Date
+    description: End date of call center record
+    data_type: date
+    expression:
+      lookup: true
+      sql: cc_rec_end_date

@@ -7,8 +7,10 @@ use crate::dag::{Entity, Graph, NodeId, NodeKind, RefKey, Reference};
 use crate::universe::Subtree;
 use crate::visitors::grain::{exclusion_dimension_ids, inclusion_dimension_ids};
 use crate::{PlanError, Result};
+use zsql_semantic::{
+    ExclusionType, Field, FieldKind, FilterMode, PermissionSource, PermissionValueFrom, PolicyMode, SecurityPolicy, Universe, Unresolved,
+};
 use zsql_spec::SecurityContext;
-use zsql_semantic::{ExclusionType, Field, FieldKind, FilterMode, PermissionSource, PermissionValueFrom, PolicyMode, SecurityPolicy, Universe, Unresolved};
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, user: &SecurityContext) -> Result<()> {
     // Policies whose context dimension does not resolve are inert.
@@ -145,7 +147,9 @@ fn ensure_context_dim_ref<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a U
         )));
     }
     let table = universe.table(exp.table_id).expect("expression table");
-    graph.nodes[id].field_refs.insert(RefKey::Field(ctx.id), Reference::Table { entity: Entity::Field(ctx), expression: exp, table, greedy: vec![] });
+    graph.nodes[id]
+        .field_refs
+        .insert(RefKey::Field(ctx.id), Reference::Table { entity: Entity::Field(ctx), expression: exp, table, greedy: vec![] });
     Ok(())
 }
 
@@ -159,7 +163,9 @@ fn skip_filter_for_node(node: &crate::dag::Node, universe: &Universe, ctx: &Fiel
         let rule = m.exclusions.iter().find(|r| exclusion_dimension_ids(universe, r).contains(&ctx.id));
         match m.exclusion_type {
             Some(ExclusionType::Exclude) => rule.map(|r| r.filter == FilterMode::Ignore).unwrap_or(false),
-            Some(ExclusionType::ExcludeAllExcept) => rule.is_none() && !m.exclusions.first().map(|r| r.filter == FilterMode::Apply).unwrap_or(false),
+            Some(ExclusionType::ExcludeAllExcept) => {
+                rule.is_none() && !m.exclusions.first().map(|r| r.filter == FilterMode::Apply).unwrap_or(false)
+            }
             _ => match &m.inclusions {
                 Some(inc) => inclusion_dimension_ids(universe, inc).contains(&ctx.id) && inc.filter == FilterMode::Ignore,
                 None => false,

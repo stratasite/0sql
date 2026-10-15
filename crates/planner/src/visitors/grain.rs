@@ -31,7 +31,13 @@ pub fn dimensionally_equivalent(node: &Node, dims: &[Projected], filters: &[Filt
 }
 
 /// The first aggregation node at this grain holding the measure, under the same segment signature.
-pub fn find_equivalent_agg(graph: &Graph, dims: &[Projected], filters: &[Filtered], measure: &Field, signature: &crate::visitors::segmentation::Signature) -> Option<NodeId> {
+pub fn find_equivalent_agg(
+    graph: &Graph,
+    dims: &[Projected],
+    filters: &[Filtered],
+    measure: &Field,
+    signature: &crate::visitors::segmentation::Signature,
+) -> Option<NodeId> {
     graph
         .live()
         .find(|n| {
@@ -76,8 +82,14 @@ pub fn create_merge_node<'a>(graph: &mut Graph<'a>, q: &RQuery<'a>) -> NodeId {
 
 /// Moves the measure's projections and filters from one node to another,
 /// keeping the same wrappers as Rails' `Node#add` does.
-pub fn move_measure_components<'a>(graph: &mut Graph<'a>, from: NodeId, to: NodeId, measure: &Field) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
-    let projs: Vec<Projected<'a>> = graph.nodes[from].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
+pub fn move_measure_components<'a>(
+    graph: &mut Graph<'a>,
+    from: NodeId,
+    to: NodeId,
+    measure: &Field,
+) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
+    let projs: Vec<Projected<'a>> =
+        graph.nodes[from].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
     let filters: Vec<Filtered<'a>> = graph.nodes[from].filters.iter().filter(|f| f.field().id == measure.id).cloned().collect();
     for p in &projs {
         if !graph.nodes[to].has_proj(p.proj.pid) {
@@ -104,12 +116,9 @@ pub fn exclusion_dimension_ids(universe: &Universe, rule: &Exclusion) -> Vec<Id>
     let names: Vec<String> = rule.entities.iter().map(|e| e.trim().to_lowercase()).collect();
     let snap = universe.snapshot();
     match rule.scope {
-        ExclusionScope::Dimension => snap
-            .fields
-            .iter()
-            .filter(|f| f.kind == FieldKind::Dimension && names.contains(&f.name.to_lowercase()))
-            .map(|f| f.id)
-            .collect(),
+        ExclusionScope::Dimension => {
+            snap.fields.iter().filter(|f| f.kind == FieldKind::Dimension && names.contains(&f.name.to_lowercase())).map(|f| f.id).collect()
+        }
         ExclusionScope::Table => {
             let tables: Vec<Id> = snap.tables.iter().filter(|t| names.contains(&t.name.to_lowercase())).map(|t| t.id).collect();
             let mut out = Vec::new();

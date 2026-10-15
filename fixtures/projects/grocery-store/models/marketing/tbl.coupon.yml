@@ -1,0 +1,40 @@
+# Coupons issued as part of direct marketing campaigns.
+# Products a coupon applies to are in the Coupon Product junction table.
+name: Coupon
+physical_name: dim_coupon
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Coupon UPC
+    description: Unique coupon barcode identifier
+    data_type: bigint
+    disable_listing: true
+    expression:
+      primary_key: true
+      sql: COUPON_UPC
+
+  - type: dimension
+    name: Coupon Eligible Products
+    description: Precomputed number of products this coupon applies to
+    data_type: integer
+    disable_listing: true
+    expression:
+      sql: Eligible_Product_Count
+
+  - type: dimension
+    name: Coupon Was Redeemed
+    description: True if this coupon was redeemed at least once
+    data_type: boolean
+    expression:
+      lookup: true
+      sql: Was_Redeemed
+
+  - type: measure
+    name: Coupon Count
+    description: Number of distinct coupons
+    data_type: integer
+    expression:
+      sql: count(*)

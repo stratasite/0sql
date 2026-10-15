@@ -3,22 +3,26 @@ name = "zsql-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "zsql: author a semantic model, deploy it, and query it through a zsqld server"
+publish = false
+description = "zsql: author a semantic model, plan SQL from it here or on a zsqld server, deploy it"
 
 [[bin]]
 name = "zsql"
 path = "src/main.rs"
 
 [features]
-# The default build talks to the server only: no warehouse drivers, so
-# it builds everywhere in seconds and the binary stays small. The full
-# build adds `zsql values sample`, which runs the sampling SQL locally.
+# The default build plans locally and talks to a server; it has no
+# warehouse drivers, so it builds everywhere in seconds. The full build
+# adds `zsql values sample`, which runs the sampling SQL locally.
 default = []
 warehouse = ["dep:zsql-warehouse"]
 
 [dependencies]
 zsql-warehouse = { workspace = true, optional = true }
+zsql-service.workspace = true
 zsql-shorthand.workspace = true
+zsql-dialect.workspace = true
+zsql-spec.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
@@ -30,3 +34,6 @@ ureq = { version = "3", features = ["json"] }
 rustyline = "15"
 chrono = "0.4"
 libc = "0.2"
+
+[lints]
+workspace = true

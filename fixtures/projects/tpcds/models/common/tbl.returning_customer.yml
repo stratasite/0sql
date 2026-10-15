@@ -1,0 +1,113 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Returning Customer
+
+# The actual table no the target datasource
+physical_name: customer
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Returning Customer ID
+    description: Business key for customer
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_customer_id
+
+  - type: dimension
+    name: Returning Customer Salutation
+    description: Customer salutation (Mr., Mrs., etc.)
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_salutation
+
+  - type: dimension
+    name: Returning Customer First Name
+    description: Customer first name
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_first_name
+
+  - type: dimension
+    name: Returning Customer Last Name
+    description: Customer last name
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_last_name
+
+  - type: dimension
+    name: Returning Customer Preferred Flag
+    description: Preferred customer flag
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_preferred_cust_flag
+
+  - type: dimension
+    name: Returning Customer Birth Day
+    description: Day of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_day
+
+  - type: dimension
+    name: Returning Customer Birth Month
+    description: Month of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_month
+
+  - type: dimension
+    name: Returning Customer Birth Year
+    description: Year of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_year
+
+  - type: dimension
+    name: Returning Customer Birth Country
+    description: Country of birth
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_birth_country
+
+  - type: dimension
+    name: Returning Customer Login
+    description: Customer login ID
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_login
+
+  - type: dimension
+    name: Returning Customer Email Address
+    description: Customer email address
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_email_address
+
+  - type: dimension
+    name: Returning Customer Last Review Date
+    description: Date of last review
+    data_type: date
+    expression:
+      lookup: true
+      sql: c_last_review_date

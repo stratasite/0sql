@@ -323,10 +323,7 @@ impl<'a> Universes<'a> {
             .into_iter()
             .filter(|ds| {
                 measures.iter().all(|m| {
-                    self.bases
-                        .iter()
-                        .filter(|b| b.datasource.id == *ds)
-                        .any(|b| universe.expression_for(b.root.id, m.id).is_some())
+                    self.bases.iter().filter(|b| b.datasource.id == *ds).any(|b| universe.expression_for(b.root.id, m.id).is_some())
                 })
             })
             .collect()

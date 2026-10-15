@@ -1,17 +1,27 @@
-//! zsql: author a semantic model, deploy it, query it. No SQL is generated
-//! here; every plan comes from a zsqld server.
+//! zsql: author a semantic model, plan SQL from it, deploy it.
+//!
+//! One rule decides where a command runs. Anything that needs only the
+//! model runs here, from the project directory at hand: sql, explain,
+//! explore, fields, tables, values, check, test. Anything about a
+//! server's copy of the model needs `-r`: deploy, status, list, remove,
+//! and the same reads against what the server holds. `--server` and
+//! `--uid` imply `-r`; `ZSQL_SERVER` in the environment does not.
 
 mod config;
-use zsql_shorthand as exprs;
+mod failure;
+mod local;
 mod remote;
+mod repl;
+mod show;
 mod templates;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use config::Project;
+use local::Local;
 use remote::Client;
 use serde_json::{json, Value};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -25,23 +35,27 @@ struct Cli {
     at: Where,
 }
 
-/// Which project and branch a command works on, and which server.
+/// Which project a command works on, and whether here or on a server.
 #[derive(Args, Clone, Default)]
 struct Where {
     /// Project directory; defaults to the one holding project.yml here or above.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
-    /// Branch; defaults to the checked-out git branch.
+    /// Use the server's copy of the model rather than the files here.
+    #[arg(short = 'r', long, global = true)]
+    remote: bool,
+    /// Branch on the server; defaults to the checked-out git branch. Implies nothing here: the files are what they are.
     #[arg(long, global = true)]
     branch: Option<String>,
-    /// The zsqld server; defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
+    /// The zsqld server (implies -r); defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
     #[arg(long, global = true)]
     server: Option<String>,
-    /// Project uid, when there is no project directory at hand.
+    /// Project uid on the server (implies -r), when there is no project directory at hand.
     #[arg(long, global = true)]
     uid: Option<String>,
 }
 
+/// A server's copy of a project's branch.
 struct Target {
     project: Option<Project>,
     uid: String,
@@ -49,8 +63,38 @@ struct Target {
     client: Client,
 }
 
+/// Where a command runs.
+enum Mode {
+    Local(Local),
+    Remote(Target),
+}
+
 impl Where {
-    fn resolve(&self) -> Result<Target> {
+    fn wants_remote(&self) -> bool {
+        self.remote || self.server.is_some() || self.uid.is_some()
+    }
+
+    /// The project directory at hand, unless the flags ask for a server.
+    fn mode(&self) -> Result<Mode> {
+        if self.wants_remote() {
+            return Ok(Mode::Remote(self.target()?));
+        }
+        if let Some(b) = &self.branch {
+            bail!("--branch {b} names a branch on the server; add -r to plan against it, or check it out to plan it here");
+        }
+        Ok(Mode::Local(Local { project: self.project_dir()? }))
+    }
+
+    fn project_dir(&self) -> Result<Project> {
+        match &self.project {
+            Some(dir) => config::read_project(dir),
+            None => config::find_project(Path::new(".")),
+        }
+    }
+
+    /// The server target, for commands that are about a server's copy.
+    /// This is the one place the git branch is read.
+    fn target(&self) -> Result<Target> {
         let project = match &self.project {
             Some(dir) => Some(config::read_project(dir)?),
             None => match (&self.uid, config::find_project(Path::new("."))) {
@@ -106,26 +150,26 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
-    /// Validate the project on the server without deploying (deploy --dry-run).
+    /// Load and validate the project here, and run its tests; with -r, validate on the server.
     Check,
-    /// Run the deployed branch's tests/*.yml on the server.
+    /// Run tests/*.yml here; with -r, the deployed branch's tests on the server.
     Test,
-    /// Generate one query's SQL on the server.
+    /// Generate one query's SQL.
     Sql {
         #[command(flatten)]
         query: QueryArgs,
         /// Explain the plan instead: node graph and timings, as `zsql explain`.
         #[arg(long)]
         explain: bool,
-        /// Print the server's answer as JSON.
+        /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Explain how the server plans a query: SQL, node graph and timings.
+    /// Explain how a query is planned: SQL, node graph and timings.
     Explain {
         #[command(flatten)]
         query: QueryArgs,
-        /// Print the server's answer as JSON.
+        /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -136,28 +180,28 @@ enum Command {
         /// Keep only fields whose name, uid or synonyms contain this, or come close.
         #[arg(long, short)]
         q: Option<String>,
-        /// Print the server's answer as JSON.
+        /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Print the query spec a shorthand line makes, without calling the server.
+    /// Print the query spec a shorthand line makes.
     Spec {
         /// The line: projections, filters and calculations, comma-separated.
         #[arg(trailing_var_arg = true, required = true)]
         line: Vec<String>,
     },
-    /// Plan interactively against the server.
+    /// Plan interactively: the model here, reloaded as its files change; with -r, the server's copy.
     Repl {
         #[arg(long)]
         context: Option<PathBuf>,
     },
-    /// Fields of the deployed branch, filtered by text.
+    /// Fields of the model, filtered by text.
     Fields {
         q: Option<String>,
         #[arg(long)]
         hidden: bool,
     },
-    /// Tables of the deployed branch.
+    /// Tables of the model.
     Tables,
     /// Sampled values of a dimension.
     Values {
@@ -175,6 +219,14 @@ enum Command {
     },
     /// Liveness of the server.
     Health,
+}
+
+impl Command {
+    /// Whether the command answers in JSON, which is where a refusal
+    /// goes too.
+    fn wants_json(&self) -> bool {
+        matches!(self, Command::Sql { json: true, .. } | Command::Explain { json: true, .. } | Command::Explore { json: true, .. })
+    }
 }
 
 #[derive(Subcommand)]
@@ -210,17 +262,15 @@ enum NewCommand {
 
 #[derive(Subcommand)]
 enum ValuesCommand {
-    /// Show a dimension's sampled values from the deployed branch.
-    Show {
-        dim: String,
-    },
+    /// Show a dimension's sampled values.
+    Show { dim: String },
     /// Sample the listable dimensions from the project's warehouses into samples/values.jsonl.gz.
-    /// The server says what to run (it knows the model); the SQL runs here, where the credentials are.
+    /// The model says what to run; the SQL runs here, where the credentials are.
     Sample {
         /// Only these dimensions (uids or names).
         #[arg(long, value_delimiter = ',')]
         dims: Vec<String>,
-        /// Every distinct value, not the top value_list_size (refused above the server's ceiling).
+        /// Every distinct value, not the top value_list_size (refused above the ceiling).
         #[arg(long)]
         full: bool,
         /// Resample only dimensions sampled more than this many days ago, or never.
@@ -235,26 +285,39 @@ enum ValuesCommand {
     },
 }
 
-fn main() -> Result<()> {
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+fn main() {
     let Cli { command, at } = Cli::parse();
     let command = match command {
         Some(c) => c,
         None if at.project.is_some() || at.uid.is_some() || config::find_project(Path::new(".")).is_ok() => Command::Repl { context: None },
         None => {
             use clap::CommandFactory;
-            Cli::command().print_help()?;
+            let _ = Cli::command().print_help();
             println!("\nInside a project, `zsql` alone opens the repl.");
-            return Ok(());
+            return;
         }
     };
+    // A closed pipe (`zsql ... | head`) ends the command quietly instead
+    // of panicking. A command that runs a server must not do this, since
+    // a client hanging up mid-answer would then kill it; when one
+    // exists, it decides here before the reset.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let json = command.wants_json();
+    if let Err(e) = run(command, at) {
+        failure::report(&e, json);
+        std::process::exit(1);
+    }
+}
+
+fn run(command: Command, at: Where) -> Result<()> {
     match command {
         Command::Spec { line } => {
-            let (spec, items) = exprs::parse_line(&line.join(" ")).map_err(|e| anyhow::anyhow!(e))?;
-            for d in exprs::describe(&items) {
+            let (spec, _, items) =
+                zsql_service::spec_of(None, Some(&line.join(" ")), &zsql_service::unlimited).map_err(failure::Refusal::from)?;
+            for d in items {
                 eprintln!("{d}");
             }
             println!("{}", serde_json::to_string_pretty(&spec)?);
@@ -263,10 +326,7 @@ fn main() -> Result<()> {
         Command::Init { dir, name, uid } => init(dir, name, uid),
         Command::New { what } => new_file(what),
         Command::Auth { api_key, server } => {
-            let project = match &at.project {
-                Some(d) => config::read_project(d)?,
-                None => config::find_project(Path::new("."))?,
-            };
+            let project = at.project_dir()?;
             config::write_secret(&project.dir, "api_key", &api_key)?;
             if let Some(s) = server {
                 config::write_secret(&project.dir, "server", &s)?;
@@ -275,11 +335,26 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Deploy { dry_run, watch } => deploy(at, dry_run, watch),
-        Command::Check => deploy(at, true, false),
+        Command::Check => match at.mode()? {
+            Mode::Local(l) => {
+                let t0 = Instant::now();
+                let m = l.model()?;
+                let v = local::check(&m);
+                let ok = show::print_deploy(&v);
+                println!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+                if !ok {
+                    bail!("tests failed");
+                }
+                Ok(())
+            }
+            Mode::Remote(_) => deploy(at, true, false),
+        },
         Command::Test => {
-            let t = at.resolve()?;
-            let v = t.client.post(&format!("{}/test", remote::branch_path(&t.uid, &t.branch)), &json!({}))?;
-            if !remote::print_tests(&v) {
+            let results = match at.mode()? {
+                Mode::Local(l) => l.model()?.run_tests(),
+                Mode::Remote(t) => t.client.post(&format!("{}/test", remote::branch_path(&t.uid, &t.branch)), &json!({}))?,
+            };
+            if !show::print_tests(&results) {
                 bail!("tests failed");
             }
             Ok(())
@@ -287,46 +362,78 @@ fn main() -> Result<()> {
         Command::Sql { query, explain, json } => query.run(at, explain, json),
         Command::Explain { query, json } => query.run(at, true, json),
         Command::Explore { query, q, json } => {
-            let (t, spec_value, context) = query.resolve(at)?;
-            let v = remote::explore(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), q.as_deref())?;
+            let (mode, Query { spec, expr, context }) = query.resolve(at)?;
+            let (v, origin) = match &mode {
+                Mode::Local(l) => (local::explore(&l.model()?, spec, expr.as_deref(), context.as_ref(), q.as_deref())?, "local"),
+                Mode::Remote(t) => (
+                    remote::explore(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), q.as_deref())?,
+                    "server",
+                ),
+            };
             if json {
-                remote::print_json(&v)?;
+                show::print_json(&v)?;
             } else {
-                remote::print_explore(&v, &|s| s.to_string());
+                show::print_explore(&v, &|s| s.to_string(), origin);
             }
             Ok(())
         }
-        Command::Repl { context } => repl(at.resolve()?, read_json(context)?),
+        Command::Repl { context } => {
+            let context = read_json(context)?;
+            match at.mode()? {
+                Mode::Local(l) => repl::run(repl::Session::open(l)?, context),
+                Mode::Remote(t) => repl::run(t, context),
+            }
+        }
         Command::Fields { q, hidden } => {
-            let t = at.resolve()?;
-            remote::print_fields(&t.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&q.unwrap_or_default())))?);
+            let q = q.unwrap_or_default();
+            let v = match at.mode()? {
+                Mode::Local(l) => l.model()?.fields(&q, hidden),
+                Mode::Remote(t) => t.client.get(&format!(
+                    "{}/fields?q={}&hidden={hidden}",
+                    remote::branch_path(&t.uid, &t.branch),
+                    remote::urlencode(&q)
+                ))?,
+            };
+            show::print_fields(&v);
             Ok(())
         }
         Command::Tables => {
-            let t = at.resolve()?;
-            remote::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?);
+            let v = match at.mode()? {
+                Mode::Local(l) => l.model()?.tables(),
+                Mode::Remote(t) => t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?,
+            };
+            show::print_tables(&v);
             Ok(())
         }
         Command::Values { what } => values(at, what),
         Command::Status => {
-            let t = at.resolve()?;
-            remote::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
+            let t = at.target()?;
+            show::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
         }
         Command::List => {
-            let server = config::server(at.server.as_deref(), at.resolve().ok().and_then(|t| t.project).as_ref());
+            let server = config::server(at.server.as_deref(), at.target().ok().and_then(|t| t.project).as_ref());
             let client = Client::new(&server, config::api_key(None));
             let v = client.get("/projects")?;
             for d in v["deployments"].as_array().into_iter().flatten() {
-                println!("{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests", d["project"].as_str().unwrap_or(""), d["branch"].as_str().unwrap_or(""), d["tables"], d["fields"], d["policies"], d["values"], d["tests"]);
+                println!(
+                    "{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests",
+                    d["project"].as_str().unwrap_or(""),
+                    d["branch"].as_str().unwrap_or(""),
+                    d["tables"],
+                    d["fields"],
+                    d["policies"],
+                    d["values"],
+                    d["tests"]
+                );
             }
             Ok(())
         }
         Command::Remove { yes } => {
-            let t = at.resolve()?;
+            let t = at.target()?;
             if !yes {
                 bail!("this removes {}/{} from {}; add --yes to confirm", t.uid, t.branch, t.client.server);
             }
-            remote::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
+            show::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
         }
         Command::Health => {
             let server = config::server(at.server.as_deref(), config::find_project(Path::new(".")).ok().as_ref());
@@ -337,57 +444,74 @@ fn main() -> Result<()> {
     }
 }
 
-/// What `zsql sql` and `zsql explain` take: the query, as a spec file or a
-/// shorthand line, and the security context.
+/// What `zsql sql`, `zsql explain` and `zsql explore` take: the query, as
+/// a spec file or a shorthand line, and the security context.
 #[derive(clap::Args)]
 struct QueryArgs {
     /// A JSON file holding a query spec.
-    #[arg(long, conflicts_with = "expr")]
+    #[arg(long, conflicts_with = "expr", required_unless_present = "expr")]
     spec: Option<PathBuf>,
     /// A comma-separated line of projections, filters and calculations.
-    #[arg(long)]
+    #[arg(long, required_unless_present = "spec")]
     expr: Option<String>,
     /// A JSON file holding the security context.
     #[arg(long)]
     context: Option<PathBuf>,
 }
 
+/// A query as it travels: the spec, or the shorthand line for whoever
+/// plans it to read, and the context.
+struct Query {
+    spec: Option<Value>,
+    expr: Option<String>,
+    context: Option<Value>,
+}
+
 impl QueryArgs {
-    /// The target, the spec and the context the arguments name.
-    fn resolve(self, at: Where) -> Result<(Target, Value, Option<Value>)> {
-        let t = at.resolve()?;
-        let spec_value = match (self.spec, self.expr) {
+    /// Where to plan, and the query. The line is read by whoever plans
+    /// it, here or on the server, so the item descriptions come from
+    /// one place.
+    fn resolve(self, at: Where) -> Result<(Mode, Query)> {
+        let mode = at.mode()?;
+        let (spec, expr) = match (self.spec, self.expr) {
             (Some(path), _) => {
                 let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
                 let value: Value = serde_json::from_str(&text)?;
-                value.get("spec").cloned().unwrap_or(value)
+                (Some(value.get("spec").cloned().unwrap_or(value)), None)
             }
-            (None, Some(line)) => {
-                let (spec, items) = exprs::parse_line(&line).map_err(|e| anyhow::anyhow!(e))?;
-                for d in exprs::describe(&items) {
-                    eprintln!("{d}");
-                }
-                spec
-            }
+            (None, Some(line)) => (None, Some(line)),
+            // clap requires one of the two; this arm is for the compiler.
             (None, None) => bail!("give the query as --spec FILE or --expr LINE"),
         };
         let context = read_json(self.context)?;
-        Ok((t, spec_value, context))
+        Ok((mode, Query { spec, expr, context }))
     }
 
     fn run(self, at: Where, explain: bool, json: bool) -> Result<()> {
-        let (t, spec_value, context) = self.resolve(at)?;
-        let v = remote::sql(&t.client, &t.uid, &t.branch, spec_value, context.as_ref(), explain)?;
+        let (mode, Query { spec, expr, context }) = self.resolve(at)?;
+        let t0 = Instant::now();
+        let (v, origin) = match &mode {
+            Mode::Local(l) => (local::sql(&l.model()?, spec, expr.as_deref(), context.as_ref(), explain)?, "local"),
+            Mode::Remote(t) => {
+                (remote::sql(&t.client, &t.uid, &t.branch, spec.as_ref(), expr.as_deref(), context.as_ref(), explain)?, "server")
+            }
+        };
         if json {
-            remote::print_json(&v)?;
+            show::print_json(&v)?;
         } else if explain {
-            remote::print_explain(&v, &|s| s.to_string());
+            show::print_explain(&v, &|s| s.to_string(), origin);
         } else {
-            for c in remote::corrections(&v) {
+            for i in show::items(&v) {
+                eprintln!("{i}");
+            }
+            for c in show::corrections(&v) {
                 eprintln!("{c}");
             }
-            println!("{}", remote::datasource_line(&v));
+            println!("{}", show::datasource_line(&v));
             println!("{}", v["sql"].as_str().unwrap_or(""));
+            if matches!(mode, Mode::Local(_)) {
+                eprintln!("-- planned here in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
         }
         Ok(())
     }
@@ -408,7 +532,9 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     if dir.join("project.yml").exists() {
         bail!("{} already holds a project", dir.display());
     }
-    let name = name.unwrap_or_else(|| dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into()));
+    let name = name.unwrap_or_else(|| {
+        dir.canonicalize().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string())).unwrap_or_else(|| "project".into())
+    });
     let uid = uid.map(|u| u.to_lowercase()).unwrap_or_else(|| config::slug(&name));
     let write = |rel: &str, text: &str| -> Result<()> {
         let path = dir.join(rel);
@@ -432,11 +558,19 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
     let gi = dir.join(".gitignore");
     let existing = std::fs::read_to_string(&gi).unwrap_or_default();
     if !existing.contains(".zsql") {
-        std::fs::write(&gi, format!("{existing}{}{}", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }, templates::GITIGNORE))?;
+        std::fs::write(
+            &gi,
+            format!("{existing}{}{}", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }, templates::GITIGNORE),
+        )?;
         println!("update .gitignore");
     }
     if !dir.join(".git").exists() {
-        let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&dir).status().map(|s| s.success()).unwrap_or(false);
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if ok {
             // Deploying reads the checked-out branch, so an uncommitted
             // project cannot be deployed. Say so here, where it is a step on
@@ -444,7 +578,7 @@ fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Resu
             println!("git init (branch main) — commit before deploying; zsql deploys the checked-out branch");
         }
     }
-    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `git commit`, `zsql auth --api-key ...`, `zsql deploy`");
+    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `zsql sql --expr ...`; then `git commit`, `zsql auth --api-key ...`, `zsql deploy`");
     Ok(())
 }
 
@@ -453,7 +587,11 @@ fn new_file(what: NewCommand) -> Result<()> {
         NewCommand::Table { name, datasource, physical_name, domain, project } => {
             let p = project_of(project)?;
             let file = config::slug(&name).replace('-', "_");
-            (p.dir, format!("models/{domain}/tbl.{file}.yml"), templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource))
+            (
+                p.dir,
+                format!("models/{domain}/tbl.{file}.yml"),
+                templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource),
+            )
         }
         NewCommand::Relation { datasource, domain, project } => {
             let p = project_of(project)?;
@@ -487,7 +625,7 @@ fn project_of(dir: Option<PathBuf>) -> Result<Project> {
 // ----------------------------------------------------------------- deploy
 
 fn deploy(at: Where, dry_run: bool, watch: bool) -> Result<()> {
-    let t = at.resolve()?;
+    let t = at.target()?;
     let Some(project) = &t.project else { bail!("deploy needs a project directory") };
     let action = if dry_run { "validate" } else { "deploy" };
     let once = |t: &Target| -> Result<bool> {
@@ -495,7 +633,7 @@ fn deploy(at: Where, dry_run: bool, watch: bool) -> Result<()> {
         let note = if t.branch == project.production_branch { " (the production branch)" } else { "" };
         println!("{action} {} ({} bytes) as {}/{}{note} to {}", project.name, archive.len(), t.uid, t.branch, t.client.server);
         let v = t.client.post_bytes(&format!("{}/{action}", remote::branch_path(&t.uid, &t.branch)), "application/gzip", &archive)?;
-        Ok(remote::print_deploy(&v))
+        Ok(show::print_deploy(&v))
     };
     if !watch {
         if !once(&t)? {
@@ -547,7 +685,16 @@ fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
 /// with its secrets removed, and samples/values.jsonl.gz. Never .zsql,
 /// .strata, .git or data files.
 fn project_archive(project: &Path) -> Result<Vec<u8>> {
-    const SECRET_KEYS: [&str; 8] = ["password", "private_key", "personal_access_token", "secret_access_key", "access_key_id", "oauth_client_secret", "oauth_client_id", "api_key"];
+    const SECRET_KEYS: [&str; 8] = [
+        "password",
+        "private_key",
+        "personal_access_token",
+        "secret_access_key",
+        "access_key_id",
+        "oauth_client_secret",
+        "oauth_client_id",
+        "api_key",
+    ];
     let mut buf = Vec::new();
     {
         let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -616,14 +763,31 @@ fn walk_yaml(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn values(at: Where, what: ValuesCommand) -> Result<()> {
     match what {
         ValuesCommand::Show { dim } => {
-            let t = at.resolve()?;
-            remote::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, &dim)?);
+            let v = match at.mode()? {
+                Mode::Local(l) => local::values_for(&l.model()?, &dim)?,
+                Mode::Remote(t) => remote::values_for(&t.client, &t.uid, &t.branch, &dim)?,
+            };
+            show::print_values(&v);
             Ok(())
         }
         ValuesCommand::Sample { dims, full, older_than, dry_run, deploy: deploy_after } => {
-            let t = at.resolve()?;
-            let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
-            let plan = t.client.get(&format!("{}/sampling-plan?dims={}&full={full}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(&dims.join(","))))?;
+            // The plan comes from the model, here or on the server; the
+            // SQL runs here either way, where the credentials are.
+            let (project, plan) = match at.mode()? {
+                Mode::Local(l) => {
+                    let plan = l.model()?.sampling_plan(&dims, full);
+                    (l.project, plan)
+                }
+                Mode::Remote(t) => {
+                    let Some(project) = t.project.clone() else { bail!("sampling needs a project directory (the credentials live there)") };
+                    let plan = t.client.get(&format!(
+                        "{}/sampling-plan?dims={}&full={full}",
+                        remote::branch_path(&t.uid, &t.branch),
+                        remote::urlencode(&dims.join(","))
+                    ))?;
+                    (project, plan)
+                }
+            };
             let jobs = plan["jobs"].as_array().cloned().unwrap_or_default();
             let skipped = plan["skipped"].as_array().cloned().unwrap_or_default();
             if !dims.is_empty() {
@@ -642,7 +806,15 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
                 .collect();
             if dry_run {
                 for j in &todo {
-                    println!("-- {} ({}) on {} via {}\n{}\n{}\n", j["uid"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or(""), j["table"].as_str().unwrap_or(""), j["datasource"].as_str().unwrap_or(""), j["distinct_sql"].as_str().unwrap_or(""), j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or(""));
+                    println!(
+                        "-- {} ({}) on {} via {}\n{}\n{}\n",
+                        j["uid"].as_str().unwrap_or(""),
+                        j["name"].as_str().unwrap_or(""),
+                        j["table"].as_str().unwrap_or(""),
+                        j["datasource"].as_str().unwrap_or(""),
+                        j["distinct_sql"].as_str().unwrap_or(""),
+                        j["values_sql"].as_str().or(j["range_sql"].as_str()).unwrap_or("")
+                    );
                 }
                 println!("{} dimensions to sample, {} skipped", todo.len(), skipped.len());
                 return Ok(());
@@ -669,73 +841,90 @@ fn values(at: Where, what: ValuesCommand) -> Result<()> {
 
 /// Without the warehouse drivers, sampling can plan (`--dry-run`) but not run.
 #[cfg(not(feature = "warehouse"))]
-fn sample_jobs(_project_dir: &Path, _todo: &[&Value], _ceiling: i64, _now: chrono::DateTime<chrono::Utc>, _catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
+fn sample_jobs(
+    _project_dir: &Path,
+    _todo: &[&Value],
+    _ceiling: i64,
+    _now: chrono::DateTime<chrono::Utc>,
+    _catalog: &mut Vec<Value>,
+) -> Result<(usize, usize)> {
     bail!("this zsql build has no warehouse drivers; `zsql values sample --dry-run` shows the SQL, and the full build (cargo build --features warehouse) runs it")
 }
 
 /// Runs each sampling job against its datasource and folds the results
 /// into the catalog; answers with how many succeeded and failed.
 #[cfg(feature = "warehouse")]
-fn sample_jobs(project_dir: &Path, todo: &[&Value], ceiling: i64, now: chrono::DateTime<chrono::Utc>, catalog: &mut Vec<Value>) -> Result<(usize, usize)> {
-            let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
-            let (mut done, mut failed) = (0, 0);
-            for j in todo {
-                let ds = j["datasource"].as_str().unwrap_or("").to_string();
-                if !connections.contains_key(&ds) {
-                    let settings = zsql_warehouse::settings_for(project_dir, &ds)?;
-                    match zsql_warehouse::connect(&settings) {
-                        Ok(c) => {
-                            connections.insert(ds.clone(), c);
-                        }
-                        Err(e) => bail!("datasource {ds}: {e}"),
-                    }
+fn sample_jobs(
+    project_dir: &Path,
+    todo: &[&Value],
+    ceiling: i64,
+    now: chrono::DateTime<chrono::Utc>,
+    catalog: &mut Vec<Value>,
+) -> Result<(usize, usize)> {
+    let mut connections: std::collections::HashMap<String, Box<dyn zsql_warehouse::Warehouse>> = Default::default();
+    let (mut done, mut failed) = (0, 0);
+    for j in todo {
+        let ds = j["datasource"].as_str().unwrap_or("").to_string();
+        if !connections.contains_key(&ds) {
+            let settings = zsql_warehouse::settings_for(project_dir, &ds)?;
+            match zsql_warehouse::connect(&settings) {
+                Ok(c) => {
+                    connections.insert(ds.clone(), c);
                 }
-                let wh = connections.get_mut(&ds).unwrap();
-                let uid = j["uid"].as_str().unwrap_or("").to_string();
-                let outcome = (|| -> Result<Value> {
-                    let distinct = wh.query(j["distinct_sql"].as_str().unwrap_or(""))?.first().and_then(|r| r.first().cloned()).flatten().and_then(|n| n.parse::<i64>().ok());
-                    let mut entry = json!({
-                        "uid": uid, "name": j["name"], "table": j["table"],
-                        "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "mode": j["mode"], "distinct": distinct,
-                    });
-                    if let Some(sql) = j["values_sql"].as_str() {
-                        if j["cap"].is_null() && distinct.map(|n| n > ceiling).unwrap_or(false) {
-                            bail!("{uid} has {} distinct values; a full sample is refused above {ceiling}", distinct.unwrap());
-                        }
-                        let values: Vec<Value> = wh
-                            .query(sql)?
-                            .into_iter()
-                            .filter_map(|r| Some(json!({ "v": r.first().cloned().flatten()?, "n": r.get(1).cloned().flatten().and_then(|n| n.parse::<i64>().ok()).unwrap_or(0) })))
-                            .collect();
-                        entry["values"] = Value::Array(values);
-                    }
-                    if let Some(sql) = j["range_sql"].as_str() {
-                        let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
-                        if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
-                            entry["range"] = json!({ "min": lo, "max": hi });
-                        }
-                    }
-                    Ok(entry)
-                })();
-                match outcome {
-                    Ok(entry) => {
-                        let what = match (entry.get("range"), entry["values"].as_array().map(Vec::len)) {
-                            (Some(r), _) => format!("{} .. {}", r["min"].as_str().unwrap_or(""), r["max"].as_str().unwrap_or("")),
-                            (None, n) => format!("{} values", n.unwrap_or(0)),
-                        };
-                        println!("{:<40} {what}", uid);
-                        catalog.retain(|e| e["uid"] != uid);
-                        catalog.push(entry);
-                        done += 1;
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("{:<40} FAILED: {e}", uid);
-                    }
+                Err(e) => bail!("datasource {ds}: {e}"),
+            }
+        }
+        let wh = connections.get_mut(&ds).unwrap();
+        let uid = j["uid"].as_str().unwrap_or("").to_string();
+        let outcome = (|| -> Result<Value> {
+            let distinct = wh
+                .query(j["distinct_sql"].as_str().unwrap_or(""))?
+                .first()
+                .and_then(|r| r.first().cloned())
+                .flatten()
+                .and_then(|n| n.parse::<i64>().ok());
+            let mut entry = json!({
+                "uid": uid, "name": j["name"], "table": j["table"],
+                "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "mode": j["mode"], "distinct": distinct,
+            });
+            if let Some(sql) = j["values_sql"].as_str() {
+                if j["cap"].is_null() && distinct.map(|n| n > ceiling).unwrap_or(false) {
+                    bail!("{uid} has {} distinct values; a full sample is refused above {ceiling}", distinct.unwrap());
+                }
+                let values: Vec<Value> = wh
+                    .query(sql)?
+                    .into_iter()
+                    .filter_map(|r| Some(json!({ "v": r.first().cloned().flatten()?, "n": r.get(1).cloned().flatten().and_then(|n| n.parse::<i64>().ok()).unwrap_or(0) })))
+                    .collect();
+                entry["values"] = Value::Array(values);
+            }
+            if let Some(sql) = j["range_sql"].as_str() {
+                let row = wh.query(sql)?.into_iter().next().unwrap_or_default();
+                if let (Some(Some(lo)), Some(Some(hi))) = (row.first().cloned(), row.get(1).cloned()) {
+                    entry["range"] = json!({ "min": lo, "max": hi });
                 }
             }
-            Ok((done, failed))
+            Ok(entry)
+        })();
+        match outcome {
+            Ok(entry) => {
+                let what = match (entry.get("range"), entry["values"].as_array().map(Vec::len)) {
+                    (Some(r), _) => format!("{} .. {}", r["min"].as_str().unwrap_or(""), r["max"].as_str().unwrap_or("")),
+                    (None, n) => format!("{} values", n.unwrap_or(0)),
+                };
+                println!("{:<40} {what}", uid);
+                catalog.retain(|e| e["uid"] != uid);
+                catalog.push(entry);
+                done += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{:<40} FAILED: {e}", uid);
+            }
+        }
+    }
+    Ok((done, failed))
 }
 
 fn read_catalog(path: &Path) -> Result<Vec<Value>> {
@@ -765,151 +954,50 @@ fn write_catalog(path: &Path, entries: &[Value]) -> Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------------- repl
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn repl(mut t: Target, context: Option<Value>) -> Result<()> {
-    let tty = std::io::stdout().is_terminal();
-    let dim = |s: &str| if tty { format!("\x1b[2m{s}\x1b[0m") } else { s.to_string() };
-    let bold = |s: &str| if tty { format!("\x1b[1m{s}\x1b[0m") } else { s.to_string() };
-    let mut field_names: Vec<String> = Vec::new();
-    let announce = |t: &Target, field_names: &mut Vec<String>| -> Result<()> {
-        let summary = t.client.get(&remote::branch_path(&t.uid, &t.branch))?;
-        println!("{}", dim(&format!("{}/{} on {}: {} tables, {} fields, {} joins, {} policies", t.uid, t.branch, t.client.server, summary["tables"], summary["fields"], summary["joins"], summary["policies"])));
-        *field_names = t
-            .client
-            .get(&format!("{}/fields?hidden=true", remote::branch_path(&t.uid, &t.branch)))?["fields"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|f| [f["uid"].as_str().unwrap_or("").to_lowercase(), f["name"].as_str().unwrap_or("").to_lowercase()])
-            .collect();
-        Ok(())
-    };
-    announce(&t, &mut field_names)?;
-    println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
+    fn project_in(root: &Path) -> PathBuf {
+        let dir = root.join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.yml"), "name: Proj\nuid: proj\n").unwrap();
+        dir
+    }
 
-    let mut editor: Option<rustyline::DefaultEditor> = if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
-    let history = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zsql").join("history"));
-    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-        let _ = std::fs::create_dir_all(h.parent().unwrap());
-        let _ = ed.load_history(h);
-    }
-    let stdin = std::io::stdin();
-    loop {
-        let line = match editor.as_mut() {
-            Some(ed) => match ed.readline("zsql> ") {
-                Ok(l) => {
-                    let _ = ed.add_history_entry(l.as_str());
-                    l
-                }
-                Err(rustyline::error::ReadlineError::Interrupted) => continue,
-                Err(_) => break,
-            },
-            None => {
-                print!("zsql> ");
-                std::io::stdout().flush()?;
-                let mut l = String::new();
-                if stdin.lock().read_line(&mut l)? == 0 {
-                    break;
-                }
-                l
-            }
+    /// The rule: here unless a flag names a server. `--server` and
+    /// `--uid` do; `--branch` alone is a mistake, not a hint.
+    #[test]
+    fn where_a_command_runs() {
+        let root = std::env::temp_dir().join(format!("zsql-where-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = project_in(&root);
+        let here = Where { project: Some(dir.clone()), ..Default::default() };
+        assert!(matches!(here.mode().unwrap(), Mode::Local(l) if l.project.uid == "proj"));
+        assert!(
+            matches!(Where { remote: true, branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.branch == "dev")
+        );
+        assert!(
+            matches!(Where { server: Some("http://x".into()), branch: Some("dev".into()), ..here.clone() }.mode().unwrap(), Mode::Remote(t) if t.client.server == "http://x")
+        );
+        // --uid alone, with no project directory anywhere near, is a server's copy.
+        assert!(
+            matches!(Where { project: None, uid: Some("other".into()), ..Default::default() }.mode().unwrap(), Mode::Remote(t) if t.uid == "other" && t.branch == "main")
+        );
+        let err = match (Where { branch: Some("dev".into()), ..here.clone() }).mode() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("--branch without -r was accepted"),
         };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
-        let names_a_field = |w: &str| field_names.iter().any(|n| n == &w.to_lowercase());
-        let cmd = match word.strip_prefix('.') {
-            Some(c) => c,
-            None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
-            None => "",
-        };
-        if matches!(cmd, "quit" | "exit" | "q") {
-            break;
-        }
-        let outcome: Result<()> = (|| {
-            match cmd {
-                "help" | "?" => println!("{}", exprs::HELP),
-                "tables" => remote::print_tables(&t.client.get(&format!("{}/tables", remote::branch_path(&t.uid, &t.branch)))?),
-                "fields" => remote::print_fields(&t.client.get(&format!("{}/fields?q={}", remote::branch_path(&t.uid, &t.branch), remote::urlencode(rest)))?),
-                "values" => {
-                    if rest.is_empty() {
-                        println!("usage: .values <dimension>");
-                    } else {
-                        remote::print_values(&remote::values_for(&t.client, &t.uid, &t.branch, rest)?);
-                    }
-                }
-                "branch" => {
-                    if rest.is_empty() {
-                        println!("{}", t.branch);
-                    } else {
-                        t.branch = rest.to_string();
-                        announce(&t, &mut field_names)?;
-                    }
-                }
-                "spec" => match exprs::parse_line(rest) {
-                    Ok((spec, items)) => {
-                        for d in exprs::describe(&items) {
-                            println!("{}", dim(&d));
-                        }
-                        println!("{}", serde_json::to_string_pretty(&spec)?);
-                    }
-                    Err(e) => println!("error: {e}"),
-                },
-                "" | "json" | "explain" | "explore" => {
-                    // A query: the shorthand, or a JSON spec after .json or
-                    // starting with a brace. .explain and .explore take
-                    // either; .explore narrows by a term after ` ? `.
-                    let text = if cmd == "" { line } else { rest };
-                    let (text, term) = match cmd {
-                        "explore" => text.rsplit_once(" ? ").map(|(l, q)| (l.trim(), Some(q.trim()))).unwrap_or((text, None)),
-                        _ => (text, None),
-                    };
-                    let spec: Result<Value, String> = if cmd == "json" || text.starts_with('{') {
-                        serde_json::from_str(text).map_err(|e| e.to_string())
-                    } else {
-                        exprs::parse_line(text).map(|(spec, items)| {
-                            for d in exprs::describe(&items) {
-                                println!("{}", dim(&d));
-                            }
-                            spec
-                        })
-                    };
-                    match spec {
-                        Err(e) => println!("error: {e}"),
-                        Ok(spec) if cmd == "explore" => match remote::explore(&t.client, &t.uid, &t.branch, spec, context.as_ref(), term) {
-                            Ok(v) => remote::print_explore(&v, &dim),
-                            Err(e) => println!("error: {e}"),
-                        },
-                        Ok(spec) => {
-                            let t0 = Instant::now();
-                            match remote::sql(&t.client, &t.uid, &t.branch, spec, context.as_ref(), cmd == "explain") {
-                                Ok(v) if cmd == "explain" => remote::print_explain(&v, &dim),
-                                Ok(v) => {
-                                    for c in remote::corrections(&v) {
-                                        println!("{}", dim(&c));
-                                    }
-                                    println!("{}", dim(&remote::datasource_line(&v)));
-                                    println!("{}", bold(v["sql"].as_str().unwrap_or("")));
-                                    println!("{}", dim(&format!("-- round trip {:.2} ms", t0.elapsed().as_secs_f64() * 1e3)));
-                                }
-                                Err(e) => println!("error: {e}"),
-                            }
-                        }
-                    }
-                }
-                other => println!("unknown command .{other}; .help lists them"),
-            }
-            Ok(())
-        })();
-        if let Err(e) = outcome {
-            println!("error: {e}");
-        }
+        assert!(err.contains("add -r"), "{err}");
+        // A project directory that is not a git repository still plans here.
+        assert!(matches!(here.mode().unwrap(), Mode::Local(_)));
+        let _ = std::fs::remove_dir_all(&root);
     }
-    if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
-        let _ = ed.save_history(h);
+
+    #[test]
+    fn json_commands() {
+        assert!(Command::Sql { query: QueryArgs { spec: None, expr: Some("a".into()), context: None }, explain: false, json: true }
+            .wants_json());
+        assert!(!Command::Tables.wants_json());
     }
-    Ok(())
 }

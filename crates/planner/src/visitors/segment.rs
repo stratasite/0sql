@@ -11,10 +11,16 @@ use crate::{PlanError, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_spec::LinkMode;
 use zsql_semantic::Universe;
+use zsql_spec::LinkMode;
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &RQuery<'a>,
+) -> Result<()> {
     if q.is_segment() {
         return Ok(());
     }
@@ -64,7 +70,8 @@ fn consumer(n: &crate::dag::Node) -> bool {
 /// unique by (segment, mode), sorted the way Rails sorts them.
 fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, LinkMode)> {
     let node = &graph.nodes[id];
-    let mut links: Vec<(usize, LinkMode)> = node.projections.iter().filter(|p| p.is_measure()).flat_map(|p| component_links(&p.proj)).collect();
+    let mut links: Vec<(usize, LinkMode)> =
+        node.projections.iter().filter(|p| p.is_measure()).flat_map(|p| component_links(&p.proj)).collect();
     let measure_sids: Vec<usize> = links.iter().map(|(s, _)| *s).collect();
     for (sid, mode) in q.query_level_links() {
         if !measure_sids.contains(&sid) {
@@ -79,7 +86,13 @@ fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, L
 
 /// Rails `Planner.plan_segment_graph` plus import: resolution and the
 /// fact-shaping visitors, with the datasource pinned to the consumer's.
-fn build_segment_node<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, segment: &Rc<RSegment<'a>>) -> Result<NodeId> {
+fn build_segment_node<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    segment: &Rc<RSegment<'a>>,
+) -> Result<NodeId> {
     let sq = segment.as_query();
     let opts = Options { datasource: Some(graph.datasource), ..Default::default() };
     let mut sub = match resolver::resolve_with(universe, universes, dialects, &sq, &opts) {
@@ -124,7 +137,12 @@ fn tree_identity(segment: &RSegment) -> String {
             }
             FilledTree::Leaf(fid) => {
                 let f = segment.filters.iter().find(|f| f.fid == *fid).expect("segment filter");
-                ruby_str(&format!("<f:{}:{}:{}>", crate::model::field_to_s(f.field), f.def.predicate.name(), f.def.filter_value.clone().unwrap_or_default()))
+                ruby_str(&format!(
+                    "<f:{}:{}:{}>",
+                    crate::model::field_to_s(f.field),
+                    f.def.predicate.name(),
+                    f.def.filter_value.clone().unwrap_or_default()
+                ))
             }
         }
     }
@@ -137,7 +155,12 @@ fn ruby_str(s: &str) -> String {
 
 /// Pre-binds each carried column to the segment node's definition projection.
 fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId, segment: &Rc<RSegment<'a>>) -> Result<()> {
-    let carried: Vec<_> = graph.nodes[id].projections.iter().filter(|p| p.proj.carried_from.map(|(_, s)| s == segment.sid).unwrap_or(false)).map(|p| p.proj.clone()).collect();
+    let carried: Vec<_> = graph.nodes[id]
+        .projections
+        .iter()
+        .filter(|p| p.proj.carried_from.map(|(_, s)| s == segment.sid).unwrap_or(false))
+        .map(|p| p.proj.clone())
+        .collect();
     for proj in carried {
         let (parent_pid, _) = proj.carried_from.expect("carried");
         let Some(seg_proj) = graph.nodes[seg_node].projected(parent_pid).map(|p| p.proj.clone()) else {

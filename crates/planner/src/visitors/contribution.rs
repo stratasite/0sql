@@ -9,12 +9,17 @@ use crate::visitors::alias::SKIP_ALIAS_PREFIX;
 use crate::visitors::grain::{create_agg_node, create_merge_node, dimensionally_equivalent};
 use crate::{PlanError, Result};
 use std::rc::Rc;
-use zsql_spec::{Decorator, DecoratorKind};
 use zsql_semantic::{Field, Universe};
+use zsql_spec::{Decorator, DecoratorKind};
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
     let node = graph.root();
-    let measures: Vec<Projected<'a>> = graph.nodes[node].projections.iter().filter(|p| p.decorators().iter().any(|d| d.kind == DecoratorKind::Contribute)).cloned().collect();
+    let measures: Vec<Projected<'a>> = graph.nodes[node]
+        .projections
+        .iter()
+        .filter(|p| p.decorators().iter().any(|d| d.kind == DecoratorKind::Contribute))
+        .cloned()
+        .collect();
     if measures.is_empty() {
         return Ok(());
     }
@@ -29,7 +34,8 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) ->
         } else if let Some(Reference::Multi { expression: Some(MultiExpr::Semantic(exp)), .. }) = r {
             process_compound(graph, universe, q, &mp, node, exp)?;
         } else {
-            let agg = graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid) && n.purpose.is_none()).map(|n| n.id);
+            let agg =
+                graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid) && n.purpose.is_none()).map(|n| n.id);
             let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
             process_table(graph, universe, q, &mp, agg)?;
         }
@@ -62,7 +68,14 @@ fn process_table<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'
     Ok(())
 }
 
-fn process_compound<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, mp: &Projected<'a>, merge: NodeId, exp: &'a zsql_semantic::Expression) -> Result<()> {
+fn process_compound<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    mp: &Projected<'a>,
+    merge: NodeId,
+    exp: &'a zsql_semantic::Expression,
+) -> Result<()> {
     let c = contributor(mp);
     let mut numerator = exp.sql.clone().unwrap_or_default();
     let refs: Vec<&Field> = exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()).filter_map(|i| universe.field(*i)).collect();
@@ -101,7 +114,16 @@ fn process_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQ
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_denominator_projection_refs<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, sql: &str, alias: &str, merge: NodeId, c: &Decorator, parent: &Rc<RProjection<'a>>) -> Result<String> {
+fn update_denominator_projection_refs<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    sql: &str,
+    alias: &str,
+    merge: NodeId,
+    c: &Decorator,
+    parent: &Rc<RProjection<'a>>,
+) -> Result<String> {
     let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(alias)).cloned() else { return Ok(sql.to_string()) };
     let mut out = sql.to_string();
     if !pj.is_calculation() && pj.is_measure() && pj.proj.pid != parent.pid {
@@ -116,7 +138,14 @@ fn update_denominator_projection_refs<'a>(graph: &mut Graph<'a>, universe: &'a U
     Ok(out)
 }
 
-fn update_denominator_fields<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, calc: &Rc<RProjection<'a>>, sql: &str, c: &Decorator) -> Result<String> {
+fn update_denominator_fields<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    calc: &Rc<RProjection<'a>>,
+    sql: &str,
+    c: &Decorator,
+) -> Result<String> {
     let mut out = sql.to_string();
     for m in calc.field_refs.iter().filter(|f| f.is_measure()) {
         let total = total_calculation(graph, universe, q, m, c)?;
@@ -130,7 +159,13 @@ fn digest(name: &str, prefix: &str) -> String {
 }
 
 /// The `__msrtotal_…` static on the partition-total node for the measure.
-fn total_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field, c: &Decorator) -> Result<Rc<RProjection<'a>>> {
+fn total_calculation<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+    c: &Decorator,
+) -> Result<Rc<RProjection<'a>>> {
     let agg = graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_field(measure.id)).map(|n| n.id);
     let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", measure.name)))?;
     let total_node = find_or_create_total_node(graph, universe, q, measure, c, agg)?;
@@ -139,13 +174,22 @@ fn total_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQue
         return Ok(existing.proj.clone());
     }
     let calc = (*q.static_calc(universe, &alias, &format!("[{}]@m", measure.name))).clone_shallow();
-    calc.set_source(graph.nodes[agg].projections.iter().find(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).map(|p| p.proj.clone()));
+    calc.set_source(
+        graph.nodes[agg].projections.iter().find(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).map(|p| p.proj.clone()),
+    );
     let calc = Rc::new(calc);
     graph.nodes[total_node].add_projection(calc.clone());
     Ok(calc)
 }
 
-fn find_or_create_total_node<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field, c: &Decorator, agg: NodeId) -> Result<NodeId> {
+fn find_or_create_total_node<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+    c: &Decorator,
+    agg: NodeId,
+) -> Result<NodeId> {
     let dims: Vec<Rc<RProjection<'a>>> = denominator_dimensions(c, q);
     let filters: Vec<Rc<RFilter<'a>>> = denominator_filters(c, q, measure);
     let dims_w: Vec<Projected<'a>> = dims.iter().cloned().map(Projected::new).collect();
@@ -187,7 +231,8 @@ fn denominator_dimensions<'a>(c: &Decorator, q: &RQuery<'a>) -> Vec<Rc<RProjecti
         return dims.into_iter().filter(|p| p.def.field_uid.as_ref().map(|u| refs.contains(u)).unwrap_or(false)).collect();
     }
     let date = dims.iter().find(|p| p.field.map(|f| f.is_date()).unwrap_or(false)).cloned();
-    let partitioning: Vec<Rc<RProjection<'a>>> = dims.iter().filter(|p| date.as_ref().map(|d| d.pid != p.pid).unwrap_or(true)).cloned().collect();
+    let partitioning: Vec<Rc<RProjection<'a>>> =
+        dims.iter().filter(|p| date.as_ref().map(|d| d.pid != p.pid).unwrap_or(true)).cloned().collect();
     match (&date, partitioning.len()) {
         (Some(d), n) if n > 0 => vec![d.clone()],
         (Some(_), 0) => vec![],

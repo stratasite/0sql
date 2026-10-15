@@ -13,15 +13,16 @@ crates/spec       the query spec, its lowering into the typed query, the formula
 crates/planner    resolution, visitors, SQL generation
 crates/project    a project directory (YAML models) loaded into a snapshot
 crates/golden     golden cases and the scoreboard
-crates/cli        zsql: init, deploy, and every server endpoint; no engine inside
-crates/devtool    zsql-dev: the engine on the command line (local plan, goldens, bench)
+crates/cli        zsql: author, plan here or on a server (-r), deploy
+crates/devtool    zsql-dev: the engine on the command line for its developers (goldens, bench, formation)
 crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
+crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by zsql and zsqld
 crates/accounts   accounts, users, keys and project access (SQLite)
 crates/server     zsqld: deploy a project, plan specs
 crates/warehouse  duckdb and postgres drivers for value sampling
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
-harness/          import of goldens from a roundhouse/strata-rs capture
+harness/          import of the golden cases captured from strata
 ```
 
 ## The contract
@@ -55,41 +56,51 @@ the project's owner, see `docs/mcp.md`.
 
 ## The CLI
 
-`zsql` authors a project and talks to a server. It generates no SQL
-itself: planning, validation and tests all run on zsqld, so the engine
-never leaves the service. The CLI keeps the warehouse credentials, which
-is why value sampling runs there.
+`zsql` authors a project, plans SQL from it, and deploys it. One rule
+says where a command runs: anything that needs only the model runs here,
+from the project directory at hand; anything about a server's copy of
+the model takes `-r`. `--server` and `--uid` imply `-r`; `ZSQL_SERVER` in
+the environment does not. The CLI keeps the warehouse credentials, which
+is why value sampling runs here whichever side planned it.
 
 ```
 zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, samples/, git init
 zsql new table Orders --datasource warehouse [--domain sales]
 zsql new relation --datasource warehouse
 zsql new test smoke
-zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
-zsql check                        # validate on the server, keep nothing
-zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
-zsql test                         # the deployed branch's tests/*.yml
 zsql sql --expr "department, sales value, department = PRODUCE" [--context user.json] [--explain] [--json]
 zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
 zsql explore --expr "department, sales value" [-q customer]   # the dimensions and measures the query can take on
-zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes, locally
-zsql repl [--context user.json]   # the shorthand, planned on the server; .explain, .branch
-zsql fields depart | zsql tables | zsql values show department | zsql status | zsql list | zsql health
-zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]   # runs the SQL locally: needs the full build
-zsql remove --yes                 # drop the deployed branch
+zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes
+zsql fields depart | zsql tables | zsql values show department
+zsql check                        # load, validate and test the project here (-r: validate on the server)
+zsql test                         # tests/*.yml here (-r: the deployed branch's, on the server)
+zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]   # runs the SQL here: needs the full build
+zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
+zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
+zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
+zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
+zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
 ```
 
-The default build has no warehouse drivers: it talks to the server only,
-builds in seconds on every platform, and is what the installer ships.
-`cargo build -p zsql-cli --features warehouse` adds DuckDB and Postgres
-for `zsql values sample`.
+A refusal is reported the same way from either side: `class: message`
+on stderr and exit 1, or `{"error": {"class", "message"}}` on stdout
+under `--json`. A usage error is clap's and exits 2.
 
-Every command takes `--project DIR`, `--branch NAME`, `--server URL` and
-`--uid UID`; without them the project is found from `project.yml` here or
-above, the branch is the checked-out git branch, and the server comes from
-`ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` (for a self-hosted
-zsqld) or the local default. `project.yml`'s `production_branch` names the
-branch production reads; deploying to it is called out.
+The default build has no warehouse drivers: it plans here and talks to
+a server, builds in seconds on every platform, and is what the installer
+ships. `cargo build -p zsql-cli --features warehouse` adds DuckDB and
+Postgres for `zsql values sample`.
+
+Every command takes `--project DIR`; the project is otherwise found from
+`project.yml` here or above. Against a server, `--branch NAME` names the
+branch (default: the checked-out git branch), `--server URL` the server
+(default: `ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` for a
+self-hosted zsqld, then the local one) and `--uid UID` the project when
+there is no directory at hand. Planning here reads no git at all: the
+files are what they are, so `--branch` without `-r` is refused.
+`project.yml`'s `production_branch` names the branch production reads;
+deploying to it is called out.
 
 Deploys carry the YAML models, tests, `security.yml`, `datasources.yml`
 with its secrets removed, and `samples/values.jsonl.gz`. The server
@@ -101,13 +112,20 @@ calculation (`Alias = formula` or `formula as Alias`), anything else is a
 projection with decorator functions such as `month(date)`, `yoy(revenue)`,
 `pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
 field. Commands start with a dot: `.fields`, `.tables`, `.values`,
-`.explore <line> [? term]`, `.json {...}`, `.spec <line>`, `.branch`, `.help`, `.quit`. Inside a project,
-`zsql` with no command opens the repl.
+`.explore <line> [? term]`, `.json {...}`, `.spec <line>`, `.reload`, `.branch`, `.help`, `.quit`. Inside a project,
+`zsql` with no command opens the repl. The repl holds the model it
+loaded and, before each line, checks the files that load read, imports
+included; when one moved it loads again and says so, and when the new
+files will not load it says that and keeps answering from the model it
+had. With `-r` it asks the server, and `.branch` switches branches there.
 
 `zsql-dev` (the devtool crate) is the engine on the command line for its
-own developers: local planning over a snapshot or project directory, the
-golden scoreboard, the bench, formation checks and export. It is not part
-of the CLI release.
+own developers: the golden scoreboard, the benches (`bench` over the
+goldens, `load-bench` over a project directory), formation checks and
+export. It is not part of the CLI release.
+
+`ZSQL_HOME` moves `~/.zsql` (the account-wide config and the repl
+history) somewhere else, which is how tests keep out of the real one.
 
 ## The server
 
@@ -215,17 +233,18 @@ and postgres are the drivers so far.
 
 ## Parity
 
-The planner is a port of strata's Rails planner, proven against goldens
-captured from that planner's own test suite (see `harness/`): every case
-that a spec can express, on the main branch and on a mutated clone. All
-385 pass, over paths formed here and over the paths Rails stored.
+The planner is its own implementation, written with strata's planner as
+the specification and proven against goldens captured from strata's test
+suite (see `harness/`): every case that a spec can express, on the main
+branch and on a mutated clone. All 385 pass, over paths formed here and
+over the paths strata stored.
 
 ```
 cargo test                     # contract, scoreboard, formation, spec round trips
 ZSQL_GOLDEN_STRICT=1 cargo test -p zsql-golden
 ```
 
-Where it improves on Rails, each covered by a test: a calculation that
+Where it goes beyond the specification, each covered by a test: a calculation that
 references another calculation is inlined before a temporal transform; a
 measure filter beside an inclusion measure stays on the node that computes
 that measure; equal-cost join routes and merge-input order follow names

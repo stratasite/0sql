@@ -1,0 +1,113 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Returning Customer Address
+
+# The actual table no the target datasource
+physical_name: customer_address
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Returning Customer Address ID
+    description: Business key for customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_address_id
+
+  - type: dimension
+    name: Returning Customer Address Street Number
+    description: Street number of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_street_number
+
+  - type: dimension
+    name: Returning Customer Address Street Name
+    description: Street name of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_street_name
+
+  - type: dimension
+    name: Returning Customer Address Street Type
+    description: Street type (e.g., Ave, St, Blvd)
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_street_type
+
+  - type: dimension
+    name: Returning Customer Address Suite Number
+    description: Suite number of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_suite_number
+
+  - type: dimension
+    name: Returning Customer Address City
+    description: City of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_city
+
+  - type: dimension
+    name: Returning Customer Address County
+    description: County of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_county
+
+  - type: dimension
+    name: Returning Customer Address State
+    description: State of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_state
+
+  - type: dimension
+    name: Returning Customer Address ZIP
+    description: ZIP code of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_zip
+
+  - type: dimension
+    name: Returning Customer Address Country
+    description: Country of customer address
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_country
+
+  - type: dimension
+    name: Returning Customer Address GMT Offset
+    description: GMT offset for customer address location
+    data_type: decimal
+    expression:
+      lookup: true
+      sql: ca_gmt_offset
+
+  - type: dimension
+    name: Returning Customer Address Location Type
+    description: Type of location (urban, rural, etc.)
+    data_type: string
+    expression:
+      lookup: true
+      sql: ca_location_type

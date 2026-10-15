@@ -1,0 +1,147 @@
+# This is the display name and primary name used 
+# in strata to access this table. 
+name: Store Sales
+
+# The actual table no the target datasource
+physical_name: store_sales
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Fact tables should generally be higher cost.
+cost: 100
+
+# Uncomment and add relative paths to other files to import 
+# fields that are common.  The imported fields can have 
+# certain properties overwrritten by redefining them below 
+# the import statement. Only fields under a "fields: " node 
+# will be imported.
+# import:
+#   - ../common/common_dates.yml
+#   - ../common/geo_dimensions.yml 
+
+# Uncomment and add partition logic to help the engine choose 
+# alternative tables if this one can't answer the users questions.
+# Currently, partitioning by date range is the only type supported.
+# partitions:
+#   - dimension: Date # name of date field
+#     predicate: between
+#     filter_value: 24m # 24 months ago
+#     filter_value_end: 1d # yesterday
+
+fields:
+  
+  - type: dimension
+    name: Store Ticket number
+    description: Actual ticket number of an order
+    data_type: integer
+    expression:
+      primary_key: true
+      sql: ss_ticket_number
+
+  - type: measure
+    name: Store Quantity
+    description: Quantity of items sold at a store
+    data_type: integer
+    expression:
+      sql: sum(ss_quantity)
+
+  - type: measure
+    name: Store Wholesale Cost
+    description: An item Wholesale cost to the store
+    data_type: decimal
+    expression:
+      sql: sum(ss_wholesale_cost)
+
+  - type: measure
+    name: Store List Price
+    description: List price of items sold
+    data_type: decimal
+    expression:
+      sql: sum(ss_list_price)
+
+  - type: measure
+    name: Store Sales Price
+    description: Actual sales price of items sold
+    data_type: decimal
+    expression:
+      sql: sum(ss_sales_price)
+
+  - type: measure
+    name: Store Extended Discount Amount
+    description: Extended discount amount applied to sales
+    data_type: decimal
+    expression:
+      sql: sum(ss_ext_discount_amt)
+
+  - type: measure
+    name: Store Extended Sales Price
+    description: Extended sales price of items sold
+    data_type: decimal
+    expression:
+      sql: sum(ss_ext_sales_price)
+
+  - type: measure
+    name: Store Extended Wholesale Cost
+    description: Extended wholesale cost of items sold
+    data_type: decimal
+    expression:
+      sql: sum(ss_ext_wholesale_cost)
+
+  - type: measure
+    name: Store Extended List Price
+    description: Extended list price of items sold
+    data_type: decimal
+    expression:
+      sql: sum(ss_ext_list_price)
+
+  - type: measure
+    name: Store Extended Tax
+    description: Extended tax amount on sales
+    data_type: decimal
+    expression:
+      sql: sum(ss_ext_tax)
+
+  - type: measure
+    name: Store Coupon Amount
+    description: Coupon amount applied to sales
+    data_type: decimal
+    expression:
+      sql: sum(ss_coupon_amt)
+
+  - type: measure
+    name: Store Net Paid
+    description: Net amount paid for sales
+    data_type: decimal
+    expression:
+      sql: sum(ss_net_paid)
+
+  - type: measure
+    name: Store Net Paid Including Tax
+    description: Net amount paid including tax
+    data_type: decimal
+    expression:
+      sql: sum(ss_net_paid_inc_tax)
+
+  - type: measure
+    name: Store Net Profit
+    tags: ["secure-cat"]
+    description: Net profit from sales
+    data_type: decimal
+    expression:
+      sql: sum(ss_net_profit)
+
+  - type: measure
+    name: Sales Throughput
+    description: Rate at which inventory is turned over
+    data_type: decimal
+    expression: "[Store Quantity] / [Inventory Quantity On Hand] * 1.0"
+
+  - type: measure
+    name: Store Net Including Returns 
+    description: Net amount paid for sales minus return amount
+    data_type: decimal
+    expression: "[Store Net Paid] - [Store Return Amount]"

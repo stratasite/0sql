@@ -1,0 +1,65 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Catalog Page
+
+# The actual table no the target datasource
+physical_name: catalog_page
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Catalog Page ID
+    description: Business key for catalog page
+    data_type: string
+    expression:
+      lookup: true
+      sql: cp_catalog_page_id
+
+  - type: dimension
+    name: Catalog Page Department
+    description: Department of the catalog page
+    data_type: string
+    expression:
+      lookup: true
+      sql: cp_department
+
+  - type: dimension
+    name: Catalog Number
+    description: Catalog number
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cp_catalog_number
+
+  - type: dimension
+    name: Catalog Page Number
+    description: Page number in catalog
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cp_catalog_page_number
+
+  - type: dimension
+    name: Catalog Page Description
+    description: Description of catalog page
+    data_type: string
+    expression:
+      lookup: true
+      sql: cp_description
+
+  - type: dimension
+    name: Catalog Page Type
+    description: Type of catalog page
+    data_type: string
+    expression:
+      lookup: true
+      sql: cp_type

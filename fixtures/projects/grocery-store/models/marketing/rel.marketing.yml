@@ -1,0 +1,74 @@
+datasource: complete_journey
+
+# Campaign exposure (factless fact) to dimensions
+
+campaign_received_household:
+  left: Campaign Received
+  right: Household
+  sql: left.household_key = right.household_key
+  cardinality: many_to_one
+
+campaign_received_campaign:
+  left: Campaign Received
+  right: Campaign
+  sql: left.CAMPAIGN = right.CAMPAIGN
+  cardinality: many_to_one
+
+# Coupon redemption events to dimensions.
+# Campaign is intentionally reached via Coupon -> Campaign (single path).
+
+coupon_redemption_household:
+  left: Coupon Redemption
+  right: Household
+  sql: left.household_key = right.household_key
+  cardinality: many_to_one
+
+coupon_redemption_coupon:
+  left: Coupon Redemption
+  right: Coupon
+  sql: left.COUPON_UPC = right.COUPON_UPC
+  cardinality: many_to_one
+
+coupon_redemption_date:
+  left: Coupon Redemption
+  right: Date
+  sql: left.DAY = right.Day_Idx
+  cardinality: many_to_one
+
+# Coupon to its campaign
+
+coupon_campaign:
+  left: Coupon
+  right: Campaign
+  sql: left.CAMPAIGN = right.CAMPAIGN
+  cardinality: many_to_one
+
+# Coupon <-> Product many-to-many resolved through the junction table.
+#
+# This bridge is only traversable FROM Coupon (or Coupon Product) toward
+# Product. Redemption measures must not cross it: Coupon Redemption -> Coupon
+# -> Coupon Product is a one_to_many away from the fact and multiplies each
+# redemption by the coupon's eligible-product count. See the header of
+# tbl.coupon_redemption.yml for what to use instead.
+
+coupon_coupon_product:
+  left: Coupon
+  right: Coupon Product
+  sql: left.COUPON_UPC = right.COUPON_UPC
+  cardinality: one_to_many
+
+coupon_product_product:
+  left: Coupon Product
+  right: Product
+  sql: left.PRODUCT_ID = right.PRODUCT_ID
+  cardinality: many_to_one
+
+# Campaign to its start-day calendar (role-playing dim_date). Gives campaign
+# exposure measures a time axis they cannot get from fact_campaign_received,
+# which stores no date. All hops from Campaign Received stay many_to_one.
+
+campaign_campaign_start_date:
+  left: Campaign
+  right: Campaign Start Date
+  sql: left.START_DAY = right.Day_Idx
+  cardinality: many_to_one

@@ -1,0 +1,81 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Returning Customer Demographics
+
+# The actual table no the target datasource
+physical_name: customer_demographics
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Returning Customer Gender
+    description: Customer gender
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_gender
+
+  - type: dimension
+    name: Returning Customer Marital Status
+    description: Customer marital status
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_marital_status
+
+  - type: dimension
+    name: Returning Customer Education Status
+    description: Customer education level
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_education_status
+
+  - type: dimension
+    name: Returning Customer Purchase Estimate
+    description: Estimated purchase amount
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_purchase_estimate
+
+  - type: dimension
+    name: Returning Customer Credit Rating
+    description: Customer credit rating
+    data_type: string
+    expression:
+      lookup: true
+      sql: cd_credit_rating
+
+  - type: dimension
+    name: Returning Customer Dependent Count
+    description: Number of dependents
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_count
+
+  - type: dimension
+    name: Returning Customer Employed Dependent Count
+    description: Number of employed dependents
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_employed_count
+
+  - type: dimension
+    name: Returning Customer College Dependent Count
+    description: Number of dependents in college
+    data_type: integer
+    expression:
+      lookup: true
+      sql: cd_dep_college_count

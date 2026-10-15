@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    static TABLE: RefCell<BTreeMap<&'static str, (Duration, u64)>> = RefCell::new(BTreeMap::new());
+    static TABLE: RefCell<BTreeMap<&'static str, (Duration, u64)>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 pub fn enabled() -> bool {

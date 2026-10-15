@@ -1,0 +1,113 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Store Returns
+
+# The actual table no the target datasource
+physical_name: store_returns
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Fact tables should generally be higher cost.
+cost: 100
+
+# Uncomment and add relative paths to other files to import
+# fields that are common.  The imported fields can have
+# certain properties overwrritten by redefining them below
+# the import statement. Only fields under a "fields: " node
+# will be imported.
+# import:
+#   - ../common/common_dates.yml
+#   - ../common/geo_dimensions.yml
+
+# Uncomment and add partition logic to help the engine choose
+# alternative tables if this one can't answer the users questions.
+# Currently, partitioning by date range is the only type supported.
+# partitions:
+#   - dimension: Date # name of date field
+#     predicate: between
+#     filter_value: 24m # 24 months ago
+#     filter_value_end: 1d # yesterday
+
+fields:
+
+  - type: dimension
+    name: Store Return Ticket Number
+    description: Ticket number of the returned order
+    data_type: integer
+    expression:
+      primary_key: true
+      sql: sr_ticket_number
+
+  - type: measure
+    name: Store Return Quantity
+    description: Quantity of items returned to a store
+    data_type: integer
+    expression:
+      sql: sum(sr_return_quantity)
+
+  - type: measure
+    name: Store Return Amount
+    description: Total return amount
+    data_type: decimal
+    expression:
+      sql: sum(sr_return_amt)
+
+  - type: measure
+    name: Store Return Tax
+    description: Tax amount on returns
+    data_type: decimal
+    expression:
+      sql: sum(sr_return_tax)
+
+  - type: measure
+    name: Store Return Amount Including Tax
+    description: Return amount including tax
+    data_type: decimal
+    expression:
+      sql: sum(sr_return_amt_inc_tax)
+
+  - type: measure
+    name: Store Return Fee
+    description: Fee charged on returns
+    data_type: decimal
+    expression:
+      sql: sum(sr_fee)
+
+  - type: measure
+    name: Store Return Shipping Cost
+    description: Shipping cost for returns
+    data_type: decimal
+    expression:
+      sql: sum(sr_return_ship_cost)
+
+  - type: measure
+    name: Store Refunded Cash
+    description: Cash refunded to customer
+    data_type: decimal
+    expression:
+      sql: sum(sr_refunded_cash)
+
+  - type: measure
+    name: Store Reversed Charge
+    description: Charge reversed on credit card
+    data_type: decimal
+    expression:
+      sql: sum(sr_reversed_charge)
+
+  - type: measure
+    name: Store Credit
+    description: Store credit issued for returns
+    data_type: decimal
+    expression:
+      sql: sum(sr_store_credit)
+
+  - type: measure
+    name: Store Net Loss
+    description: Net loss from returns
+    data_type: decimal
+    expression:
+      sql: sum(sr_net_loss)

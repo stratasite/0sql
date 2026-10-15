@@ -1,0 +1,11 @@
+datasource: complete_journey
+
+# Weekly promotional state to product. Date is week-grain here, so the
+# time link to day-grain facts is handled by the "weeks" blend group
+# rather than a physical join.
+
+weekly_promotions_product:
+  left: Weekly Promotions
+  right: Product
+  sql: left.PRODUCT_ID = right.PRODUCT_ID
+  cardinality: many_to_one

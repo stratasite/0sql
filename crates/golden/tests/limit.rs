@@ -54,7 +54,11 @@ fn the_statement_carries_the_limit_only_through_sql_with_limit() {
     let query = lower(&Spec::from_value(case.spec.clone()).unwrap(), &universe, &base).unwrap();
     let plan = planner.plan_query(query, case.context.as_ref()).expect("the first golden case plans");
 
-    assert!(!plan.sql.trim_end().to_uppercase().ends_with("LIMIT 5000"), "the plan's own SQL must not carry the spec's limit:\n{}", plan.sql);
+    assert!(
+        !plan.sql.trim_end().to_uppercase().ends_with("LIMIT 5000"),
+        "the plan's own SQL must not carry the spec's limit:\n{}",
+        plan.sql
+    );
     assert_eq!(plan.sql_with_limit(None), plan.sql, "no limit leaves the statement alone");
     assert!(plan.sql_with_limit(Some(25)).trim_end().ends_with("\nLIMIT 25"), "a limit is appended as its own clause");
 }

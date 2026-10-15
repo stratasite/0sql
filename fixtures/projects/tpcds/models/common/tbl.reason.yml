@@ -1,0 +1,33 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Reason
+
+# The actual table no the target datasource
+physical_name: reason
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Reason ID
+    description: Business key for reason
+    data_type: string
+    expression:
+      lookup: true
+      sql: r_reason_id
+
+  - type: dimension
+    name: Reason Description
+    description: Description of the reason
+    data_type: string
+    expression:
+      lookup: true
+      sql: r_reason_desc

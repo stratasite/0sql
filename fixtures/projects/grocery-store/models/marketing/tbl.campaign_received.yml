@@ -1,0 +1,56 @@
+# Factless fact: one row per (household, campaign) the household received.
+# 1,584 of 2,500 households received at least one campaign.
+#
+# The physical table has exactly two columns: household_key and campaign.
+# There is no exposure date and no product, so these measures can never group
+# by the transaction-grain "Date" dimension or by any Product attribute.
+#
+# For a time axis, group by campaign-level time instead:
+#   - "Campaign Start Week" (Campaign) - in the "weeks" blend group, so it
+#     shares an axis with Transactions, Coupon Redemption, and Weekly
+#     Promotions measures in the same query.
+#   - "Campaign Start Date" and its month/quarter/year fields (Campaign Start
+#     Date, a role-playing view of dim_date) - campaign-start calendar.
+# Both attribute a campaign to when it STARTED; the data does not record when
+# a household was actually exposed.
+name: Campaign Received
+physical_name: fact_campaign_received
+datasource: complete_journey
+cost: 50
+
+fields:
+
+  - type: measure
+    name: Campaign Receipts
+    description: Number of household-campaign exposures
+    data_type: integer
+    expression:
+      sql: count(*)
+
+  - type: measure
+    name: Households Reached
+    description: Number of distinct households that received a campaign
+    data_type: integer
+    synonyms:
+      - campaign reach
+    expression:
+      sql: count(distinct household_key)
+
+  # Funnel compounds hosted here so campaign exposure defines their
+  # dimensionality; redemption measures blend in via shared dimensions.
+  - type: measure
+    name: Redeemer Conversion
+    description: Share of households reached by a campaign that redeemed a coupon
+    data_type: decimal
+    format: percent:2
+    synonyms:
+      - campaign conversion rate
+    expression:
+      sql: "[Redeeming Households] / [Households Reached]"
+
+  - type: measure
+    name: Redemptions per Exposure
+    description: Coupon redemption events per household-campaign exposure
+    data_type: decimal
+    expression:
+      sql: "[Coupon Redemptions] / [Campaign Receipts]"

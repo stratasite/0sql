@@ -13,12 +13,17 @@ use crate::{PlanError, Result};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use std::collections::HashSet;
 use std::rc::Rc;
-use zsql_spec::{Decorator, DecoratorKind};
 use zsql_semantic::{Field, Predicate, Universe};
+use zsql_spec::{Decorator, DecoratorKind};
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
     let node = graph.root();
-    let measures: Vec<Projected<'a>> = graph.nodes[node].projections.iter().filter(|p| p.decorators().iter().any(|d| d.kind == DecoratorKind::Temporalize)).cloned().collect();
+    let measures: Vec<Projected<'a>> = graph.nodes[node]
+        .projections
+        .iter()
+        .filter(|p| p.decorators().iter().any(|d| d.kind == DecoratorKind::Temporalize))
+        .cloned()
+        .collect();
     if measures.is_empty() {
         return Ok(());
     }
@@ -124,7 +129,14 @@ fn process_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQ
     Ok(())
 }
 
-fn update_transformed_fields<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, calc: &Rc<RProjection<'a>>, sql: &str, t: &Decorator) -> Result<String> {
+fn update_transformed_fields<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    calc: &Rc<RProjection<'a>>,
+    sql: &str,
+    t: &Decorator,
+) -> Result<String> {
     let mut out = sql.to_string();
     for m in calc.field_refs.iter().filter(|f| f.is_measure()) {
         let tf = transformed_calculation(graph, universe, q, m, t, None, None)?;
@@ -134,7 +146,16 @@ fn update_transformed_fields<'a>(graph: &mut Graph<'a>, universe: &'a Universe, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_transformed_projection_refs<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, sql: &str, alias: &str, merge: NodeId, t: &Decorator, parent: &Rc<RProjection<'a>>) -> Result<String> {
+fn update_transformed_projection_refs<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    sql: &str,
+    alias: &str,
+    merge: NodeId,
+    t: &Decorator,
+    parent: &Rc<RProjection<'a>>,
+) -> Result<String> {
     let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(alias)).cloned() else { return Ok(sql.to_string()) };
     let mut out = sql.to_string();
     if !pj.is_calculation() && pj.is_measure() && pj.proj.pid != parent.pid {
@@ -153,7 +174,15 @@ fn update_transformed_projection_refs<'a>(graph: &mut Graph<'a>, universe: &'a U
 /// A calculation's formula with every measure it stands on, directly or
 /// through aliases, replaced by the comparison-period static. `seen` guards
 /// alias cycles.
-fn transformed_formula<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, calc: &Rc<RProjection<'a>>, merge: NodeId, t: &Decorator, seen: &mut Vec<usize>) -> Result<String> {
+fn transformed_formula<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    calc: &Rc<RProjection<'a>>,
+    merge: NodeId,
+    t: &Decorator,
+    seen: &mut Vec<usize>,
+) -> Result<String> {
     let original = calc.def.sql.clone().unwrap_or_default();
     let mut out = update_transformed_fields(graph, universe, q, calc, &original, t)?;
     for r in calc.def.projection_refs.clone() {
@@ -173,7 +202,14 @@ fn transformed_formula<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQ
     Ok(out)
 }
 
-fn process_compound<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, mp: &Projected<'a>, merge: NodeId, exp: &'a zsql_semantic::Expression) -> Result<()> {
+fn process_compound<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    mp: &Projected<'a>,
+    merge: NodeId,
+    exp: &'a zsql_semantic::Expression,
+) -> Result<()> {
     let t = temporalizer(mp);
     let mut original = exp.sql.clone().unwrap_or_default();
     let refs: Vec<&Field> = exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()).filter_map(|i| universe.field(*i)).collect();
@@ -221,7 +257,13 @@ fn transformed_calculation<'a>(
         Some(p) => p.proj.clone(),
         None => {
             let c = (*q.static_calc(universe, &alias, &format!("[{}]@m", measure.name))).clone_shallow();
-            c.set_source(graph.nodes[agg].projections.iter().find(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).map(|p| p.proj.clone()));
+            c.set_source(
+                graph.nodes[agg]
+                    .projections
+                    .iter()
+                    .find(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false))
+                    .map(|p| p.proj.clone()),
+            );
             let c = Rc::new(c);
             graph.nodes[transformed].add_projection(c.clone());
             c
@@ -234,11 +276,17 @@ fn transformed_calculation<'a>(
         if let Some(mp) = mp {
             graph.nodes[agg].delete_projection(mp.proj.pid);
         }
-        let plain_left = graph.nodes[agg].projections.iter().any(|p| !p.is_calculation() && p.field().map(|f| f.id == measure.id).unwrap_or(false));
+        let plain_left =
+            graph.nodes[agg].projections.iter().any(|p| !p.is_calculation() && p.field().map(|f| f.id == measure.id).unwrap_or(false));
         if !plain_left {
             let root = graph.root();
             let agg_fids: Vec<usize> = graph.nodes[agg].filters.iter().map(|f| f.fid()).collect();
-            let doomed: Vec<usize> = graph.nodes[root].filters.iter().filter(|f| f.is_measure() && f.field().id == measure.id && agg_fids.contains(&f.fid())).map(|f| f.fid()).collect();
+            let doomed: Vec<usize> = graph.nodes[root]
+                .filters
+                .iter()
+                .filter(|f| f.is_measure() && f.field().id == measure.id && agg_fids.contains(&f.fid()))
+                .map(|f| f.fid())
+                .collect();
             for fid in doomed {
                 graph.nodes[root].delete_filter(fid);
             }
@@ -250,7 +298,14 @@ fn transformed_calculation<'a>(
     Ok(calc)
 }
 
-fn find_or_create_transformed_node<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field, t: &Decorator, agg: NodeId) -> Result<NodeId> {
+fn find_or_create_transformed_node<'a>(
+    graph: &mut Graph<'a>,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+    t: &Decorator,
+    agg: NodeId,
+) -> Result<NodeId> {
     let transform = t.str("transform").unwrap_or("").to_string();
     let agg_dims: HashSet<String> = graph.nodes[agg].projections.iter().filter(|p| p.is_dimension()).map(grain_key).collect();
     let signature = crate::visitors::segmentation::node_signature(&graph.nodes[agg]);
@@ -269,7 +324,8 @@ fn find_or_create_transformed_node<'a>(graph: &mut Graph<'a>, universe: &'a Univ
     if let Some(n) = found {
         return Ok(n);
     }
-    let projections: Vec<Rc<RProjection<'a>>> = graph.nodes[agg].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
+    let projections: Vec<Rc<RProjection<'a>>> =
+        graph.nodes[agg].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
     let mut filters: Vec<Filtered<'a>> = graph.nodes[agg].filters.iter().filter(|f| !f.is_date()).cloned().collect();
     // Date filters will be shifted, so they get uncoupled copies.
     filters.extend(graph.nodes[agg].filters.iter().filter(|f| f.is_date()).map(|f| Filtered::new(f.filter.clone())));
@@ -299,7 +355,8 @@ fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorat
     let base_sql = graph.dialect.date_add(&u, 1, "@expression")?;
     let grain = projected_grain(q);
     for p in graph.nodes[id].projections.iter_mut().filter(|p| p.field().map(|f| f.is_date()).unwrap_or(false)) {
-        let extract = p.proj.def.decorators.iter().find(|d| d.kind == DecoratorKind::Extract).and_then(|d| d.str("extract").map(str::to_string));
+        let extract =
+            p.proj.def.decorators.iter().find(|d| d.kind == DecoratorKind::Extract).and_then(|d| d.str("extract").map(str::to_string));
         let sql = match extract.as_deref() {
             Some("year") => Some("@expression + 1".to_string()),
             Some("year_month") if u == "year" => Some("@expression + 100".to_string()),

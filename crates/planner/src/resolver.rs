@@ -11,7 +11,7 @@ use std::sync::Arc;
 use zsql_dialect::Dialects;
 use zsql_semantic::{Field, FieldKind, Id, Universe};
 
-fn uniq_fields<'a>(fields: Vec<&'a Field>) -> Vec<&'a Field> {
+fn uniq_fields(fields: Vec<&Field>) -> Vec<&Field> {
     let mut out: Vec<&Field> = Vec::new();
     for f in fields {
         if !out.iter().any(|o| o.id == f.id) {
@@ -74,12 +74,7 @@ impl<'a> Default for Options<'a> {
     }
 }
 
-pub fn resolve<'a>(
-    universe: &'a Universe,
-    universes: &Universes<'a>,
-    dialects: &Dialects,
-    q: &RQuery<'a>,
-) -> Result<Graph<'a>> {
+pub fn resolve<'a>(universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<Graph<'a>> {
     resolve_with(universe, universes, dialects, q, &Options::default())
 }
 
@@ -97,7 +92,8 @@ pub fn resolve_with<'a>(
             let without = Options { segment_keys: false, ..opts.clone() };
             match resolve_inner(universe, universes, dialects, q, &without, &[]) {
                 Ok(_) => {
-                    let names: Vec<String> = q.query_level_links().iter().filter_map(|(sid, _)| q.segment(*sid)).map(|s| s.name()).collect();
+                    let names: Vec<String> =
+                        q.query_level_links().iter().filter_map(|(sid, _)| q.segment(*sid)).map(|s| s.name()).collect();
                     let keys: Vec<String> = segment_keys.iter().map(|k| k.name.clone()).collect();
                     Err(PlanError::Resolution(format!(
                         "Segment {} cannot be applied to the query \"{}\": key dimension {} is not reachable together with the query's fields. Apply the segment to specific measures instead, or re-key it on a dimension every field can reach.",
@@ -174,9 +170,7 @@ fn resolve_inner<'a>(
     };
 
     let datasource = chosen[0].datasource;
-    let dialect = dialects
-        .get(&datasource.adapter)?
-        .with_overrides(q.def.db_settings.iter().map(|(k, v)| (k.as_str(), v)));
+    let dialect = dialects.get(&datasource.adapter)?.with_overrides(q.def.db_settings.iter().map(|(k, v)| (k.as_str(), v)));
     let mut graph = Graph::new(datasource, dialect);
 
     if chosen.len() == 1 && !calculations_depend_on_measures(q) {
@@ -226,15 +220,10 @@ fn resolve_inner<'a>(
 
             // Materialize every field the merge-level calculations reference
             // that this universe resolves, so the merge reads it as a column.
-            let merge_calcs: Vec<&Rc<RProjection<'a>>> = q
-                .projections
-                .iter()
-                .filter(|p| p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid))
-                .collect();
-            let ref_uids: Vec<&str> = merge_calcs
-                .iter()
-                .flat_map(|c| c.def.measure_refs.iter().chain(c.def.dimension_refs.iter()).map(String::as_str))
-                .collect();
+            let merge_calcs: Vec<&Rc<RProjection<'a>>> =
+                q.projections.iter().filter(|p| p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid)).collect();
+            let ref_uids: Vec<&str> =
+                merge_calcs.iter().flat_map(|c| c.def.measure_refs.iter().chain(c.def.dimension_refs.iter()).map(String::as_str)).collect();
             let calc_measures = calculation_fields(universe, q, FieldKind::Measure);
             let calc_dimensions = calculation_fields(universe, q, FieldKind::Dimension);
             for f in calc_measures.iter().chain(calc_dimensions.iter()) {
@@ -289,9 +278,10 @@ fn pushable<'a>(c: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> bool {
     if !c.is_calculation() || !c.is_dimension() || c.measure_dependent(&q.projections) {
         return false;
     }
-    c.def.projection_refs.iter().all(|r| {
-        q.projections.iter().find(|p| p.match_alias(r)).map(|t| !t.is_calculation() && t.is_dimension()).unwrap_or(false)
-    })
+    c.def
+        .projection_refs
+        .iter()
+        .all(|r| q.projections.iter().find(|p| p.match_alias(r)).map(|t| !t.is_calculation() && t.is_dimension()).unwrap_or(false))
 }
 
 /// Rails `resolvable_in?`: the universe reaches every field the calculation reads.

@@ -3,9 +3,9 @@
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use regex::Regex;
+use std::sync::LazyLock;
 use zsql_dialect::Dialect;
 use zsql_semantic::Field;
-use std::sync::LazyLock;
 
 fn dynamic_re() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(\d{1,3})([hdwmqy])").unwrap());
@@ -49,7 +49,8 @@ pub fn dynamic_to_date(value: &str, is_ending: bool) -> Option<NaiveDateTime> {
         "m" => {
             let first = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap();
             if is_ending {
-                (shift_months(first.and_time(NaiveTime::MIN), 1).date() - Duration::days(1)).and_time(NaiveTime::from_hms_opt(23, 59, 59).unwrap())
+                (shift_months(first.and_time(NaiveTime::MIN), 1).date() - Duration::days(1))
+                    .and_time(NaiveTime::from_hms_opt(23, 59, 59).unwrap())
             } else {
                 first.and_time(NaiveTime::MIN)
             }
@@ -58,7 +59,8 @@ pub fn dynamic_to_date(value: &str, is_ending: bool) -> Option<NaiveDateTime> {
             let qm = (dt.month() - 1) / 3 * 3 + 1;
             let first = NaiveDate::from_ymd_opt(dt.year(), qm, 1).unwrap();
             if is_ending {
-                (shift_months(first.and_time(NaiveTime::MIN), 3).date() - Duration::days(1)).and_time(NaiveTime::from_hms_opt(23, 59, 59).unwrap())
+                (shift_months(first.and_time(NaiveTime::MIN), 3).date() - Duration::days(1))
+                    .and_time(NaiveTime::from_hms_opt(23, 59, 59).unwrap())
             } else {
                 first.and_time(NaiveTime::MIN)
             }

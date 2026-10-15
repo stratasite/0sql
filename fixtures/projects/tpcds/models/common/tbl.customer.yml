@@ -1,0 +1,114 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Customer
+
+# The actual table no the target datasource
+physical_name: customer
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Customer ID
+    description: Business key for customer
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_customer_id
+
+  - type: dimension
+    name: Customer Salutation
+    description: Customer salutation (Mr., Mrs., etc.)
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_salutation
+
+  - type: dimension
+    name: Customer First Name
+    description: Customer first name
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_first_name
+
+  - type: dimension
+    name: Customer Last Name
+    description: Customer last name
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_last_name
+
+  - type: dimension
+    name: Customer Preferred Flag
+    description: Preferred customer flag
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_preferred_cust_flag
+
+  - type: dimension
+    name: Customer Birth Day
+    description: Day of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_day
+
+  - type: dimension
+    name: Customer Birth Month
+    description: Month of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_month
+
+  - type: dimension
+    name: Customer Birth Year
+    description: Year of birth
+    data_type: integer
+    expression:
+      lookup: true
+      sql: c_birth_year
+
+  - type: dimension
+    name: Customer Birth Country
+    description: Country of birth
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_birth_country
+
+  - type: dimension
+    name: Customer Login
+    description: Customer login ID
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_login
+
+  - type: dimension
+    name: Customer Email Address
+    description: Customer email address
+    tags: ["pii"]
+    data_type: string
+    expression:
+      lookup: true
+      sql: c_email_address
+
+  - type: dimension
+    name: Customer Last Review Date
+    description: Date of last review
+    data_type: date
+    expression:
+      lookup: true
+      sql: c_last_review_date

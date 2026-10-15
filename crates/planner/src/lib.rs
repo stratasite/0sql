@@ -16,8 +16,8 @@ pub mod universe;
 pub mod visitors;
 
 use zsql_dialect::Dialects;
-use zsql_spec::SecurityContext;
 use zsql_semantic::Universe;
+use zsql_spec::SecurityContext;
 
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -224,7 +224,13 @@ impl<'a> Planner<'a> {
                 if measures.is_empty() {
                     bases.iter().any(|u| u.all_dimensions(&dim_ids) && u.has_field(f.id))
                 } else {
-                    ds_with_all.iter().any(|ds| msr_ids.iter().all(|m| bases.iter().any(|u| u.datasource.id == *ds && u.all_dimensions(&dim_ids) && u.has_measure(*m) && u.has_field(f.id))))
+                    ds_with_all.iter().any(|ds| {
+                        msr_ids.iter().all(|m| {
+                            bases
+                                .iter()
+                                .any(|u| u.datasource.id == *ds && u.all_dimensions(&dim_ids) && u.has_measure(*m) && u.has_field(f.id))
+                        })
+                    })
                 }
             })
             .collect();
@@ -306,7 +312,13 @@ fn run_plan<'a>(
     let sql = phase!("final_query", visitors::final_query::to_sql(&graph)?);
     let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
 
-    Ok(Plan { sql, datasource: graph.datasource.name.clone(), datasource_uid: graph.datasource.uid.clone(), adapter: graph.datasource.adapter.clone(), explain })
+    Ok(Plan {
+        sql,
+        datasource: graph.datasource.name.clone(),
+        datasource_uid: graph.datasource.uid.clone(),
+        adapter: graph.datasource.adapter.clone(),
+        explain,
+    })
 }
 
 fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
@@ -323,7 +335,7 @@ fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
                 root: n.is_root(),
                 table: base.map(|b| b.root.name.clone()),
                 datasource: base.map(|b| b.datasource.uid.clone()),
-                paths: n.subtrees.iter().map(|t| universe::Model::to_s(t)).collect(),
+                paths: n.subtrees.iter().map(universe::Model::to_s).collect(),
                 purpose: n.purpose,
                 transform: n.transform.clone(),
                 segment: n.owner.is_some(),
@@ -334,7 +346,11 @@ fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
                 join_type: if n.is_merge() { n.join_type.clone() } else { String::new() },
                 group_by: n.should_group_by.unwrap_or(false),
                 security_filters: n.security_filters.iter().map(|(f, allowed)| security_to_s(f, allowed)).collect(),
-                security_masks: n.security_masks.iter().map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_to_s(f, allowed))).collect(),
+                security_masks: n
+                    .security_masks
+                    .iter()
+                    .map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_to_s(f, allowed)))
+                    .collect(),
                 identity: n.to_s(graph),
             }
         })

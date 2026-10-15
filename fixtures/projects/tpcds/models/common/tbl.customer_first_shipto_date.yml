@@ -1,0 +1,113 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Customer First Ship To Date
+
+# The actual table no the target datasource
+physical_name: date_dim
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Customer First Ship To Date ID
+    description: Business key for customer first ship to date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_date_id
+
+  - type: dimension
+    name: Customer First Ship To Date
+    description: Date of customer's first ship to
+    data_type: date
+    expression:
+      lookup: true
+      sql: d_date
+
+  - type: dimension
+    name: Customer First Ship To Month Sequence
+    description: Sequential month number for customer first ship to
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_month_seq
+
+  - type: dimension
+    name: Customer First Ship To Week Sequence
+    description: Sequential week number for customer first ship to
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_week_seq
+
+  - type: dimension
+    name: Customer First Ship To Quarter Sequence
+    description: Sequential quarter number for customer first ship to
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_quarter_seq
+
+  - type: dimension
+    name: Customer First Ship To Year
+    description: Year of customer's first ship to
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_year
+
+  - type: dimension
+    name: Customer First Ship To Day of Week
+    description: Day of week for customer first ship to (0-6)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dow
+
+  - type: dimension
+    name: Customer First Ship To Month of Year
+    description: Month of year for customer first ship to (1-12)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_moy
+
+  - type: dimension
+    name: Customer First Ship To Day of Month
+    description: Day of month for customer first ship to (1-31)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dom
+
+  - type: dimension
+    name: Customer First Ship To Quarter of Year
+    description: Quarter of year for customer first ship to (1-4)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_qoy
+
+  - type: dimension
+    name: Customer First Ship To Day Name
+    description: Name of the day for customer first ship to
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_day_name
+
+  - type: dimension
+    name: Customer First Ship To Quarter Name
+    description: Name of the quarter for customer first ship to
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_quarter_name

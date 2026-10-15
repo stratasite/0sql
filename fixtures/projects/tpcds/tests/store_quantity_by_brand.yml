@@ -1,0 +1,6 @@
+# A planner test: project these fields and compare the SQL.
+name: store quantity by item brand
+projections:
+  - Item Brand ID
+  - Store Quantity
+assert_regex: SELECT.*store_sales.*GROUP BY

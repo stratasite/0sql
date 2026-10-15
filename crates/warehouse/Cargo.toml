@@ -3,6 +3,7 @@ name = "zsql-warehouse"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Runs SQL against a project's datasources, for sampling dimension values"
 
 [dependencies]
@@ -10,3 +11,6 @@ thiserror.workspace = true
 serde_yaml.workspace = true
 duckdb = { version = "1", features = ["bundled"] }
 postgres = "0.19"
+
+[lints]
+workspace = true

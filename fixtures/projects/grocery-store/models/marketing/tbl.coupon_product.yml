@@ -1,0 +1,15 @@
+# Junction table resolving the many-to-many between coupons and the
+# products they apply to (Strata does not support many_to_many joins).
+name: Coupon Product
+physical_name: bridge_coupon_product
+datasource: complete_journey
+cost: 20
+
+fields:
+
+  - type: measure
+    name: Coupon Product Links
+    description: Number of coupon-to-product eligibility links
+    data_type: integer
+    expression:
+      sql: count(*)

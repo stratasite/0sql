@@ -1,0 +1,57 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Ship Mode
+
+# The actual table no the target datasource
+physical_name: ship_mode
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Ship Mode ID
+    description: Business key for ship mode
+    data_type: string
+    expression:
+      lookup: true
+      sql: sm_ship_mode_id
+
+  - type: dimension
+    name: Ship Mode Type
+    description: Type of shipping mode
+    data_type: string
+    expression:
+      lookup: true
+      sql: sm_type
+
+  - type: dimension
+    name: Ship Mode Code
+    description: Code for shipping mode
+    data_type: string
+    expression:
+      lookup: true
+      sql: sm_code
+
+  - type: dimension
+    name: Ship Mode Carrier
+    description: Carrier for shipping
+    data_type: string
+    expression:
+      lookup: true
+      sql: sm_carrier
+
+  - type: dimension
+    name: Ship Mode Contract
+    description: Contract for shipping
+    data_type: string
+    expression:
+      lookup: true
+      sql: sm_contract

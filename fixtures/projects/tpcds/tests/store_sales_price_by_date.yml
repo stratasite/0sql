@@ -1,0 +1,5 @@
+name: store sales price by date
+projections:
+  - Date
+  - Store Sales Price
+assert_regex: JOIN.*date_dim

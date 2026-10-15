@@ -4,9 +4,9 @@
 
 use crate::dag::{Entity, Graph, MultiExpr, NodeId, NodeKind, RefKey, Reference};
 use crate::model::{RProjection, RQuery};
-use std::rc::Rc;
 use crate::universe::Subtree;
 use crate::{PlanError, Result};
+use std::rc::Rc;
 use zsql_semantic::{Expression, Field, Universe};
 
 pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, _q: &RQuery<'a>) -> Result<()> {
@@ -36,7 +36,8 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
         graph.nodes[id].field_refs.insert(RefKey::Field(field.id), r);
     }
     // Calculations: a formula over the node's own fields and projections.
-    let calcs: Vec<Rc<RProjection<'a>>> = graph.nodes[id].projections.iter().filter(|p| p.is_calculation()).map(|p| p.proj.clone()).collect();
+    let calcs: Vec<Rc<RProjection<'a>>> =
+        graph.nodes[id].projections.iter().filter(|p| p.is_calculation()).map(|p| p.proj.clone()).collect();
     for calc in calcs {
         if graph.nodes[id].field_refs.contains_key(&RefKey::Proj(calc.pid)) {
             continue;
@@ -62,7 +63,8 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
 
 fn only_carried(graph: &Graph, id: NodeId, field: &Field) -> bool {
     let n = &graph.nodes[id];
-    let projs: Vec<_> = n.projections.iter().filter(|p| !p.is_calculation() && p.field().map(|f| f.id == field.id).unwrap_or(false)).collect();
+    let projs: Vec<_> =
+        n.projections.iter().filter(|p| !p.is_calculation() && p.field().map(|f| f.id == field.id).unwrap_or(false)).collect();
     !projs.is_empty() && projs.iter().all(|p| p.proj.is_carried()) && !n.filters.iter().any(|f| f.field().id == field.id)
 }
 
@@ -121,7 +123,11 @@ fn create_reference_within<'a>(
         universe.expression_for(path.target_table_id, field.id)
     };
     let exp = exp.ok_or_else(|| {
-        PlanError::Resolution(format!("Could not find expression for {} in the the target table {}.", crate::model::field_to_s(field), path.target_table_id))
+        PlanError::Resolution(format!(
+            "Could not find expression for {} in the the target table {}.",
+            crate::model::field_to_s(field),
+            path.target_table_id
+        ))
     })?;
     let table = universe.table(exp.table_id).expect("expression table");
     if !exp.dimension_ref_ids.is_empty() || !exp.measure_ref_ids.is_empty() {
@@ -133,7 +139,12 @@ fn create_reference_within<'a>(
 
 /// Rails `append_projection_references`: `[Alias]` references resolve to a
 /// projection of this node, or of an input when none here matches.
-fn append_projection_references<'a>(graph: &mut Graph<'a>, id: NodeId, calc: &Rc<RProjection<'a>>, sources: &mut Vec<Reference<'a>>) -> Result<()> {
+fn append_projection_references<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    calc: &Rc<RProjection<'a>>,
+    sources: &mut Vec<Reference<'a>>,
+) -> Result<()> {
     for alias in calc.def.projection_refs.clone() {
         let local = graph.nodes[id].projections.iter().find(|p| p.proj.match_alias(&alias)).map(|p| p.proj.clone());
         let local = local.filter(|p| p.pid != calc.pid);
@@ -244,12 +255,8 @@ fn create_greedy_filter_ref<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a
         }
     }
     table_ids.retain(|t| *t != ref_table_id);
-    let extra: Vec<&'a Expression> = universe
-        .snapshot()
-        .expressions
-        .iter()
-        .filter(|e| e.field_id == field.id && table_ids.contains(&e.table_id))
-        .collect();
+    let extra: Vec<&'a Expression> =
+        universe.snapshot().expressions.iter().filter(|e| e.field_id == field.id && table_ids.contains(&e.table_id)).collect();
     if let Some(Reference::Table { greedy, .. }) = graph.nodes[id].field_refs.get_mut(&RefKey::Field(field.id)) {
         for e in extra {
             if !greedy.iter().any(|g| g.id == e.id) {
@@ -285,7 +292,8 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
 
     // Unconstrained copies bind first, so the field-keyed fallback always
     // belongs to an unsegmented copy when one exists.
-    let (plain, constrained): (Vec<_>, Vec<_>) = projections.into_iter().partition(|p| !(p.is_measure() && !crate::visitors::segmentation::component_links(p).is_empty()));
+    let (plain, constrained): (Vec<_>, Vec<_>) =
+        projections.into_iter().partition(|p| !(p.is_measure() && !crate::visitors::segmentation::component_links(p).is_empty()));
     let projections: Vec<_> = plain.into_iter().chain(constrained).collect();
     for p in projections {
         build_out_multi_source_reference(graph, id, universe, RefKey::Proj(p.pid))?;
@@ -336,7 +344,10 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
         if graph.nodes[id].field_refs.contains_key(&RefKey::Field(f.field.id)) {
             continue;
         }
-        let source = inputs.iter().copied().find(|i| graph.nodes[*i].projections.iter().any(|p| p.field().map(|x| x.id == f.field.id).unwrap_or(false)));
+        let source = inputs
+            .iter()
+            .copied()
+            .find(|i| graph.nodes[*i].projections.iter().any(|p| p.field().map(|x| x.id == f.field.id).unwrap_or(false)));
         let Some(source) = source else {
             return Err(PlanError::Resolution(format!(
                 "The filter on {} cannot be applied at the final pass: no input outputs that column. Filter a projected copy of the field, or remove the filter.",

@@ -1,0 +1,82 @@
+# This is the display name and primary name used
+# in strata to access this table.
+name: Catalog Ship Date
+
+# The actual table no the target datasource
+physical_name: date_dim
+
+# The datasource this table belongs to. It should match
+# an existing datasource node in datasources.yml
+datasource: tpcds
+
+# Cost number influences how the table is preferentially
+# selected if multiple tables can answer the same question.
+# Dimension tables should generally be lower cost.
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Catalog Ship Date ID
+    description: Business key for catalog ship date
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_date_id
+
+  - type: dimension
+    name: Catalog Ship Date
+    description: Date when catalog order was shipped
+    data_type: date
+    extended_blend_group: common_dates
+    expression:
+      lookup: true
+      sql: d_date
+
+  - type: dimension
+    name: Catalog Ship Year
+    description: Year of catalog ship date
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_year
+
+  - type: dimension
+    name: Catalog Ship Month of Year
+    description: Month of year for catalog ship (1-12)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_moy
+
+  - type: dimension
+    name: Catalog Ship Day of Month
+    description: Day of month for catalog ship (1-31)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_dom
+
+  - type: dimension
+    name: Catalog Ship Quarter of Year
+    description: Quarter of year for catalog ship (1-4)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: d_qoy
+
+  - type: dimension
+    name: Catalog Ship Day Name
+    description: Name of the day for catalog ship
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_day_name
+
+  - type: dimension
+    name: Catalog Ship Quarter Name
+    description: Name of the quarter for catalog ship
+    data_type: string
+    expression:
+      lookup: true
+      sql: d_quarter_name

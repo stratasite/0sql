@@ -1,0 +1,105 @@
+# Synthetic calendar for the Complete Journey dataset.
+# The raw data has no real dates - only day indexes 1..711.
+# AnchorDate anchors Day 1 to 2020-01-01 for cosmetic calendar use.
+name: Date
+physical_name: dim_date
+datasource: complete_journey
+cost: 10
+
+fields:
+
+  - type: dimension
+    name: Day Index
+    description: Sequential day number from start of observation (1-711)
+    data_type: integer
+    expression:
+      primary_key: true
+      lookup: true
+      sql: Day_Idx
+
+  - type: dimension
+    name: Date
+    description: Synthetic calendar date (Day 1 anchored to 2020-01-01). The dataset has no real-world dates.
+    data_type: date
+    grains:
+      - day
+      - week
+      - month
+      - quarter
+      - year
+    expression:
+      lookup: true
+      sql: CAST(AnchorDate AS DATE)
+
+  - type: dimension
+    name: Week Number
+    description: Sequential week number from start of observation (1-102)
+    data_type: integer
+    extended_blend_group: weeks
+    expression:
+      lookup: true
+      sql: Week_No
+
+  - type: dimension
+    name: Month Index
+    description: Sequential month number from start of observation (1-24)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Month_Idx
+
+  - type: dimension
+    name: Quarter Index
+    description: Sequential quarter number from start of observation
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Quarter_Idx
+
+  - type: dimension
+    name: Half Index
+    description: Sequential half-year number from start of observation
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Half_Idx
+
+  - type: dimension
+    name: Year Index
+    description: Observation year (1 or 2)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: Year_Idx
+
+  - type: dimension
+    name: Day of Week
+    description: Day of week number (1-7)
+    data_type: integer
+    expression:
+      lookup: true
+      sql: DayOfWeek
+
+  - type: dimension
+    name: Year Month
+    description: Synthetic year-month label (e.g. 2020-01)
+    data_type: string
+    expression:
+      lookup: true
+      sql: YearMonth
+
+  - type: dimension
+    name: Year Label
+    description: Observation year label (Y1, Y2)
+    data_type: string
+    expression:
+      lookup: true
+      sql: YearLabel
+
+  - type: dimension
+    name: Week Label
+    description: Observation week label (W001-W102)
+    data_type: string
+    expression:
+      lookup: true
+      sql: WeekLabel

@@ -1926,9 +1926,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-accounts"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "argon2",
  "hex",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-cli"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3040,25 +3040,22 @@ dependencies = [
  "serde_yaml",
  "tar",
  "ureq",
+ "zsql-dialect",
+ "zsql-service",
  "zsql-shorthand",
+ "zsql-spec",
  "zsql-warehouse",
 ]
 
 [[package]]
 name = "zsql-devtool"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "flate2",
  "libc",
- "regex",
- "rustyline",
  "serde_json",
- "serde_yaml",
- "tar",
- "ureq",
  "zsql-dialect",
  "zsql-formation",
  "zsql-golden",
@@ -3066,12 +3063,11 @@ dependencies = [
  "zsql-project",
  "zsql-semantic",
  "zsql-spec",
- "zsql-warehouse",
 ]
 
 [[package]]
 name = "zsql-dialect"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde_json",
  "serde_yaml",
@@ -3080,14 +3076,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-formation"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "zsql-semantic",
 ]
 
 [[package]]
 name = "zsql-golden"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -3102,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-planner"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "md5",
@@ -3117,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-project"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "serde",
@@ -3133,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-semantic"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "serde",
@@ -3143,14 +3139,13 @@ dependencies = [
 
 [[package]]
 name = "zsql-server"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
  "flate2",
  "http-body-util",
  "regex",
- "self_cell",
  "serde",
  "serde_json",
  "tar",
@@ -3158,6 +3153,24 @@ dependencies = [
  "tower",
  "zsql-accounts",
  "zsql-dialect",
+ "zsql-semantic",
+ "zsql-service",
+ "zsql-shorthand",
+ "zsql-spec",
+]
+
+[[package]]
+name = "zsql-service"
+version = "0.6.0"
+dependencies = [
+ "flate2",
+ "regex",
+ "self_cell",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zsql-dialect",
+ "zsql-golden",
  "zsql-planner",
  "zsql-project",
  "zsql-semantic",
@@ -3167,14 +3180,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-shorthand"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "zsql-spec"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "regex",
  "serde",
@@ -3186,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-warehouse"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "duckdb",
  "postgres",

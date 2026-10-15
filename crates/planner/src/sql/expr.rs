@@ -2,9 +2,9 @@
 //! table alias, and substituting `[Entity]@m` references.
 
 use regex::Regex;
-use zsql_dialect::Dialect;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use zsql_dialect::Dialect;
 
 pub use zsql_spec::expr::{literal_pattern, quote_pair};
 
@@ -93,7 +93,7 @@ pub fn entity_gsub(sql: &str, entity_name: &str, replacement: &str) -> String {
             out.push_str(replacement);
             let mut after = close + 1;
             // An optional `@m`/`@d` suffix belongs to the reference.
-            let tail = rest[after..].as_bytes();
+            let tail = &rest.as_bytes()[after..];
             if tail.len() >= 2 && tail[0] == b'@' && matches!(tail[1], b'm' | b'd' | b'M' | b'D') {
                 after += 2;
             }
@@ -147,5 +147,4 @@ mod tests {
         let d = zsql_dialect::Dialects::builtin().get("mysql").unwrap();
         assert_eq!(column_gsub("`date` || \"date\"", "date", &d, "T0"), "T0.`date` || \"date\"");
     }
-
 }

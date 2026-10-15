@@ -3,6 +3,7 @@ name = "zsql-accounts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Accounts, users, keys and project access for zsqld"
 
 [dependencies]
@@ -14,3 +15,6 @@ sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
 argon2 = { version = "0.5", features = ["std"] }
+
+[lints]
+workspace = true

@@ -36,7 +36,12 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
         return Ok(());
     }
 
-    let measure_projections: Vec<_> = graph.nodes[id].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).map(|p| p.proj.clone()).collect();
+    let measure_projections: Vec<_> = graph.nodes[id]
+        .projections
+        .iter()
+        .filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false))
+        .map(|p| p.proj.clone())
+        .collect();
     let mut merge = graph.root();
     let base = graph.nodes[id].universe.clone().expect("agg universe");
     let mut projections = measure_projections.clone();
@@ -66,7 +71,13 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
 
 /// Rails `get_allowed_components`: the dimensions and filters the measure
 /// may aggregate with, per its rules. Sets keep first-insertion order.
-fn allowed_components<'a>(graph: &Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field) -> Result<(Vec<Projected<'a>>, Vec<Filtered<'a>>)> {
+fn allowed_components<'a>(
+    graph: &Graph<'a>,
+    id: NodeId,
+    universe: &'a Universe,
+    q: &RQuery<'a>,
+    measure: &'a Field,
+) -> Result<(Vec<Projected<'a>>, Vec<Filtered<'a>>)> {
     let node = &graph.nodes[id];
     let mut projections: Vec<Projected<'a>> = Vec::new();
     let mut filters: Vec<Filtered<'a>> = node.filters.iter().filter(|f| f.is_measure()).cloned().collect();

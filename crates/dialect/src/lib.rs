@@ -173,7 +173,11 @@ impl Dialect {
 
     /// Rails `date_add`; Postgres spells a quarter as three months.
     pub fn date_add(&self, unit: &str, val: i64, exp: &str) -> Result<String, DialectError> {
-        let (unit, val) = if self.name == "postgres" && unit.trim().to_lowercase() == "quarter" { ("months".to_string(), val * 3) } else { (unit.to_string(), val) };
+        let (unit, val) = if self.name == "postgres" && unit.trim().to_lowercase() == "quarter" {
+            ("months".to_string(), val * 3)
+        } else {
+            (unit.to_string(), val)
+        };
         self.render("date_add", &[("unit", &unit), ("val", &val.to_string()), ("exp", exp)])
     }
 
@@ -347,7 +351,11 @@ impl Dialects {
         let d = match &self.source {
             Source::Dir(dir) => Dialect::load(dir, adapter)?,
             Source::Builtin => {
-                let own = BUILTIN.iter().find(|(n, _)| *n == adapter).map(|(_, t)| *t).ok_or_else(|| DialectError::Unknown(adapter.to_string()))?;
+                let own = BUILTIN
+                    .iter()
+                    .find(|(n, _)| *n == adapter)
+                    .map(|(_, t)| *t)
+                    .ok_or_else(|| DialectError::Unknown(adapter.to_string()))?;
                 Dialect::from_texts(adapter, BUILTIN_BASE, own)?
             }
         };
@@ -452,7 +460,8 @@ mod tests {
 
     #[test]
     fn placeholders_are_greedy() {
-        let r = render_template("DATE_DIFF('@unit', @start_exp, @end_exp)", &[("unit", "day"), ("start_exp", "a"), ("end_exp", "b")]).unwrap();
+        let r =
+            render_template("DATE_DIFF('@unit', @start_exp, @end_exp)", &[("unit", "day"), ("start_exp", "a"), ("end_exp", "b")]).unwrap();
         assert_eq!(r, "DATE_DIFF('day', a, b)");
     }
 

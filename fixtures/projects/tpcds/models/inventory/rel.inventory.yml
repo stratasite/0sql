@@ -1,0 +1,27 @@
+# Required: The datasource these relationships are valid for.
+# The chosen tables will be scoped to those within this datasource.
+# Strata does not support cross datasource sqls
+datasource: tpcds
+
+# Define relationships for inventory fact table
+
+# Inventory to Date Dimension
+inventory_date:
+  left: Inventory
+  right: Date
+  sql: left.inv_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Inventory to Item Dimension
+inventory_item:
+  left: Inventory
+  right: Item
+  sql: left.inv_item_sk = right.i_item_sk
+  cardinality: many_to_one
+
+# Inventory to Warehouse Dimension
+inventory_warehouse:
+  left: Inventory
+  right: Warehouse
+  sql: left.inv_warehouse_sk = right.w_warehouse_sk
+  cardinality: many_to_one

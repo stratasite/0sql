@@ -3,6 +3,7 @@ name = "zsql-planner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Query planning: universe resolution, DAG visitors and SQL generation"
 
 [dependencies]
@@ -15,3 +16,6 @@ thiserror.workspace = true
 md5 = "0.7"
 regex = "1"
 chrono = "0.4"
+
+[lints]
+workspace = true

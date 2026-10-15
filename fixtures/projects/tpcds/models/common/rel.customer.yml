@@ -1,0 +1,48 @@
+# Required: The datasource these relationships are valid for.
+# The chosen tables will be scoped to those within this datasource.
+# Strata does not support cross datasource sqls
+datasource: tpcds
+
+# Define relationships between customer and related dimension tables
+
+# Customer to Customer Demographics
+customer_demographics:
+  left: Customer
+  right: Customer Demographics
+  sql: left.c_current_cdemo_sk = right.cd_demo_sk
+  cardinality: many_to_one
+
+# Customer to Household Demographics
+customer_household_demographics:
+  left: Customer
+  right: Household Demographics
+  sql: left.c_current_hdemo_sk = right.hd_demo_sk
+  cardinality: many_to_one
+
+# Customer to Customer Address
+customer_address:
+  left: Customer
+  right: Customer Address
+  sql: left.c_current_addr_sk = right.ca_address_sk
+  cardinality: many_to_one
+
+# Customer to First Ship To Date
+customer_first_shipto_date:
+  left: Customer
+  right: Customer First Ship To Date
+  sql: left.c_first_shipto_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Customer to First Sales Date
+customer_first_sales_date:
+  left: Customer
+  right: Customer First Sales Date
+  sql: left.c_first_sales_date_sk = right.d_date_sk
+  cardinality: many_to_one
+
+# Household Demographics to Income Band
+household_demographics_income_band:
+  left: Household Demographics
+  right: Income Band
+  sql: left.hd_income_band_sk = right.ib_income_band_sk
+  cardinality: many_to_one
