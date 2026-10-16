@@ -277,7 +277,10 @@ fn the_background_server_starts_reports_and_stops() {
     let run = |cwd: &Path, args: &[&str]| zsql().args(args).current_dir(cwd).env("ZSQL_HOME", &home).output().unwrap();
 
     // Started inside the project, with a relative data directory.
-    let out = run(&project, &["server", "start", "--bind", "127.0.0.1:0", "--data-dir", "data-here"]);
+    let out = run(
+        &project,
+        &["server", "start", "--bind", "127.0.0.1:0", "--data-dir", "data-here", "--public-url", "https://zsql.example.test"],
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let said = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(said.contains("started process") && said.contains("127.0.0.1:") && !said.contains(":0;"), "{said}");
@@ -287,8 +290,9 @@ fn the_background_server_starts_reports_and_stops() {
     let out = run(&root.0, &["server", "status"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("running as process") && text.contains("it answers"), "{text}");
+    assert!(text.contains("(public URL https://zsql.example.test)"), "{text}");
     // The project at hand was handed over: it is deployed.
-    let addr = text.split(" at http://").nth(1).and_then(|t| t.split(';').next()).unwrap().trim().to_string();
+    let addr = text.split(" at http://").nth(1).and_then(|t| t.split(' ').next()).unwrap().trim().to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !get(&addr, "/projects").1.contains("\"grocery-store\"") {
         assert!(std::time::Instant::now() < deadline, "the project was not deployed by the background server");

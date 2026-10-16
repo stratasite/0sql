@@ -211,6 +211,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let accounts_on = config.accounts;
     let accounts = if accounts_on { Some(Store::open_with(&config.data_dir.join("accounts.db"), config.auth_cache_ttl)?) } else { None };
+    let advertised = config.public_url.clone();
     let public_url = config.public_url.clone().unwrap_or_else(|| format!("http://{}", config.bind));
     let secure_cookies = public_url.starts_with("https://");
     let limits = Limiter::new(config.limits);
@@ -288,11 +289,13 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // port it got.
     let addr = listener.local_addr()?;
     say!("zsqld: listening on http://{addr}");
-    // The address joins the pid in the lock file, so `zsql server
-    // status` can say where a server it did not start is reached.
+    // The address, and the public URL when there is one, join the pid
+    // in the lock file, so `zsql server status` can say where a server
+    // it did not start is reached.
     {
         use std::io::{Seek, Write};
-        let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| write!(lock, "{}\n{addr}\n", std::process::id()));
+        let public = advertised.as_deref().unwrap_or("");
+        let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| write!(lock, "{}\n{addr}\n{public}\n", std::process::id()));
     }
     listening(addr);
     // Connect info: the per-address limits need the peer's address.
@@ -350,7 +353,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 
 /// One server per data directory. The lock file holds the pid of the
 /// server that has it, so the refusal can say who, and once it is bound
-/// the address, so `zsql server status` can say where.
+/// the address and the public URL, so `zsql server status` can say where.
 fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     use std::io::{Read, Write};
     let path = dir.join("lock");

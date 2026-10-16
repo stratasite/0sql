@@ -340,6 +340,9 @@ struct Started {
     pid: u32,
     bind: String,
     data_dir: PathBuf,
+    /// Where the server is reached from outside, when it was told.
+    #[serde(default)]
+    public_url: Option<String>,
 }
 
 fn pid_file() -> Result<PathBuf> {
@@ -356,9 +359,9 @@ fn log_file() -> Result<PathBuf> {
 enum Lock {
     /// Nobody: the file could be opened and locked.
     Free,
-    /// A process, by the pid it wrote, and the address it wrote once
-    /// it was bound.
-    Held { pid: Option<u32>, addr: Option<String> },
+    /// A process, by the pid it wrote, and the address and public URL
+    /// it wrote once it was bound.
+    Held { pid: Option<u32>, addr: Option<String>, public: Option<String> },
     /// The file could not be opened, so nothing can be said.
     Unreachable,
 }
@@ -375,7 +378,9 @@ fn lock_holder(data_dir: &Path) -> Lock {
     let mut text = String::new();
     let _ = file.read_to_string(&mut text);
     let mut lines = text.lines().map(str::trim);
-    Lock::Held { pid: lines.next().and_then(|l| l.parse().ok()), addr: lines.next().filter(|l| !l.is_empty()).map(str::to_string) }
+    let pid = lines.next().and_then(|l| l.parse().ok());
+    let mut rest = lines.map(|l| if l.is_empty() { None } else { Some(l.to_string()) });
+    Lock::Held { pid, addr: rest.next().flatten(), public: rest.next().flatten() }
 }
 
 #[cfg(not(unix))]
@@ -469,7 +474,7 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         }
     }
     let mut child = cmd.spawn().context("starting zsql serve")?;
-    let mut started = Started { pid: child.id(), bind: args.bind(), data_dir };
+    let mut started = Started { pid: child.id(), bind: args.bind(), data_dir, public_url: args.public_url.clone() };
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
     // Wait for it to say where it listens, which is also when a bad
     // bind or a held data directory has been refused. The child is
@@ -538,7 +543,7 @@ fn stop() -> Result<()> {
 /// That server was not started here, so `stop` will not stop it.
 fn status(data_dir: Option<PathBuf>) -> Result<()> {
     if let Some(s) = running()? {
-        println!("running as process {} at {}; {}", s.pid, url_of(&s.bind), answers(&s.bind));
+        println!("running as process {} at {}{}; {}", s.pid, url_of(&s.bind), public_note(s.public_url.as_deref()), answers(&s.bind));
         return Ok(());
     }
     let dir = match data_dir {
@@ -547,13 +552,14 @@ fn status(data_dir: Option<PathBuf>) -> Result<()> {
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
     match lock_holder(&dir) {
-        Lock::Held { pid: Some(pid), addr: Some(addr) } => println!(
-            "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}; {}",
+        Lock::Held { pid: Some(pid), addr: Some(addr), public } => println!(
+            "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}{}; {}",
             dir.display(),
             url_of(&addr),
+            public_note(public.as_deref()),
             answers(&addr)
         ),
-        Lock::Held { pid: Some(pid), addr: None } => {
+        Lock::Held { pid: Some(pid), addr: None, .. } => {
             println!("not started by `zsql server start`, but process {pid} holds {} and has not bound yet", dir.display())
         }
         Lock::Held { pid: None, .. } => println!("not started by `zsql server start`, but another process holds {}", dir.display()),
@@ -570,6 +576,11 @@ fn url_of(bind: &str) -> String {
         _ => bind.to_string(),
     };
     format!("http://{host_port}")
+}
+
+/// The public URL, when the server was told one, beside the local one.
+fn public_note(public: Option<&str>) -> String {
+    public.map(|u| format!(" (public URL {u})")).unwrap_or_default()
 }
 
 /// Whether the server at the bind answers `/healthz`.

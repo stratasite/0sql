@@ -244,7 +244,7 @@ licences, and Dependabot for crates and actions.
 
 ## Progress
 
-- 2026-10-16: `zsql server status` answered "not running" beside a foreground `zsql serve` that was up, because it only knew the server `server start` recorded. It now also looks at the data directory's lock (`--data-dir`, `ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`) and names the process holding it in the foreground and the URL it is reached at, which the server writes into the lock file once bound, and says whether it answers; `stop` is still only for servers it started.
+- 2026-10-16: `zsql server status` answered "not running" beside a foreground `zsql serve` that was up, because it only knew the server `server start` recorded. It now also looks at the data directory's lock (`--data-dir`, `ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`) and names the process holding it in the foreground and the URL it is reached at, with the public URL beside it when one was configured (the server writes pid, address and public URL into the lock file once bound; `start` records the public URL too), and says whether it answers; `stop` is still only for servers it started.
 
 - 2026-10-16, from CI: a mail command that exits before reading the message broke the pipe, and the broken pipe was the whole report. The write's failure is kept and the command waited for, so what it said and how it exited are what the log gets; a command that exits 0 that way is an error, since nothing was sent. Two tests hold it, with a message larger than a pipe holds.
 
