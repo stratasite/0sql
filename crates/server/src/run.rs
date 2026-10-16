@@ -207,7 +207,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// talks to the server needs.
 pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + 'static) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let _lock = lock_data_dir(&config.data_dir)?;
+    let mut lock = lock_data_dir(&config.data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let accounts_on = config.accounts;
     let accounts = if accounts_on { Some(Store::open_with(&config.data_dir.join("accounts.db"), config.auth_cache_ttl)?) } else { None };
@@ -288,6 +288,12 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // port it got.
     let addr = listener.local_addr()?;
     say!("zsqld: listening on http://{addr}");
+    // The address joins the pid in the lock file, so `zsql server
+    // status` can say where a server it did not start is reached.
+    {
+        use std::io::{Seek, Write};
+        let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| write!(lock, "{}\n{addr}\n", std::process::id()));
+    }
     listening(addr);
     // Connect info: the per-address limits need the peer's address.
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await?;
@@ -343,7 +349,8 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 }
 
 /// One server per data directory. The lock file holds the pid of the
-/// server that has it, so the refusal can say who.
+/// server that has it, so the refusal can say who, and once it is bound
+/// the address, so `zsql server status` can say where.
 fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     use std::io::{Read, Write};
     let path = dir.join("lock");
@@ -362,10 +369,11 @@ fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
         if !taken {
             let mut other = String::new();
             let _ = file.read_to_string(&mut other);
+            let pid = other.lines().next().unwrap_or("").trim();
             anyhow::bail!(
                 "{} is already served by process {}; stop that server, or give this one another data directory",
                 dir.display(),
-                if other.trim().is_empty() { "?".to_string() } else { other.trim().to_string() }
+                if pid.is_empty() { "?" } else { pid }
             );
         }
     }

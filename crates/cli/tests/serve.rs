@@ -161,7 +161,8 @@ fn the_server_comes_up_survives_a_hang_up_and_stops_on_sigterm() {
         String::from_utf8_lossy(&out.stdout).to_string()
     };
     let said = status(&["--data-dir", data.to_str().unwrap()]);
-    assert!(said.contains(&format!("process {} holds", s.child.id())) && said.contains("foreground"), "{said}");
+    assert!(said.contains(&format!("process {} serves", s.child.id())) && said.contains("foreground"), "{said}");
+    assert!(said.contains(&format!("at http://{}; it answers", s.addr)), "{said}");
     let said = status(&[]);
     assert!(said.contains("not running (nothing holds"), "{said}");
 
@@ -287,7 +288,7 @@ fn the_background_server_starts_reports_and_stops() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("running as process") && text.contains("it answers"), "{text}");
     // The project at hand was handed over: it is deployed.
-    let addr = text.split(" on ").nth(1).and_then(|t| t.split(';').next()).unwrap().trim().to_string();
+    let addr = text.split(" at http://").nth(1).and_then(|t| t.split(';').next()).unwrap().trim().to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !get(&addr, "/projects").1.contains("\"grocery-store\"") {
         assert!(std::time::Instant::now() < deadline, "the project was not deployed by the background server");

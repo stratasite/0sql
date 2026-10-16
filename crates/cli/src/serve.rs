@@ -356,8 +356,9 @@ fn log_file() -> Result<PathBuf> {
 enum Lock {
     /// Nobody: the file could be opened and locked.
     Free,
-    /// A process, by the pid it wrote.
-    Held(Option<u32>),
+    /// A process, by the pid it wrote, and the address it wrote once
+    /// it was bound.
+    Held { pid: Option<u32>, addr: Option<String> },
     /// The file could not be opened, so nothing can be said.
     Unreachable,
 }
@@ -373,7 +374,8 @@ fn lock_holder(data_dir: &Path) -> Lock {
     }
     let mut text = String::new();
     let _ = file.read_to_string(&mut text);
-    Lock::Held(text.trim().parse().ok())
+    let mut lines = text.lines().map(str::trim);
+    Lock::Held { pid: lines.next().and_then(|l| l.parse().ok()), addr: lines.next().filter(|l| !l.is_empty()).map(str::to_string) }
 }
 
 #[cfg(not(unix))]
@@ -388,7 +390,7 @@ fn running() -> Result<Option<Started>> {
     let Ok(text) = std::fs::read_to_string(pid_file()?) else { return Ok(None) };
     let Ok(s) = serde_json::from_str::<Started>(&text) else { return Ok(None) };
     let yes = match lock_holder(&s.data_dir) {
-        Lock::Held(pid) => pid == Some(s.pid),
+        Lock::Held { pid, .. } => pid == Some(s.pid),
         Lock::Free => false,
         Lock::Unreachable => alive(s.pid),
     };
@@ -533,15 +535,10 @@ fn stop() -> Result<()> {
 
 /// The server `start` recorded, if it is running; failing that, the
 /// data directory's lock, which a foreground `zsql serve` holds too.
-/// That server was not started here, so `stop` will not stop it, and
-/// its address is not on record, so it is not probed.
+/// That server was not started here, so `stop` will not stop it.
 fn status(data_dir: Option<PathBuf>) -> Result<()> {
     if let Some(s) = running()? {
-        let server = format!("http://{}", s.bind);
-        match remote::Client::new(&server, None).get("/healthz") {
-            Ok(_) => println!("running as process {} on {}; it answers", s.pid, s.bind),
-            Err(e) => println!("running as process {} on {}; it does not answer: {e}", s.pid, s.bind),
-        }
+        println!("running as process {} at {}; {}", s.pid, url_of(&s.bind), answers(&s.bind));
         return Ok(());
     }
     let dir = match data_dir {
@@ -550,11 +547,35 @@ fn status(data_dir: Option<PathBuf>) -> Result<()> {
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
     match lock_holder(&dir) {
-        Lock::Held(Some(pid)) => {
-            println!("not started by `zsql server start`, but process {pid} holds {} and is serving it in the foreground", dir.display())
+        Lock::Held { pid: Some(pid), addr: Some(addr) } => println!(
+            "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}; {}",
+            dir.display(),
+            url_of(&addr),
+            answers(&addr)
+        ),
+        Lock::Held { pid: Some(pid), addr: None } => {
+            println!("not started by `zsql server start`, but process {pid} holds {} and has not bound yet", dir.display())
         }
-        Lock::Held(None) => println!("not started by `zsql server start`, but another process holds {}", dir.display()),
+        Lock::Held { pid: None, .. } => println!("not started by `zsql server start`, but another process holds {}", dir.display()),
         Lock::Free | Lock::Unreachable => println!("not running (nothing holds {})", dir.display()),
     }
     Ok(())
+}
+
+/// The address as a URL to go to: a server bound to every interface is
+/// reached on the loopback from here.
+fn url_of(bind: &str) -> String {
+    let host_port = match bind.rsplit_once(':') {
+        Some(("0.0.0.0" | "[::]" | "::", port)) => format!("127.0.0.1:{port}"),
+        _ => bind.to_string(),
+    };
+    format!("http://{host_port}")
+}
+
+/// Whether the server at the bind answers `/healthz`.
+fn answers(bind: &str) -> String {
+    match remote::Client::new(&url_of(bind), None).get("/healthz") {
+        Ok(_) => "it answers".to_string(),
+        Err(e) => format!("it does not answer: {e}"),
+    }
 }
