@@ -244,6 +244,8 @@ licences, and Dependabot for crates and actions.
 
 ## Progress
 
+- 2026-10-16, from CI: a mail command that exits before reading the message broke the pipe, and the broken pipe was the whole report. The write's failure is kept and the command waited for, so what it said and how it exited are what the log gets; a command that exits 0 that way is an error, since nothing was sent. Two tests hold it, with a message larger than a pipe holds.
+
 - 2026-10-15, review's test gaps: the branch caps, the per-address login gate with its `Retry-After`, and the app's CSRF header are each held over the wire; a negative table cost is refused by name; every built-in dialect is held to quoting a literal and an identifier, and a query's `db_settings` to leaving the catalogue's copy alone; `list` and `status -r` run end to end in the CLI's serve test.
 
 - 2026-10-15, review continued: every refusal is in the API's shape, including the ones axum would have made for a body that is not JSON, a path parameter of the wrong type or a query string that does not parse (`Input`, `Params`, `Search` in the server's `error` module); an IPv6 caller is limited by its /64, and an IPv4 address in IPv6 clothing by the IPv4 address; the mail command's stderr is drained on a thread and its first lines go into the error, so a loud relay cannot wedge a send; a plan's dialect is shared with its sub-graphs through an `Arc` and a query without `db_settings` shares the catalogue's copy; the CLI's slug is the project crate's `parameterize`; the devtool's `--paths` is an enum; stale docs that called the stored paths an oracle and the planner's refusals unported are reworded.
