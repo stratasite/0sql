@@ -469,6 +469,31 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> Result<String, 
 mod tests {
     use super::*;
 
+    /// Every built-in dialect quotes a literal so that a quote inside it
+    /// cannot end it, and quotes an identifier to something other than
+    /// the bare word; a query's `db_settings` lay over the catalogue's
+    /// copy without touching it.
+    #[test]
+    fn every_builtin_dialect_quotes_and_overlays() {
+        let dialects = Dialects::builtin();
+        for name in dialects.names().unwrap() {
+            let d = dialects.get(&name).unwrap();
+            let lit = d.string_lit("it's").unwrap();
+            assert!(lit.contains("it''s"), "{name}: {lit}");
+            assert!(lit.starts_with('\'') && lit.ends_with('\''), "{name}: {lit}");
+            let ident = d.quote("order").unwrap();
+            assert_ne!(ident, "order", "{name} must quote a reserved word");
+            assert!(ident.contains("order"), "{name}: {ident}");
+            assert!(!d.reserved_keywords().is_empty() && !d.aggregate_functions().is_empty(), "{name}");
+        }
+        let pg = dialects.get("postgres").unwrap();
+        let same = pg.with_overrides(std::iter::empty());
+        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalogue's copy");
+        let over = pg.with_overrides([("final_pass_measure_join_type", &serde_json::json!("inner"))]);
+        assert_eq!(over.final_pass_measure_join_type(), "inner");
+        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalogue's copy is untouched");
+    }
+
     #[test]
     fn placeholders_are_greedy() {
         let r =

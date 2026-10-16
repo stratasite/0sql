@@ -62,3 +62,25 @@ fn a_message_names_what_would_have_been_right() {
     assert!(err.contains("Data type 'text' is not included in the list (one of: string,"), "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// What the loader lets through, the universe still checks: a negative
+/// cost would rank a route backwards, and a model that would plan
+/// wrong is refused rather than loaded.
+#[test]
+fn a_negative_cost_is_refused_by_name() {
+    let root = std::env::temp_dir().join(format!("zsql-cost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("project");
+    std::fs::create_dir_all(dir.join("models")).unwrap();
+    std::fs::write(dir.join("project.yml"), "name: P\nuid: p\n").unwrap();
+    std::fs::write(dir.join("datasources.yml"), "wh:\n  adapter: duckdb\n").unwrap();
+    std::fs::write(
+        dir.join("models/tbl.t.yml"),
+        "name: T\nphysical_name: t\ndatasource: wh\ncost: -3\nfields:\n  - type: dimension\n    name: X\n    data_type: string\n    expression: x\n",
+    )
+    .unwrap();
+    let dialects = Dialects::builtin();
+    let err = zsql_project::load(&dir, &dialects).unwrap_err().to_string();
+    assert!(err.contains("table t has a negative cost (-3)"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}

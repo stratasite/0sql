@@ -53,15 +53,24 @@ impl Drop for Server {
 }
 
 fn server() -> Server {
+    server_with(Caps { per_project: 5, per_account: 20 }, limits::Config { mode: limits::Mode::Off, ..limits::Config::default() })
+}
+
+/// A server with caps and limits of the test's choosing.
+fn server_with(caps: Caps, limits: limits::Config) -> Server {
     let data_dir = std::env::temp_dir().join(format!("zsqld-isolation-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&data_dir).unwrap();
-    let app = app_over(&data_dir);
+    let app = app_with(&data_dir, caps, limits);
     Server { router: router(app.clone()), app, data_dir }
 }
 
 /// An app over a data directory, as `main` builds one, with the limits
 /// off so the tests are about access and not about pace.
 fn app_over(data_dir: &std::path::Path) -> Shared {
+    app_with(data_dir, Caps { per_project: 5, per_account: 20 }, limits::Config { mode: limits::Mode::Off, ..limits::Config::default() })
+}
+
+fn app_with(data_dir: &std::path::Path, caps: Caps, limits: limits::Config) -> Shared {
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     Arc::new(App {
         dialects,
@@ -70,9 +79,9 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         accounts: Some(Store::in_memory().unwrap()),
         signup_open: true,
         secure_cookies: false,
-        limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
+        limits: Limiter::new(limits),
         admission: Admission::new(&limits::AdmissionCounts::default()),
-        caps: Caps { per_project: 5, per_account: 20 },
+        caps,
         mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
         mcp: mcp::Settings::builtin(),
         deploying: std::sync::Mutex::new(()),
@@ -810,6 +819,84 @@ async fn refusals_from_the_extractors_are_in_the_api_shape() {
     let a = s.send(Method::GET, &format!("{b}/fields?hidden=maybe"), Some(&ann), None).await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST);
     assert_eq!(a.class(), "Invalid", "{}", a.body);
+}
+
+/// The branch caps, over the wire: the first branch past the cap is
+/// refused with the class and the advice the CLI prints, a redeploy of
+/// a branch that is there is not a new branch, and a validate is never
+/// held to the caps.
+#[tokio::test]
+async fn the_branch_caps_refuse_the_branch_past_them_and_nothing_else() {
+    let s = server_with(Caps { per_project: 1, per_account: 2 }, limits::Config { mode: limits::Mode::Off, ..limits::Config::default() });
+    let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    let a = s.deploy(CS, "dev", &ann, archive(CS, "acme-dev")).await;
+    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
+    assert_eq!(a.class(), "OverLimit");
+    assert!(a.error().contains("customer-service already has 1 deployed branch of the 1 allowed"), "{}", a.error());
+    assert!(a.error().contains("zsql remove --branch"), "{}", a.error());
+
+    let a = s.deploy(CS, "main", &ann, archive(CS, "acme-again")).await;
+    assert_eq!(a.status, StatusCode::OK, "a redeploy is not a new branch: {}", a.error());
+    let a = s.validate(CS, "dev", &ann, archive(CS, "acme-dev")).await;
+    assert_eq!(a.status, StatusCode::OK, "a validate keeps nothing: {}", a.error());
+
+    // The account cap counts across projects.
+    let a = s.deploy("billing", "main", &ann, archive("billing", "acme-billing")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("web", "main", &ann, archive("web", "acme-web")).await;
+    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
+    assert!(a.error().contains("this account already has 2 deployed branches of the 2 allowed"), "{}", a.error());
+    assert_eq!(s.keys_in_memory(), ["acme/billing/main", "acme/customer-service/main"]);
+}
+
+/// The per-address gate on signing in, over the wire: past its burst
+/// the answer is 429 with `Retry-After`, in the API's shape, and
+/// another route is not touched by it.
+#[tokio::test]
+async fn the_login_gate_answers_a_burst_with_retry_after() {
+    let cfg = limits::Config { mode: limits::Mode::On, login: limits::Rate { per_sec: 0.001, burst: 2.0 }, ..limits::Config::default() };
+    let s = server_with(Caps { per_project: 5, per_account: 20 }, cfg);
+    s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let login = json!({ "email": "ann@acme.test", "password": "annpassword1" });
+    for _ in 0..2 {
+        let a = s.post("/login", None, login.clone()).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    }
+    let a = s.post("/login", None, login.clone()).await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    assert_eq!(a.class(), "RateLimited");
+    let wait: u64 = a.headers["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!(wait >= 1, "retry-after {wait}");
+    let a = s.get("/healthz", None).await;
+    assert_eq!(a.status, StatusCode::OK);
+}
+
+/// A cross-site form can post with the session cookie attached but
+/// cannot send the header the app's own scripts send, so a cookie
+/// without the header moves nothing; a read is still answered.
+#[tokio::test]
+async fn a_cookie_without_the_apps_header_cannot_act() {
+    let s = server();
+    s.signup("acme", "ann@acme.test", "annpassword1").await;
+    let cookie = s.login_cookie("ann@acme.test", "annpassword1").await;
+    let body = serde_json::to_vec(&json!({ "name": "forged" })).unwrap();
+
+    let a = s.send_with(Method::POST, "/account/keys", None, &[("cookie", &cookie)], Some(("application/json", body.clone()))).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    assert!(a.error().contains("did not come from the app"), "{}", a.error());
+    let a = s.send_with(Method::POST, "/logout", None, &[("cookie", &cookie)], None).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+
+    let a = s.send_with(Method::GET, "/account/keys", None, &[("cookie", &cookie)], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["keys"].as_array().unwrap().len(), 1, "the sign-up key only: {}", a.body);
+    let headers = [("cookie", cookie.as_str()), ("x-requested-with", "zsql")];
+    let a = s.send_with(Method::POST, "/account/keys", None, &headers, Some(("application/json", body))).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["key"]["name"], "forged");
 }
 
 // ------------------------------------------------------------------- mcp

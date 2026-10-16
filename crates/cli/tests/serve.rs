@@ -222,6 +222,13 @@ fn inside_a_project_it_serves_that_project_and_minus_r_reaches_it() {
     assert_eq!(v["error"]["class"], "FieldNotFound");
     let fields = run(&["fields", "-r", "--branch", "main", "disc"]);
     assert!(String::from_utf8_lossy(&fields.stdout).contains("retail-discount"));
+    let list = run(&["list"]);
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    assert!(String::from_utf8_lossy(&list.stdout).contains("grocery-store"), "{}", String::from_utf8_lossy(&list.stdout));
+    let status = run(&["status", "-r", "--branch", "main"]);
+    assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(v["branch"], "main", "{v}");
 
     let (status, _) = s.stop();
     assert!(status.success());
