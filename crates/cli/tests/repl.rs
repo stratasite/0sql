@@ -120,6 +120,13 @@ fn the_local_repl_holds_the_model_and_reloads_it() {
     let answer = read_until(&mut out, "check out dev");
     assert!(answer.contains("-r repl --branch dev"), "{answer}");
 
+    // `.explore` narrows what the query can add by a term after ` ? `.
+    writeln!(stdin, ".explore department ? sales").unwrap();
+    writeln!(stdin, "department").unwrap();
+    let answer = read_until(&mut out, "-- planned here in");
+    assert!(answer.contains("sales-value"), "{answer}");
+    assert!(!answer.contains("retail-discount"), "the term did not narrow it: {answer}");
+
     writeln!(stdin, ".quit").unwrap();
     drop(stdin);
     let status = child.wait().unwrap();
@@ -159,4 +166,26 @@ fn refusals_and_usage_errors_exit_as_promised() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("add -r"));
+
+    // A spec file is planned as the shorthand is, to the same SQL.
+    let spec = std::env::temp_dir().join(format!("zsql-spec-{}.json", std::process::id()));
+    std::fs::write(&spec, r#"{"projections": [{"field": "Department"}, {"field": "Sales Value"}]}"#).unwrap();
+    let from_spec = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["sql", "--json", "--spec", spec.to_str().unwrap()])
+        .current_dir(fixture())
+        .env_remove("ZSQL_SERVER")
+        .output()
+        .unwrap();
+    let from_expr = Command::new(env!("CARGO_BIN_EXE_zsql"))
+        .args(["sql", "--json", "--expr", "department, sales value"])
+        .current_dir(fixture())
+        .env_remove("ZSQL_SERVER")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&spec);
+    assert!(from_spec.status.success(), "{}", String::from_utf8_lossy(&from_spec.stderr));
+    let a: serde_json::Value = serde_json::from_slice(&from_spec.stdout).unwrap();
+    let b: serde_json::Value = serde_json::from_slice(&from_expr.stdout).unwrap();
+    assert_eq!(a["sql"], b["sql"], "{a}\n{b}");
+    assert!(a["sql"].as_str().unwrap().contains("Sales Value"), "{a}");
 }
