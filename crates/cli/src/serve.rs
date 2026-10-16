@@ -192,8 +192,13 @@ pub enum ServerCommand {
     },
     /// Stop the background server (SIGTERM, then wait for it to finish).
     Stop,
-    /// Whether the background server is running, and whether it answers.
-    Status,
+    /// Whether the background server is running, and whether it answers;
+    /// also whether a foreground `zsql serve` holds the data directory.
+    Status {
+        /// The data directory to look at for a foreground server; $ZSQL_HOME/data when neither this nor the variable says.
+        #[arg(long, env = "ZSQL_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+    },
     /// The last lines of the background server's log.
     Logs {
         #[arg(long, default_value_t = 100)]
@@ -416,7 +421,7 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
     match command {
         ServerCommand::Start { args } => start(args, at),
         ServerCommand::Stop => stop(),
-        ServerCommand::Status => status(),
+        ServerCommand::Status { data_dir } => status(data_dir),
         ServerCommand::Logs { lines } => {
             let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
             let all: Vec<&str> = text.lines().collect();
@@ -526,16 +531,30 @@ fn stop() -> Result<()> {
     Ok(())
 }
 
-fn status() -> Result<()> {
-    match running()? {
-        Some(s) => {
-            let server = format!("http://{}", s.bind);
-            match remote::Client::new(&server, None).get("/healthz") {
-                Ok(_) => println!("running as process {} on {}; it answers", s.pid, s.bind),
-                Err(e) => println!("running as process {} on {}; it does not answer: {e}", s.pid, s.bind),
-            }
+/// The server `start` recorded, if it is running; failing that, the
+/// data directory's lock, which a foreground `zsql serve` holds too.
+/// That server was not started here, so `stop` will not stop it, and
+/// its address is not on record, so it is not probed.
+fn status(data_dir: Option<PathBuf>) -> Result<()> {
+    if let Some(s) = running()? {
+        let server = format!("http://{}", s.bind);
+        match remote::Client::new(&server, None).get("/healthz") {
+            Ok(_) => println!("running as process {} on {}; it answers", s.pid, s.bind),
+            Err(e) => println!("running as process {} on {}; it does not answer: {e}", s.pid, s.bind),
         }
-        None => println!("not running"),
+        return Ok(());
+    }
+    let dir = match data_dir {
+        Some(d) => d,
+        None => home()?.join("data"),
+    };
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    match lock_holder(&dir) {
+        Lock::Held(Some(pid)) => {
+            println!("not started by `zsql server start`, but process {pid} holds {} and is serving it in the foreground", dir.display())
+        }
+        Lock::Held(None) => println!("not started by `zsql server start`, but another process holds {}", dir.display()),
+        Lock::Free | Lock::Unreachable => println!("not running (nothing holds {})", dir.display()),
     }
     Ok(())
 }

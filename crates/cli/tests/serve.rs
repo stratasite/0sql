@@ -154,6 +154,17 @@ fn the_server_comes_up_survives_a_hang_up_and_stops_on_sigterm() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(get(&s.addr, "/healthz").0, 200, "the server died when a client hung up");
 
+    // `server status` was not told about this server, but it can see
+    // who holds the data directory; told nothing, it looks under home.
+    let status = |args: &[&str]| {
+        let out = zsql().arg("server").arg("status").args(args).env("ZSQL_HOME", root.path("home")).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let said = status(&["--data-dir", data.to_str().unwrap()]);
+    assert!(said.contains(&format!("process {} holds", s.child.id())) && said.contains("foreground"), "{said}");
+    let said = status(&[]);
+    assert!(said.contains("not running (nothing holds"), "{said}");
+
     // Another server on the same data directory is refused, and says who has it.
     let second = zsql()
         .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", data.to_str().unwrap()])

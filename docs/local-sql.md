@@ -244,6 +244,8 @@ licences, and Dependabot for crates and actions.
 
 ## Progress
 
+- 2026-10-16: `zsql server status` answered "not running" beside a foreground `zsql serve` that was up, because it only knew the server `server start` recorded. It now also looks at the data directory's lock (`--data-dir`, `ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`) and names the process holding it in the foreground; `stop` is still only for servers it started.
+
 - 2026-10-16, from CI: a mail command that exits before reading the message broke the pipe, and the broken pipe was the whole report. The write's failure is kept and the command waited for, so what it said and how it exited are what the log gets; a command that exits 0 that way is an error, since nothing was sent. Two tests hold it, with a message larger than a pipe holds.
 
 - 2026-10-15, review's test gaps: the branch caps, the per-address login gate with its `Retry-After`, and the app's CSRF header are each held over the wire; a negative table cost is refused by name; every built-in dialect is held to quoting a literal and an identifier, and a query's `db_settings` to leaving the catalogue's copy alone; `list` and `status -r` run end to end in the CLI's serve test.
