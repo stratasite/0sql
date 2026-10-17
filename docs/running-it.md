@@ -123,6 +123,14 @@ build installs `musl-gcc` and the arm64 build goes through `cross`.
    environment file. Confirm the startup line names the same number
    of deployments as before, then remove `/usr/local/bin/zsqld`.
 
+   Done 2026-10-17 at 18:05Z: nine deployments loaded as before, no
+   schema change (version 3 on both sides), the previous unit kept at
+   `/root/zsqld.service.0.5.4` beside the old binaries. Rolling that
+   install back is the old unit over the new one, `daemon-reload` and a
+   restart, since `zsqld` is still there. From the host,
+   `ZSQL_HOME=/var/lib/zsqld zsql server status --data-dir /var/lib/zsqld`
+   names the process, the loopback URL and the public one.
+
 7. **Read the first lines it logs.** `journalctl -u zsqld -n 10`. The
    startup line says how many deployments loaded, whether accounts and
    sign-up are on, the rate limit mode and whether mail is configured —
