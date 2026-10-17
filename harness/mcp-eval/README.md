@@ -1,6 +1,6 @@
 # The MCP instruction-set eval
 
-An agent connected to zsqld over MCP answers questions about the customer
+An agent connected to the server over MCP answers questions about the customer
 service demo model by writing query specs. This harness measures how well,
 and it is what the instruction set in `crates/server/src/mcp_prompts.json`
 and the spec schema in `crates/server/src/mcp_spec_schema.json` are tuned

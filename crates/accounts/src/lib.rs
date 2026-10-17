@@ -253,13 +253,28 @@ pub struct Store {
 /// How long an invite token stays redeemable.
 pub const INVITE_DAYS: i64 = 7;
 
-/// How long an authentication decision may be reused. Long enough to
-/// take the store off the hot path, short enough that a change which
-/// somehow skipped invalidation is forgotten quickly. `0` turns the
-/// cache off, which is also how to prove a bug is not the cache's.
-fn ttl_from_env() -> Duration {
-    Duration::from_secs(std::env::var("ZSQL_AUTH_CACHE_TTL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60))
+// A lock is never poisoned here on purpose: a panic in one request
+// must not take the lock, and with it every later request, down with
+// it. The data behind these locks is a connection, a cache or a map
+// that a half-finished request leaves consistent.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+fn read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How long an authentication decision may be reused when the caller
+/// does not say: long enough to take the store off the hot path, short
+/// enough that a change which somehow skipped invalidation is forgotten
+/// quickly. Zero turns the cache off, which is also how to prove a bug
+/// is not the cache's.
+pub const DEFAULT_AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// The schema as numbered steps, oldest first. `PRAGMA user_version`
 /// holds how many of them a file has seen, so the length of this list is
@@ -521,6 +536,20 @@ pub fn parse_role(s: &str) -> Result<Role> {
     }
 }
 
+/// A name someone typed, for an account, a user or a key: trimmed,
+/// one line, no control characters, at most eighty characters, so it
+/// can be shown and logged as it is.
+fn name_of(s: &str, what: &str) -> Result<String> {
+    let s = s.trim();
+    if s.chars().any(char::is_control) {
+        return Err(Error::Invalid(format!("{what} holds a control character")));
+    }
+    if s.chars().count() > 80 {
+        return Err(Error::Invalid(format!("{what} is longer than 80 characters")));
+    }
+    Ok(s.to_string())
+}
+
 fn email_of(s: &str) -> Result<String> {
     let e = s.trim().to_lowercase();
     // 254 is the longest address that fits in a mail envelope; anything
@@ -575,25 +604,31 @@ pub struct Signup {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
+        Self::open_with(path, DEFAULT_AUTH_CACHE_TTL)
+    }
+
+    /// [`Store::open`] with how long an authentication decision may be
+    /// reused.
+    pub fn open_with(path: &Path, auth_cache_ttl: Duration) -> Result<Store> {
         let conn = Connection::open(path)?;
         // WAL with synchronous=NORMAL: a commit does not fsync, the
         // checkpoint does, so a power cut can lose the last moments of
         // writes but never corrupts the file. Right for key metadata.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
         migrate(&conn)?;
-        Ok(Store::over(conn))
+        Ok(Store::over(conn, auth_cache_ttl))
     }
 
     pub fn in_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         migrate(&conn)?;
-        Ok(Store::over(conn))
+        Ok(Store::over(conn, DEFAULT_AUTH_CACHE_TTL))
     }
 
-    fn over(conn: Connection) -> Store {
+    fn over(conn: Connection, ttl: Duration) -> Store {
         let decoy = hash_password(&new_secret("decoy")).expect("a generated secret is long enough");
-        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl: ttl_from_env(), decoy }
+        Store { conn: Mutex::new(conn), cache: RwLock::new(Cache::default()), generation: AtomicU64::new(0), ttl, decoy }
     }
 
     // --------------------------------------------------------- the cache
@@ -603,7 +638,7 @@ impl Store {
         if self.ttl.is_zero() {
             return None;
         }
-        let (value, at) = pick(&self.cache.read().unwrap())?;
+        let (value, at) = pick(&read(&self.cache))?;
         (at.elapsed() < self.ttl).then_some(value)
     }
 
@@ -612,7 +647,7 @@ impl Store {
         if self.ttl.is_zero() || self.generation.load(Ordering::Acquire) != generation {
             return;
         }
-        put(&mut self.cache.write().unwrap());
+        put(&mut write(&self.cache));
     }
 
     /// Throws every cached decision away. Called by the audit row that
@@ -625,7 +660,7 @@ impl Store {
     /// after one costs nothing.
     fn bump(&self) {
         self.generation.fetch_add(1, Ordering::Release);
-        let mut c = self.cache.write().unwrap();
+        let mut c = write(&self.cache);
         c.principals.clear();
         c.sessions.clear();
         c.projects.clear();
@@ -653,13 +688,39 @@ impl Store {
     pub fn signup(&self, account_name: &str, email: &str, user_name: &str, password: Option<&str>) -> Result<Signup> {
         let email = email_of(email)?;
         let password_hash = password.map(hash_password).transpose()?;
-        let name = account_name.trim();
+        let name = name_of(account_name, "the account name")?;
+        let user_name = name_of(user_name, "the user name")?;
         if name.is_empty() {
             return Err(Error::Invalid("an account name is required".into()));
         }
-        let mut conn = self.conn.lock().unwrap();
+        // The address may already be someone's. Sign-up is open to the
+        // world, so whoever typed it has to show they are that someone:
+        // the user's own password. The check runs with no lock held,
+        // since a password hash takes a while and everything else that
+        // needs the store would wait behind it.
+        let existing: Option<(User, Option<String>)> = {
+            let conn = lock(&self.conn);
+            conn.query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| {
+                Ok((user_row(r)?, r.get::<_, Option<String>>(4)?))
+            })
+            .optional()?
+        };
+        let proven_hash: Option<String> = match (&existing, password) {
+            (Some((_, Some(h))), Some(p)) if password_matches(h, p) => Some(h.clone()),
+            (Some((_, Some(_))), _) => {
+                return Err(Error::Denied(
+                    "this email already belongs to a user; to open another account, sign up with that user's password, or reset it first"
+                        .into(),
+                ));
+            }
+            (Some((_, None)), _) => {
+                return Err(Error::Denied("this email already belongs to a user who has no password yet; request a password reset link, set one, then sign up with it".into()));
+            }
+            (None, _) => None,
+        };
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
-        let base = slug(name);
+        let base = slug(&name);
         let base = if base.is_empty() { "account".to_string() } else { base };
         let mut uid = base.clone();
         let mut n = 1;
@@ -675,27 +736,15 @@ impl Store {
             })
             .optional()?
         {
-            // The address is already someone's. Sign-up is open to the
-            // world, so whoever typed it has to show they are that
-            // someone: the user's own password. Nothing about the user
-            // is changed, and no credential is issued, until they have.
-            // A user with no password yet proves the address through a
-            // reset link, which sets one.
-            Some((u, stored)) => match (stored, password) {
-                (Some(h), Some(p)) if password_matches(&h, p) => u,
-                (Some(_), _) => {
-                    return Err(Error::Denied("this email already belongs to a user; to open another account, sign up with that user's password, or reset it first".into()));
-                }
-                (None, _) => {
-                    return Err(Error::Denied("this email already belongs to a user who has no password yet; request a password reset link, set one, then sign up with it".into()));
-                }
-            },
+            // The row as it is now, inside the transaction: the password
+            // proven a moment ago must still be the one stored, and a
+            // user who appeared meanwhile is not ours to claim.
+            Some((u, stored)) if stored.is_some() && stored == proven_hash => u,
+            Some(_) => return Err(Error::Denied("this email's user changed while signing up; try again".into())),
+            None if proven_hash.is_some() => return Err(Error::Denied("this email's user changed while signing up; try again".into())),
             None => {
-                tx.execute(
-                    "INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)",
-                    params![email, user_name.trim(), password_hash],
-                )?;
-                User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.trim().to_string(), email_verified: false }
+                tx.execute("INSERT INTO users (email, name, password_hash) VALUES (?1, ?2, ?3)", params![email, user_name, password_hash])?;
+                User { id: tx.last_insert_rowid(), email: email.clone(), name: user_name.clone(), email_verified: false }
             }
         };
         tx.execute("INSERT INTO memberships (account_id, user_id, role) VALUES (?1, ?2, 'admin')", params![account.id, user.id])?;
@@ -745,7 +794,7 @@ impl Store {
     /// Also records the key's use, at most once a minute, which now
     /// happens on a cache miss rather than on every request.
     fn authenticate_uncached(&self, secret: &str, h: &str) -> Result<(Option<Principal>, u64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let generation = self.generation.load(Ordering::Acquire);
         if secret.starts_with("zsk_") {
             let row = conn
@@ -854,7 +903,7 @@ impl Store {
             return Ok(l);
         }
         let (granted, generation) = {
-            let conn = self.conn.lock().unwrap();
+            let conn = lock(&self.conn);
             let generation = self.generation.load(Ordering::Acquire);
             let granted: Option<String> = conn
                 .query_row("SELECT level FROM project_access WHERE project_id = ?1 AND user_id = ?2", params![project.id, user_id], |r| {
@@ -877,7 +926,7 @@ impl Store {
     // ------------------------------------------------------------ members
 
     pub fn members(&self, account_id: i64) -> Result<Vec<Membership>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare("SELECT u.id, u.email, u.name, u.email_verified_at, m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = ?1 ORDER BY u.email")?;
         let rows = st.query_map(params![account_id], |r| Ok(Membership { user: user_row(r)?, role: role_of(&r.get::<_, String>(4)?) }))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -887,7 +936,7 @@ impl Store {
     /// with a role, or changes the role of a member.
     pub fn add_member(&self, account_id: i64, actor: &str, email: &str, name: &str, role: Role) -> Result<Membership> {
         let email = email_of(email)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let user = match tx.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()? {
             Some(u) => u,
@@ -911,7 +960,7 @@ impl Store {
 
     pub fn remove_member(&self, account_id: i64, actor: &str, email: &str) -> Result<()> {
         let email = email_of(email)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let user = tx
             .query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row)
@@ -940,7 +989,7 @@ impl Store {
     /// redeems it with [`Store::accept_invite`] for a first personal key.
     pub fn create_invite(&self, account_id: i64, actor: &str, email: &str) -> Result<String> {
         let email = email_of(email)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let user = conn
             .query_row(
                 &format!("SELECT {USER_COLS} FROM users u WHERE u.email = ?1 AND EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id AND m.account_id = ?2)"),
@@ -974,7 +1023,7 @@ impl Store {
         password: Option<&str>,
     ) -> Result<(Account, User, UserKey, String)> {
         let password_hash = password.map(hash_password).transpose()?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let (invite_id, account_id, user_id): (i64, i64, i64) = tx
             .query_row(
@@ -1039,13 +1088,13 @@ impl Store {
     }
 
     pub fn user_key(&self, id: i64) -> Result<UserKey> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         Self::user_key_in(&conn, id)
     }
 
     /// The user's live keys in this account.
     pub fn user_keys(&self, account_id: i64, user_id: i64) -> Result<Vec<UserKey>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare("SELECT id, user_id, account_id, name, prefix, created_at, last_used_at FROM user_keys WHERE user_id = ?1 AND account_id = ?2 AND revoked_at IS NULL ORDER BY id")?;
         let rows = st.query_map(params![user_id, account_id], |r| {
             Ok(UserKey {
@@ -1065,7 +1114,7 @@ impl Store {
     /// live key in any account. Such a user is not a newcomer, needs no
     /// invite token, and may not be set up by one.
     pub fn can_sign_in(&self, user_id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         Ok(Self::has_credentials(&conn, user_id)?)
     }
 
@@ -1079,12 +1128,13 @@ impl Store {
 
     /// A new personal key; the secret is returned once.
     pub fn create_user_key(&self, account_id: i64, user: &User, name: &str) -> Result<(UserKey, String)> {
-        let name = name.trim();
+        let name = name_of(name, "the key name")?;
+        let name = name.as_str();
         if name.is_empty() {
             return Err(Error::Invalid("a key name is required".into()));
         }
         let secret = new_secret("zsk");
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         conn.execute(
             "INSERT INTO user_keys (user_id, account_id, name, prefix, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![user.id, account_id, name, prefix_of(&secret), hash(&secret)],
@@ -1095,7 +1145,7 @@ impl Store {
     }
 
     pub fn revoke_user_key(&self, account_id: i64, user: &User, key_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let n = conn.execute(
             "UPDATE user_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1 AND user_id = ?2 AND revoked_at IS NULL",
             params![key_id, user.id],
@@ -1120,12 +1170,12 @@ impl Store {
     }
 
     pub fn query_key(&self, account_id: i64, id: i64) -> Result<QueryKey> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         Self::query_key_in(&conn, account_id, id)
     }
 
     pub fn query_keys(&self, account_id: i64) -> Result<Vec<QueryKey>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare("SELECT id, account_id, name, prefix, created_by, created_at, last_used_at FROM query_keys WHERE account_id = ?1 AND revoked_at IS NULL ORDER BY id")?;
         let rows = st.query_map(params![account_id], |r| {
             Ok(QueryKey {
@@ -1143,12 +1193,13 @@ impl Store {
 
     /// A new query key with no grants; the secret is returned once.
     pub fn create_query_key(&self, account_id: i64, actor: &User, name: &str) -> Result<(QueryKey, String)> {
-        let name = name.trim();
+        let name = name_of(name, "the key name")?;
+        let name = name.as_str();
         if name.is_empty() {
             return Err(Error::Invalid("a key name is required".into()));
         }
         let secret = new_secret("zqk");
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         conn.execute(
             "INSERT INTO query_keys (account_id, name, prefix, hash, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![account_id, name, prefix_of(&secret), hash(&secret), actor.id],
@@ -1161,7 +1212,7 @@ impl Store {
     /// A new secret for the same key and grants; the old secret stops working.
     pub fn rotate_query_key(&self, account_id: i64, actor: &User, id: i64) -> Result<(QueryKey, String)> {
         let secret = new_secret("zqk");
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let key = Self::query_key_in(&conn, account_id, id)?;
         conn.execute("UPDATE query_keys SET prefix = ?1, hash = ?2 WHERE id = ?3", params![prefix_of(&secret), hash(&secret), key.id])?;
         self.audit(&conn, account_id, &actor.email, "query_key_rotated", &format!("{} {}", key.name, prefix_of(&secret)))?;
@@ -1169,7 +1220,7 @@ impl Store {
     }
 
     pub fn revoke_query_key(&self, account_id: i64, actor: &User, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let key = Self::query_key_in(&conn, account_id, id)?;
         conn.execute("UPDATE query_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1", params![key.id])?;
         self.audit(&conn, account_id, &actor.email, "query_key_revoked", &key.name)?;
@@ -1190,7 +1241,7 @@ impl Store {
     }
 
     pub fn grants(&self, account_id: i64, key_id: i64) -> Result<Vec<Grant>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         Self::query_key_in(&conn, account_id, key_id)?;
         Ok(Self::grants_in(&conn, key_id)?)
     }
@@ -1210,7 +1261,7 @@ impl Store {
         branch: Option<&str>,
         context: Option<&serde_json::Value>,
     ) -> Result<Grant> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let key = Self::query_key_in(&conn, account_id, key_id)?;
         let branch = branch.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
         let context_text = context.map(serde_json::Value::to_string);
@@ -1230,7 +1281,7 @@ impl Store {
     }
 
     pub fn revoke_grant(&self, account_id: i64, actor: &User, key_id: i64, project: &Project) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let key = Self::query_key_in(&conn, account_id, key_id)?;
         let n = conn.execute("DELETE FROM query_key_grants WHERE query_key_id = ?1 AND project_id = ?2", params![key.id, project.id])?;
         if n == 0 {
@@ -1242,7 +1293,7 @@ impl Store {
 
     /// Every key granted on a project, for its owners to see.
     pub fn keys_granted_on(&self, project: &Project) -> Result<Vec<(QueryKey, Grant)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare(
             "SELECT k.id, k.account_id, k.name, k.prefix, k.created_by, k.created_at, k.last_used_at, g.branch, g.context FROM query_key_grants g JOIN query_keys k ON k.id = g.query_key_id WHERE g.project_id = ?1 AND k.revoked_at IS NULL ORDER BY k.name",
         )?;
@@ -1277,7 +1328,7 @@ impl Store {
             return Ok(Some(p));
         }
         let (found, generation) = {
-            let conn = self.conn.lock().unwrap();
+            let conn = lock(&self.conn);
             let generation = self.generation.load(Ordering::Acquire);
             let found = conn
                 .query_row(
@@ -1299,7 +1350,7 @@ impl Store {
     }
 
     pub fn projects(&self, account_id: i64) -> Result<Vec<Project>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare(&format!("SELECT {PROJECT_COLS} FROM projects WHERE account_id = ?1 ORDER BY uid"))?;
         let rows = st.query_map(params![account_id], project_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1313,7 +1364,7 @@ impl Store {
         }
         let production_branch = production_branch.trim();
         let production_branch = if production_branch.is_empty() { "main" } else { production_branch };
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO projects (account_id, uid, name, production_branch, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1341,7 +1392,7 @@ impl Store {
                 return Err(Error::Invalid(format!("'{v}' is not a visibility (account, restricted)")));
             }
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         conn.execute(
             "UPDATE projects SET name = coalesce(?1, name), production_branch = coalesce(?2, production_branch), visibility = coalesce(?3, visibility), protected_production = coalesce(?4, protected_production) WHERE id = ?5",
             params![name.map(str::trim), production_branch.map(str::trim).filter(|b| !b.is_empty()), visibility, protected_production.map(|b| b as i64), project.id],
@@ -1351,7 +1402,7 @@ impl Store {
     }
 
     pub fn delete_project(&self, actor: &User, project: &Project) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM query_key_grants WHERE project_id = ?1", params![project.id])?;
         tx.execute("DELETE FROM project_access WHERE project_id = ?1", params![project.id])?;
@@ -1362,7 +1413,7 @@ impl Store {
     }
 
     pub fn project_access(&self, project: &Project) -> Result<Vec<(User, Level)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare("SELECT u.id, u.email, u.name, u.email_verified_at, a.level FROM project_access a JOIN users u ON u.id = a.user_id WHERE a.project_id = ?1 ORDER BY u.email")?;
         let rows = st.query_map(params![project.id], |r| Ok((user_row(r)?, level_of(&r.get::<_, String>(4)?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1372,7 +1423,7 @@ impl Store {
     /// the account; a project keeps at least one owner.
     pub fn set_access(&self, actor: &User, project: &Project, email: &str, level: Level) -> Result<(User, Level)> {
         let email = email_of(email)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let user = tx
             .query_row(
@@ -1396,7 +1447,7 @@ impl Store {
 
     pub fn remove_access(&self, actor: &User, project: &Project, email: &str) -> Result<()> {
         let email = email_of(email)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let n = tx.execute(
             "DELETE FROM project_access WHERE project_id = ?1 AND user_id = (SELECT id FROM users WHERE email = ?2)",
@@ -1422,9 +1473,21 @@ impl Store {
     /// Sets the password and ends the user's other sessions: someone
     /// changing a password they think is known keeps only the session
     /// they are doing it from, `keep`, when the caller has one.
-    pub fn set_password(&self, account_id: i64, user: &User, password: &str, keep: Option<&str>) -> Result<()> {
+    /// `current` is the password as it is, which a user who has one must
+    /// give: a personal key alone may not take the web app over.
+    pub fn set_password(&self, account_id: i64, user: &User, password: &str, current: Option<&str>, keep: Option<&str>) -> Result<()> {
+        let stored: Option<String> = {
+            let conn = lock(&self.conn);
+            conn.query_row("SELECT password_hash FROM users WHERE id = ?1", params![user.id], |r| r.get(0)).optional()?.flatten()
+        };
+        if let Some(h) = &stored {
+            match current {
+                Some(c) if password_matches(h, c) => {}
+                _ => return Err(Error::Denied("the current password is needed to set a new one".into())),
+            }
+        }
         let h = hash_password(password)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, user.id])?;
         conn.execute(
             "DELETE FROM sessions WHERE user_id = ?1 AND hash != ?2",
@@ -1438,12 +1501,15 @@ impl Store {
     /// including for users who never set a password.
     pub fn verify_password(&self, email: &str, password: &str) -> Result<Option<User>> {
         let Ok(email) = email_of(email) else { return Ok(None) };
-        let conn = self.conn.lock().unwrap();
-        let row: Option<(User, Option<String>)> = conn
-            .query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| {
+        // The row is read under the lock; the hash is checked without
+        // it, since that takes a while and everyone else waits behind it.
+        let row: Option<(User, Option<String>)> = {
+            let conn = lock(&self.conn);
+            conn.query_row(&format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"), params![email], |r| {
                 Ok((user_row(r)?, r.get(4)?))
             })
-            .optional()?;
+            .optional()?
+        };
         // An unknown address, or one with no password, is answered in
         // the time a wrong password takes, so the clock does not say
         // which addresses are registered.
@@ -1457,7 +1523,7 @@ impl Store {
     /// A browser session for the user on an account; the token is the
     /// cookie value, stored hashed, good for `days`.
     pub fn create_session(&self, user: &User, days: i64) -> Result<(String, Account)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         // The home account when the user is still a member of it: the
         // one they opened, or were first invited into. Else the oldest
         // membership, which is what it always was.
@@ -1470,6 +1536,7 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::Denied(format!("{} belongs to no account", user.email)))?;
         let token = new_secret("zss");
+        conn.execute("DELETE FROM sessions WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')", [])?;
         conn.execute(
             "INSERT INTO sessions (user_id, account_id, hash, expires_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now', ?4))",
             params![user.id, account.id, hash(&token), format!("+{days} days")],
@@ -1495,7 +1562,7 @@ impl Store {
     }
 
     fn session_uncached(&self, h: &str) -> Result<(Option<Principal>, u64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let generation = self.generation.load(Ordering::Acquire);
         let row: Option<(i64, i64)> = conn
             .query_row(
@@ -1518,7 +1585,7 @@ impl Store {
     }
 
     pub fn delete_session(&self, token: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         conn.execute("DELETE FROM sessions WHERE hash = ?1", params![hash(token.trim())])?;
         self.bump();
         Ok(())
@@ -1600,7 +1667,7 @@ impl Store {
         if user.email_verified {
             return Ok(None);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let token = self.issue_token(&conn, user, account_id, TokenKind::Verify)?;
         if token.is_some() {
             self.audit(&conn, account_id, &user.email, "verification_sent", &user.email)?;
@@ -1610,7 +1677,7 @@ impl Store {
 
     /// Marks the address proven. The link stops working.
     pub fn verify_email(&self, token: &str) -> Result<(Account, User)> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let (user_id, account_id, _) = Self::take_token(&tx, TokenKind::Verify, token)?;
         tx.execute(
@@ -1632,7 +1699,7 @@ impl Store {
     /// accounts.
     pub fn start_reset(&self, email: &str) -> Result<Option<(Account, User, String)>> {
         let Ok(email) = email_of(email) else { return Ok(None) };
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let Some(user) = conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE email = ?1"), params![email], user_row).optional()?
         else {
             return Ok(None);
@@ -1658,7 +1725,7 @@ impl Store {
     /// from the account pages when it is.
     pub fn reset_password(&self, token: &str, password: &str) -> Result<(Account, User)> {
         let password_hash = hash_password(password)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = lock(&self.conn);
         let tx = conn.transaction()?;
         let (user_id, account_id, _) = Self::take_token(&tx, TokenKind::Reset, token)?;
         tx.execute(
@@ -1676,12 +1743,12 @@ impl Store {
     // --------------------------------------------------------------- audit
 
     pub fn record(&self, account_id: i64, actor: &str, action: &str, subject: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         Ok(self.audit(&conn, account_id, actor, action, subject)?)
     }
 
     pub fn audit_log(&self, account_id: i64, limit: usize) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn);
         let mut st = conn.prepare("SELECT actor, action, subject, at FROM audit WHERE account_id = ?1 ORDER BY id DESC LIMIT ?2")?;
         let rows = st.query_map(params![account_id, limit as i64], |r| {
             Ok(serde_json::json!({ "actor": r.get::<_, String>(0)?, "action": r.get::<_, String>(1)?, "subject": r.get::<_, String>(2)?, "at": r.get::<_, String>(3)? }))
@@ -1713,7 +1780,7 @@ mod tests {
 
         // Warm the cache, and check it is really holding the answer.
         assert!(s.authenticate(&bob_secret).unwrap().is_some());
-        assert_eq!(s.cache.read().unwrap().principals.len(), 1, "the decision is cached");
+        assert_eq!(read(&s.cache).principals.len(), 1, "the decision is cached");
         assert!(s.authenticate(&bob_secret).unwrap().is_some(), "a second ask is served from memory");
 
         // Revoking the key stops it on the next request, not in a minute.
@@ -1755,7 +1822,7 @@ mod tests {
         // Sessions: logging out ends the session now.
         let (cookie, _) = s.create_session(&ann, 30).unwrap();
         assert!(s.session(&cookie).unwrap().is_some());
-        assert_eq!(s.cache.read().unwrap().sessions.len(), 1);
+        assert_eq!(read(&s.cache).sessions.len(), 1);
         s.delete_session(&cookie).unwrap();
         assert!(s.session(&cookie).unwrap().is_none(), "logout ends it at once");
 
@@ -1774,7 +1841,7 @@ mod tests {
         for i in 0..50 {
             assert!(s.authenticate(&format!("zsk_nonsense{i}")).unwrap().is_none());
         }
-        assert!(s.cache.read().unwrap().principals.is_empty());
+        assert!(read(&s.cache).principals.is_empty());
     }
 
     #[test]
@@ -1893,7 +1960,7 @@ mod tests {
         // A newcomer is set up by the invite, and a token has a shelf life.
         s.add_member(ann.account.id, "ann@acme.test", "bob@acme.test", "Bob", Role::Developer).unwrap();
         let token = s.create_invite(ann.account.id, "ann@acme.test", "bob@acme.test").unwrap();
-        s.conn.lock().unwrap().execute("UPDATE invites SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-8 days')", []).unwrap();
+        lock(&s.conn).execute("UPDATE invites SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-8 days')", []).unwrap();
         assert!(matches!(s.accept_invite(&token, "Bob", "", Some("bobpassword1")), Err(Error::NotFound(_))));
         let token = s.create_invite(ann.account.id, "ann@acme.test", "bob@acme.test").unwrap();
         let (acct, bob, key, secret) = s.accept_invite(&token, "Bob", "", Some("bobpassword1")).unwrap();
@@ -1933,13 +2000,13 @@ mod tests {
         let ann = s.signup("Acme", "ann@acme.test", "Ann", Some("hunter2hunter2")).unwrap();
         let (mine, _) = s.create_session(&ann.user, 1).unwrap();
         let (theirs, _) = s.create_session(&ann.user, 1).unwrap();
-        s.set_password(ann.account.id, &ann.user, "freshpassword1", Some(&mine)).unwrap();
+        s.set_password(ann.account.id, &ann.user, "freshpassword1", Some("hunter2hunter2"), Some(&mine)).unwrap();
         assert!(s.session(&mine).unwrap().is_some(), "the session the change was made from stays");
         assert!(s.session(&theirs).unwrap().is_none(), "every other session is gone");
         assert!(s.verify_password("ann@acme.test", "freshpassword1").unwrap().is_some());
         // Without a session to keep, all of them go.
         let (c, _) = s.create_session(&ann.user, 1).unwrap();
-        s.set_password(ann.account.id, &ann.user, "freshpassword2", None).unwrap();
+        s.set_password(ann.account.id, &ann.user, "freshpassword2", Some("freshpassword1"), None).unwrap();
         assert!(s.session(&c).unwrap().is_none());
     }
 
@@ -1968,7 +2035,7 @@ mod tests {
         // A key whose user belongs nowhere has no account, and answers for nothing.
         let orphan: Option<i64> = conn.query_row("SELECT account_id FROM user_keys WHERE id = 2", [], |r| r.get(0)).unwrap();
         assert_eq!(orphan, None);
-        let s = Store::over(conn);
+        let s = Store::over(conn, DEFAULT_AUTH_CACHE_TTL);
         assert!(s.authenticate("zsk_whatever").unwrap().is_none());
     }
 

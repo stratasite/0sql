@@ -1,10 +1,10 @@
 //! The planner: a universe, a query definition and an optional principal in,
 //! SQL for the datasource the query resolves to out.
 //!
-//! The pipeline mirrors strata's `Planner.plan`: resolve a universe, build
-//! the DAG, run the visitors in order, then assemble the final statement.
-//! Visitors not yet ported report [`PlanError::Unimplemented`] when the
-//! query needs them, so the golden scoreboard stays honest.
+//! The pipeline: resolve a universe, build the DAG, run the visitors in
+//! order, then assemble the final statement. A shape the planner does not
+//! plan is refused with [`PlanError::Unimplemented`] rather than planned
+//! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
 pub mod model;
@@ -138,7 +138,8 @@ impl PlanError {
             PlanError::Resolution(_) => "Unresolvable",
             PlanError::SegmentDatasource(_) => "SegmentDatasource",
             PlanError::SecurityPolicy(_) => "SecurityPolicy",
-            PlanError::Unimplemented(_) | PlanError::Dialect(_) => "Unimplemented",
+            PlanError::Unimplemented(_) => "Unimplemented",
+            PlanError::Dialect(_) => "Dialect",
         }
     }
 }

@@ -63,7 +63,7 @@ pub struct Fixtures {
 /// Where the planner takes its join paths from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathSource {
-    /// The paths Rails' formation engine stored in the snapshot.
+    /// The paths stored with the snapshot.
     Snapshot,
     /// Paths the formation crate computes from the join graph.
     Formed,

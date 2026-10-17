@@ -6,17 +6,21 @@
 //! up it deploys the directory and redeploys as the files change, so
 //! one command gives a teammate a live endpoint over the model they
 //! are editing. Outside a project it serves whatever its data
-//! directory holds. The server itself is `zsql_server`, the crate
-//! `zsqld` is built from; this module only configures it from flags
-//! and keeps it company.
+//! directory holds. The server itself is the `zsql_server` library;
+//! this module configures it and keeps it company. The settings come
+//! from `ZSQL_*` variables, the environment file a deployment loads,
+//! with flags overriding what they name; this is the one place in the
+//! product a `ZSQL_*` variable is read.
 
-use crate::{config, project_archive, remote, show, Where};
+use crate::{config, project, remote, show, Where};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zsql_server::limits::{Mode, Rate};
+use zsql_server::{Config, MailConfig, McpSettings};
 
 /// Where the server listens when nothing else is said: the address the
 /// CLI's other commands talk to by default.
@@ -25,14 +29,17 @@ const DEFAULT_BIND: &str = "127.0.0.1:3699";
 #[derive(Args, Clone, Debug)]
 pub struct ServeArgs {
     /// Address to listen on; port 0 takes a free one, which is logged.
-    #[arg(long, default_value = DEFAULT_BIND)]
+    #[arg(long, env = "ZSQL_BIND", default_value = DEFAULT_BIND)]
     pub bind: String,
-    /// Where deployed models live; defaults to $ZSQL_HOME/data.
-    #[arg(long)]
+    /// Where deployed models live; $ZSQL_HOME/data when neither this nor the variable says.
+    #[arg(long, env = "ZSQL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Multi-tenant: keys, accounts, sign-up. Off, there is one tenant and no auth.
-    #[arg(long)]
+    /// Multi-tenant: keys, accounts, sign-up. Off, there is one tenant and no auth. ZSQL_ACCOUNTS=on means the same.
+    #[arg(long, overrides_with = "no_accounts")]
     pub accounts: bool,
+    /// One tenant and no auth, whatever ZSQL_ACCOUNTS says.
+    #[arg(long)]
+    pub no_accounts: bool,
     /// Allow listening beyond the loopback with accounts off, which lets anyone who can reach the port deploy and plan.
     #[arg(long)]
     pub open: bool,
@@ -40,29 +47,126 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_project: bool,
     /// Where the app is reached from outside, for links and cookies; the bind address otherwise.
-    #[arg(long)]
+    #[arg(long, env = "ZSQL_PUBLIC_URL")]
     pub public_url: Option<String>,
 }
 
 impl ServeArgs {
-    /// Where deployed models live.
-    fn data_dir(&self) -> Result<PathBuf> {
-        match &self.data_dir {
-            Some(d) => Ok(d.clone()),
-            None => Ok(home()?.join("data")),
+    fn bind(&self) -> String {
+        self.bind.clone()
+    }
+
+    /// `--accounts` and `--no-accounts` each win over the variable.
+    fn accounts(&self) -> bool {
+        if self.no_accounts {
+            false
+        } else {
+            self.accounts || on("ZSQL_ACCOUNTS")
         }
+    }
+
+    /// Where deployed models live, as an absolute path: the background
+    /// form records it, and `status` and `stop` read it from wherever
+    /// they are run.
+    fn data_dir(&self) -> Result<PathBuf> {
+        let dir = match &self.data_dir {
+            Some(d) => d.clone(),
+            None => home()?.join("data"),
+        };
+        Ok(std::path::absolute(&dir).unwrap_or(dir))
+    }
+
+    /// The whole configuration: the environment's settings, with the
+    /// flags over them.
+    fn config(&self) -> Result<Config> {
+        let accounts = self.accounts();
+        let mut cfg = Config::local(self.data_dir()?, self.bind());
+        cfg.accounts = accounts;
+        cfg.signup_open = !matches!(var("ZSQL_SIGNUP").as_deref(), Some("closed" | "off" | "0"));
+        cfg.public_url = self.public_url.clone();
+        // The limits are about sharing one server between tenants, so
+        // they start with the accounts.
+        cfg.limits.mode = if accounts { Mode::On } else { Mode::Off };
+        if let Some(v) = var("ZSQL_LIMITS") {
+            cfg.limits.mode = Mode::parse(&v);
+        }
+        let l = &mut cfg.limits;
+        for (name, slot) in [
+            ("ZSQL_LIMIT_PLAN", &mut l.plan),
+            ("ZSQL_LIMIT_EXPLORE", &mut l.explore),
+            ("ZSQL_LIMIT_HEAVY", &mut l.heavy),
+            ("ZSQL_LIMIT_MANAGE", &mut l.manage),
+            ("ZSQL_LIMIT_KEY_PLAN", &mut l.key_plan),
+            ("ZSQL_LIMIT_KEY_EXPLORE", &mut l.key_explore),
+            ("ZSQL_LIMIT_LOGIN", &mut l.login),
+            ("ZSQL_LIMIT_SIGNUP", &mut l.signup),
+            ("ZSQL_LIMIT_INVITE", &mut l.invite),
+            ("ZSQL_LIMIT_RESET", &mut l.reset),
+            ("ZSQL_LIMIT_BAD_KEY", &mut l.bad_key),
+            ("ZSQL_LIMIT_HANDSHAKE", &mut l.handshake),
+        ] {
+            rate(name, slot)?;
+        }
+        if let Some(v) = var("ZSQL_LIMIT_EMAIL_FAILURES") {
+            l.email_failures = if v.eq_ignore_ascii_case("off") {
+                0
+            } else {
+                v.parse().with_context(|| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))?
+            };
+        }
+        if let Some(v) = var("ZSQL_LIMIT_EMAIL_WINDOW") {
+            l.email_window = Duration::from_secs(number(&v, "ZSQL_LIMIT_EMAIL_WINDOW")? as u64);
+        }
+        l.trusted_proxy = on("ZSQL_TRUSTED_PROXY");
+
+        let a = &mut cfg.admission;
+        for (name, slot) in [
+            ("ZSQL_ADMIT_PLAN", &mut a.plan),
+            ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
+            ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
+            ("ZSQL_ADMIT_MANAGE", &mut a.manage),
+            ("ZSQL_ADMIT_PASSWORD", &mut a.password),
+        ] {
+            if let Some(v) = var(name) {
+                *slot = number(&v, name)?;
+            }
+        }
+        for (name, slot) in
+            [("ZSQL_MAX_BRANCHES_PER_PROJECT", &mut cfg.caps.per_project), ("ZSQL_MAX_BRANCHES_PER_ACCOUNT", &mut cfg.caps.per_account)]
+        {
+            match var(name) {
+                Some(v) if v.eq_ignore_ascii_case("off") => *slot = usize::MAX,
+                Some(v) => *slot = number(&v, name)?,
+                None => {}
+            }
+        }
+
+        cfg.mail =
+            MailConfig { command: var("ZSQL_MAIL_COMMAND"), from: var("ZSQL_MAIL_FROM").unwrap_or_default(), ..MailConfig::default() };
+        if let Some(v) = var("ZSQL_MAIL_TIMEOUT") {
+            cfg.mail.timeout = Duration::from_secs(number(&v, "ZSQL_MAIL_TIMEOUT")? as u64);
+        }
+
+        if let Some(v) = var("ZSQL_AUTH_CACHE_TTL") {
+            cfg.auth_cache_ttl = Duration::from_secs(number(&v, "ZSQL_AUTH_CACHE_TTL")? as u64);
+        }
+        let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
+        cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(cfg)
     }
 
     /// These arguments as `zsql serve` would take them, for the
     /// background form to hand on; kept next to the fields so a new
     /// flag cannot be forgotten here.
-    fn to_argv(&self, project: Option<&Path>) -> Vec<OsString> {
+    fn to_argv(&self, project: Option<&Path>) -> Result<Vec<OsString>> {
         let mut argv: Vec<OsString> = vec!["serve".into(), "--bind".into(), self.bind.clone().into()];
-        if let Some(d) = &self.data_dir {
-            argv.extend(["--data-dir".into(), d.clone().into()]);
-        }
+        argv.extend(["--data-dir".into(), self.data_dir()?.into()]);
         if self.accounts {
             argv.push("--accounts".into());
+        }
+        if self.no_accounts {
+            argv.push("--no-accounts".into());
         }
         if self.open {
             argv.push("--open".into());
@@ -75,7 +179,7 @@ impl ServeArgs {
         if let Some(u) = &self.public_url {
             argv.extend(["--public-url".into(), u.clone().into()]);
         }
-        argv
+        Ok(argv)
     }
 }
 
@@ -88,8 +192,13 @@ pub enum ServerCommand {
     },
     /// Stop the background server (SIGTERM, then wait for it to finish).
     Stop,
-    /// Whether the background server is running, and whether it answers.
-    Status,
+    /// Whether the background server is running, and whether it answers;
+    /// also whether a foreground `zsql serve` holds the data directory.
+    Status {
+        /// The data directory to look at for a foreground server; $ZSQL_HOME/data when neither this nor the variable says.
+        #[arg(long, env = "ZSQL_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+    },
     /// The last lines of the background server's log.
     Logs {
         #[arg(long, default_value_t = 100)]
@@ -101,6 +210,39 @@ fn home() -> Result<PathBuf> {
     config::home().context("neither ZSQL_HOME nor HOME is set")
 }
 
+// ---------------------------------------------------- the environment
+
+fn var(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn on(name: &str) -> bool {
+    matches!(var(name).as_deref(), Some("on" | "1" | "true"))
+}
+
+fn number(v: &str, name: &str) -> Result<usize> {
+    v.parse().with_context(|| format!("{name}: {v:?} is not a number"))
+}
+
+fn rate(name: &str, slot: &mut Rate) -> Result<()> {
+    if let Some(v) = var(name) {
+        *slot = Rate::parse(&v).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// A file named by a variable, read whole, or nothing.
+fn file(name: &str) -> Result<Option<String>> {
+    match var(name) {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path).with_context(|| format!("{name}: cannot read {path}"))?;
+            eprintln!("zsqld: mcp: {name} read from {path}");
+            Ok(Some(text))
+        }
+        None => Ok(None),
+    }
+}
+
 fn loopback(bind: &str) -> bool {
     bind.parse::<SocketAddr>().map(|a| a.ip().is_loopback()).unwrap_or(false) || bind.starts_with("localhost:")
 }
@@ -109,23 +251,17 @@ fn loopback(bind: &str) -> bool {
 /// accounts off, the project is deployed to it and redeployed as its
 /// files change.
 pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
-    if !args.accounts && !args.open && !loopback(&args.bind) {
-        bail!("{} is not a loopback address, and with accounts off anyone who reaches it may deploy and plan; add --accounts, or --open to mean it", args.bind);
+    let (bind, accounts) = (args.bind(), args.accounts());
+    if !accounts && !args.open && !loopback(&bind) {
+        bail!("{bind} is not a loopback address, and with accounts off anyone who reaches it may deploy and plan; add --accounts, or --open to mean it");
     }
-    let data_dir = args.data_dir()?;
     // A project named explicitly must be there; one looked for is optional.
     let project = match (args.no_project, at.project.is_some()) {
         (true, _) => None,
         (false, true) => Some(at.project_dir()?),
         (false, false) => at.project_dir().ok(),
     };
-    let mut cfg = zsql_server::Config::local(data_dir, args.bind.clone());
-    cfg.accounts = args.accounts;
-    cfg.public_url = args.public_url;
-    if args.accounts {
-        // The limits are about sharing one server between tenants.
-        cfg.limits.mode = zsql_server::limits::Mode::On;
-    }
+    let cfg = args.config()?;
 
     let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
     let server = std::thread::Builder::new()
@@ -146,7 +282,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         }
     };
 
-    match (project, args.accounts) {
+    match (project, accounts) {
         (Some(p), false) => {
             // An unspecified address is listened on, not connected to.
             let reach = match addr.ip() {
@@ -158,7 +294,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
             let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
             eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
             let deploy = || -> Result<()> {
-                let archive = project_archive(&p.dir)?;
+                let archive = project::archive(&p.dir)?;
                 let v = client.post_bytes(&format!("{}/deploy", remote::branch_path(&p.uid, &branch)), "application/gzip", &archive)?;
                 show::print_deploy(&v);
                 Ok(())
@@ -166,7 +302,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
             if let Err(e) = deploy() {
                 eprintln!("error: {e}");
             }
-            crate::watch_files(
+            project::watch(
                 &p.dir,
                 || server.is_finished(),
                 || {
@@ -182,15 +318,8 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
                 "zsql: accounts are on, so {} is not deployed by itself; sign up, make a key, and `zsql deploy --server http://{addr}`",
                 p.dir.display()
             );
-            while !server.is_finished() {
-                std::thread::sleep(Duration::from_millis(500));
-            }
         }
-        (None, _) => {
-            while !server.is_finished() {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
+        (None, _) => {}
     }
     finish(server)
 }
@@ -211,6 +340,9 @@ struct Started {
     pid: u32,
     bind: String,
     data_dir: PathBuf,
+    /// Where the server is reached from outside, when it was told.
+    #[serde(default)]
+    public_url: Option<String>,
 }
 
 fn pid_file() -> Result<PathBuf> {
@@ -221,39 +353,60 @@ fn log_file() -> Result<PathBuf> {
     Ok(home()?.join("server.log"))
 }
 
-/// The pid holding a data directory's lock, if any: the server itself
-/// writes its pid there under the lock, so this is the one answer that
-/// a stale pidfile or a reused pid cannot fake.
+/// Who holds a data directory's lock: the server itself writes its pid
+/// there under the lock, so this is the one answer that a stale pidfile
+/// or a reused pid cannot fake.
+enum Lock {
+    /// Nobody: the file could be opened and locked.
+    Free,
+    /// A process, by the pid it wrote, and the address and public URL
+    /// it wrote once it was bound.
+    Held { pid: Option<u32>, addr: Option<String>, public: Option<String> },
+    /// The file could not be opened, so nothing can be said.
+    Unreachable,
+}
+
 #[cfg(unix)]
-fn lock_holder(data_dir: &Path) -> Option<u32> {
+fn lock_holder(data_dir: &Path) -> Lock {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(data_dir.join("lock")).ok()?;
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(data_dir.join("lock")) else { return Lock::Unreachable };
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return None;
+        return Lock::Free;
     }
     let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    text.trim().parse().ok()
+    let _ = file.read_to_string(&mut text);
+    let mut lines = text.lines().map(str::trim);
+    let pid = lines.next().and_then(|l| l.parse().ok());
+    let mut rest = lines.map(|l| if l.is_empty() { None } else { Some(l.to_string()) });
+    Lock::Held { pid, addr: rest.next().flatten(), public: rest.next().flatten() }
 }
 
 #[cfg(not(unix))]
-fn lock_holder(_data_dir: &Path) -> Option<u32> {
-    None
+fn lock_holder(_data_dir: &Path) -> Lock {
+    Lock::Unreachable
 }
 
 /// The server `start` recorded, when it is the one holding its data
-/// directory's lock.
+/// directory's lock. When the lock cannot be reached, the recorded pid
+/// is believed only while that process exists.
 fn running() -> Result<Option<Started>> {
     let Ok(text) = std::fs::read_to_string(pid_file()?) else { return Ok(None) };
     let Ok(s) = serde_json::from_str::<Started>(&text) else { return Ok(None) };
-    Ok((lock_holder(&s.data_dir) == Some(s.pid)).then_some(s))
+    let yes = match lock_holder(&s.data_dir) {
+        Lock::Held { pid, .. } => pid == Some(s.pid),
+        Lock::Free => false,
+        Lock::Unreachable => alive(s.pid),
+    };
+    Ok(yes.then_some(s))
 }
 
+/// Whether a process exists. Not being allowed to signal it still means
+/// it exists; only "no such process" means it does not.
 #[cfg(unix)]
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__errno_location() != libc::ESRCH }
 }
 
 #[cfg(not(unix))]
@@ -275,7 +428,7 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
     match command {
         ServerCommand::Start { args } => start(args, at),
         ServerCommand::Stop => stop(),
-        ServerCommand::Status => status(),
+        ServerCommand::Status { data_dir } => status(data_dir),
         ServerCommand::Logs { lines } => {
             let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
             let all: Vec<&str> = text.lines().collect();
@@ -302,9 +455,12 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         (false, true) => Some(at.project_dir()?.dir),
         (false, false) => at.project_dir().ok().map(|p| p.dir),
     };
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_file()?)?;
+    let project = project.map(|p| std::path::absolute(&p).unwrap_or(p));
+    let log_path = log_file()?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let log_len = log.metadata().map(|m| m.len()).unwrap_or(0);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(args.to_argv(project.as_deref()));
+    cmd.args(args.to_argv(project.as_deref())?);
     cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     #[cfg(unix)]
     {
@@ -318,20 +474,34 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         }
     }
     let mut child = cmd.spawn().context("starting zsql serve")?;
-    let started = Started { pid: child.id(), bind: args.bind.clone(), data_dir };
+    let mut started = Started { pid: child.id(), bind: args.bind(), data_dir, public_url: args.public_url.clone() };
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
-    // Give it a moment to refuse, so a bad bind or a held data
-    // directory is reported here and not only in the log. The child is
-    // reaped here, not just signalled: an exited child answers a signal
-    // until it is.
-    std::thread::sleep(Duration::from_millis(700));
-    if let Some(status) = child.try_wait()? {
-        let _ = std::fs::remove_file(pid_file()?);
-        let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
-        let last = text.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        bail!("the server stopped at once ({status}); the log ends:\n{last}");
+    // Wait for it to say where it listens, which is also when a bad
+    // bind or a held data directory has been refused. The child is
+    // reaped here, not just signalled, since an exited child answers a
+    // signal until it is.
+    let t0 = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let _ = std::fs::remove_file(pid_file()?);
+            let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let last = text.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            bail!("the server stopped at once ({status}); the log ends:\n{last}");
+        }
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let since = text.get(log_len as usize..).unwrap_or("");
+        if let Some(addr) = since.lines().find_map(|l| l.trim().strip_prefix("zsqld: listening on http://")) {
+            // The address actually bound, which a bind of port 0 does not say.
+            started.bind = addr.to_string();
+            std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
+            break;
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    println!("started process {} on {}; log at {}", started.pid, started.bind, log_file()?.display());
+    println!("started process {} on {}; log at {}", started.pid, started.bind, log_path.display());
     Ok(())
 }
 
@@ -368,16 +538,55 @@ fn stop() -> Result<()> {
     Ok(())
 }
 
-fn status() -> Result<()> {
-    match running()? {
-        Some(s) => {
-            let server = format!("http://{}", s.bind);
-            match remote::Client::new(&server, None).get("/healthz") {
-                Ok(_) => println!("running as process {} on {}; it answers", s.pid, s.bind),
-                Err(e) => println!("running as process {} on {}; it does not answer: {e}", s.pid, s.bind),
-            }
+/// The server `start` recorded, if it is running; failing that, the
+/// data directory's lock, which a foreground `zsql serve` holds too.
+/// That server was not started here, so `stop` will not stop it.
+fn status(data_dir: Option<PathBuf>) -> Result<()> {
+    if let Some(s) = running()? {
+        println!("running as process {} at {}{}; {}", s.pid, url_of(&s.bind), public_note(s.public_url.as_deref()), answers(&s.bind));
+        return Ok(());
+    }
+    let dir = match data_dir {
+        Some(d) => d,
+        None => home()?.join("data"),
+    };
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    match lock_holder(&dir) {
+        Lock::Held { pid: Some(pid), addr: Some(addr), public } => println!(
+            "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}{}; {}",
+            dir.display(),
+            url_of(&addr),
+            public_note(public.as_deref()),
+            answers(&addr)
+        ),
+        Lock::Held { pid: Some(pid), addr: None, .. } => {
+            println!("not started by `zsql server start`, but process {pid} holds {} and has not bound yet", dir.display())
         }
-        None => println!("not running"),
+        Lock::Held { pid: None, .. } => println!("not started by `zsql server start`, but another process holds {}", dir.display()),
+        Lock::Free | Lock::Unreachable => println!("not running (nothing holds {})", dir.display()),
     }
     Ok(())
+}
+
+/// The address as a URL to go to: a server bound to every interface is
+/// reached on the loopback from here.
+fn url_of(bind: &str) -> String {
+    let host_port = match bind.rsplit_once(':') {
+        Some(("0.0.0.0" | "[::]" | "::", port)) => format!("127.0.0.1:{port}"),
+        _ => bind.to_string(),
+    };
+    format!("http://{host_port}")
+}
+
+/// The public URL, when the server was told one, beside the local one.
+fn public_note(public: Option<&str>) -> String {
+    public.map(|u| format!(" (public URL {u})")).unwrap_or_default()
+}
+
+/// Whether the server at the bind answers `/healthz`.
+fn answers(bind: &str) -> String {
+    match remote::Client::new(&url_of(bind), None).get("/healthz") {
+        Ok(_) => "it answers".to_string(),
+        Err(e) => format!("it does not answer: {e}"),
+    }
 }

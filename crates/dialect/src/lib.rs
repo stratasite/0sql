@@ -56,12 +56,22 @@ impl Dialect {
     }
 
     /// A copy with per-query overrides applied (the query's `db_settings`).
-    pub fn with_overrides<'a>(&self, overrides: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>) -> Self {
-        let mut d = self.clone();
+    /// This dialect with a query's `db_settings` laid over it. Without
+    /// any, the dialect itself: a plan shares the catalogue's copy rather
+    /// than cloning the whole settings map.
+    pub fn with_overrides<'a>(
+        self: &std::sync::Arc<Self>,
+        overrides: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+    ) -> std::sync::Arc<Self> {
+        let mut overrides = overrides.into_iter().peekable();
+        if overrides.peek().is_none() {
+            return self.clone();
+        }
+        let mut d = Self::clone(self);
         for (k, v) in overrides {
             d.settings.insert(k.to_string(), json_to_yaml(v));
         }
-        d
+        std::sync::Arc::new(d)
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -231,7 +241,6 @@ impl Dialect {
         matches!(self.measure_filtering_strategy(), "both" | "final")
     }
 
-    /// Aggregate function names, base list plus the adapter's extras, lowercased.
     /// The SQL keywords an expression parser must not read as columns:
     /// `base.yml`'s list plus the adapter's `extra_reserved_keywords`, lower-cased.
     pub fn reserved_keywords(&self) -> Vec<String> {
@@ -254,6 +263,8 @@ impl Dialect {
         out
     }
 
+    /// Aggregate function names: `base.yml`'s list plus the adapter's
+    /// `extra_aggregate_functions`, lower-cased.
     pub fn aggregate_functions(&self) -> Vec<String> {
         let mut out = Vec::new();
         for key in ["aggregate_functions", "extra_aggregate_functions"] {
@@ -457,6 +468,31 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every built-in dialect quotes a literal so that a quote inside it
+    /// cannot end it, and quotes an identifier to something other than
+    /// the bare word; a query's `db_settings` lay over the catalogue's
+    /// copy without touching it.
+    #[test]
+    fn every_builtin_dialect_quotes_and_overlays() {
+        let dialects = Dialects::builtin();
+        for name in dialects.names().unwrap() {
+            let d = dialects.get(&name).unwrap();
+            let lit = d.string_lit("it's").unwrap();
+            assert!(lit.contains("it''s"), "{name}: {lit}");
+            assert!(lit.starts_with('\'') && lit.ends_with('\''), "{name}: {lit}");
+            let ident = d.quote("order").unwrap();
+            assert_ne!(ident, "order", "{name} must quote a reserved word");
+            assert!(ident.contains("order"), "{name}: {ident}");
+            assert!(!d.reserved_keywords().is_empty() && !d.aggregate_functions().is_empty(), "{name}");
+        }
+        let pg = dialects.get("postgres").unwrap();
+        let same = pg.with_overrides(std::iter::empty());
+        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalogue's copy");
+        let over = pg.with_overrides([("final_pass_measure_join_type", &serde_json::json!("inner"))]);
+        assert_eq!(over.final_pass_measure_join_type(), "inner");
+        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalogue's copy is untouched");
+    }
 
     #[test]
     fn placeholders_are_greedy() {

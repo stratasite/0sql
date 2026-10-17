@@ -4,11 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "zsqld: deploy a project, get SQL back"
-
-[[bin]]
-name = "zsqld"
-path = "src/main.rs"
+description = "The server: deploy a project, get SQL back; run by `zsql serve`"
 
 [dependencies]
 zsql-semantic.workspace = true

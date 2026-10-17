@@ -17,6 +17,7 @@
 //! limits reset on restart. A limiter shared between instances belongs
 //! with the storage trait, not here. See `docs/rate-limiting.md`.
 
+use crate::lock;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -26,13 +27,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// What a request costs, which decides both its bucket and its
 /// concurrency cap. One deploy is not one `sql`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Class {
+pub(crate) enum Class {
     /// sql, explain, tables, values, summaries: microseconds each.
     Plan,
     /// explore and the fields search: a walk or a scoring pass over
     /// every visible field, milliseconds, and retriggered on keystrokes.
     Explore,
-    /// deploy, validate, test, sampling-plan: seconds of CPU.
+    /// deploy, validate, test: seconds of CPU.
     Heavy,
     /// the account endpoints: cheap, but not for applications to hammer.
     Manage,
@@ -69,7 +70,7 @@ const SITE_FILES: &[&str] = &[
 ];
 
 /// A request's class, from its method and path alone.
-pub fn classify(method: &str, path: &str) -> Class {
+pub(crate) fn classify(method: &str, path: &str) -> Class {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method, p.as_slice()) {
         (_, []) | (_, ["healthz"]) | (_, ["app", ..]) | (_, [".well-known", ..]) => Class::Exempt,
@@ -83,7 +84,7 @@ pub fn classify(method: &str, path: &str) -> Class {
         // the explore-class tools take an explore token too, in mcp.rs.
         ("POST", ["mcp"]) => Class::Plan,
         (_, ["projects", _, "branches", _, verb]) => match *verb {
-            "deploy" | "validate" | "test" | "sampling-plan" => Class::Heavy,
+            "deploy" | "validate" | "test" => Class::Heavy,
             "sql" | "explain" => Class::Plan,
             "explore" | "fields" => Class::Explore,
             _ => Class::Plan,
@@ -102,7 +103,7 @@ pub fn classify(method: &str, path: &str) -> Class {
 ///
 /// `/account/verify-email` is not in this list: it sends the caller
 /// their own link, so it needs to know who the caller is.
-pub fn authenticates(path: &str) -> bool {
+pub(crate) fn authenticates(path: &str) -> bool {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // `.well-known` is where OAuth clients look for an authorization
     // server before they present anything; there is none here, and the
@@ -179,7 +180,7 @@ impl Bucket {
 
 /// What a check decided, and what to tell the caller.
 #[derive(Debug, Clone, Copy)]
-pub struct Decision {
+pub(crate) struct Decision {
     pub allowed: bool,
     /// Seconds to wait before retrying; 0 when allowed.
     pub retry_after: u64,
@@ -198,7 +199,7 @@ impl Decision {
 /// The routes an address is limited on separately. Each is its own
 /// bucket, because each has its own rate.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Gate {
+pub(crate) enum Gate {
     Login,
     Signup,
     /// Redeeming a one-time link: an invite, a reset, a verification.
@@ -336,7 +337,7 @@ impl Config {
 
 // ----------------------------------------------------------------- limiter
 
-pub struct Limiter {
+pub(crate) struct Limiter {
     pub cfg: Config,
     shards: [Mutex<HashMap<BKey, Bucket>>; SHARDS],
     /// Failed logins per email: how many, and when the window started.
@@ -411,7 +412,7 @@ impl Limiter {
     }
 
     /// An address's allowance on a route that costs before anyone is
-    /// identified.
+    /// identified. See [`bucket`] for what counts as one address.
     pub fn address(&self, addr: IpAddr, gate: Gate) -> Decision {
         if self.cfg.mode == Mode::Off {
             return Decision::ok();
@@ -424,7 +425,7 @@ impl Limiter {
             Gate::BadKey => self.cfg.bad_key,
             Gate::Handshake => self.cfg.handshake,
         };
-        self.take(BKey::Addr(addr, gate), rate, 1.0, Instant::now())
+        self.take(BKey::Addr(bucket(addr), gate), rate, 1.0, Instant::now())
     }
 
     /// Whether a decision actually refuses: in shadow mode it never does,
@@ -434,7 +435,7 @@ impl Limiter {
             return false;
         }
         if self.cfg.mode == Mode::Shadow {
-            eprintln!("zsqld: rate limit (shadow) would refuse {what}: retry after {}s", d.retry_after);
+            say!("zsqld: rate limit (shadow) would refuse {what}: retry after {}s", d.retry_after);
             return false;
         }
         true
@@ -452,7 +453,7 @@ impl Limiter {
         if self.cfg.mode == Mode::Off || self.cfg.email_failures == 0 {
             return false;
         }
-        let mut map = self.failures.lock().unwrap();
+        let mut map = lock(&self.failures);
         let e = map.entry(email.to_ascii_lowercase()).or_insert((0, now));
         if now.saturating_duration_since(e.1) > self.cfg.email_window {
             *e = (0, now);
@@ -471,14 +472,14 @@ impl Limiter {
             return None;
         }
         let over = {
-            let map = self.failures.lock().unwrap();
+            let map = lock(&self.failures);
             let (n, since) = map.get(&email.to_ascii_lowercase())?;
             let age = now.saturating_duration_since(*since);
             (*n > self.cfg.email_failures && age <= self.cfg.email_window).then(|| (self.cfg.email_window - age).as_secs().max(1))
         };
         match (over, self.cfg.mode) {
             (Some(secs), Mode::Shadow) => {
-                eprintln!("zsqld: rate limit (shadow) would refuse logins for this email for {secs}s");
+                say!("zsqld: rate limit (shadow) would refuse logins for this email for {secs}s");
                 None
             }
             (other, _) => other,
@@ -487,7 +488,7 @@ impl Limiter {
 
     /// A good password clears the email's failures.
     pub fn login_ok(&self, email: &str) {
-        self.failures.lock().unwrap().remove(&email.to_ascii_lowercase());
+        lock(&self.failures).remove(&email.to_ascii_lowercase());
     }
 
     // ------------------------------------------------------------- upkeep
@@ -497,7 +498,7 @@ impl Limiter {
     pub fn sweep(&self) {
         let now = Instant::now();
         for shard in &self.shards {
-            let mut map = shard.lock().unwrap();
+            let mut map = lock(shard);
             map.retain(|_, b| {
                 let rate = b.rate;
                 b.refill(rate, now);
@@ -505,7 +506,26 @@ impl Limiter {
             });
         }
         let window = self.cfg.email_window;
-        self.failures.lock().unwrap().retain(|_, (_, since)| now.saturating_duration_since(*since) <= window);
+        lock(&self.failures).retain(|_, (_, since)| now.saturating_duration_since(*since) <= window);
+    }
+}
+
+/// The address a per-address bucket is keyed by.
+///
+/// An IPv4 address is itself. An IPv6 host is usually handed a whole
+/// /64, so one caller could take a fresh address per request and never
+/// meet a limit; the bucket is the /64 instead. An IPv4 address
+/// arriving as IPv6 (`::ffff:a.b.c.d`) is the IPv4 address.
+pub(crate) fn bucket(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+        },
     }
 }
 
@@ -514,7 +534,7 @@ impl Limiter {
 /// How many requests of each class may be inside the server at once.
 /// This is what keeps the process alive: past the cap a request waits a
 /// moment and is then refused rather than queueing without bound.
-pub struct Admission {
+pub(crate) struct Admission {
     plan: Arc<Semaphore>,
     explore: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
@@ -539,7 +559,7 @@ fn patience(class: Class) -> Duration {
 /// the CLI cannot act on it and the caller is left guessing about a
 /// deploy that may well have landed. Better that the server always gets
 /// to give its own answer first.
-pub fn deadline(class: Class) -> Duration {
+pub(crate) fn deadline(class: Class) -> Duration {
     match class {
         Class::Heavy => Duration::from_secs(90),
         _ => Duration::from_secs(30),
@@ -730,10 +750,10 @@ mod tests {
         let l = Limiter::new(cfg);
         let t0 = Instant::now();
         l.principal_at(1, None, Class::Plan, t0);
-        let before: usize = l.shards.iter().map(|s| s.lock().unwrap().len()).sum();
+        let before: usize = l.shards.iter().map(|s| lock(s).len()).sum();
         assert_eq!(before, 1);
         l.sweep();
-        let after: usize = l.shards.iter().map(|s| s.lock().unwrap().len()).sum();
+        let after: usize = l.shards.iter().map(|s| lock(s).len()).sum();
         assert_eq!(after, 1, "a bucket mid-refill is kept");
     }
 
@@ -748,7 +768,6 @@ mod tests {
             ("POST", "/projects/a/branches/main/deploy", Heavy),
             ("POST", "/projects/a/branches/main/validate", Heavy),
             ("POST", "/projects/a/branches/main/test", Heavy),
-            ("GET", "/projects/a/branches/main/sampling-plan", Heavy),
             ("GET", "/projects/a/branches/main/values/dim", Plan),
             ("GET", "/projects/a/branches/main", Plan),
             ("DELETE", "/projects/a/branches/main", Manage),
@@ -825,6 +844,22 @@ mod address_tests {
         assert!(h.address(a, Gate::Handshake).allowed);
         assert!(!h.address(a, Gate::Handshake).allowed, "a keyless handshake has its own allowance per address");
         assert!(h.address(a, Gate::BadKey).allowed, "and does not spend the bad-key one");
+    }
+
+    /// An IPv6 caller is one /64, not one address of the 2^64 it was
+    /// handed; an IPv4 address in IPv6 clothing is the IPv4 address.
+    #[test]
+    fn an_ipv6_caller_is_counted_by_its_sixty_four() {
+        let l = Limiter::new(Config { mode: Mode::On, login: Rate { per_sec: 0.01, burst: 1.0 }, ..Config::default() });
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let next: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(l.address(first, Gate::Login).allowed);
+        assert!(!l.address(next, Gate::Login).allowed, "the same /64 shares the allowance");
+        assert!(l.address(other, Gate::Login).allowed, "the next /64 has its own");
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(bucket(mapped), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_eq!(bucket("203.0.113.7".parse().unwrap()), "203.0.113.7".parse::<IpAddr>().unwrap());
     }
 }
 

@@ -7,6 +7,7 @@
 
 use crate::config::Project;
 use crate::failure::Refusal;
+use crate::side::Query;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -50,8 +51,8 @@ fn context_of(v: Option<&Value>) -> Result<Option<SecurityContext>> {
 }
 
 /// `/sql` and `/explain`, planned here.
-pub fn sql(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Option<&Value>, explain: bool) -> Result<Value> {
-    let req = SqlRequest { spec, expr: expr.map(str::to_string), context: context_of(context)? };
+pub fn sql(m: &Model, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
+    let req = SqlRequest { spec: query.spec().cloned(), expr: query.expr().map(str::to_string), context: context_of(context)? };
     let v = if explain {
         serde_json::to_value(m.explain(req, &unlimited).map_err(Refusal::from)?)?
     } else {
@@ -61,27 +62,21 @@ pub fn sql(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Option<&
 }
 
 /// `/explore`, planned here.
-pub fn explore(m: &Model, spec: Option<Value>, expr: Option<&str>, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
+pub fn explore(m: &Model, query: &Query, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
     let req = ExploreRequest {
-        spec,
-        expr: expr.map(str::to_string),
+        spec: query.spec().cloned(),
+        expr: query.expr().map(str::to_string),
         context: context_of(context)?,
         q: q.map(str::trim).filter(|q| !q.is_empty()).map(str::to_string),
     };
     Ok(serde_json::to_value(m.explore(req, &unlimited).map_err(Refusal::from)?)?)
 }
 
-/// A dimension's sampled values by uid, name or unique substring; the
-/// service resolves the name, the same way the server does.
-pub fn values_for(m: &Model, dim: &str) -> Result<Value> {
-    Ok(m.values_of(dim).map_err(Refusal::from)?)
-}
-
 /// What a validate answers with: the summary, the test results, and
 /// that nothing was kept.
-pub fn check(m: &Model) -> Value {
+pub fn check(m: &Model) -> Result<Value> {
     let mut out = m.summary();
-    out["test_results"] = m.run_tests();
+    out["test_results"] = m.run_tests().map_err(Refusal::from)?;
     out["validated_only"] = json!(true);
-    out
+    Ok(out)
 }

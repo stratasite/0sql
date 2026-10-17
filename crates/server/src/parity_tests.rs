@@ -7,11 +7,28 @@
 //! catalogue, the field search, and the refusals with their classes.
 //! A difference here is a seam the service crate was meant to close.
 
-use super::*;
+use crate::error::ApiError;
+use crate::limits;
+use crate::limits::{Admission, Limiter};
+use crate::mail;
+use crate::mcp;
+use crate::run::router;
+use crate::{App, Caps, Shared};
 use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::StatusCode;
 use axum::http::{Method, Request};
+use axum::Router;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tower::ServiceExt;
+use zsql_dialect::Dialects;
 use zsql_service::unlimited;
+use zsql_service::{Model, Trust};
 
 const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40001);
 
@@ -156,7 +173,7 @@ async fn local_and_server_answer_alike() {
         let base = format!("/projects/{uid}/branches/main");
         let (status, body) = call(&router, Method::POST, &format!("{base}/deploy"), Some(archive_of_dir(dir)), "application/gzip").await;
         assert_eq!(status, StatusCode::OK, "{uid}: {body}");
-        assert_eq!(body["test_results"], local.run_tests(), "{uid}: test results");
+        assert_eq!(body["test_results"], local.run_tests().unwrap(), "{uid}: test results");
         assert_eq!(body["fields"], local.summary()["fields"], "{uid}: field count");
 
         for spec in specs_over(&local) {

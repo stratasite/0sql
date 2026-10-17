@@ -11,7 +11,7 @@ description: \n\
 # branch, so this is the branch to merge into when a change is ready.\n\
 production_branch: main\n\
 \n\
-# A self-hosted zsqld, if any. The hosted service is used otherwise; the\n\
+# The server `zsql deploy` sends to, when it is not the local one; the\n\
 # api key lives in .zsql, never here.\n\
 # server: http://127.0.0.1:3699\n"
     )
@@ -21,7 +21,7 @@ pub const DATASOURCES_YML: &str = "\
 # The warehouses this project's tables live in. One entry per datasource,\n\
 # keyed by a short id that table files refer to.\n\
 #\n\
-# 0sql never connects to your warehouse. zsqld has no database driver in\n\
+# 0sql never connects to your warehouse. The server has no database driver in\n\
 # it at all: it takes a query spec and gives back SQL text. Running that\n\
 # SQL against your data stays inside your network, with your credentials,\n\
 # and nothing about the rows ever reaches the service.\n\
@@ -33,12 +33,11 @@ pub const DATASOURCES_YML: &str = "\
 # ranks datasources when more than one could answer a query. They are\n\
 # compiled into the deployed model.\n\
 #\n\
-# This machine needs the rest: host, port, database, username, schema,\n\
-# file. They are here so `zsql values sample` can connect from here and\n\
-# collect the dimension values that make authoring easier. Nothing on the\n\
-# server reads them. A deploy does upload this file, with the secrets\n\
-# taken out, but every one of these keys is ignored and none of them is\n\
-# kept: the deployed model holds the adapter, the tier and the name.\n\
+# Anything else here (host, port, database, username, schema, file) is\n\
+# for the tools that run the SQL on your side; 0sql never reads it. A\n\
+# deploy does upload this file, with the secrets taken out, but every\n\
+# one of those keys is ignored and none of them is kept: the deployed\n\
+# model holds the adapter, the tier and the name.\n\
 #\n\
 # Secrets never leave this machine. Passwords, tokens and keys go in\n\
 # .zsql under the same datasource key, or in ZSQL_DS_<KEY>_PASSWORD;\n\
@@ -49,7 +48,7 @@ pub const DATASOURCES_YML: &str = "\
 #   name: Warehouse\n\
 #   adapter: postgres            # the dialect to generate; duckdb | postgres | snowflake | bigquery | databricks | trino | mysql | sqlserver | ...\n\
 #   tier: hot                    # hot | warm | cold; the planner prefers hotter tiers\n\
-#   host: localhost              # from here down: so this machine can sample; the server ignores it\n\
+#   host: localhost              # from here down: for your own tools; the server ignores it\n\
 #   port: 5432\n\
 #   database: analytics\n\
 #   username: analyst\n\
@@ -118,7 +117,7 @@ fields:\n\
   #   data_type: string               # string | integer | bigint | decimal | date | date_time | boolean\n\
   #   synonyms: [dept]\n\
   #   tags: []                        # policy triggers, e.g. [pii]\n\
-  #   values: sample                  # sample | full | none, for `zsql values sample`\n\
+  #   values: sample                  # sample | full | none: whether samples/values.jsonl.gz lists this dimension\n\
   #   expression:\n\
   #     sql: category\n\
   #     primary_key: false\n\
@@ -166,8 +165,3 @@ pub const GITIGNORE: &str = "\
 .zsql\n\
 .strata\n\
 samples/values.jsonl.gz\n";
-
-pub const SAMPLES_README: &str = "\
-Sample data for this project. `zsql values sample` writes values.jsonl.gz\n\
-here (the top values of each listable dimension); it is customer data and\n\
-is gitignored by default.\n";

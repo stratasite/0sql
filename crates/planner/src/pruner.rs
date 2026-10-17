@@ -41,7 +41,10 @@ pub fn sort_for_max_hints_and_dims<M: Model>(
 pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], dimensions: &[&Field]) -> Result<Vec<M>> {
     let mut pruned: Vec<M> = Vec::new();
     if measures.is_empty() {
-        let first = models.first().cloned().ok_or_else(|| PlanError::Resolution("Could not find a universe for the query.".into()))?;
+        let first = models.first().cloned().ok_or_else(|| {
+            let names: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
+            PlanError::Resolution(format!("no table reaches every dimension of the query together: {}", names.join(", ")))
+        })?;
         pruned.push(first);
     } else {
         for m in measures.iter().rev() {
@@ -49,7 +52,14 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
                 .iter()
                 .find(|u| u.has_field(m.id))
                 .cloned()
-                .ok_or_else(|| PlanError::Resolution(format!("Could not find Universe for measure: {}, id: {}", m.name, m.id)))?;
+                .ok_or_else(|| {
+                    let dims: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
+                    PlanError::Resolution(format!(
+                        "no table holding the measure {} reaches every dimension of the query ({}); it may need a join path, or the dimensions may belong to different tables",
+                        m.name,
+                        dims.join(", ")
+                    ))
+                })?;
             pruned.push(u);
         }
         for d in dimensions.iter().rev() {

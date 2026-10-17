@@ -285,7 +285,7 @@ pub struct Universes<'a> {
 }
 
 impl<'a> Universes<'a> {
-    /// Universes over the snapshot's own (Rails-enumerated) paths.
+    /// Universes over the paths stored with the snapshot.
     pub fn build(universe: &'a Universe) -> Self {
         Self::build_from(universe, &universe.snapshot().paths)
     }

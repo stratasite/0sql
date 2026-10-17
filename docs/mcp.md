@@ -1,6 +1,6 @@
 # The MCP endpoint
 
-Decided and implemented 2026-10-09. `POST /mcp` on zsqld gives an agent
+Decided and implemented 2026-10-09. `POST /mcp` on the server gives an agent
 the server's reads as tools, under the same keys, the same gate and the
 same limits as everything else. `crates/server/src/mcp.rs` is the whole
 of it.
@@ -240,8 +240,8 @@ reason rather than a transport failure.
 ## Tests
 
 `crates/server/src/isolation_tests.rs` drives the real router for all
-of it: a cookie is refused on `/mcp`, a wrong Origin gets 403 before
-authentication, the challenge header is on every 401, GET and DELETE
+of it: a cookie is refused on `/mcp`, any Origin is let through (there is
+no Origin check, as above), the challenge header is on every 401, GET and DELETE
 are 405, a query key lists and plans only its granted branches and the
 other account's columns are unreachable by any name, a revoked key is
 refused on the very next call, no tool takes a context and one sent is

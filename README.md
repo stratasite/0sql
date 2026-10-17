@@ -16,10 +16,9 @@ crates/golden     golden cases and the scoreboard
 crates/cli        zsql: author, plan here or on a server (-r), deploy
 crates/devtool    zsql-dev: the engine on the command line for its developers (goldens, bench, formation)
 crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
-crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by zsql and zsqld
+crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by local planning and the server
 crates/accounts   accounts, users, keys and project access (SQLite)
-crates/server     zsqld: deploy a project, plan specs
-crates/warehouse  duckdb and postgres drivers for value sampling
+crates/server     the server, run by `zsql serve`: deploy a project, plan specs, accounts, MCP
 dialects/         the dwh adapter settings the binary embeds (MIT)
 fixtures/golden   golden cases and the universes they plan against
 harness/          import of the golden cases captured from strata
@@ -60,11 +59,10 @@ the project's owner, see `docs/mcp.md`.
 says where a command runs: anything that needs only the model runs here,
 from the project directory at hand; anything about a server's copy of
 the model takes `-r`. `--server` and `--uid` imply `-r`; `ZSQL_SERVER` in
-the environment does not. The CLI keeps the warehouse credentials, which
-is why value sampling runs here whichever side planned it.
+the environment does not.
 
 ```
-zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, samples/, git init
+zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, git init
 zsql new table Orders --datasource warehouse [--domain sales]
 zsql new relation --datasource warehouse
 zsql new test smoke
@@ -72,16 +70,15 @@ zsql sql --expr "department, sales value, department = PRODUCE" [--context user.
 zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
 zsql explore --expr "department, sales value" [-q customer]   # the dimensions and measures the query can take on
 zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes
-zsql fields depart | zsql tables | zsql values show department
+zsql fields depart | zsql tables | zsql values department
 zsql check                        # load, validate and test the project here (-r: validate on the server)
 zsql test                         # tests/*.yml here (-r: the deployed branch's, on the server)
-zsql values sample [--dims a,b] [--full] [--older-than 7] [--dry-run] [--deploy]   # runs the SQL here: needs the full build
 zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
 zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
 zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
 zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
 zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
-zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts] [--open]   # the server, here; inside a project, serving that project
+zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts | --no-accounts] [--open] [--no-project]   # the server, here; inside a project, serving that project
 zsql server start | stop | status | logs   # the same, kept running in the background
 ```
 
@@ -92,9 +89,9 @@ teammate a live endpoint over the model they are editing; `--no-project`
 serves only the data directory. Accounts are off by default (one tenant,
 no auth), and listening beyond the loopback with them off is refused
 unless `--open` says you mean it. Two servers cannot share a data
-directory; the second is told which process has it. `zsqld` is the same
-server configured from `ZSQL_*` variables, for a deployment that reads an
-environment file.
+directory; the second is told which process has it. `ZSQL_*` variables,
+the environment file a deployment loads, set what the flags do not:
+accounts, limits, mail, the MCP wording; a flag wins over its variable.
 
 A refusal is reported the same way from either side: `class: message`
 on stderr and exit 1, or `{"error": {"class", "message"}}` on stdout
@@ -102,14 +99,13 @@ under `--json`. A usage error is clap's and exits 2.
 
 The default build plans here, talks to a server, and is one. It needs
 a C compiler, for the SQLite behind accounts; `cargo build -p zsql-cli
---no-default-features` is the slim build without the server. `--features
-warehouse` adds DuckDB and Postgres for `zsql values sample`.
+--no-default-features` is the slim build without the server.
 
 Every command takes `--project DIR`; the project is otherwise found from
 `project.yml` here or above. Against a server, `--branch NAME` names the
 branch (default: the checked-out git branch), `--server URL` the server
 (default: `ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` for a
-self-hosted zsqld, then the local one) and `--uid UID` the project when
+self-hosted server, then the local one) and `--uid UID` the project when
 there is no directory at hand. Planning here reads no git at all: the
 files are what they are, so `--branch` without `-r` is refused.
 `project.yml`'s `production_branch` names the branch production reads;
@@ -137,18 +133,20 @@ own developers: the golden scoreboard, the benches (`bench` over the
 goldens, `load-bench` over a project directory), formation checks and
 export. It is not part of the CLI release.
 
-`ZSQL_HOME` moves `~/.zsql` (the account-wide config and the repl
-history) somewhere else, which is how tests keep out of the real one.
+`ZSQL_HOME` moves `~/.zsql` somewhere else: the account-wide config, the
+repl history, the default data directory of `zsql serve`, and the
+background server's pidfile and log (`server.log`, which grows until
+you trim it). It is how tests keep out of the real one.
 
 ## The server
 
-`zsqld` is the light service: deploy a project, get SQL back. No accounts,
-users or keys yet. Deployed models live in memory and under `ZSQL_DATA_DIR`
-(default `data/`), so a restart reloads them. `ZSQL_BIND` sets the address
-(default `127.0.0.1:3699`).
+The server is `zsql serve`: deploy a project, get SQL back. Deployed
+models live in memory and under the data directory (`--data-dir`,
+`ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`), so a restart reloads them;
+`--bind` or `ZSQL_BIND` sets the address (default `127.0.0.1:3699`).
 
 ```
-cargo run --release -p zsql-server
+zsql serve
 zsql deploy --project ../myproject --server http://127.0.0.1:3699
 curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
      -H 'content-type: application/json' \
@@ -160,7 +158,6 @@ curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
 | `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets; tests run, results in the answer |
 | `POST /projects/{uid}/branches/{branch}/validate` | the same, keeping nothing |
 | `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
-| `GET /projects/{uid}/branches/{branch}/sampling-plan` | the SQL the CLI runs to sample values |
 | `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
 | `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` or `{expr, context?}` (a shorthand line; the answer then carries the `spec` it made and `items`) to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
 | `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
@@ -229,20 +226,16 @@ The CLI covers every endpoint; see above.
 
 ## Dimension values
 
-`zsql values sample` asks the server which dimensions to sample and the SQL
-to run (the server knows the model), runs it against the project's
-warehouses with the local credentials, and writes `samples/values.jsonl.gz`:
-for text, the
-top `value_list_size` values by row count (default 1000) with their counts,
-or every value with `values: full` on the field (refused above 100k
-distinct); for numbers and dates, the min and max. Hidden dimensions,
-listing-disabled ones, `values: none`, and any dimension a security policy
-names are never sampled. The file is customer data: gitignore it unless
-you want it reviewed. `--dims a,b` limits the run, `--older-than 7`
-resamples only stale entries, `--dry-run` prints the SQL, `--deploy`
-redeploys afterwards. Connections come from `datasources.yml`, secrets from
-`.zsql` (or `.strata`) in the project or `ZSQL_DS_<KEY>_PASSWORD`; duckdb
-and postgres are the drivers so far.
+A project may carry `samples/values.jsonl.gz`: for each dimension, the
+values it takes with their row counts, or its range. `zsql values
+<dim>`, the `/values/{dim}` route and the MCP `values` tool answer from
+it, which is what lets an agent write `department = PRODUCE` rather than
+guess at the spelling. 0sql never runs SQL, so the file is written by
+whatever can: one JSON object per line, gzipped, as
+`crates/project/src/values.rs` reads it (`uid`, `name`, `table`,
+`sampled_at`, `distinct`, then `values: [{v, n}]` or `range: {min, max}`).
+It is customer data: keep it out of git unless you want it reviewed.
+Deploys carry it; a field's `values: none` says to leave it out.
 
 ## Parity
 

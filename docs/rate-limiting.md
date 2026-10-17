@@ -104,14 +104,16 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 
 | class | routes | permits | wait before 503 |
 |---|---|---|---|
-| heavy | deploy, validate, test, sampling-plan | 2 | 5 s |
+| heavy | deploy, validate, test | 2 | 5 s |
 | password | login, signup, invites/accept, account/password, the reset and verification routes | 2 | 2 s |
 | explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
 | plan | sql, explain, tables, values, branch summary, projects, `POST /mcp` | cores × 4 | 1 s |
 | manage | the account endpoints | cores × 2 | 1 s |
 
 The heavy and password classes also run on `tokio::task::spawn_blocking`,
-so a deploy or an argon2 hash never holds a runtime worker. Measured: 508
+so a deploy or an argon2 hash never holds a runtime worker, and a hash
+is checked with the store's lock released, so a login in progress does
+not stall every other authentication behind it. Measured: 508
 deploys running flat out during a load test cost plan throughput 20% and
 left its p99 at 5.7 ms. Before, deploys stalled the runtime.
 

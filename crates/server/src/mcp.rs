@@ -41,8 +41,24 @@
 //! every byte between the Authorization header and `gate()` is in this
 //! crate, where it is tested with the rest of the isolation suite.
 
-use super::*;
-use axum::http::HeaderMap;
+use crate::auth::{busy, too_many, Auth, Held};
+use crate::error::{internal, ApiError};
+use crate::limits::Class;
+use crate::reads::{explain_of, explore_of, fields_of, projects_of, sql_of, tables_of, values_of, FieldsQuery};
+use crate::tenancy::{check_uid, gate, in_scope, model, scope_of};
+use crate::{read, App, Shared};
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use zsql_accounts::{Principal, Verb};
+use zsql_semantic::FieldKind;
+use zsql_service::{ExploreRequest, Model, SqlRequest};
+use zsql_spec::SecurityContext;
 
 pub const PATH: &str = "/mcp";
 
@@ -118,7 +134,7 @@ pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
     };
     let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
     let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    eprintln!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
+    say!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
 }
 
 /// Whether the caller may read anything: with accounts on, a key must
@@ -207,7 +223,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
             )
             .trim()
             .to_string();
-            eprintln!(
+            say!(
                 "zsqld: mcp: {} connected: {client}",
                 who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() {
                     "no key".into()
@@ -250,7 +266,7 @@ const CATALOGUE_BYTES: usize = 48 * 1024;
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
 fn catalogue(app: &App, who: &Option<Principal>) -> String {
-    let models = app.models.read().unwrap();
+    let models = read(&app.models);
     let mut readable: Vec<Arc<Model>> =
         in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
     drop(models);
@@ -467,7 +483,7 @@ fn branch_for(app: &App, who: &Option<Principal>, uid: &str, branch: Option<Stri
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}")))?;
         return Ok(project.production_branch);
     }
-    let models = app.models.read().unwrap();
+    let models = read(&app.models);
     let mut branches: Vec<String> = models.values().filter(|d| d.uid == uid).map(|d| d.branch.clone()).collect();
     match branches.len() {
         1 => Ok(branches.remove(0)),

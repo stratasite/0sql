@@ -23,25 +23,13 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --exclude zsql-warehouse --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
-        run: cargo test --workspace --exclude zsql-warehouse --locked
+        run: cargo test --workspace --locked
       - name: Goldens
         run: cargo run --release --locked -p zsql-devtool -- golden --strict
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
-
-  # The warehouse drivers compile DuckDB from source, which takes a
-  # while, so they get a job of their own and the fast one stays fast.
-  warehouse:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Toolchain
-        run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: CLI with the warehouse drivers
-        run: cargo check --locked -p zsql-cli --features warehouse
 
   # Advisories, licences and sources of every crate in the tree, from
   # deny.toml. No build, so it is quick and runs on its own.

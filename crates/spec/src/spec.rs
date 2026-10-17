@@ -64,6 +64,39 @@ fn invalid(msg: impl Into<String>) -> SpecError {
     SpecError::Invalid(msg.into())
 }
 
+/// The dialect settings a query may change: how it is planned, not how
+/// its SQL is spelt. A template such as `string_literal` or `quote`
+/// renders security clauses, so a query that could rewrite one could
+/// rewrite those.
+pub const DB_SETTINGS: &[&str] = &[
+    "final_pass_measure_join_type",
+    "cross_universe_measure_filtering_strategy",
+    "force_group_by",
+    "greedy_apply_date_filters",
+    "extend_ending_date_to_last_hour_of_day",
+    "apply_advanced_filtering_on_array_projections",
+    "supports_array_functions",
+    "supports_common_table_expressions",
+    "supports_sub_queries",
+    "temp_table_type",
+    "temp_table_prefix",
+    "week_start_day",
+    "default_week_start_day",
+];
+
+fn checked_db_settings(given: Option<&Attrs>) -> Result<Attrs> {
+    let Some(given) = given else { return Ok(Attrs::new()) };
+    for key in given.keys() {
+        if !DB_SETTINGS.contains(&key.as_str()) {
+            return Err(record_invalid(format!(
+                "db_settings: {key} is not a setting a query may change (one of: {})",
+                DB_SETTINGS.join(", ")
+            )));
+        }
+    }
+    Ok(given.clone())
+}
+
 fn record_invalid(msg: impl Into<String>) -> SpecError {
     SpecError::RecordInvalid(msg.into())
 }
@@ -454,7 +487,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
         // No default: a limit the caller did not ask for is not ours to
         // invent, and the server emits one only when it is here.
         limit: spec.limit,
-        db_settings: spec.db_settings.clone().unwrap_or_default(),
+        db_settings: checked_db_settings(spec.db_settings.as_ref())?,
         hints: spec.hints.clone(),
         filter_tree,
         projections,

@@ -1,6 +1,6 @@
-//! A strata CLI project directory, loaded into a [`Snapshot`] the planner
-//! can use, without a server. The layout is what `strata init` produces
-//! and `strata deploy` uploads:
+//! A project directory, loaded into a [`Snapshot`] the planner can use,
+//! without a server. The layout is what `zsql init` produces and `zsql
+//! deploy` uploads:
 //!
 //! ```text
 //! project.yml           name, uid, production_branch
@@ -11,11 +11,11 @@
 //! tests/*.yml           planner assertions (see [`ProjectTest`])
 //! ```
 //!
-//! Loading follows the Rails deployer's handlers (`Deployer::Handlers::*`)
-//! and its formation cycle: tables and fields, then joins, then paths, then
-//! what needs paths (snapshot dates, partitions, exclusion and inclusion
-//! rules, expression integrity), then policies. Ids are sequential; uids
-//! are derived from names the way FriendlyId does on the server, so a
+//! Loading follows the deployer's order, which is also the formation
+//! cycle: tables and fields, then joins, then paths, then what needs
+//! paths (snapshot dates, partitions, exclusion and inclusion rules,
+//! expression integrity), then policies. Ids are sequential; uids are
+//! slugs of names, made unique the way the server makes them, so a
 //! project deployed to a server and loaded here name the same things.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -36,7 +36,7 @@ pub enum ProjectError {
     #[error("{0}: {1}")]
     Yaml(String, serde_yaml::Error),
     /// A definition the deployer would refuse, with the file it is in.
-    #[error("Error in {file}: \n\t{message}")]
+    #[error("{file}: {message}")]
     Invalid { file: String, message: String },
     #[error("{0}")]
     Dialect(#[from] zsql_dialect::DialectError),
@@ -397,9 +397,18 @@ impl<'d> Builder<'d> {
             let chunks: Vec<_> = files.chunks(files.len().div_ceil(workers)).collect();
             let handles: Vec<_> = chunks
                 .into_iter()
-                .map(|chunk| scope.spawn(move || chunk.iter().map(|f| (f.clone(), read_yaml(f))).collect::<Vec<_>>()))
+                .map(|chunk| (chunk, scope.spawn(move || chunk.iter().map(|f| (f.clone(), read_yaml(f))).collect::<Vec<_>>())))
                 .collect();
-            handles.into_iter().flat_map(|h| h.join().expect("a parsing thread")).collect()
+            handles
+                .into_iter()
+                .flat_map(|(chunk, h)| {
+                    // A parser that panics on a file is a refusal of that
+                    // file, said when the file is read in order.
+                    h.join().unwrap_or_else(|_| {
+                        chunk.iter().map(|f| (f.clone(), Err(invalid(f, "the YAML parser failed on this file")))).collect()
+                    })
+                })
+                .collect()
         });
         self.prefetched.extend(parsed);
     }
@@ -512,7 +521,9 @@ impl<'d> Builder<'d> {
         let v = self.read(&file)?;
         let m = as_map(&v).ok_or_else(|| invalid(&file, "datasources.yml must map each datasource key to its settings"))?;
         for (key, def) in m {
-            let Some(uid) = key.as_str() else { continue };
+            let Some(uid) = key.as_str() else {
+                return Err(invalid(&file, format!("datasource keys are names; {key:?} is not one")));
+            };
             let uid = uid.trim().to_lowercase();
             let Some(d) = as_map(def) else {
                 return Err(invalid(&file, format!("datasource {uid} must be a mapping")));
@@ -554,10 +565,10 @@ impl<'d> Builder<'d> {
     fn datasource_for(&self, file: &Path, m: &serde_yaml::Mapping, what: &str) -> Result<usize> {
         let val =
             str_of(m, "datasource").ok_or_else(|| invalid(file, format!("datasource key is required in {what} file.")))?.to_lowercase();
-        self.datasources
-            .iter()
-            .position(|d| d.uid == val || d.name.to_lowercase() == val)
-            .ok_or_else(|| invalid(file, format!("datasource with uid or name {val} not found in branch.")))
+        self.datasources.iter().position(|d| d.uid == val || d.name.to_lowercase() == val).ok_or_else(|| {
+            let known: Vec<&str> = self.datasources.iter().map(|d| d.uid.as_str()).collect();
+            invalid(file, format!("datasource '{val}' is not in datasources.yml (one of: {})", known.join(", ")))
+        })
     }
 
     // ---- models/**/tbl.*.yml
@@ -632,9 +643,9 @@ impl<'d> Builder<'d> {
         }
         for f in local {
             let Some(name) = str_of(&f, "name") else { continue };
-            match merged.get(&name).cloned() {
+            match merged.remove(&name) {
                 Some(base) => {
-                    let mut out = f.clone();
+                    let mut out = f;
                     for (k, v) in base {
                         if k.as_str() == Some("name") {
                             continue;
@@ -707,12 +718,12 @@ impl<'d> Builder<'d> {
             partitions,
         });
 
-        let fields = match get(m, "fields") {
-            Some(Yaml::Sequence(items)) => items.clone(),
-            Some(Yaml::Null) | None => vec![],
+        let fields: &[Yaml] = match get(m, "fields") {
+            Some(Yaml::Sequence(items)) => items,
+            Some(Yaml::Null) | None => &[],
             Some(_) => return Err(invalid(file, format!("fields must be a list ({name})"))),
         };
-        for f in &fields {
+        for f in fields {
             let Some(fm) = as_map(f) else {
                 return Err(invalid(file, format!("each field of {name} must be a mapping")));
             };
@@ -731,12 +742,12 @@ impl<'d> Builder<'d> {
         };
         let data_type: DataType = match str_of(fm, "data_type") {
             Some(d) => serde_json::from_value(Json::String(d.to_lowercase()))
-                .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list")))?,
+                .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list (one of: string, integer, decimal, date, date_time, boolean, bigint, binary)")))?,
             None => return Err(invalid(file, format!("Field {name} errors: Data type can't be blank"))),
         };
         let display_type = str_of(fm, "display_type").map(|d| d.to_lowercase()).unwrap_or_else(|| "default".into());
         if !["default", "html", "url", "email", "phone_number", "image"].contains(&display_type.as_str()) {
-            return Err(invalid(file, format!("Field {name} errors: Display type '{display_type}' is not included in the list")));
+            return Err(invalid(file, format!("Field {name} errors: Display type '{display_type}' is not included in the list (one of: default, html, url, email, phone_number, image)")));
         }
         let grains = strs_of(fm, "grains").into_iter().map(|g| g.to_lowercase()).collect::<Vec<_>>();
         if let Some(bad) = grains.iter().find(|g| !DATE_GRAINS.contains(&g.as_str())) {
@@ -746,14 +757,21 @@ impl<'d> Builder<'d> {
             None => None,
             Some("ending") => Some(SnapshotKind::Ending),
             Some("beginning") => Some(SnapshotKind::Beginning),
-            Some(other) => return Err(invalid(file, format!("Field {name} errors: Snapshot '{other}' is not included in the list"))),
+            Some(other) => {
+                return Err(invalid(
+                    file,
+                    format!("Field {name} errors: Snapshot '{other}' is not included in the list (one of: ending, beginning)"),
+                ))
+            }
         };
         let exclusion_type = match str_of(fm, "exclusion_type").map(|s| s.to_lowercase()).as_deref() {
             None => None,
             Some("exclude") => Some(ExclusionType::Exclude),
             Some("exclude_all_except") => Some(ExclusionType::ExcludeAllExcept),
             Some("exclude_all") => Some(ExclusionType::ExcludeAll),
-            Some(other) => return Err(invalid(file, format!("Field {name} errors: Exclusion type '{other}' is not included in the list"))),
+            Some(other) => {
+                return Err(invalid(file, format!("Field {name} errors: Exclusion type '{other}' is not included in the list (one of: exclude, exclude_all_except, exclude_all)")))
+            }
         };
         let exclusions = self.exclusions(file, &name, fm)?;
         if exclusion_type == Some(ExclusionType::ExcludeAll) && !exclusions.is_empty() {
@@ -839,7 +857,7 @@ impl<'d> Builder<'d> {
         }
 
         // The expression on this table.
-        let (sql, array, lookup, primary_key) = match get(fm, "expression").or_else(|| get(fm, "expresssion")) {
+        let (sql, array, lookup, primary_key) = match get(fm, "expression") {
             Some(Yaml::String(s)) => (s.trim().to_string(), false, false, false),
             Some(Yaml::Mapping(em)) => {
                 self.unknown_keys(file, &format!("expression of {name}"), em, EXPRESSION_KEYS);
@@ -947,8 +965,9 @@ impl<'d> Builder<'d> {
     fn relationships(&mut self) -> Result<()> {
         let files = self.files("models", "rel.")?;
         for file in files {
-            let v = self.read(&file)?;
-            let m = as_map(&v).cloned().ok_or_else(|| invalid(&file, "Empty file detected."))?;
+            let Yaml::Mapping(m) = self.read(&file)? else {
+                return Err(invalid(&file, "Empty file detected."));
+            };
             let ds = self.datasource_for(&file, &m, "relationship")?;
             let mut seen_pairs: Vec<(Id, Id)> = Vec::new();
             for (key, def) in &m {
@@ -994,14 +1013,19 @@ impl<'d> Builder<'d> {
             None | Some("inner") => JoinType::Inner,
             Some("left") => JoinType::Left,
             Some("right") => JoinType::Right,
-            Some(other) => return Err(invalid(file, format!("JoinDef errors for {key}: Join type '{other}' is not included in the list"))),
+            Some(other) => {
+                return Err(invalid(
+                    file,
+                    format!("JoinDef errors for {key}: Join type '{other}' is not included in the list (one of: inner, left, right)"),
+                ))
+            }
         };
         let mut cardinality = match str_of(jm, "cardinality").map(|c| c.to_lowercase()).as_deref() {
             Some("one_to_many") => Cardinality::OneToMany,
             Some("many_to_one") => Cardinality::ManyToOne,
             Some("one_to_one") => Cardinality::OneToOne,
             Some(other) => {
-                return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality '{other}' is not included in the list")))
+                return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality '{other}' is not included in the list (one of: one_to_many, many_to_one, one_to_one)")))
             }
             None => return Err(invalid(file, format!("JoinDef errors for {key}: Cardinality can't be blank"))),
         };
@@ -1108,7 +1132,9 @@ impl<'d> Builder<'d> {
                     .ok_or_else(|| invalid(&pt.file, format!("Partition errors: Dimension must exist ({dim_name})")))?;
                 let predicate: Predicate = str_of(pm, "predicate")
                     .and_then(|p| serde_json::from_value(Json::String(p.to_lowercase())).ok())
-                    .ok_or_else(|| invalid(&pt.file, format!("Partition errors: Predicate is not included in the list ({dim_name})")))?;
+                    .ok_or_else(|| {
+                        invalid(&pt.file, format!("Partition errors: Predicate is not included in the list ({dim_name}; one of: between, greater_than, greater_than_or_equal_to, less_than, less_than_or_equal_to, in_list)"))
+                    })?;
                 // Ranges need a number or date dimension to compare on; a
                 // list partition works on any type.
                 let ranged = matches!(
@@ -1455,12 +1481,12 @@ impl<'d> Builder<'d> {
         }
         let v = self.read(&file)?;
         let m = as_map(&v).ok_or_else(|| invalid(&file, "security.yml must have a 'policies' key."))?;
-        let policies = match get(m, "policies") {
-            Some(Yaml::Sequence(items)) => items.clone(),
+        let policies: &[Yaml] = match get(m, "policies") {
+            Some(Yaml::Sequence(items)) => items,
             Some(Yaml::Null) | None => return Err(invalid(&file, "security.yml must have a 'policies' key.")),
             Some(_) => return Err(invalid(&file, "policies must be a list")),
         };
-        for p in &policies {
+        for p in policies {
             let Some(pm) = as_map(p) else {
                 return Err(invalid(&file, "Each policy must be a mapping."));
             };
@@ -1491,7 +1517,10 @@ impl<'d> Builder<'d> {
                 None | Some("groups") => PermissionSource::Groups,
                 Some("user") => PermissionSource::User,
                 Some(other) => {
-                    return Err(invalid(&file, format!("Policy '{name}' errors: Permission source '{other}' is not included in the list")))
+                    return Err(invalid(
+                        &file,
+                        format!("Policy '{name}' errors: Permission source '{other}' is not included in the list (one of: groups, user)"),
+                    ))
                 }
             };
             let permission_value_from = match str_of(&resolution, "value_from").map(|s| s.to_lowercase()).as_deref() {
@@ -1501,7 +1530,10 @@ impl<'d> Builder<'d> {
                 other => {
                     return Err(invalid(
                         &file,
-                        format!("Policy '{name}' errors: Permission value from '{}' is not included in the list", other.unwrap_or("")),
+                        format!(
+                            "Policy '{name}' errors: Permission value from '{}' is not included in the list (one of: name, tag, email)",
+                            other.unwrap_or("")
+                        ),
                     ))
                 }
             };
@@ -1539,18 +1571,20 @@ impl<'d> Builder<'d> {
         if !dir.is_dir() {
             return Ok(());
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| ProjectError::Io(dir.display().to_string(), e))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yml") | Some("yaml")))
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|e| ProjectError::Io(dir.display().to_string(), e))? {
+            let path = entry.map_err(|e| ProjectError::Io(dir.display().to_string(), e))?.path();
+            if matches!(path.extension().and_then(|e| e.to_str()), Some("yml" | "yaml")) {
+                files.push(path);
+            }
+        }
         files.sort();
         for file in files {
             if self.confined && !self.inside(&file) {
                 return Err(invalid(&file, "this file is a link to somewhere outside the project"));
             }
             let v = self.read(&file)?;
-            let Some(m) = as_map(&v) else { continue };
+            let m = as_map(&v).ok_or_else(|| invalid(&file, "a test is a mapping with name, projections and an assertion"))?;
             let name = str_of(m, "name").ok_or_else(|| invalid(&file, "Test must have a name"))?;
             let projections = strs_of(m, "projections");
             if projections.is_empty() {

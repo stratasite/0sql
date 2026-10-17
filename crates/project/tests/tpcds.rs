@@ -1,13 +1,11 @@
-//! Loads the TPC-DS sample project that ships with strata's own test
-//! fixtures, when that checkout is present beside this workspace.
+//! Loads the TPC-DS fixture project that ships with this repository.
 
 use std::path::PathBuf;
 use zsql_dialect::Dialects;
 use zsql_semantic::Universe;
 
-fn sample() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../strata/test/fixtures/files/tpcds");
-    p.is_dir().then_some(p)
+fn sample() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects/tpcds")
 }
 
 fn plan(universe: &Universe, dialects: &Dialects, spec: serde_json::Value) -> Result<String, String> {
@@ -20,19 +18,17 @@ fn plan(universe: &Universe, dialects: &Dialects, spec: serde_json::Value) -> Re
 
 #[test]
 fn tpcds_sample_loads_forms_and_plans() {
-    let Some(dir) = sample() else {
-        eprintln!("strata checkout not found; skipping");
-        return;
-    };
+    let dir = sample();
     let dialects = Dialects::builtin();
     let loaded = zsql_project::load(&dir, &dialects).unwrap();
     let snap = &loaded.snapshot;
     assert_eq!(snap.datasources.len(), 1);
     assert_eq!(snap.datasources[0].uid, "tpcds");
-    assert_eq!(snap.tables.len(), 27);
-    assert!(snap.fields.len() > 200);
-    assert_eq!(snap.expressions.len(), snap.fields.len(), "every field in this sample maps to one table");
+    assert_eq!(snap.tables.len(), 33);
+    assert!(snap.fields.len() > 300);
+    assert!(snap.expressions.len() >= snap.fields.len(), "a field is mapped on at least one table");
     assert!(snap.join_defs.len() >= 50);
+    assert!(loaded.sources.iter().any(|s| s.ends_with("project.yml")) && loaded.sources.iter().any(|s| s.ends_with("models")));
     assert!(snap.paths.len() > snap.fields.len());
     // uids are FriendlyId slugs of the names
     let store_sales = snap.tables.iter().find(|t| t.name == "Store Sales").unwrap();

@@ -96,24 +96,47 @@ impl Mailer {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("starting the mail command: {e}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or("the mail command took no stdin")?
-            .write_all(message.as_bytes())
-            .map_err(|e| format!("writing the message: {e}"))?;
+        // Read on a thread of its own, so a command that complains at
+        // length cannot fill the pipe and wedge on it; the first of it
+        // goes into the error when the command fails. The thread is not
+        // joined: a child of the command may hold the pipe open after
+        // the command itself has gone.
+        let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut head = String::new();
+                let _ = (&mut stderr).take(2048).read_to_string(&mut head);
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                let _ = tail_tx.send(head);
+            });
+        }
+        // A command that stops reading before the message is through
+        // breaks the pipe. Its exit status and what it said are the
+        // better story than the broken pipe, so the write's failure is
+        // kept and the command is waited for all the same.
+        let written = child.stdin.take().ok_or("the mail command took no stdin")?.write_all(message.as_bytes());
+        match &written {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(format!("writing the message: {e}")),
+        }
         // A wedged mail command must not hold a blocking thread for the
         // life of the process, so it is waited for with a deadline and
         // killed past it. `wait` has no timeout of its own.
         let deadline = Instant::now() + self.timeout;
         loop {
             match child.try_wait().map_err(|e| format!("waiting for the mail command: {e}"))? {
-                Some(status) if status.success() => return Ok(Sent::Delivered),
+                Some(status) if status.success() && written.is_ok() => return Ok(Sent::Delivered),
+                Some(status) if status.success() => return Err("the mail command exited 0 without reading the message".into()),
                 Some(status) => {
+                    let said = tail_rx.recv_timeout(Duration::from_millis(200)).unwrap_or_default();
+                    let said = said.trim();
                     return Err(format!(
-                        "the mail command exited {}",
-                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "on a signal".into())
-                    ))
+                        "the mail command exited {}{}",
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "on a signal".into()),
+                        if said.is_empty() { String::new() } else { format!(": {said}") }
+                    ));
                 }
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
@@ -266,6 +289,51 @@ mod tests {
         };
         let err = m.send("ann@acme.test", "hi", "body").expect_err("it exits non-zero");
         assert!(err.contains("78"), "{err}");
+    }
+
+    /// What the command said on stderr is in the error, and a command
+    /// that says a great deal does not fill the pipe and hang on it.
+    #[test]
+    fn what_the_command_said_is_reported_and_never_wedges_it() {
+        let m = Mailer {
+            command: Some("echo 'relay refused' >&2; exit 1".into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_secs(5),
+        };
+        let err = m.send("ann@acme.test", "hi", "body").expect_err("it exits non-zero");
+        assert!(err.contains("exited 1: relay refused"), "{err}");
+
+        let loud = Mailer {
+            command: Some("head -c 1000000 /dev/zero | tr '\\0' x >&2; exit 2".into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let err = loud.send("ann@acme.test", "hi", "body").expect_err("it exits non-zero");
+        assert!(err.contains("exited 2: xxxx"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(4), "it was wedged for {:?}", started.elapsed());
+    }
+
+    /// A command that stops reading before the message is through
+    /// breaks the pipe; what it said and how it exited are reported,
+    /// not the broken pipe. One that exits 0 that way did not send.
+    #[test]
+    fn a_command_that_stops_reading_is_reported_by_its_exit() {
+        // Larger than a pipe holds, so the write cannot finish before
+        // the command closes its end.
+        let body = "x".repeat(512 * 1024);
+        let m = |command: &str| Mailer {
+            command: Some(command.into()),
+            from: "0sql <s@t.test>".into(),
+            public_url: "https://x.test".into(),
+            timeout: Duration::from_secs(5),
+        };
+        let err = m("exec 0<&-; echo 'no relay' >&2; exit 3").send("ann@acme.test", "hi", &body).expect_err("it exits non-zero");
+        assert!(err.contains("exited 3: no relay"), "{err}");
+        let err = m("exec 0<&-; exit 0").send("ann@acme.test", "hi", &body).expect_err("nothing was read");
+        assert!(err.contains("exited 0 without reading"), "{err}");
     }
 
     #[test]

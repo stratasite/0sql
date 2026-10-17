@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "A loaded model and the reads over it: sql, explain, explore, fields, tables, values, tests; shared by zsql and zsqld"
+description = "A loaded model and the reads over it: sql, explain, explore, fields, tables, values, tests; shared by local planning and the server"
 
 [dependencies]
 zsql-semantic.workspace = true

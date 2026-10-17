@@ -134,7 +134,11 @@ fn resolve_inner<'a>(
     let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
     let ds_ids = universes.datasources_with_all_measures(universe, &measures);
     if ds_ids.is_empty() {
-        return Err(PlanError::Resolution("All measures must be in the same datasource.".into()));
+        let names: Vec<&str> = measures.iter().map(|m| m.name.as_str()).collect();
+        return Err(PlanError::Resolution(format!(
+            "the measures are not all in one datasource, and a query plans against one: {}",
+            names.join(", ")
+        )));
     }
 
     let candidates: Vec<Arc<Base<'a>>> = universes

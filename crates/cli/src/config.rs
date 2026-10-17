@@ -1,7 +1,7 @@
 //! Where the CLI finds the project, the server and the API key.
 //!
 //! - `project.yml` in the project directory: `uid`, `name`, `production_branch`,
-//!   and optionally `server` (a self-hosted zsqld).
+//!   and optionally `server` (a self-hosted server).
 //! - `.zsql` in the project directory (or `.strata`, the strata CLI's file,
 //!   when `.zsql` is absent): `api_key`, `server`, and per-datasource secrets.
 //! - `~/.zsql/config`: the same keys, account-wide.
@@ -46,8 +46,12 @@ pub fn read_project(dir: &Path) -> Result<Project> {
     let text = std::fs::read_to_string(&file).with_context(|| file.display().to_string())?;
     let v: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| file.display().to_string())?;
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-    let uid =
-        v.get("uid").and_then(|u| u.as_str()).map(|u| u.trim().to_lowercase()).filter(|u| !u.is_empty()).unwrap_or_else(|| slug(&name));
+    let uid = v
+        .get("uid")
+        .and_then(|u| u.as_str())
+        .map(|u| u.trim().to_lowercase())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| zsql_project::parameterize(&name));
     if uid.is_empty() {
         anyhow::bail!("{}: name or uid is required", file.display());
     }
@@ -58,25 +62,6 @@ pub fn read_project(dir: &Path) -> Result<Project> {
         production_branch: v.get("production_branch").and_then(|b| b.as_str()).unwrap_or("main").trim().to_string(),
         server: v.get("server").and_then(|s| s.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     })
-}
-
-/// ActiveSupport `parameterize`, as the server derives uids.
-pub fn slug(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut dash = false;
-    for ch in s.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            out.push(ch);
-            dash = ch == '-';
-        } else if !dash && !out.is_empty() {
-            out.push('-');
-            dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
 }
 
 /// The account-wide directory: `ZSQL_HOME`, else `~/.zsql`.

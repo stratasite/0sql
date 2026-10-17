@@ -46,12 +46,13 @@ lifted out of `server/src/main.rs` without behaviour change:
   refactor fails there and not inside axum.
 - The request and response types and the functions behind every read:
   `sql`, `explain`, `explore`, `fields`, `tables`, `values`, `run_tests`,
-  `summary`, `sampling_plan`, `spec_of`. They take `&Model` and an
+  `summary`, `spec_of`. They take `&Model` and an
   `Option<SecurityContext>`. Dialects stay `&'static`, leaked once per
   process in each binary, and live on `Model` so the functions do not
   take them separately.
 - `ServiceError { class, message, kind }` where `kind` is `Invalid`,
-  `TooLarge`, `Unprocessable`, `NotFound` or `Internal`. The server maps
+  `Unprocessable`, `NotFound` or `Internal` (the server's request-shape
+  limits make their own `TooLarge`). The server maps
   the kind to a status; the CLI prints `class: message`, which is what it
   already prints for a server refusal. The `ContextRequired` rule lives
   here so local planning enforces it. The request shape limits stay in
@@ -63,9 +64,9 @@ lifted out of `server/src/main.rs` without behaviour change:
 
 `zsql_server::run(Config)` takes one struct: bind, data dir, accounts on
 or off with sign-up, public URL, trusted proxy, limits, admission, caps,
-mail and MCP settings. `Config::from_env()` exists only in the `zsqld`
-binary; the library makes zero `std::env::var` calls, enforced by a unit
-test that greps its own source. The `OnceLock` holding `ZSQL_MCP_TOOLS`
+mail and MCP settings. the library makes zero `std::env::var` calls, enforced by
+a unit test that greps its own source (phase B moved the one place that
+reads `ZSQL_*` variables into the CLI's serve module, and `zsqld` went). The `OnceLock` holding `ZSQL_MCP_TOOLS`
 becomes a field on `App`, so two servers can start in one test process.
 This is the widest part of the refactor and the reason the
 server-in-CLI work is its own phase.
@@ -79,9 +80,8 @@ server's copy needs `-r`.
   `ZSQL_SERVER` in the environment does not. `--branch` without remote
   is an error that says to add `-r` or check the branch out.
 - Local by default: `sql`, `explain`, `explore`, `fields`, `tables`,
-  `values show`, `check`, `test`, `repl`, and the planning half of
-  `values sample`. Always remote: `deploy`, `status`, `list`, `remove`,
-  `health`, `auth`.
+  `values`, `check`, `test`, `repl`. Always remote: `deploy`, `status`,
+  `list`, `remove`, `health`, `auth`.
 - Local mode never runs git. `Where::resolve` splits into a local
   target, which needs only the project directory, and a remote one,
   which is the only place the branch is read.
@@ -150,8 +150,7 @@ whole server, accounts included. The tool exists so developers can
 deploy a service their own applications call, and that service needs
 keys, the MCP endpoint and mail; a single-tenant stand-in would be the
 thing everyone learns and then has to leave. So `zsql serve` is the
-server, `zsqld` is the same server configured from the environment for
-the existing deployment, and SQLite (the only C in the build) comes
+server, and SQLite (the only C in the build) comes
 into the CLI, which the server's musl build already proves. An MCP
 server over stdio for Claude Code is parked: the apps talk HTTP, and
 the HTTP MCP endpoint is already there.
@@ -171,8 +170,8 @@ directory, and the refusal names the other pid. SIGTERM and ctrl-c
 trigger axum's graceful shutdown. A deploy writes the branch beside
 the live one and swaps it in by rename, so a kill mid-deploy leaves the
 previous branch whole; what a crash leaves behind is swept at startup.
-The library reads no environment, enforced by a test; `zsqld`'s main
-is the one place a `ZSQL_*` variable is read. `server install` (a
+The library reads no environment, enforced by a test; the CLI's serve
+module is the one place a `ZSQL_*` variable is read. `server install` (a
 systemd user unit or a launchd agent) is parked until someone asks.
 
 Embedding beats downloading: one artefact, one version, one thing to
@@ -244,6 +243,20 @@ licences, and Dependabot for crates and actions.
 - Golden fixtures are read, never edited, without an explicit decision.
 
 ## Progress
+
+- 2026-10-16: `zsql server status` answered "not running" beside a foreground `zsql serve` that was up, because it only knew the server `server start` recorded. It now also looks at the data directory's lock (`--data-dir`, `ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`) and names the process holding it in the foreground and the URL it is reached at, with the public URL beside it when one was configured (the server writes pid, address and public URL into the lock file once bound; `start` records the public URL too), and says whether it answers; `stop` is still only for servers it started.
+
+- 2026-10-16, from CI: a mail command that exits before reading the message broke the pipe, and the broken pipe was the whole report. The write's failure is kept and the command waited for, so what it said and how it exited are what the log gets; a command that exits 0 that way is an error, since nothing was sent. Two tests hold it, with a message larger than a pipe holds.
+
+- 2026-10-15, review's test gaps: the branch caps, the per-address login gate with its `Retry-After`, and the app's CSRF header are each held over the wire; a negative table cost is refused by name; every built-in dialect is held to quoting a literal and an identifier, and a query's `db_settings` to leaving the catalogue's copy alone; `list` and `status -r` run end to end in the CLI's serve test.
+
+- 2026-10-15, review continued: every refusal is in the API's shape, including the ones axum would have made for a body that is not JSON, a path parameter of the wrong type or a query string that does not parse (`Input`, `Params`, `Search` in the server's `error` module); an IPv6 caller is limited by its /64, and an IPv4 address in IPv6 clothing by the IPv4 address; the mail command's stderr is drained on a thread and its first lines go into the error, so a loud relay cannot wedge a send; a plan's dialect is shared with its sub-graphs through an `Arc` and a query without `db_settings` shares the catalogue's copy; the CLI's slug is the project crate's `parameterize`; the devtool's `--paths` is an enum; stale docs that called the stored paths an oracle and the planner's refusals unported are reworded.
+
+- 2026-10-15, review: the server library is one module per concern (`auth`, `tenancy`, `error`, `deploy`, `reads`, `accounts_api`, `ui`, `run`, with `mcp`, `limits` and `mail` as before), every item crate-private unless another module needs it, the router naming handlers by module; the isolation and parity tests drive the same router through explicit imports. A deploy's work directory is named by a counter rather than the clock, which is the likely cause of the two isolation tests that failed now and then under a parallel run: two deploys in one process at the same nanosecond shared a directory and the second was refused for files that existed. The no-environment test now scans every server source file.
+
+- 2026-10-15, phase B continued: the warehouse crate and the sampling feature are gone (the CLI never runs SQL; `samples/values.jsonl.gz` is written by the project's own tooling and read as before). The review's findings taken: a reference unit in `ops/zsqld.service` and a first-install step in the runbook; tests strip every `ZSQL_*` variable and prove a flag wins over its variable; `--no-accounts`; the email-failure limit parsed strictly; the auth cache TTL on `Config`; the tag check as its own job ahead of the builds; clap's `env` for the string settings; stale `zsqld` prose cleared. Signal handlers are installed before the listening line, so a stop that arrives at once is graceful.
+
+- 2026-10-15, phase B: `zsqld` is gone; `zsql serve` is the server, with `ZSQL_*` variables as the base and flags over them, read in one place (the CLI's serve module; the library still reads none). One release workflow on a `v*` tag builds `zsql` for four platforms, proves the server starts from the binary, and publishes here and on the installer's repository. The runbook describes the host's unit running `zsql serve`.
 
 - 2026-10-15, phase A: the server crate is a library with one `Config` and `run`; `zsqld` is a thin binary and the one place a `ZSQL_*` variable is read, which a test enforces; the MCP settings live on the app; the data directory is locked with the holder's pid; shutdown is graceful; a deploy is staged beside the branch and swapped in; `zsql serve` serves the project at hand and `zsql server start|stop|status|logs` keeps it running; integration tests cover a client hanging up, a second instance, SIGTERM, the in-project deploy and the background form. Review taken: only a deploy's own `.<branch>.staging-N`/`.previous-N` leftovers are swept (never another dot directory under a mistyped data dir); `start` reaps a child that exits at once and reports the log's tail; whether a server is running is answered by its data directory's lock, not by a pidfile and a pid that may have been reused; `stop` escalates to SIGKILL after 15 s; `status` probes the bind `start` recorded; an explicit `--project` that is missing is an error; one watch loop serves `deploy --watch` and `serve`, and it sees a deleted file; deploys of one branch are serialised; an unspecified bind is reached over loopback.
 

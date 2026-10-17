@@ -2,7 +2,7 @@
 //! divides itself by the same measure aggregated over the partition the
 //! decorator names, computed in a sibling node.
 
-use crate::dag::{Entity, Filtered, Graph, MultiExpr, NodeId, NodeKind, Projected, Reference};
+use crate::dag::{Filtered, Graph, MultiExpr, NodeId, NodeKind, Projected, Reference};
 use crate::model::{RFilter, RProjection, RQuery};
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
@@ -253,6 +253,3 @@ fn denominator_filters<'a>(c: &Decorator, q: &RQuery<'a>, measure: &Field) -> Ve
     let ignorable: Vec<&String> = dim_uids.iter().filter(|u| !denom_uids.contains(u)).collect();
     filters.into_iter().filter(|f| f.is_date() || !ignorable.contains(&&f.def.field_uid)).collect()
 }
-
-#[allow(dead_code)]
-fn _keep(_: Entity) {}

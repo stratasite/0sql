@@ -1,7 +1,7 @@
 //! The service layer: a loaded model, and every read over it.
 //!
-//! `zsqld` keeps one [`Model`] per deployed branch and answers each
-//! route from it; `zsql` builds one from the project directory at hand
+//! The server keeps one [`Model`] per deployed branch and answers each
+//! route from it; the CLI builds one from the project directory at hand
 //! and answers the same questions without a server. Both call the
 //! functions here, so what a caller gets back, the SQL, the explain
 //! graph, the field catalogue, a refusal and its class, is the same
@@ -106,6 +106,8 @@ pub enum StoredError {
     Universe(#[from] zsql_semantic::BuildError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("tests.json does not parse: {0}")]
+    Tests(String),
 }
 
 // ------------------------------------------------------------------- model
@@ -152,7 +154,7 @@ pub struct Model {
     pub values: Option<ValueCatalog>,
     pub tests: Vec<ProjectTest>,
     pub warnings: Vec<String>,
-    /// When it was loaded, as `humantime` writes it; the summary calls
+    /// When it was loaded, as `utc_minute` writes it; the summary calls
     /// it `deployed_at`, which is what it is on a server.
     pub loaded_at: String,
     /// What a load from a directory depends on, for whoever wants to
@@ -232,11 +234,12 @@ impl Model {
         let mut m = Self::build(uid, branch, snapshot, dialects)?;
         m.warnings.clear();
         m.values = ValueCatalog::read(&dir.join(zsql_project::values::FILE_NAME))?;
-        m.tests = std::fs::read_to_string(dir.join(TESTS_FILE))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<ProjectTest>>(&t).ok())
-            .unwrap_or_default();
-        m.loaded_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(humantime).unwrap_or_default();
+        m.tests = match std::fs::read_to_string(dir.join(TESTS_FILE)) {
+            Ok(text) => serde_json::from_str(&text).map_err(|e| StoredError::Tests(e.to_string()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e.into()),
+        };
+        m.loaded_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(utc_minute).unwrap_or_default();
         Ok(m)
     }
 
@@ -283,12 +286,9 @@ impl Model {
 
     /// Runs the project's tests/*.yml: each projects its fields and
     /// compares the SQL with the assertion.
-    pub fn run_tests(&self) -> Value {
+    pub fn run_tests(&self) -> Result<Value> {
         let planner = self.planner();
-        let base = match self.dialects.base() {
-            Ok(b) => b,
-            Err(e) => return json!({ "error": e.to_string() }),
-        };
+        let base = self.dialects.base()?;
         let normalize = |sql: &str| sql.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
         let mut results = Vec::new();
         let (mut passed, mut failed) = (0, 0);
@@ -341,7 +341,7 @@ impl Model {
             }
             results.push(r);
         }
-        json!({ "passed": passed, "failed": failed, "results": results })
+        Ok(json!({ "passed": passed, "failed": failed, "results": results }))
     }
 
     // ------------------------------------------------------- sql, explain
@@ -553,31 +553,6 @@ impl Model {
             None => Err(ServiceError::not_found(format!("no sampled values for {}", field.uid))),
         }
     }
-
-    /// The SQL that samples each listable dimension's values, for the
-    /// CLI to run where the warehouse credentials are. `dims` narrows
-    /// to those uids or names; empty means every listable dimension.
-    pub fn sampling_plan(&self, dims: &[String], full: bool) -> Value {
-        let qualify = |sql: &str, columns: &[String], adapter: &str, alias: &str| -> String {
-            match self.dialects.get(adapter) {
-                Ok(dl) => zsql_planner::sql::expr::qualify(sql, columns, &dl, alias),
-                Err(_) => sql.to_string(),
-            }
-        };
-        let (jobs, skipped) = zsql_project::values::plan(self.universe(), dims, full, &qualify);
-        let jobs: Vec<Value> = jobs
-            .iter()
-            .map(|j| {
-                json!({
-                    "uid": j.uid, "name": j.name, "table": j.table_uid, "datasource": j.datasource_uid, "adapter": j.adapter,
-                    "mode": j.mode, "cap": j.cap, "distinct_sql": j.distinct_sql, "values_sql": j.values_sql, "range_sql": j.range_sql,
-                    "sampled_at": self.values.as_ref().and_then(|v| v.get(&j.uid)).map(|e| e.sampled_at.clone()),
-                })
-            })
-            .collect();
-        let skipped: Vec<Value> = skipped.iter().map(|(uid, why)| json!({ "uid": uid, "reason": why })).collect();
-        json!({ "jobs": jobs, "skipped": skipped, "full_ceiling": zsql_project::values::FULL_CEILING })
-    }
 }
 
 // ---------------------------------------------------------------- requests
@@ -703,13 +678,13 @@ pub struct ExploreResponse {
 
 // -------------------------------------------------------------------- time
 
-/// Now, as `humantime` writes it.
+/// Now, as `utc_minute` writes it.
 pub fn now() -> String {
-    humantime(std::time::SystemTime::now())
+    utc_minute(std::time::SystemTime::now())
 }
 
 /// UTC, to the minute: `2026-10-01 15:04`.
-pub fn humantime(t: std::time::SystemTime) -> String {
+pub fn utc_minute(t: std::time::SystemTime) -> String {
     let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     // Civil-from-days (Howard Hinnant), so no date crate is needed here.
     let days = secs.div_euclid(86400);
