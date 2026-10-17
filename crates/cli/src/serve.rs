@@ -406,7 +406,13 @@ fn running() -> Result<Option<Started>> {
 /// it exists; only "no such process" means it does not.
 #[cfg(unix)]
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__errno_location() != libc::ESRCH }
+    // errno through std, which knows where each platform keeps it;
+    // `libc::__errno_location` is Linux's name alone and does not build
+    // on macOS.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(not(unix))]
