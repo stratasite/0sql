@@ -4,41 +4,52 @@
 # environment file and its user keep the name zsqld.
 [Unit]
 Description=0sql server
+Documentation=https://github.com/stratasite/0sql
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=exec
 User=zsqld
 Group=zsqld
 EnvironmentFile=/etc/zsqld.env
-# The data directory is StateDirectory, so systemd creates and owns it;
-# the variable points the server at it, since the default is under
-# the user's home.
+# systemd makes and owns the data directory (StateDirectory); the
+# variable points the server at it, since the default is under the
+# user's home, which is also pointed there.
 Environment=ZSQL_DATA_DIR=/var/lib/zsqld
 Environment=ZSQL_HOME=/var/lib/zsqld
 ExecStart=/usr/local/bin/zsql serve
 StateDirectory=zsqld
+StateDirectoryMode=0750
 Restart=on-failure
 RestartSec=2
-# No capabilities, a read-only filesystem apart from the state
-# directory, a private temp directory, a system call filter, and
-# network limited to IPv4, IPv6 and Unix sockets.
+
+# The binary is static and the service wants nothing from the system
+# but its own state directory and a loopback socket: no capabilities,
+# a read-only filesystem apart from the state directory, a private
+# temp directory (a deploy unpacks an archive there), a system call
+# filter, and network limited to IPv4, IPv6 and Unix sockets.
 CapabilityBoundingSet=
 AmbientCapabilities=
-NoNewPrivileges=true
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-RestrictRealtime=true
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 [Install]
