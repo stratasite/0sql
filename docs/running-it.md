@@ -52,9 +52,12 @@ refuses a tag that disagrees with it.
 Since 0.6.0, `.github/workflows/ci.yml` runs `cargo fmt --check`,
 clippy with warnings as errors, the tests, the golden scoreboard, the
 CLI's feature combinations and `cargo deny` (advisories, licences,
-sources; `deny.toml`) on every push and pull request. A tag still builds
-nothing but the release; the tests still run locally before tagging,
-because CI running them later does not stop a tag going out first.
+sources; `deny.toml`) on every push and pull request, and compiles the
+CLI on macOS, since the release builds there and the first `v0.6.0`
+tag failed on a Linux-only name for errno that no Linux job could see.
+A tag still builds nothing but the release; the tests still run
+locally before tagging, because CI running them later does not stop a
+tag going out first.
 
 The Linux builds are musl rather than glibc, and static. A statically
 linked glibc cannot resolve names, because it loads its name service
