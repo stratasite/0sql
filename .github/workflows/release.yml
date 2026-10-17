@@ -173,10 +173,12 @@ jobs:
           rm -f *.sha256
           ls -l
 
+      # The repository is named: this job checks nothing out, so gh has
+      # no git tree to read it from.
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "zsql ${GITHUB_REF_NAME#v}" dist/*
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --title "zsql ${GITHUB_REF_NAME#v}" dist/*
 
       # The installer, 0sql.io/install.sh, reads stratasite/0sql-cli
       # through its permanent /releases/latest/download/ redirect, so

@@ -1,7 +1,8 @@
 # Every push and pull request: formatting, clippy with warnings as
 # errors, the tests, the golden scoreboard, the CLI's feature
-# combinations, and cargo-deny over the dependency tree. The toolchain
-# is whatever rust-toolchain.toml names, as the release workflows use.
+# combinations, cargo-deny over the dependency tree, and a macOS
+# compile of the CLI. The toolchain is whatever rust-toolchain.toml
+# names, as the release workflow uses.
 name: ci
 
 on:
@@ -38,3 +39,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The release builds for macOS too, and a platform-only break (the
+  # name of errno, once) reached a tag because nothing here compiled
+  # for it. A check, not the tests: the Linux job runs those.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: CLI compiles
+        run: cargo check --locked -p zsql-cli --all-targets
