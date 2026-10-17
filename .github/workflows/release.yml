@@ -179,32 +179,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --title "zsql ${GITHUB_REF_NAME#v}" dist/*
-
-      # The installer, 0sql.io/install.sh, reads stratasite/0sql-cli
-      # through its permanent /releases/latest/download/ redirect, so
-      # the same files go there too. It needs a token because a
-      # workflow's own token only reaches the repository it runs in.
-      # Without the secret this does nothing and the release here is
-      # still made.
-      - name: Publish where the installer reads
-        env:
-          GH_TOKEN: ${{ secrets.CLI_RELEASES_TOKEN }}
-          PUBLIC_REPO: stratasite/0sql-cli
-        run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "no CLI_RELEASES_TOKEN set; the release is on this repository only,"
-            echo "so the installer has nothing new to download. Add the secret and re-run."
-            exit 0
-          fi
-          version="${GITHUB_REF_NAME}"
-          gh release create "$version" --repo "$PUBLIC_REPO" \
-            --title "zsql $version" \
-            --notes "The 0sql command line tool and server, $version.
-
-          Install:
-
-              curl -fsSL https://0sql.io/install.sh | sh
-
-          Or take the build for your platform below and check it against \`SHA256SUMS\`." \
-            dist/*
-          echo "published https://github.com/$PUBLIC_REPO/releases/tag/$version"

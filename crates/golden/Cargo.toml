@@ -3,6 +3,8 @@ name = "zsql-golden"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Loads the captured planner goldens and scores the planner against them"
 

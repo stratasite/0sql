@@ -3,6 +3,8 @@ name = "zsql-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "The server: deploy a project, get SQL back; run by `zsql serve`"
 

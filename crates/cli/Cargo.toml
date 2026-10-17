@@ -3,6 +3,8 @@ name = "zsql-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "zsql: author a semantic model, plan SQL from it here or on a server, deploy it, and serve it"
 

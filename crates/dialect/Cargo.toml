@@ -3,6 +3,8 @@ name = "zsql-dialect"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Per-warehouse SQL settings and templates, the dwh gem's YAML files read as data"
 

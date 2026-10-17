@@ -3,11 +3,11 @@
 One tag, one workflow (`.github/workflows/release.yml`), one binary per
 platform: `zsql`, which is the CLI and the server. Four builds go on the
 release: Linux x86_64 and arm64, statically linked against musl, and
-macOS on Apple silicon and Intel. With the `CLI_RELEASES_TOKEN` secret
-set, the same files are published on `stratasite/0sql-cli`, which is
-what `https://0sql.io/install.sh` reads through the permanent
-`releases/latest/download/` redirect. That redirect ignores
-prereleases, so anything published as one is invisible to the installer.
+macOS on Apple silicon and Intel, with one `SHA256SUMS` beside them.
+`https://0sql.io/install.sh` reads the release through GitHub's
+permanent `releases/latest/download/` redirect and checks the download
+against that file. The redirect ignores prereleases, so anything
+published as one is invisible to the installer.
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with warnings
 as errors, the tests, the golden scoreboard, the CLI's feature

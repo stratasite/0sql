@@ -3,6 +3,8 @@ name = "zsql-planner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Query planning: universe resolution, DAG visitors and SQL generation"
 
