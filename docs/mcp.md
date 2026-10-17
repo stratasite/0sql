@@ -7,9 +7,8 @@ of it.
 
 ## What it is
 
-- **One route on the existing server**, reached at
-  `https://app.0sql.io/mcp` through the same tunnel as the API. Always
-  on; nothing to configure.
+- **One route on the existing server**, `/mcp` beside the API, reached
+  however the API is. Always on; nothing to configure.
 - **Streamable HTTP, stateless, JSON only.** Each HTTP request carries
   one JSON-RPC message and the key. No `Mcp-Session-Id`, no server-sent
   events, no GET stream: `GET` and `DELETE` answer 405. The
@@ -209,7 +208,7 @@ or a search, the `sql` call, and the answer.
 Claude Code, with a query key:
 
 ```
-ENABLE_TOOL_SEARCH=false claude mcp add --transport http 0sql https://app.0sql.io/mcp \
+ENABLE_TOOL_SEARCH=false claude mcp add --transport http 0sql https://<your server>/mcp \
   --header "Authorization: Bearer zqk_..."
 ```
 
@@ -218,7 +217,7 @@ in, not only on the `add`; it applies to every MCP server the session
 has.
 
 claude.ai and Claude Desktop, with a query key: Customize, Connectors,
-Add custom connector. Name it, give the URL `https://app.0sql.io/mcp`,
+Add custom connector. Name it, give the URL `https://<your server>/mcp`,
 Continue. When asked how to sign in choose **No sign in**: there is no
 OAuth here, and the key is the credential. Under **Request headers**
 add `Authorization` with the value `Bearer zqk_...`, then Add. The bare
@@ -253,7 +252,7 @@ person over MCP plans as their email and nothing more.
 
 ## Later
 
-- OAuth with zsqld as its own authorization server, so a client can sign
+- OAuth with the server as its own authorization server, so a client can sign
   a user in rather than paste a key. Not needed by any Claude client
   today; when it comes, the protected resource metadata goes on the 401
   and the rest of this document stands.

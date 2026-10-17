@@ -1,1 +1,0 @@
-netdata ALL=(zsqld) NOPASSWD: /usr/bin/msmtp

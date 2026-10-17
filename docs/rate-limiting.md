@@ -6,7 +6,7 @@ numbers measured rather than guessed.
 
 ## What saturated the server
 
-zsqld is one process. Every request ran on the tokio runtime, and every
+The server is one process. Every request ran on the tokio runtime, and every
 handler was synchronous inside its `async fn`: nothing was moved to a
 blocking thread. The costs, measured on a Ryzen 5 7640U (12 threads),
 release build, against the TPC-DS sample:

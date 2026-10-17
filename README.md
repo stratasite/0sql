@@ -1,271 +1,199 @@
 # 0sql
 
-Semantic layer to SQL, as a service. A project describes its warehouse
-tables, dimensions, measures, joins and row-level security policies; 0sql
-takes a query spec and a security context and returns the SQL, in
-microseconds. Nothing about the caller's queries is stored.
+**Don't let the model write SQL.** Your agent or your application sends
+a query spec in business terms; 0sql resolves it against your governed
+semantic model and returns one correct, deterministic SQL statement, or
+a refusal that says why. It never connects to your warehouse and never
+runs a query.
 
-```
-crates/semantic   snapshot types, universe index and integrity checks
-crates/formation  join routes per root table, computed from the join graph
-crates/dialect    per-warehouse settings and templates (dwh gem YAML, compiled in)
-crates/spec       the query spec, its lowering into the typed query, the formula parser, the security context
-crates/planner    resolution, visitors, SQL generation
-crates/project    a project directory (YAML models) loaded into a snapshot
-crates/golden     golden cases and the scoreboard
-crates/cli        zsql: author, plan here or on a server (-r), deploy
-crates/devtool    zsql-dev: the engine on the command line for its developers (goldens, bench, formation)
-crates/shorthand  the comma-separated query shorthand, shared by the CLI and the server
-crates/service    a loaded model and every read over it (sql, explain, explore, fields, tests), shared by local planning and the server
-crates/accounts   accounts, users, keys and project access (SQLite)
-crates/server     the server, run by `zsql serve`: deploy a project, plan specs, accounts, MCP
-dialects/         the dwh adapter settings the binary embeds (MIT)
-fixtures/golden   golden cases and the universes they plan against
-harness/          import of the golden cases captured from strata
+One static binary, `zsql`, is the command line, the planner and the
+server. Open source under MIT. Docs at [0sql.io/docs](https://0sql.io/docs/),
+a live playground at [0sql.io/try](https://0sql.io/try/).
+
+## Getting started
+
+Install it:
+
+```sh
+curl -fsSL https://0sql.io/install.sh | sh
 ```
 
-## The contract
+Start a project and describe one table:
 
-Input is a spec: projections (fields by uid or name, decorated), filters
-(flat or an `and`/`or` tree), calculations (formulas over `[Name]@m`,
-`[Name]@d` and `[Alias]` references) and segments (populations keyed on
-dimensions, applied to the query or to named measures). Output is one SQL
-statement for the project's warehouse, or an error naming what could not
-be resolved. Filters are plain values: whoever lets a viewer change one
-resolves it before sending the spec. There are no views, reports, linked
-or interactive filters here; those belong to the caller.
-
-The security context travels with the request: an email, admin flags, the
-user's tags and groups with tags. Policies in the project decide from it
-which rows and values the user may see. A policy fires when the query
-projects a field it names by tag or by name; it then resolves the values
-of its context dimension the user is allowed, from the groups' names or
-tags or from the user's email or tags, and either filters rows to those
-values or masks the field outside them. A fired policy that resolves
-nothing denies by default (no rows, or every value masked); a policy may
-say `unresolved: allow` under `permission_resolution` to be skipped
-instead, which is what strata does. Bypass flags open the door explicitly.
-A measure's own exclusion or inclusion rule on a policy's context
-dimension outranks the policy, as it outranks a caller's filter: a
-`total across all regions` measure is the unsecured total for everyone,
-and so is the list of regions beside it. That is the modeler's decision,
-made in the model where only the deployer can make it; a denial still
-holds. Who a query is planned for can also be fixed on a query key by
-the project's owner, see `docs/mcp.md`.
-
-## The CLI
-
-`zsql` authors a project, plans SQL from it, and deploys it. One rule
-says where a command runs: anything that needs only the model runs here,
-from the project directory at hand; anything about a server's copy of
-the model takes `-r`. `--server` and `--uid` imply `-r`; `ZSQL_SERVER` in
-the environment does not.
-
-```
-zsql init [DIR] [--name N]        # project.yml, datasources.yml, security.yml, models/, tests/, git init
-zsql new table Orders --datasource warehouse [--domain sales]
-zsql new relation --datasource warehouse
-zsql new test smoke
-zsql sql --expr "department, sales value, department = PRODUCE" [--context user.json] [--explain] [--json]
-zsql explain --expr "..." | --spec query.json   # the SQL, the node graph and timings
-zsql explore --expr "department, sales value" [-q customer]   # the dimensions and measures the query can take on
-zsql spec department, sales value, department = PRODUCE   # the spec JSON a line makes
-zsql fields depart | zsql tables | zsql values department
-zsql check                        # load, validate and test the project here (-r: validate on the server)
-zsql test                         # tests/*.yml here (-r: the deployed branch's, on the server)
-zsql auth --api-key KEY [--server URL]   # written to .zsql (gitignored); .strata is read when .zsql is absent
-zsql deploy [--watch] [--dry-run] # the checked-out git branch, as the server's branch
-zsql -r sql --expr "..." | zsql -r fields | zsql -r repl   # the same, against the server's copy
-zsql status | zsql list | zsql health | zsql remove --yes   # always about the server
-zsql repl [--context user.json]   # the model here, reloaded as its files change; -r: the server's copy
-zsql serve [--bind 127.0.0.1:3699] [--data-dir DIR] [--accounts | --no-accounts] [--open] [--no-project]   # the server, here; inside a project, serving that project
-zsql server start | stop | status | logs   # the same, kept running in the background
+```sh
+zsql init shop
+cd shop
 ```
 
-`zsql serve` is the whole server (deploy, plan, accounts, keys, MCP,
-mail), run in this process. Inside a project it deploys the directory
-once it is up and redeploys as the files change, so one command gives a
-teammate a live endpoint over the model they are editing; `--no-project`
-serves only the data directory. Accounts are off by default (one tenant,
-no auth), and listening beyond the loopback with them off is refused
-unless `--open` says you mean it. Two servers cannot share a data
-directory; the second is told which process has it. `ZSQL_*` variables,
-the environment file a deployment loads, set what the flags do not:
-accounts, limits, mail, the MCP wording; a flag wins over its variable.
+```yaml
+# datasources.yml
+warehouse:
+  adapter: postgres
+```
 
-A refusal is reported the same way from either side: `class: message`
-on stderr and exit 1, or `{"error": {"class", "message"}}` on stdout
-under `--json`. A usage error is clap's and exits 2.
+```yaml
+# models/sales/tbl.orders.yml
+name: Orders
+physical_name: orders
+datasource: warehouse
+cost: 100
+fields:
+  - type: dimension
+    name: Order Date
+    data_type: date
+    expression: ordered_at
+  - type: dimension
+    name: Country
+    data_type: string
+    expression: ship_country
+  - type: measure
+    name: Revenue
+    data_type: decimal
+    expression: sum(amount)
+  - type: measure
+    name: Orders
+    data_type: integer
+    expression: count(*)
+```
 
-The default build plans here, talks to a server, and is one. It needs
-a C compiler, for the SQLite behind accounts; `cargo build -p zsql-cli
---no-default-features` is the slim build without the server.
-
-Every command takes `--project DIR`; the project is otherwise found from
-`project.yml` here or above. Against a server, `--branch NAME` names the
-branch (default: the checked-out git branch), `--server URL` the server
-(default: `ZSQL_SERVER`, `.zsql`, `project.yml`'s `server:` for a
-self-hosted server, then the local one) and `--uid UID` the project when
-there is no directory at hand. Planning here reads no git at all: the
-files are what they are, so `--branch` without `-r` is refused.
-`project.yml`'s `production_branch` names the branch production reads;
-deploying to it is called out.
-
-Deploys carry the YAML models, tests, `security.yml`, `datasources.yml`
-with its secrets removed, and `samples/values.jsonl.gz`. The server
-answers with counts, warnings and the test results.
-
-The repl takes one comma-separated line and reads each item from its shape:
-a predicate makes it a filter, a formula with a bracket reference is a
-calculation (`Alias = formula` or `formula as Alias`), anything else is a
-projection with decorator functions such as `month(date)`, `yoy(revenue)`,
-`pct(revenue)`, `moving_avg(revenue, 7)`. `[Name]` or `"Name"` is always a
-field. Commands start with a dot: `.fields`, `.tables`, `.values`,
-`.explore <line> [? term]`, `.json {...}`, `.spec <line>`, `.reload`, `.branch`, `.help`, `.quit`. Inside a project,
-`zsql` with no command opens the repl. The repl holds the model it
-loaded and, before each line, checks the files that load read, imports
-included; when one moved it loads again and says so, and when the new
-files will not load it says that and keeps answering from the model it
-had. With `-r` it asks the server, and `.branch` switches branches there.
-
-`zsql-dev` (the devtool crate) is the engine on the command line for its
-own developers: the golden scoreboard, the benches (`bench` over the
-goldens, `load-bench` over a project directory), formation checks and
-export. It is not part of the CLI release.
-
-`ZSQL_HOME` moves `~/.zsql` somewhere else: the account-wide config, the
-repl history, the default data directory of `zsql serve`, and the
-background server's pidfile and log (`server.log`, which grows until
-you trim it). It is how tests keep out of the real one.
-
-## The server
-
-The server is `zsql serve`: deploy a project, get SQL back. Deployed
-models live in memory and under the data directory (`--data-dir`,
-`ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`), so a restart reloads them;
-`--bind` or `ZSQL_BIND` sets the address (default `127.0.0.1:3699`).
+Ask for SQL, from the files at hand:
 
 ```
+$ zsql sql --expr "country, revenue, orders, country = Canada"
+SELECT
+	T0."ship_country" AS "Country",
+	sum(T0."amount") AS "Revenue",
+	count(*) AS "Orders"
+FROM
+	orders T0
+WHERE
+	LOWER(T0."ship_country") = 'canada'
+GROUP BY
+	T0."ship_country"
+-- planned here in 1.8 ms
+```
+
+Serve it, and let your application ask:
+
+```sh
 zsql serve
-zsql deploy --project ../myproject --server http://127.0.0.1:3699
-curl -s -X POST 127.0.0.1:3699/projects/myproject/branches/main/sql \
-     -H 'content-type: application/json' \
-     -d '{"spec": {"projections": [{"field": "department"}, {"field": "sales value"}]}, "context": {...}}'
 ```
 
-| route | what |
+```sh
+curl -s http://127.0.0.1:3699/projects/shop/branches/main/sql \
+  -H 'content-type: application/json' \
+  -d '{"spec": {"projections": [
+        {"field": "Order Date", "decorators": [{"type": "truncate", "grain": "month"}]},
+        {"field": "Revenue"}]}}'
+```
+
+```json
+{"sql": "SELECT\n\tDATE_TRUNC('month', T0.\"ordered_at\")::DATE AS \"Month(Order Date)\",\n\tsum(T0.\"amount\") AS \"Revenue\"\nFROM\n\torders T0\nGROUP BY\n\tDATE_TRUNC('month', T0.\"ordered_at\")::DATE",
+ "datasource": "warehouse", "datasource_uid": "warehouse", "adapter": "postgres"}
+```
+
+Run that statement against your own warehouse, with your own
+credentials, in your own code. The [quickstart](https://0sql.io/docs/getting-started/quickstart/)
+takes it from here, joins and security included, in about ten minutes.
+
+## What it does
+
+- **Resolves names to SQL.** A request names fields, not columns. The
+  planner finds the tables that hold them, the join route between them
+  and the aggregation each measure needs.
+- **Blends across fact tables safely.** Measures from different facts at
+  different grains are aggregated apart and stitched on the conformed
+  dimensions. No fan-out, no double counting.
+- **Applies your security policies.** Each request carries a security
+  context; policies in the model become `WHERE` filters or `CASE` masks
+  in the statement. A branch with policies refuses to plan without one.
+- **Speaks 13 dialects.** One model, one request shape, SQL for
+  Postgres, Snowflake, BigQuery, Databricks, Redshift, Athena, Trino,
+  ClickHouse, Druid, DuckDB, MySQL, SQL Server and SQLite.
+- **Refuses before it is wrong.** A request that cannot be resolved
+  comes back as an error naming what was not found and the nearest
+  fields; a near miss is corrected and reported.
+- **Plans, never runs.** 0sql is given the shape of your warehouse,
+  never its contents. No connection, no rows, no cache; a spec is
+  planned in memory and never stored.
+- **Works with agents.** `POST /mcp` offers the same reads as MCP tools
+  under the same keys, so an agent plans against the model instead of
+  guessing at the schema. The shorthand (`country, revenue, country =
+  Canada`) is for people at a prompt; agents write specs.
+
+The model is YAML in git: branches, pull requests, tests (`zsql check`),
+and a deploy that is the checked-out branch. Accounts, users, personal
+keys and read-only query keys with per-project grants are built in and
+off by default; turn them on when the server is shared.
+
+## Where to go
+
+| You want to | Read |
 |---|---|
-| `POST /projects/{uid}/branches/{branch}/deploy` | body: tar.gz of the project; `zsql deploy` builds it without secrets; tests run, results in the answer |
-| `POST /projects/{uid}/branches/{branch}/validate` | the same, keeping nothing |
-| `POST /projects/{uid}/branches/{branch}/test` | run the deployed tests again |
-| `DELETE /projects/{uid}/branches/{branch}` | drop a deployment |
-| `POST /projects/{uid}/branches/{branch}/sql` | `{spec, context?}` or `{expr, context?}` (a shorthand line; the answer then carries the `spec` it made and `items`) to `{sql, datasource, datasource_uid, adapter, corrections?}`, or `{error: {class, message}}` |
-| `POST /projects/{uid}/branches/{branch}/explain` | the same request, answered with `{sql, datasource, datasource_uid, adapter, timings: {parser_us, plan_us, total_us}, phases: [{name, us}], nodes: [...]}`: each node's kind, CTE alias, table, join paths, projections, filters, inputs, strategies and identity |
-| `POST /projects/{uid}/branches/{branch}/explore` | `{spec, context?, q?}` to the visible dimensions and measures the query can add and still resolve, from a walk of the formed universes: `{dimensions: [{uid, name, data_type, tables, score?}], measures: [...], total_us}`; `q` keeps fields containing or near the term, best first |
-| `GET /projects/{uid}/branches/{branch}` | summary and warnings |
-| `GET /projects/{uid}/branches/{branch}/fields?q=&hidden=` | field discovery: containing matches, then near matches with a `score` (hidden fields excluded by default) |
-| `GET /projects/{uid}/branches/{branch}/tables` | tables with their fields |
-| `GET /projects/{uid}/branches/{branch}/values/{dim}` | sampled values of a dimension |
-| `GET /projects`, `GET /healthz` | every deployment; liveness |
-| `POST /mcp` | the reads above as MCP tools for an agent, under the same key; `docs/mcp.md` |
+| Send your first request | [Quickstart](https://0sql.io/docs/getting-started/quickstart/) |
+| Write the YAML model | [Semantic model](https://0sql.io/docs/semantic-model/) |
+| Construct a request: projections, filters, calculations, segments | [Query API](https://0sql.io/docs/query/) |
+| Lock rows down per user | [Row-level security](https://0sql.io/docs/security/) |
+| Run the server, with accounts and keys | [Running the server](https://0sql.io/docs/getting-started/server/) |
+| Drive it from a terminal or CI | [zsql CLI](https://0sql.io/docs/cli/) |
+| Put it behind an agent | [MCP](https://0sql.io/docs/mcp/) and the [chat dashboard tutorial](https://0sql.io/docs/examples/chat-dashboard/) |
+| Look up an endpoint | [API reference](https://0sql.io/docs/api-reference/) |
+| Point an agent at the docs | [llms.txt](https://0sql.io/docs/llms.txt) |
 
-A branch with security policies refuses to plan without a context.
+## The design, briefly
 
-With `ZSQL_ACCOUNTS=on` the server is multi-tenant: accounts, users,
-personal keys and read-only query keys with per-project grants, in a
-SQLite file in the data directory; see `docs/accounts-and-access.md` for
-the model and the `/signup`, `/me`, `/account/...` and `/projects/{uid}`
-endpoints, and the web app at `/app/` for sign-up, keys, members and
-project access. Off, it is the single-tenant self-hosted mode with no auth.
+A **project** is a directory: `project.yml`, `datasources.yml`,
+`security.yml`, tables and relations under `models/`, tests under
+`tests/`. A **spec** is projections, filters, calculations and segments;
+a **security context** is who the query is planned for. From those the
+planner resolves a universe (a root table and the join routes it can
+safely reach), builds a graph of nodes, runs its visitors and renders
+one statement in the datasource's dialect. The same code plans on your
+machine and on the server, held byte-identical by a test. Planning a
+query takes tens of microseconds; the server answers tens of thousands
+of requests a second on a laptop.
 
-An account may keep 5 deployed branches per project and 20 in all
-(`ZSQL_MAX_BRANCHES_PER_PROJECT`, `ZSQL_MAX_BRANCHES_PER_ACCOUNT`, `off`
-for neither), since a deployed model stays in memory for the life of the
-process. Going over answers `409 OverLimit` and names what to remove.
+The planner is its own implementation, written with the
+[Strata](https://strata.do) planner as its specification and held to
+385 golden cases captured from it, on formed join paths and on stored
+ones. 0sql is the open source core of that platform.
 
-Password reset and email verification are emailed links. The server has
-no SMTP client: it writes the message to `ZSQL_MAIL_COMMAND` on stdin
-(`msmtp -t`, `sendmail -t`, a script), with `ZSQL_MAIL_FROM` as the
-sender and `ZSQL_PUBLIC_URL` as the base of the link. With no command
-configured the links go to the journal instead, never into a response,
-so a self-hosted server works without mail.
+## Building from source
 
-`docs/running-it.md` is where the service actually runs, how a release
-reaches it, how the backups work and what is still open.
+The toolchain `rust-toolchain.toml` names (Rust 1.98), and a C compiler
+for the SQLite behind accounts.
 
-Requests are rate limited and admitted by cost class: planning, exploring,
-deploying, account changes and the password routes each have their own
-per-account allowance and their own cap on how many may run at once, and
-deploys and password hashing run off the request threads. Bodies and
-query specs are bounded too. With accounts off only the admission caps
-and those bounds apply. `docs/rate-limiting.md` has the design, the
-settings and the measurements; `429` and `503` both say when to come
-back, and the CLI waits and asks again.
-
-Each deployment keeps its planner, the per-root universe index, built
-once at deploy beside the universe; requests borrow it, so server time
-is lowering plus planning only.
-
-`[Name]` inside a formula names a field in a model expression, and a
-projection of the same query (then a field) in a calculation; `@d` and
-`@m` pick the dimension or the measure, and in a calculation they also
-say you mean the field rather than a projection that shares the name. A
-name belongs to at most one dimension and at most one measure, so a bare
-reference is ambiguous only when both exist, which is when the suffix is
-required. Square brackets always name a field: a warehouse column goes
-in bare or in double quotes, whatever its warehouse uses for quoting.
-
-A field reference resolves by uid, name or synonym, case ignored. One that
-matches nothing resolves to the nearest field by character trigram
-similarity when that field clearly leads (score 0.5 or more, 0.2 ahead of
-the next); the answer lists it under `corrections` and the CLI echoes
-`departmnt → Department (~0.8)`. Anything less clear fails with the closest
-fields named. References under four characters only resolve exactly.
-
-The CLI covers every endpoint; see above.
-
-## Dimension values
-
-A project may carry `samples/values.jsonl.gz`: for each dimension, the
-values it takes with their row counts, or its range. `zsql values
-<dim>`, the `/values/{dim}` route and the MCP `values` tool answer from
-it, which is what lets an agent write `department = PRODUCE` rather than
-guess at the spelling. 0sql never runs SQL, so the file is written by
-whatever can: one JSON object per line, gzipped, as
-`crates/project/src/values.rs` reads it (`uid`, `name`, `table`,
-`sampled_at`, `distinct`, then `values: [{v, n}]` or `range: {min, max}`).
-It is customer data: keep it out of git unless you want it reviewed.
-Deploys carry it; a field's `values: none` says to leave it out.
-
-## Parity
-
-The planner is its own implementation, written with strata's planner as
-the specification and proven against goldens captured from strata's test
-suite (see `harness/`): every case that a spec can express, on the main
-branch and on a mutated clone. All 385 pass, over paths formed here and
-over the paths strata stored.
-
-```
-cargo test                     # contract, scoreboard, formation, spec round trips
-ZSQL_GOLDEN_STRICT=1 cargo test -p zsql-golden
+```sh
+cargo build --release -p zsql-cli              # target/release/zsql
+cargo build -p zsql-cli --no-default-features  # the CLI without the server
+cargo test --workspace
+cargo run --release -p zsql-devtool -- golden --strict
 ```
 
-Where it goes beyond the specification, each covered by a test: a calculation that
-references another calculation is inlined before a temporal transform; a
-measure filter beside an inclusion measure stays on the node that computes
-that measure; equal-cost join routes and merge-input order follow names
-rather than row ids, so the same model and query produce the same SQL on
-every deploy.
+```
+crates/semantic   the model as the planner sees it: snapshot types, universe index, integrity checks
+crates/formation  join routes per root table, formed from the join graph
+crates/dialect    the 13 dialects: settings and templates, compiled in from dialects/
+crates/spec       the query spec, its lowering, the formula parser, the security context
+crates/planner    resolution, the node graph, the visitors, SQL
+crates/project    a project directory loaded into a snapshot
+crates/shorthand  the comma-separated line, for people at a prompt
+crates/service    a loaded model and every read over it, shared by the CLI and the server
+crates/accounts   accounts, users, keys and project access (SQLite)
+crates/server     the server: deploy, plan, accounts, the web app, MCP
+crates/cli        zsql
+crates/devtool    zsql-dev: the goldens, benches and formation checks, for developers of the engine
+crates/golden     the golden cases and the scoreboard
+fixtures/         public sample projects (TPC-DS, a grocery store) and the golden cases
+harness/          how the golden cases were captured, and the MCP wording evaluation
+docs/             design notes: accounts and access, rate limiting, MCP, operating and releasing
+```
 
-## Planning cost
+`docs/operating.md` is for whoever runs a server for others: the data
+directory, the settings, backups, what changes shape on disk and when.
+`docs/releasing.md` is how a release is cut.
 
-A `Planner` is built once per loaded model and reused for every request;
-the index build is the only per-model cost. Planning a golden case takes
-about 70 microseconds in release builds, about a third of it in resolution
-and the rest in SQL generation.
+## Licence
 
-End to end over HTTP, on a twelve-thread laptop against the TPC-DS sample,
-the `sql` endpoint answers about 42,000 requests a second with accounts on
-and about 39,000 with the rate limits enforcing. Authentication is cached
-in memory for a minute and emptied by every change, which is what moved
-that from 13,000; see `docs/rate-limiting.md`.
+MIT. See [LICENSE](LICENSE). The dialect settings under `dialects/`
+carry their own MIT licence file.

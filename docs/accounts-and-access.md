@@ -193,12 +193,12 @@ operational side of this list.
   above.
 - What startup should do when it cannot load every deployment. The caps
   bound one account, not the machine across many, and a process that
-  runs out of memory still restarts into the same reload. `running-it.md`
+  runs out of memory still restarts into the same reload. `operating.md`
   keeps this open.
 - A user in several accounts: the schema allows it, the key answers for
   the first membership for now.
 - Key expiry, a viewer role, teams. Binding a query key to a security
   context is done, per grant: see `docs/mcp.md`.
 - Multiple server instances: a storage trait with a Postgres and S3
-  backend behind the same endpoints (see the hosted-service notes in the
-  conversation of 2026-10-01: lazy load, LRU, version stamps).
+  backend behind the same endpoints: lazy load, an LRU over deployed
+  models, version stamps.
