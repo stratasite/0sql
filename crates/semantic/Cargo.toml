@@ -3,6 +3,8 @@ name = "zsql-semantic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Semantic model types: branch snapshots and the in-memory universe built from them"
 

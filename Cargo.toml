@@ -20,6 +20,8 @@ members = [
 version = "0.6.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/stratasite/0sql"
+homepage = "https://0sql.io"
 
 # Two of clippy's stylistic lints are allowed across the workspace:
 # the planner's signatures are long because its types are, and the

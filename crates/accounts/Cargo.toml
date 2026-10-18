@@ -3,6 +3,8 @@ name = "zsql-accounts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Accounts, users, keys and project access for the server"
 

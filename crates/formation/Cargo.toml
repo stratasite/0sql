@@ -3,6 +3,8 @@ name = "zsql-formation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Universe formation: join routes from each root table, computed from the join graph"
 

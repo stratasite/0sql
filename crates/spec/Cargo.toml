@@ -3,6 +3,8 @@ name = "zsql-spec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 description = "Query definitions: the record graph the planner consumes, and the principal it plans for"
 
