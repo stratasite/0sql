@@ -154,6 +154,22 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
 
     let (ok, out) = run(zsql(&home, &project).args(["introspect", "wh"]));
     assert!(ok && out.contains("in shop"), "{out}");
+    if !out.contains("2 tables, 1 views") {
+        // Say what this connection can see at all, so a miss explains itself.
+        let ds = std::fs::read_to_string(project.join("datasources.yml")).unwrap().replace("  schema: shop\n", "");
+        std::fs::write(project.join("datasources.yml"), ds).unwrap();
+        let (_, every) = run(zsql(&home, &project).args(["introspect", "wh"]));
+        let cat = std::fs::read_to_string(project.join("catalogue/wh.json")).unwrap_or_default();
+        let names: Vec<String> = serde_json::from_str::<serde_json::Value>(&cat)
+            .ok()
+            .and_then(|v| {
+                v["tables"].as_array().map(|ts| {
+                    ts.iter().map(|t| format!("{}.{}", t["schema"].as_str().unwrap_or("-"), t["name"].as_str().unwrap_or("-"))).collect()
+                })
+            })
+            .unwrap_or_default();
+        panic!("shop was empty for the CLI. Without a scope it saw: {every}\n{}", names.join(", "));
+    }
     let (ok, out) = run(zsql(&home, &project).args(["generate", "wh"]));
     assert!(ok && out.contains("created models/shop/tbl.customers.yml"), "{out}");
 
