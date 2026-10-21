@@ -471,20 +471,46 @@ what makes the remaining adapters cheap instead of frightening.
       promises, and when a container will not come up, print what it said
       before tearing it down.
 
-      **TLS is off on MySQL and SQL Server, and `sslmode` is the item
-      that turns it on** — the one piece of B2 that is deferred rather
-      than done. A decision taken three times for the same reason: a
-      container on loopback presents a certificate nothing signed and
-      there is no flag to trust one; tiberius's rustls feature pulls
-      rustls's default provider, aws-lc, in beside ring — a second
-      provider, C and assembly in the build, a run-time panic unless a
-      process default is installed — and TDS 8.0 refuses to build without
-      TLS because it is TLS-first by definition, so the transport speaks
-      7.3; and mysql's rustls feature drags in the old `webpki` and the
-      unmaintained `rustls-pemfile`, which cargo-deny refuses under
-      RUSTSEC-2025-0134. The `sslmode` change takes all of that once, with
-      a measurement. Until it lands, Azure SQL and any MySQL that requires
-      TLS are unreachable, and Postgres is `Prefer`.
+      **`sslmode`, landed, and the last of B2.** libpq's five rungs under
+      libpq's names, with libpq's meanings, because that is the ladder
+      every warehouse client shares — MySQL's `--ssl-mode` is the same
+      five under other names, and SQL Server's `Encrypt` with and without
+      `TrustServerCertificate` maps onto three of them. `require` encrypts
+      and does not verify, as it does in libpq: the rung a self-signed
+      development server needs, named rather than hidden behind a flag.
+      The default is `verify-full`, where Microsoft moved its drivers'
+      default in 2022 and what the PostgreSQL documentation recommends
+      over its own `prefer`, which it says "makes no sense from a security
+      point of view". `prefer` is accepted, never defaulted to, and a
+      connection that ends plaintext under it says so in its warnings,
+      which `introspect` prints. The trust store is the platform's, with
+      the Mozilla bundle when the platform has none and `ca_file` on top
+      for a private CA; `ca_file` is also read as `sslrootcert` and
+      `ssl_ca`. Over HTTP the ladder collapses to two questions — is plain
+      `http` allowed, and is the certificate checked — since the scheme
+      already encrypts. Errors carry their cause chain, so a refusal under
+      the default against a server with no TLS says "server does not
+      support TLS" and not only "handshake".
+
+      What it cost, measured as this plan asked. SQL Server's TLS brings
+      rustls's default provider, aws-lc, in beside ring through tiberius's
+      `tokio-rustls` dependency, which has no switch for it: 2.7 MB of
+      binary, deny-clean, with `ring` installed as the process default
+      once so the two coexist and every configuration here names its
+      provider. MySQL moved from the synchronous `mysql` crate, whose TLS
+      feature dragged in the old `webpki` and the unmaintained
+      `rustls-pemfile`, to `mysql_async`, whose tree is ring and the bundle
+      alone. TDS stays 7.3; `strict` can come with 8.0.
+
+      Proven by the containers on CI: Postgres offers TLS with the pair in
+      `harness/sources/tls/`, so `require` is shown to accept a certificate
+      signed by nobody, `verify-full` to refuse it, and `verify-full` with
+      `ca_file` to accept it; MySQL and SQL Server make themselves such
+      certificates, so the same two rungs are shown on each. The Postgres
+      container publishes on 5466, since a developer's own Postgres tends
+      to hold 5432. *Gate, held:* the same catalogue assertions pass
+      against every container, so a thirteenth adapter is a file and not
+      a project.
 - [ ] **C — model from catalogue.** Generation with marked inferences;
       diff-and-patch on re-run with `--dry-run` the default for an existing
       project; `zsql check` against a catalogue with dialect-correct
