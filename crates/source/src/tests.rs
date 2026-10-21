@@ -644,7 +644,18 @@ fn a_real_postgres_with_tls_proves_every_rung() {
         ..Default::default()
     };
     let secret = || Some(Secret(std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")));
-    let ca = std::env::var("ZSQL_TEST_PG_CA").map(PathBuf::from).unwrap_or_else(|_| test_cert());
+    // A relative ZSQL_TEST_PG_CA is relative to the repository, as bin/ci
+    // and the workflow spell it; cargo runs this binary from the crate.
+    let ca = std::env::var("ZSQL_TEST_PG_CA")
+        .map(|p| {
+            let p = PathBuf::from(p);
+            if p.is_absolute() {
+                p
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(p)
+            }
+        })
+        .unwrap_or_else(|_| test_cert());
     let with = |mode: SslMode, ca_file: Option<PathBuf>| Connection { sslmode: mode, ca_file, ..base.clone() };
     let ssl_of = |src: &mut Box<dyn Source>| {
         let r = src.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", 1).unwrap();
