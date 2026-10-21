@@ -446,44 +446,45 @@ what makes the remaining adapters cheap instead of frightening.
       slim build (`--no-default-features`, which CI checks) still compiles
       — tokio enters it here, which is a measurable change and not a free
       one.
-- [ ] **B2 — the containers, and the other two transports.** Landed:
-      the compose file and the CI job, with the environment for every
-      adapter; the HTTP transport on the ureq the CLI already had, proved
-      against the public ClickHouse playground (which found that
-      `readonly=1` forbids every setting in a request, so a connection asks
-      its mode on open); SQLite in-process, read-only by the file's own
-      flag; MySQL and SQL Server on the wire and Trino over HTTP, written
-      against the containers and **not yet run against a server**; the
-      catalogue read for all six, assembled once from per-adapter
-      statements; and `zsql introspect`, writing
-      `catalogue/<datasource>.json` — one file per datasource rather than
-      the single `catalogue.json` first proposed, so re-reading one never
-      rewrites another. Measured with six adapters linked: 16.5 MB
-      stripped, +2.7 MB over the baseline, under the survey's +3 MB for
-      the wire-and-HTTP set alone; a clean release build of 77 s against
-      69 s; the slim build compiles with tokio in it; `cargo deny` passes
-      and ring is the only crypto provider.
+- [x] **B2 — the containers, and the other two transports.** Six
+      adapters across three transports, every one proven against a real
+      server by the CI job: Postgres, MySQL and SQL Server on the wire;
+      ClickHouse and Trino over HTTP; SQLite in-process. `zsql introspect`
+      writes `catalogue/<datasource>.json`, one file per datasource.
+      Measured with six linked: 16.5 MB stripped, +2.7 MB; a clean release
+      build of 77 s, +8 s; the slim build compiles with tokio in it;
+      `cargo deny` passes and ring is the only crypto provider. The gate
+      held: the same catalogue assertions pass against every container,
+      and the three adapters written without a server needed one fix each
+      — MySQL answers an unaliased `information_schema` column under its
+      upper-case name, and `sys.objects` lists user objects only.
+
+      What the containers taught, kept for whoever adds the seventh: the
+      job ran four times before it was green, three of them lost to one
+      probe. Trino's server started in fourteen seconds every time; a
+      `curl` against `/v1/info` passed once and then never, and nine
+      minutes of "not healthy" could not tell a slow JVM from a dead
+      probe. The diagnostics step — `compose ps`, free memory, each
+      container's log tail and inspect line, on failure only — is what
+      answered it, and the probe is now the image's own
+      `/usr/lib/trino/bin/health-check`. Probe with what the image
+      promises, and when a container will not come up, print what it said
+      before tearing it down.
 
       **TLS is off on MySQL and SQL Server, and `sslmode` is the item
-      that turns it on.** This is a decision, not an omission, taken
-      three times for the same reason: a container on loopback presents a
-      certificate nothing signed and there is no flag to trust one;
-      tiberius's rustls feature pulls rustls's default provider, aws-lc,
-      in beside ring — a second provider, C and assembly in the build, a
-      run-time panic unless a process default is installed — and TDS 8.0
-      refuses to build without TLS because it is TLS-first by definition,
-      so the transport speaks 7.3; and mysql's rustls feature drags in the
-      old `webpki` and the unmaintained `rustls-pemfile`, which cargo-deny
-      refuses under RUSTSEC-2025-0134. The `sslmode` change takes all of
-      that once, with a measurement. Until it lands, Azure SQL and any
-      MySQL that requires TLS are unreachable, and Postgres is `Prefer`.
-
-      Still to do: run the three against the containers, which needs
-      either the containers on this machine or a pull request, since
-      `ci.yml` triggers only on `main` and on pull requests; prove
-      ClickHouse's `readonly=0` path, which the playground cannot; then
-      the gate. *Gate:* the same catalogue assertions pass against every
-      container, so a thirteenth adapter is a file and not a project.
+      that turns it on** — the one piece of B2 that is deferred rather
+      than done. A decision taken three times for the same reason: a
+      container on loopback presents a certificate nothing signed and
+      there is no flag to trust one; tiberius's rustls feature pulls
+      rustls's default provider, aws-lc, in beside ring — a second
+      provider, C and assembly in the build, a run-time panic unless a
+      process default is installed — and TDS 8.0 refuses to build without
+      TLS because it is TLS-first by definition, so the transport speaks
+      7.3; and mysql's rustls feature drags in the old `webpki` and the
+      unmaintained `rustls-pemfile`, which cargo-deny refuses under
+      RUSTSEC-2025-0134. The `sslmode` change takes all of that once, with
+      a measurement. Until it lands, Azure SQL and any MySQL that requires
+      TLS are unreachable, and Postgres is `Prefer`.
 - [ ] **C — model from catalogue.** Generation with marked inferences;
       diff-and-patch on re-run with `--dry-run` the default for an existing
       project; `zsql check` against a catalogue with dialect-correct
@@ -516,12 +517,10 @@ what makes the remaining adapters cheap instead of frightening.
 - Whether a batched `COUNT(DISTINCT …)` over every sampled column of a
   wide table beats one query per column. It should on a columnar
   warehouse and may not on a row store.
-- Whether all five containers are workable on a CI runner: SQL Server's
-  image is large and its licence is development-only, and Trino needs a
-  catalog configuration mounted before it will answer anything. If either
-  is awkward, it moves to a nightly job rather than the pull-request path,
-  and the transport it proves is covered by the other container on the
-  same transport.
+- The five images are `latest` or a major tag, which is how Trino's
+  probe broke between one run and the next. Pin each to the version the
+  green run pulled, and bump them on purpose; the diagnostics step prints
+  what a container is running, which is where to read the versions from.
 - Whether `range` should leave `DimensionValues` rather than staying
   unwritten. Ranges are out of scope for now rather than never, and
   `show.rs` branches on the field, so it is kept; it is dead weight until
