@@ -32,6 +32,33 @@ jobs:
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
 
+  # The transports in zsql-source against real servers, one container per
+  # warehouse that can run without a cloud account. Its own job so a slow
+  # image never holds up the planner's tests; the ignored tests are the
+  # ones that need a server, and here they get one.
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Warehouses
+        run: docker compose -f harness/sources/compose.yml up -d --wait --wait-timeout 180
+      - name: Transports against them
+        env:
+          ZSQL_TEST_PG_HOST: localhost
+          ZSQL_TEST_PG_USER: postgres
+          ZSQL_TEST_PG_DB: postgres
+          ZSQL_TEST_PG_PASSWORD: zsql
+          ZSQL_TEST_CLICKHOUSE_URL: http://localhost:8123
+          ZSQL_TEST_CLICKHOUSE_USER: default
+          ZSQL_TEST_CLICKHOUSE_PASSWORD: zsql
+        run: cargo test --locked -p zsql-source -- --ignored
+      - name: Warehouses down
+        if: always()
+        run: docker compose -f harness/sources/compose.yml down -v
+
   # Advisories, licences and sources of every crate in the tree, from
   # deny.toml. No build, so it is quick and runs on its own.
   deny:
