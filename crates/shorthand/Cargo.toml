@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = false
-description = "The comma-separated query shorthand: projections, filters and calculations to a query spec"
+description = "The expression language: comma-separated projections, filters, calculations, segments and settings to a query spec"
 
 [dependencies]
 serde_json.workspace = true

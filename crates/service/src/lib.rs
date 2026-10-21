@@ -411,7 +411,7 @@ impl Model {
     /// universes, narrowed by a search term when one is given.
     pub fn explore(&self, req: ExploreRequest, check: ShapeCheck) -> Result<ExploreResponse> {
         let base = self.dialects.base()?;
-        let (spec_value, _, _) = spec_of(req.spec, req.expr.as_deref(), check)?;
+        let (spec_value, made, items) = spec_of(req.spec, req.expr.as_deref(), check)?;
         let t0 = Instant::now();
         let spec = zsql_spec::Spec::from_value(spec_value)?;
         let query = zsql_spec::lower(&spec, self.universe(), &base)?;
@@ -451,7 +451,13 @@ impl Model {
             }
             out.into_iter().map(|(_, v)| v).collect()
         };
-        Ok(ExploreResponse { dimensions: describe(x.dimensions), measures: describe(x.measures), total_us: t0.elapsed().as_micros() })
+        Ok(ExploreResponse {
+            dimensions: describe(x.dimensions),
+            measures: describe(x.measures),
+            total_us: t0.elapsed().as_micros(),
+            spec: made,
+            items,
+        })
     }
 
     // ---------------------------------------------------------- discovery
@@ -674,6 +680,11 @@ pub struct ExploreResponse {
     pub dimensions: Vec<Value>,
     pub measures: Vec<Value>,
     pub total_us: u128,
+    /// The spec an expression line made, and how each item was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
 }
 
 // -------------------------------------------------------------------- time

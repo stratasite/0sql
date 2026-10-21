@@ -1,20 +1,35 @@
-//! The interactive loop, over either side: a line of the shorthand, or
-//! a dot command, until `.quit`.
+//! The interactive loop, over either side: a line of the expression
+//! language, or a dot command, until `.quit`.
 
+use crate::assist::Assist;
 use crate::failure::Refusal;
 use crate::side::{bold, dim, Query, Side};
 use crate::{config, show};
 use anyhow::Result;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::io::{BufRead, IsTerminal, Write};
+use std::rc::Rc;
 use std::time::Instant;
 
-pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
-    let mut field_names = side.announce()?;
-    println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
+type Editor<S> = rustyline::Editor<Assist<Rc<RefCell<S>>>, rustyline::history::DefaultHistory>;
 
-    let mut editor: Option<rustyline::DefaultEditor> =
-        if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
+pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
+    let side = Rc::new(RefCell::new(side));
+    let mut field_names = side.borrow_mut().announce()?;
+    println!("{}", dim("type a line: projections, filters, calculations, segments; tab completes, .help for the forms, .quit to leave"));
+
+    // The line editor, with the grammar's completion, hints and colour,
+    // when stdin is a terminal; a plain read otherwise.
+    let mut editor: Option<Editor<S>> = if std::io::stdin().is_terminal() {
+        let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
+        rustyline::Editor::with_config(config).ok().map(|mut ed: Editor<S>| {
+            ed.set_helper(Some(Assist::new(side.clone())));
+            ed
+        })
+    } else {
+        None
+    };
     let history = config::home().map(|h| h.join("history"));
     if let (Some(ed), Some(h)) = (editor.as_mut(), &history) {
         if let Some(parent) = h.parent() {
@@ -22,6 +37,14 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
         }
         let _ = ed.load_history(h);
     }
+    // After the model changes: the field names here, the helper's catalogue.
+    let reread = |editor: &mut Option<Editor<S>>, side: &Rc<RefCell<S>>| -> Result<Vec<String>> {
+        let names = side.borrow_mut().announce()?;
+        if let Some(h) = editor.as_ref().and_then(|ed| ed.helper()) {
+            h.refresh();
+        }
+        Ok(names)
+    };
     let stdin = std::io::stdin();
     loop {
         let line = match editor.as_mut() {
@@ -47,12 +70,16 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
         if line.is_empty() {
             continue;
         }
-        if side.refresh()? {
-            field_names = side.announce()?;
+        if side.borrow_mut().refresh()? {
+            field_names = reread(&mut editor, &side)?;
         }
         let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
         let names_a_field = |w: &str| field_names.iter().any(|n| n == &w.to_lowercase());
         let cmd = match word.strip_prefix('.') {
+            Some("") => {
+                println!("a dot alone is no command; .help lists them");
+                continue;
+            }
             Some(c) => c,
             None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
             None => "",
@@ -62,24 +89,24 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
         }
         let outcome: Result<()> = (|| {
             match cmd {
-                "help" | "?" => println!("{}", zsql_shorthand::HELP),
-                "tables" => show::print_tables(&side.tables()?),
-                "fields" => show::print_fields(&side.fields(rest, false)?),
+                "help" | "?" => println!("{}", zsql_shorthand::help()),
+                "tables" => show::print_tables(&side.borrow_mut().tables()?),
+                "fields" => show::print_fields(&side.borrow_mut().fields(rest, false)?),
                 "values" => {
                     if rest.is_empty() {
                         println!("usage: .values <dimension>");
                     } else {
-                        show::print_values(&side.values(rest)?);
+                        show::print_values(&side.borrow_mut().values(rest)?);
                     }
                 }
                 "branch" => {
-                    if side.branch(if rest.is_empty() { None } else { Some(rest) })? {
-                        field_names = side.announce()?;
+                    if side.borrow_mut().branch(if rest.is_empty() { None } else { Some(rest) })? {
+                        field_names = reread(&mut editor, &side)?;
                     }
                 }
                 "reload" => {
-                    side.reload()?;
-                    field_names = side.announce()?;
+                    side.borrow_mut().reload()?;
+                    field_names = reread(&mut editor, &side)?;
                 }
                 "spec" => match zsql_service::spec_of(None, Some(rest), &zsql_service::unlimited).map_err(Refusal::from) {
                     Ok((spec, _, items)) => {
@@ -91,7 +118,7 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
                     Err(e) => println!("error: {e}"),
                 },
                 "" | "json" | "explain" | "explore" => {
-                    // A query: the shorthand, or a JSON spec after .json or
+                    // A query: an expression line, or a JSON spec after .json or
                     // starting with a brace. .explain and .explore take
                     // either; .explore narrows by a term after ` ? `.
                     let text = if cmd.is_empty() { line } else { rest };
@@ -110,16 +137,16 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
                     } else {
                         Query::Expr(text.to_string())
                     };
-                    let origin = side.origin();
+                    let origin = side.borrow_mut().origin();
                     if cmd == "explore" {
-                        match side.explore(&query, context.as_ref(), term) {
+                        match side.borrow_mut().explore(&query, context.as_ref(), term) {
                             Ok(v) => show::print_explore(&v, &dim, origin),
                             Err(e) => println!("error: {e}"),
                         }
                         return Ok(());
                     }
                     let t0 = Instant::now();
-                    match side.sql(&query, context.as_ref(), cmd == "explain") {
+                    match side.borrow_mut().sql(&query, context.as_ref(), cmd == "explain") {
                         Ok(v) if cmd == "explain" => show::print_explain(&v, &dim, origin),
                         Ok(v) => {
                             show::print_sql(&v, &dim, &bold);

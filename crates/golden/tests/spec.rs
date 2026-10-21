@@ -91,3 +91,80 @@ fn unresolvable_references_are_named_in_the_error() {
     let bad = Spec::from_value(serde_json::json!({ "projections": [], "filtres": [] }));
     assert!(matches!(bad, Err(SpecError::Invalid(ref m)) if m.contains("filtres")), "{bad:?}");
 }
+
+/// A window's or contribution's partition and order refs resolve by name
+/// and alias as well as by uid, and one that names no projected
+/// dimension is refused rather than dropped.
+#[test]
+fn partition_and_order_refs_resolve_by_name_and_refuse_a_miss() {
+    let fx = Fixtures::open(Fixtures::default_root());
+    let dialects = fx.dialects();
+    let base = dialects.base().unwrap();
+    let (mut checked, mut refused) = (0, 0);
+    for (_, cases) in fx.cases().unwrap() {
+        for case in cases.iter().filter(|c| matches!(c.expected, zsql_golden::Expected::Sql { .. })) {
+            let (universe, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            if !run_case_on(&planner, dialects, case).unwrap().passed() {
+                continue;
+            }
+            let spec = Spec::from_value(case.spec.clone()).unwrap();
+            let has_refs = spec.projections.iter().chain(spec.calculations.iter()).any(|p| {
+                p.decorators.iter().any(|d| {
+                    d.attrs
+                        .get("partition_refs")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.iter().any(|r| r.as_str().is_some_and(|s| s != "-1")))
+                        || d.attrs.get("order_by").and_then(|v| v.as_object()).is_some_and(|m| m.keys().any(|k| k != "-1"))
+                })
+            });
+            if !has_refs {
+                continue;
+            }
+            // Every uid in a partition or order ref becomes the field's name.
+            let name_of = |uid: &str| {
+                universe
+                    .field_by_uid(uid, Some(zsql_semantic::FieldKind::Dimension))
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| uid.to_string())
+            };
+            let mut by_name = spec.clone();
+            let mut miss = spec.clone();
+            for (p, q) in by_name
+                .projections
+                .iter_mut()
+                .chain(by_name.calculations.iter_mut())
+                .zip(miss.projections.iter_mut().chain(miss.calculations.iter_mut()))
+            {
+                for (d, e) in p.decorators.iter_mut().zip(q.decorators.iter_mut()) {
+                    if let Some(serde_json::Value::Array(refs)) = d.attrs.get_mut("partition_refs") {
+                        for r in refs.iter_mut() {
+                            if let Some(s) = r.as_str().filter(|s| *s != "-1") {
+                                *r = serde_json::Value::String(name_of(s));
+                            }
+                        }
+                        e.attrs.insert("partition_refs".into(), serde_json::json!(["no such dimension"]));
+                    }
+                    if let Some(serde_json::Value::Object(order)) = d.attrs.get_mut("order_by") {
+                        let renamed: serde_json::Map<String, serde_json::Value> =
+                            order.iter().map(|(k, v)| (if k == "-1" { k.clone() } else { name_of(k) }, v.clone())).collect();
+                        *order = renamed;
+                    }
+                }
+            }
+            let a = planner.plan_query(lower(&spec, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
+            let b = planner.plan_query(lower(&by_name, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
+            assert_eq!(a.sql, b.sql, "{}: naming the partition changes the plan", case.id);
+            checked += 1;
+            if miss.to_value() != spec.to_value() {
+                match lower(&miss, &universe, &base) {
+                    Err(SpecError::RecordInvalid(msg)) => assert!(msg.contains("not a projected dimension"), "{}: {msg}", case.id),
+                    other => panic!("{}: a partition naming nothing was accepted: {other:?}", case.id),
+                }
+                refused += 1;
+            }
+        }
+    }
+    eprintln!("partition refs: {checked} renamed, {refused} refused");
+    assert!(checked > 0 && refused > 0);
+}

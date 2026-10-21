@@ -136,7 +136,7 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
-/// The body of a planning request: the spec, or the shorthand line
+/// The body of a planning request: the spec, or the expression line
 /// for the server to read, and the context.
 fn query_body(query: &Query, context: Option<&Value>) -> Value {
     let mut body = match query {

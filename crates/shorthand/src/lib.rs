@@ -1,582 +1,335 @@
-//! The shorthand: one line of comma-separated items, each read as a
-//! projection, a filter or a calculation from its shape, turned into the
-//! JSON spec the server plans.
+//! The expression language: one line (or a few) of comma-separated items,
+//! each read by its leading structure, turned into the JSON spec the
+//! server plans. The grammar is `docs/expression-language.md`; `parse`
+//! is that PEG read top down, `lower` is the AST to the spec.
 //!
 //! ```text
-//! item category, month(date), store net paid desc, item category in (Books, Music)
-//! yoy(store net paid), date between 2024-01-01 and 2024-12-31
-//! Share = sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m)
+//! item category, month(order date), store net paid, yoy_pct(store net paid) as Growth desc,
+//! order date between 2024-01-01 and 2024-12-31, item category top 5 by store net paid,
+//! include (customer id, catalog net paid > 0), limit 100
 //! ```
 //!
-//! A filter has a predicate: `=`, `!=`, `>`, `>=`, `<`, `<=`, `in (...)`,
-//! `not in (...)`, `between a and b`, `contains`, `starts with`, `ends with`
-//! (each with `not`), `is null`, `is not null`, `top N [by measure]`.
-//! A calculation is a formula holding a bracket reference (`[Name]@m`,
-//! `[Name]@d`, `[Alias]`), named with `Alias = formula` or `formula as
-//! Alias`; unnamed, the formula is its own alias. Anything else is a
-//! projection: a field name or uid wrapped in decorator functions
-//! (`month(...)`, `yoy(...)`, `pct(...)`, `running_sum(...)`,
-//! `moving_avg(..., 7)`), with an optional `as Alias` and `asc`/`desc`.
-//! A name in brackets or quotes is a field and nothing else.
+//! A field is bare words, `[bracketed]` or `"quoted"`, with `@d` or `@m`
+//! when a name is both. A value is bare text or `'single quoted'`. A
+//! projection is a field inside decorator functions, with `as Alias`
+//! and `asc`/`desc`. A filter is a field, a predicate and a value, joined
+//! into trees with `and`, `or` and parentheses. A calculation is
+//! `calc(sql) as Alias`. A segment is `include (...)`, `exclude (...)` or
+//! `expand (...) with (...)`. `limit N` and `hints table` are the settings,
+//! and `{...}` merges spec JSON into the query or the item before it.
 
-use serde_json::{json, Map, Value};
+pub mod complete;
+#[cfg(test)]
+mod corner_tests;
+mod lower;
+mod parse;
 
-/// Whether a quote at this point opens a quoted span: at the start of
-/// a token, never inside one, so `Men's` is a word with an apostrophe
-/// and `'Men''s'` is a quoted name.
-fn opens_quote(prev: Option<char>) -> bool {
-    matches!(prev, None | Some(' ' | '\t' | '(' | ',' | '='))
-}
+pub use parse::{
+    Expr, Field, FilterNode, Item, ItemKind, Kind, Leaf, ParseError, Pred, Projection, Segment, SegmentItem, SegmentKind, Val,
+};
+use serde_json::Value;
 
-/// Splits on commas outside quotes, brackets and parentheses. A quote
-/// left open is an error rather than a swallowed line.
-pub fn split_items(line: &str) -> Result<Vec<String>, String> {
-    let mut items = Vec::new();
-    let mut cur = String::new();
-    let (mut depth, mut quote): (i32, Option<char>) = (0, None);
-    let mut prev: Option<char> = None;
-    for ch in line.chars() {
-        match quote {
-            Some(q) => {
-                cur.push(ch);
-                if ch == q {
-                    quote = None;
-                }
-            }
-            None => match ch {
-                '\'' | '"' if opens_quote(prev) => {
-                    quote = Some(ch);
-                    cur.push(ch);
-                }
-                '(' | '[' => {
-                    depth += 1;
-                    cur.push(ch);
-                }
-                ')' | ']' => {
-                    depth -= 1;
-                    cur.push(ch);
-                }
-                ',' if depth <= 0 => items.push(std::mem::take(&mut cur)),
-                _ => cur.push(ch),
-            },
-        }
-        prev = Some(ch);
-    }
-    if let Some(q) = quote {
-        return Err(format!("a {q} is opened and never closed in `{}`", line.trim()));
-    }
-    items.push(cur);
-    Ok(items.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-}
-
-#[derive(Debug, Clone)]
-pub enum Item {
-    Projection(Value),
-    Filter(Value),
-    Calculation(Value),
-}
-
-/// The line as a spec, with what each item was read as.
+/// The line as a spec, with what each item was read as. An error names
+/// the mistake and where it is.
 pub fn parse_line(line: &str) -> Result<(Value, Vec<Item>), String> {
-    let mut items = Vec::new();
-    for text in split_items(line)? {
-        items.push(parse_item(&text)?);
-    }
-    if items.is_empty() {
-        return Err("nothing to plan".into());
-    }
-    let mut spec = Map::new();
-    let (mut projections, mut calculations, mut filters) = (Vec::new(), Vec::new(), Vec::new());
-    for it in &items {
-        match it {
-            Item::Projection(p) => projections.push(p.clone()),
-            Item::Calculation(c) => calculations.push(c.clone()),
-            Item::Filter(f) => filters.push(f.clone()),
-        }
-    }
-    spec.insert("projections".into(), Value::Array(projections));
-    if !calculations.is_empty() {
-        spec.insert("calculations".into(), Value::Array(calculations));
-    }
-    if !filters.is_empty() {
-        spec.insert("filters".into(), Value::Array(filters));
-    }
-    Ok((Value::Object(spec), items))
-}
-
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"'))) {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-fn list_values(inner: &str) -> Result<String, String> {
-    Ok(split_items(inner)?.iter().map(|v| unquote(v)).collect::<Vec<_>>().join(", "))
-}
-
-/// A field written as `[Name]`, `[Name]@m`, `"Name"` or `'Name'`.
-fn escaped_field(s: &str) -> Option<String> {
-    let s = s.trim();
-    let (body, suffix) = match s.rsplit_once('@') {
-        Some((b, k)) if b.ends_with(']') && matches!(k.to_lowercase().as_str(), "d" | "m" | "dim" | "measure") => (b, format!("@{k}")),
-        _ => (s, String::new()),
-    };
-    // Brackets escape a name with or without a kind suffix; quotes
-    // escape one only when no suffix follows.
-    let bracketed = body.starts_with('[') && body.ends_with(']');
-    let quoted = suffix.is_empty() && ((body.starts_with('"') && body.ends_with('"')) || (body.starts_with('\'') && body.ends_with('\'')));
-    if body.len() < 2 || !(bracketed || quoted) {
-        return None;
-    }
-    let inner = &body[1..body.len() - 1];
-    let inner = inner.trim();
-    (!inner.is_empty() && !inner.contains(['[', ']', '"', '\''])).then(|| format!("{inner}{suffix}"))
-}
-
-fn field_text(s: &str) -> String {
-    escaped_field(s).unwrap_or_else(|| s.trim().to_string())
-}
-
-/// Lower-cased with the inside of every bracketed or quoted span blanked,
-/// so keyword searches never look inside a field name. Byte for byte
-/// the same length as `text`, so an offset found here slices `text`:
-/// a letter whose lower case is longer (`İ`) or wider is kept as it is,
-/// which only means a keyword spelt with such a letter is not matched.
-fn masked(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut closer: Option<char> = None;
-    let mut prev: Option<char> = None;
-    for ch in text.chars() {
-        match closer {
-            Some(c) if ch == c => {
-                closer = None;
-                out.push(ch);
-            }
-            Some(_) => out.extend(std::iter::repeat_n('_', ch.len_utf8())),
-            None => {
-                closer = match ch {
-                    '[' => Some(']'),
-                    '"' | '\'' if opens_quote(prev) => Some(ch),
-                    _ => None,
-                };
-                let mut lower = ch.to_lowercase();
-                match (lower.next(), lower.next()) {
-                    (Some(l), None) if l.len_utf8() == ch.len_utf8() => out.push(l),
-                    _ => out.push(ch),
-                }
-            }
-        }
-        prev = Some(ch);
-    }
-    debug_assert_eq!(out.len(), text.len());
-    out
-}
-
-pub fn parse_item(text: &str) -> Result<Item, String> {
-    let text = text.trim();
-    if let Some(field) = escaped_field(text) {
-        return Ok(Item::Projection(json!({ "field": field })));
-    }
-    let lower = masked(text);
-
-    if let Some(eq) = lower.find(":=").or_else(|| lower.find('=')) {
-        let width = if lower[eq..].starts_with(":=") { 2 } else { 1 };
-        let (alias, formula) = (text[..eq].trim(), text[eq + width..].trim());
-        if formula.contains('[') && !alias.is_empty() && !alias.contains(|c: char| "<>!=".contains(c)) && escaped_field(alias).is_none() {
-            return Ok(Item::Calculation(json!({ "alias": alias, "sql": formula, "calculation": true })));
-        }
-    }
-
-    let filter = |field: &str,
-                  predicate: &str,
-                  value: Option<String>,
-                  value_end: Option<String>,
-                  top_n_measure: Option<String>|
-     -> Result<Item, String> {
-        let field = field_text(field);
-        if field.is_empty() {
-            return Err(format!("'{text}': a filter needs a field before its predicate"));
-        }
-        let mut f = json!({ "field": field, "predicate": predicate });
-        if let Some(v) = value {
-            f["value"] = Value::String(v);
-        }
-        if let Some(v) = value_end {
-            f["value_end"] = Value::String(v);
-        }
-        if let Some(m) = top_n_measure {
-            f["top_n_measure"] = Value::String(m);
-        }
-        Ok(Item::Filter(f))
-    };
-    if let Some(field) = lower.strip_suffix(" is not null") {
-        return filter(&text[..field.len()], "is_not_null", None, None, None);
-    }
-    if let Some(field) = lower.strip_suffix(" is null") {
-        return filter(&text[..field.len()], "is_null", None, None, None);
-    }
-    // The text predicates come before `in`, since a value may hold the
-    // word: `description contains made in china`.
-    for (kw, yes, no) in [
-        (" contains ", "contains", "does_not_contain"),
-        (" starts with ", "starts_with", "does_not_start_with"),
-        (" ends with ", "ends_with", "does_not_end_with"),
-    ] {
-        if let Some(pos) = lower.find(kw) {
-            let field = &text[..pos];
-            let value = unquote(&text[pos + kw.len()..]);
-            let field_l = masked(field);
-            return match field_l.strip_suffix(" not").or_else(|| field_l.strip_suffix(" does not")) {
-                Some(f) => filter(&field[..f.len()], no, Some(value), None, None),
-                None => filter(field, yes, Some(value), None, None),
-            };
-        }
-    }
-    // The English negations without the `s`: `does not contain`.
-    for (kw, no) in [
-        (" does not contain ", "does_not_contain"),
-        (" does not start with ", "does_not_start_with"),
-        (" does not end with ", "does_not_end_with"),
-    ] {
-        if let Some(pos) = lower.find(kw) {
-            return filter(&text[..pos], no, Some(unquote(&text[pos + kw.len()..])), None, None);
-        }
-    }
-    for (kw, predicate) in [(" not in ", "exclude_list"), (" in ", "in_list")] {
-        if let Some(pos) = lower.find(kw) {
-            let rest = text[pos + kw.len()..].trim();
-            let inner = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).unwrap_or(rest);
-            return filter(&text[..pos], predicate, Some(list_values(inner)?), None, None);
-        }
-        let paren = if kw == " not in " { " not in(" } else { " in(" };
-        if let Some(pos) = lower.find(paren) {
-            let inner = text[pos + paren.len() - 1..].trim().trim_start_matches('(').trim_end_matches(')');
-            return filter(&text[..pos], predicate, Some(list_values(inner)?), None, None);
-        }
-    }
-    if let Some(pos) = lower.find(" between ") {
-        let rest = &text[pos + 9..];
-        let Some(and) = masked(rest).find(" and ") else {
-            return Err(format!("'{text}': between needs `a and b`"));
-        };
-        return filter(&text[..pos], "between", Some(unquote(&rest[..and])), Some(unquote(&rest[and + 5..])), None);
-    }
-    if let Some(pos) = lower.find(" top ") {
-        let rest = text[pos + 5..].trim();
-        let (n, measure) = match masked(rest).find(" by ") {
-            Some(by) => (rest[..by].trim(), Some(rest[by + 4..].trim().to_string())),
-            None => (rest, None),
-        };
-        if n.parse::<i64>().is_err() {
-            return Err(format!("'{text}': top needs a count, as in `category top 10 by revenue`"));
-        }
-        return filter(&text[..pos], "top_n", Some(n.to_string()), None, measure);
-    }
-    for (op, predicate) in [
-        (">=", "greater_than_or_equal_to"),
-        ("<=", "less_than_or_equal_to"),
-        ("!=", "does_not_equal"),
-        ("<>", "does_not_equal"),
-        ("=", "equals"),
-        (">", "greater_than"),
-        ("<", "less_than"),
-    ] {
-        if let Some(pos) = lower.find(op) {
-            return filter(&text[..pos], predicate, Some(unquote(&text[pos + op.len()..])), None, None);
-        }
-    }
-
-    match parse_projection(text) {
-        Ok(item) => Ok(item),
-        Err(_) if text.contains('[') => {
-            let (formula, alias) = match lower.find(" as ") {
-                Some(pos) => (text[..pos].trim(), field_text(&text[pos + 4..])),
-                None => (text, text.to_string()),
-            };
-            Ok(Item::Calculation(json!({ "alias": alias, "sql": formula, "calculation": true })))
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn parse_projection(text: &str) -> Result<Item, String> {
-    let mut body = text.to_string();
-    let mut order_by = None;
-    for (suffix, dir) in [(" desc", "desc"), (" asc", "asc")] {
-        if masked(&body).ends_with(suffix) {
-            order_by = Some(dir);
-            body.truncate(body.len() - suffix.len());
-            body = body.trim().to_string();
-        }
-    }
-    let mut alias = None;
-    if let Some(pos) = masked(&body).find(" as ") {
-        alias = Some(field_text(&body[pos + 4..]));
-        body.truncate(pos);
-    }
-    let mut decorators = Vec::new();
-    let mut inner = body.trim().to_string();
-    loop {
-        if escaped_field(&inner).is_some() {
-            break;
-        }
-        let Some(paren) = inner.find('(') else { break };
-        if !inner.ends_with(')') {
-            break;
-        }
-        let func = inner[..paren].trim().to_lowercase();
-        let args = inner[paren + 1..inner.len() - 1].to_string();
-        let mut parts = split_items(&args)?;
-        if parts.is_empty() {
-            return Err(format!("'{text}': {func}() needs a field"));
-        }
-        let field = parts.remove(0);
-        let dec = decorator(&func, &parts).ok_or_else(|| format!("'{text}': unknown function {func}(); see .help"))?;
-        decorators.push(dec);
-        inner = field;
-    }
-    decorators.reverse();
-    let inner = field_text(&inner);
-    if inner.is_empty() {
-        return Err(format!("'{text}': a projection needs a field"));
-    }
-    let mut p = json!({ "field": inner });
-    if let Some(a) = alias {
-        p["alias"] = Value::String(a);
-    }
-    if let Some(o) = order_by {
-        p["order_by"] = Value::String(o.into());
-    }
-    if !decorators.is_empty() {
-        p["decorators"] = Value::Array(decorators);
-    }
-    Ok(Item::Projection(p))
-}
-
-fn decorator(func: &str, args: &[String]) -> Option<Value> {
-    let d = match func {
-        "raw" | "millisecond" | "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year" => {
-            json!({ "type": "truncate", "grain": func })
-        }
-        "dow" | "dom" | "doy" | "woy" | "hr" | "min" | "mon" | "qtr" | "yr" | "day_name" | "month_name" | "year_month" | "day_of_week"
-        | "day_of_month" | "day_of_year" | "week_of_year" => {
-            let part = match func {
-                "dow" => "day_of_week",
-                "dom" => "day_of_month",
-                "doy" => "day_of_year",
-                "woy" => "week_of_year",
-                "hr" => "hour",
-                "min" => "minute",
-                "mon" => "month",
-                "qtr" => "quarter",
-                "yr" => "year",
-                other => other,
-            };
-            json!({ "type": "extract", "extract": part })
-        }
-        "yoy" | "qoq" | "mom" | "wow" | "dod" | "yoy_pct" | "qoq_pct" | "mom_pct" | "wow_pct" | "dod_pct" => {
-            let (base, pct) = match func.strip_suffix("_pct") {
-                Some(b) => (b, true),
-                None => (func, false),
-            };
-            let transform = match base {
-                "yoy" => "year_over_year",
-                "qoq" => "quarter_over_quarter",
-                "mom" => "month_over_month",
-                "wow" => "week_over_week",
-                _ => "day_over_day",
-            };
-            let mut d = json!({ "type": "temporalize", "transform": transform });
-            if pct {
-                d["percent_change"] = Value::Bool(true);
-            }
-            d
-        }
-        "pct" | "share" | "contribute" | "contribution" => {
-            let mut d = json!({ "type": "contribute" });
-            if !args.is_empty() {
-                d["partition_refs"] = Value::Array(args.iter().map(|s| Value::String(s.clone())).collect());
-            }
-            d
-        }
-        _ => {
-            let (mode, function) = func.split_once('_')?;
-            if !matches!(mode, "running" | "moving") {
-                return None;
-            }
-            let mut d = json!({ "type": "window", "mode": mode, "function": function });
-            if let Some(size) = args.first().and_then(|s| s.trim().parse::<i64>().ok()) {
-                d["size"] = Value::from(size);
-            }
-            let partitions: Vec<Value> =
-                args.iter().filter(|s| s.trim().parse::<i64>().is_err()).map(|s| Value::String(s.clone())).collect();
-            if !partitions.is_empty() {
-                d["partition_refs"] = Value::Array(partitions);
-            }
-            d
-        }
-    };
-    Some(d)
+    let items = parse::parse(line).map_err(|e| located(line, e))?;
+    let spec = lower::to_spec(&items)?;
+    Ok((spec, items))
 }
 
 /// One line per item, for echoing what was understood.
 pub fn describe(items: &[Item]) -> Vec<String> {
-    items
-        .iter()
-        .map(|it| match it {
-            Item::Projection(p) => {
-                let field = p["field"].as_str().unwrap_or("?").to_string();
-                let decs = p["decorators"].as_array().cloned().unwrap_or_default();
-                let mut s = decs.iter().rev().fold(field, |acc, d| {
-                    let detail: Vec<String> = d
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .filter(|(k, _)| *k != "type" && *k != "partition_refs")
-                        .map(|(k, v)| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
-                        .collect();
-                    format!(
-                        "{}({acc}{})",
-                        d["type"].as_str().unwrap_or("?"),
-                        if detail.is_empty() { String::new() } else { format!("; {}", detail.join(", ")) }
-                    )
-                });
-                if let Some(a) = p["alias"].as_str() {
-                    s.push_str(&format!(" as {a}"));
-                }
-                if let Some(o) = p["order_by"].as_str() {
-                    s.push_str(&format!(" {o}"));
-                }
-                format!("projection   {s}")
-            }
-            Item::Filter(f) => {
-                let field = f["field"].as_str().unwrap_or("?");
-                let v = f["value"].as_str().unwrap_or("");
-                let tail = match f["predicate"].as_str().unwrap_or("") {
-                    "between" => format!("{v} and {}", f["value_end"].as_str().unwrap_or("")),
-                    "top_n" => format!("{v}{}", f["top_n_measure"].as_str().map(|m| format!(" by {m}")).unwrap_or_default()),
-                    "is_null" | "is_not_null" => String::new(),
-                    _ => v.to_string(),
-                };
-                format!("filter       {field} {} {tail}", f["predicate"].as_str().unwrap_or("")).trim_end().to_string()
-            }
-            Item::Calculation(c) => format!("calculation  {} = {}", c["alias"].as_str().unwrap_or("?"), c["sql"].as_str().unwrap_or("")),
-        })
-        .collect()
+    lower::describe(items)
 }
 
-pub const HELP: &str = "\
-Type a comma-separated line. Each item is read from its shape:
-  projection   item category | month(date) | yoy(store net paid) | store net paid as Paid desc
-               functions: raw hour day week month quarter year (truncate); dow dom doy woy month_name (extract);
-               yoy qoq mom wow dod [+_pct] (period over period); pct(x) (share of total);
-               running_sum(x) moving_avg(x, 7) and other running_/moving_ windows
-  filter       item category = Books | store net paid > 100 | date between 2024-01-01 and 2024-12-31
-               category in (Books, Music) | category not in (Toys) | name contains foo | name does not start with x
-               date is null | category top 10 by store net paid
-  calculation  Share = sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m) | max([gross sales]@m) as Peak
-               a formula with a [Name]@m, [Name]@d or [Alias] reference; unnamed, the formula is its alias
+/// The message with its place: a column on a one-line input, a line and
+/// a column otherwise. Columns count characters, not bytes.
+fn located(line: &str, e: ParseError) -> String {
+    let at = e.at.min(line.len());
+    let before = &line[..at];
+    let row = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    if line.contains('\n') {
+        format!("{} (line {row}, column {col})", e.msg)
+    } else {
+        format!("{} (column {col})", e.msg)
+    }
+}
+
+/// What the language is, in a sentence or two: the long help of `zsql spec`.
+pub const ABOUT: &str = "\
+Print the query spec an expression line makes, and how each item was read.
+
+A line is comma-separated items (a newline separates items too), each read from its shape: a field, or a
+function around one, projects; a field followed by a predicate filters; calc(sql) as Alias calculates;
+include, exclude and expand (...) are segments; limit N and hints TABLE are settings; {json} merges spec JSON.
+Fields are bare words, [bracketed] or \"quoted\"; values are bare text or 'single-quoted'.";
+
+/// The forms of the language, one block per kind of item.
+pub const FORMS: &str = "\
+Forms:
+  projection   item category | month(order date) | yoy(store net paid) | store net paid as Paid desc
+               truncate: hour day week month quarter year (also raw minute second millisecond)
+               extract(part, x): minute hour day_of_month day_of_week day_of_year week_of_year month quarter year
+                                 day_name month_name year_month
+               yoy qoq mom wow dod (prior period), yoy_pct ... (relative change)
+               share(x), share(x by region), share_filtered(x by region) (keeps the query's filters in the total)
+               running_sum/avg/min/max/count(x by a order by b), moving_avg(x, 7 by a) (7 rows in the frame)
+               rank dense_rank row_number percent_rank cume_dist first_value last_value, ntile(x, 4), lag(x, 1), lead(x, 1)
+               custom('upper(@expression)', x)
+  calculation  calc(sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m)) as Share | calc(count(*), integer) as Rows
+               SQL over [Name]@m, [Name]@d and [Alias]; a decorator wraps it like a field: yoy_pct(calc(...)) as Growth
+  filter       country = Canada | store net paid > 100 | order date between 2024-01-01 and 2024-12-31 | order date >= 28d
+               category in (Books, Music) | category not in (Toys) | name contains foo | name not starts with x
+               date is null | category top 10 by store net paid | description keyword (sale, clearance)
+               (country = Canada or region = West) and store net paid > 10
+  segment      include (customer id, catalog net paid > 0) as Buyers | exclude (customer id, net paid > 1000) for net paid
+               expand (customer id, item = Books) with (item as Also bought) left dedupe none
+  settings     limit 100 | hints store-sales | {\"name\": \"...\"} merges spec JSON; after an item it merges into that item
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
-[Name] or \"Name\" is always a field, whatever the name says: [Tables], \"Sales in Store\" > 5.
+[Name] or \"Name\" is always a field, 'text' is always a value. Reserved words, which end a bare name:
+  and or not in is between top contains starts ends keyword as asc desc";
+
+/// The repl's dot commands.
+pub const REPL_COMMANDS: &str = "\
 Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explore <line> [? term] (what the query can add),
 .fields [text], .tables, .values <dim>,
 .json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
 
+/// The repl's `.help`: the forms, then its dot commands.
+pub fn help() -> String {
+    format!("Type comma-separated items; a newline separates items too. Each item is read from its shape.\n{FORMS}\n{REPL_COMMANDS}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn shapes_are_detected() {
-        let (spec, items) = parse_line("item category, yoy(month(date)) as Growth desc, store net paid > 100, category in (Books, Music), Share = sum([A]@m) / sum([B]@m), date between 2024-01-01 and 2024-12-31, cat top 5 by revenue, name is not null, max([gross sales]@m) as Peak, [Tables]").unwrap();
-        assert_eq!(spec["projections"].as_array().unwrap().len(), 3);
-        assert_eq!(spec["calculations"].as_array().unwrap().len(), 2);
-        assert_eq!(spec["filters"].as_array().unwrap().len(), 5);
-        match &items[1] {
-            Item::Projection(p) => {
-                assert_eq!(p["alias"], "Growth");
-                assert_eq!(p["order_by"], "desc");
-                assert_eq!(p["decorators"][0]["type"], "truncate");
-                assert_eq!(p["decorators"][1]["type"], "temporalize");
-            }
-            other => panic!("{other:?}"),
+    fn spec(line: &str) -> Value {
+        parse_line(line).unwrap_or_else(|e| panic!("{line}: {e}")).0
+    }
+    fn err(line: &str) -> String {
+        match parse_line(line) {
+            Ok((spec, _)) => panic!("{line}: parsed to {spec}"),
+            Err(e) => e,
         }
-        assert!(matches!(&items[3], Item::Filter(f) if f["predicate"] == "in_list" && f["value"] == "Books, Music"));
-        assert!(matches!(&items[6], Item::Filter(f) if f["predicate"] == "top_n" && f["top_n_measure"] == "revenue"));
-        assert!(matches!(&items[8], Item::Calculation(c) if c["alias"] == "Peak"));
-        assert!(matches!(&items[9], Item::Projection(p) if p["field"] == "Tables"));
-        assert!(parse_item("frob(date)").is_err());
     }
 
+    /// The examples of docs/expression-language.md, with the specs it gives.
     #[test]
-    fn items_split_outside_parens_and_quotes() {
-        assert_eq!(split_items("a, month(b), c in (x, y), 'p, q'").unwrap(), vec!["a", "month(b)", "c in (x, y)", "'p, q'"]);
-    }
-
-    /// Letters whose lower case is longer, or wider, must never move a
-    /// byte offset: these inputs panicked before the mask kept length.
-    #[test]
-    fn names_in_any_script_are_sliced_on_char_boundaries() {
-        for line in
-            ["İİ€ as y", "aİİ€€ as y", "İİİ€€€ as y desc", "ẞ€ as y", "İ€€ = 1", "İ€€€ in (a, b)", "İ€ contains x", "Ärger between 1 and 2"]
-        {
-            let _ = parse_line(line);
+    fn documented_examples_lower_to_their_specs() {
+        let cases = [
+            (
+                "item category, store net paid desc",
+                json!({"projections": [{"field": "item category"}, {"field": "store net paid", "order_by": "desc"}]}),
+            ),
+            (
+                "month(order date), store net paid, yoy_pct(store net paid) as Growth",
+                json!({"projections": [
+                    {"field": "order date", "decorators": [{"type": "truncate", "grain": "month"}]},
+                    {"field": "store net paid"},
+                    {"field": "store net paid", "alias": "Growth",
+                     "decorators": [{"type": "temporalize", "transform": "year_over_year", "percent_change": true}]}]}),
+            ),
+            (
+                "region, store net paid, order date between 2024-01-01 and 2024-12-31, item category in (Books, Music)",
+                json!({"projections": [{"field": "region"}, {"field": "store net paid"}],
+                       "filters": [
+                        {"field": "order date", "predicate": "between", "value": "2024-01-01", "value_end": "2024-12-31"},
+                        {"field": "item category", "predicate": "in_list", "value": "Books, Music"}]}),
+            ),
+            (
+                "item category, orders, item category top 5 by store net paid",
+                json!({"projections": [{"field": "item category"}, {"field": "orders"}],
+                       "filters": [{"field": "item category", "predicate": "top_n", "value": 5, "top_n_measure": "store net paid"}]}),
+            ),
+            (
+                "region, item category, store net paid, share(store net paid by region) as Share of region",
+                json!({"projections": [
+                    {"field": "region"}, {"field": "item category"}, {"field": "store net paid"},
+                    {"field": "store net paid", "alias": "Share of region",
+                     "decorators": [{"type": "contribute", "partition_refs": ["region"]}]}]}),
+            ),
+            (
+                "day(order date), region, store net paid, moving_avg(store net paid, 7 by region order by order date) as 7 day avg",
+                json!({"projections": [
+                    {"field": "order date", "decorators": [{"type": "truncate", "grain": "day"}]},
+                    {"field": "region"}, {"field": "store net paid"},
+                    {"field": "store net paid", "alias": "7 day avg",
+                     "decorators": [{"type": "window", "mode": "moving", "function": "avg", "size": 6,
+                                     "partition_refs": ["region"], "order_by": {"order date": "asc"}}]}]}),
+            ),
+            (
+                "country, store net paid, (country = Canada or region = West) and store net paid > 1000",
+                json!({"projections": [{"field": "country"}, {"field": "store net paid"}],
+                       "filters": {"and": [
+                        {"or": [{"field": "country", "predicate": "equals", "value": "Canada"},
+                                {"field": "region", "predicate": "equals", "value": "West"}]},
+                        {"field": "store net paid", "predicate": "greater_than", "value": 1000}]}}),
+            ),
+            (
+                "country, calc(sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m)) as Store to catalog, calc(count(*), integer) as Rows",
+                json!({"projections": [{"field": "country"}],
+                       "calculations": [
+                        {"calculation": true, "alias": "Store to catalog", "sql": "sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m)"},
+                        {"calculation": true, "alias": "Rows", "sql": "count(*)", "data_type": "integer"}]}),
+            ),
+            (
+                "customer id, store net paid, include (customer id, catalog net paid > 0) as Catalog buyers",
+                json!({"projections": [{"field": "customer id"}, {"field": "store net paid"}],
+                       "segments": [{"name": "Catalog buyers", "mode": "include", "keys": ["customer id"],
+                                     "filters": [{"field": "catalog net paid", "predicate": "greater_than", "value": 0}]}]}),
+            ),
+            (
+                "item category, orders, expand (customer id, item category = Books) with (item category as Also bought) left dedupe none as Book pairs",
+                json!({"projections": [{"field": "item category"}, {"field": "orders"}],
+                       "segments": [{"name": "Book pairs", "keys": ["customer id"],
+                                     "filters": [{"field": "item category", "predicate": "equals", "value": "Books"}],
+                                     "expanding": [{"field": "item category", "alias": "Also bought"}],
+                                     "join": "left", "pair_dedupe": "none"}]}),
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(spec(line), expected, "{line}");
         }
-        assert!(matches!(parse_item("İ€€ = 1"), Ok(Item::Filter(f)) if f["field"] == "İ€€" && f["value"] == "1"));
-        assert!(matches!(parse_item("İ€€€ in (a, b)"), Ok(Item::Filter(f)) if f["field"] == "İ€€€" && f["value"] == "a, b"));
-        assert!(matches!(parse_item("İ€ contains x"), Ok(Item::Filter(f)) if f["field"] == "İ€" && f["value"] == "x"));
-        assert!(matches!(parse_item("Größe as Size"), Ok(Item::Projection(p)) if p["field"] == "Größe" && p["alias"] == "Size"));
     }
 
-    /// An apostrophe inside a word is a letter; a quote left open is an
-    /// error, not a swallowed line.
+    /// The remaining documented lines parse, and read back as themselves.
     #[test]
-    fn apostrophes_and_unclosed_quotes() {
-        let (spec, items) = parse_line("category = Men's, revenue").unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(spec["projections"].as_array().unwrap().len(), 1);
-        assert!(matches!(&items[0], Item::Filter(f) if f["value"] == "Men's"));
-        assert!(matches!(parse_item("name = O'Brien"), Ok(Item::Filter(f)) if f["value"] == "O'Brien"));
-        let err = parse_line("category in ('a, b), revenue").unwrap_err();
-        assert!(err.contains("never closed"), "{err}");
+    fn remaining_examples_parse() {
+        let lines = [
+            "region, store net paid, catalog net paid, exclude (customer id, store net paid > 1000) for store net paid",
+            "include (customer id, store net paid@m), customer id, catalog net paid",
+            "month(order date), running_sum(orders) as Orders to date",
+            "region, item category, store net paid, row_number(store net paid by region) as \"Row in region\"",
+            "extract(day_of_week, order date) as Weekday, orders",
+            "custom('upper(@expression)', country) as Country, orders",
+            "item category, orders, item category keyword (book, music)",
+            "month(order date), yoy_pct(calc(sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m))) as Mix growth desc",
+            "item category, store net paid, item category not in (Toys, Games), item category not starts with X",
+            "\"Is Active\" = true, customer id, store net paid@m > 100",
+            "store net paid, order date >= 28d, limit 10, hints store-sales",
+            "country, store net paid {\"format\": {\"type\": \"currency\"}}, {\"name\": \"Paid by country\"}",
+        ];
+        for line in lines {
+            let (first, items) = parse_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            let again = describe(&items).iter().map(|d| d[13..].to_string()).collect::<Vec<_>>().join(", ");
+            let (second, _) = parse_line(&again).unwrap_or_else(|e| panic!("{again}: {e}"));
+            assert_eq!(first, second, "{line} read back as {again}");
+        }
+        let s = spec("month(order date), yoy_pct(calc(sum([A]@m) / sum([B]@m))) as Mix growth desc");
+        assert_eq!(s["calculations"][0]["decorators"][0]["type"], "temporalize");
+        assert_eq!(s["calculations"][0]["order_by"], "desc");
+        let s = spec("store net paid, order date >= 28d, limit 10, hints store-sales");
+        assert_eq!(s["limit"], 10);
+        assert_eq!(s["hints"], json!(["store-sales"]));
+        assert_eq!(s["filters"][0]["value"], "28d");
+        let s = spec("country, store net paid {\"format\": {\"type\": \"currency\"}}, {\"name\": \"Paid by country\"}");
+        assert_eq!(s["projections"][1]["format"]["type"], "currency");
+        assert_eq!(s["name"], "Paid by country");
+        let s = spec("\"Is Active\" = true, customer id, store net paid@m > 100");
+        assert_eq!(s["filters"][0], json!({"field": "Is Active", "predicate": "equals", "value": true}));
+        assert_eq!(s["filters"][1]["field_type"], "measure");
+        let s = spec("include (customer id, store net paid@m), customer id");
+        assert_eq!(s["segments"][0]["measures"], json!(["store net paid"]));
+        let s = spec("custom('upper(@expression)', country) as Country");
+        assert_eq!(s["projections"][0]["decorators"][0], json!({"type": "customize", "custom_sql": "upper(@expression)"}));
     }
 
-    /// A value may hold a keyword: text predicates are read before `in`,
-    /// and the English negation is accepted.
     #[test]
-    fn keywords_inside_values_do_not_win() {
-        assert!(
-            matches!(parse_item("description contains made in china"), Ok(Item::Filter(f)) if f["predicate"] == "contains" && f["value"] == "made in china")
-        );
-        assert!(
-            matches!(parse_item("name does not contain test"), Ok(Item::Filter(f)) if f["predicate"] == "does_not_contain" && f["field"] == "name")
-        );
-        assert!(matches!(parse_item("name not starts with x"), Ok(Item::Filter(f)) if f["predicate"] == "does_not_start_with"));
-        assert!(matches!(parse_item("region in (a, b)"), Ok(Item::Filter(f)) if f["predicate"] == "in_list"));
+    fn the_multi_line_form() {
+        let line = "month(order date), region\nstore net paid, share_filtered(store net paid by region) as Share\norder date >= 1y, region in (West, East)\ninclude (customer id, catalog net paid > 0) as Catalog buyers\nlimit 500";
+        let s = spec(line);
+        assert_eq!(s["projections"].as_array().unwrap().len(), 4);
+        assert_eq!(s["projections"][3]["decorators"][0]["ignore_partition_filters"], false);
+        assert_eq!(s["filters"].as_array().unwrap().len(), 2);
+        assert_eq!(s["segments"][0]["name"], "Catalog buyers");
+        assert_eq!(s["limit"], 500);
+        // A continuation line may begin with and/or, and a list may wrap.
+        let s = spec("country\ncountry = Canada\nor region = West\nregion in (\n  West,\n  East\n)");
+        assert_eq!(s["filters"]["and"][0]["or"].as_array().unwrap().len(), 2);
+        assert_eq!(s["filters"]["and"][1]["value"], "West, East");
     }
 
-    /// A name in brackets or quotes is a field whatever it says, with
-    /// its kind suffix kept; a formula keeps its brackets and is its
-    /// own alias when unnamed.
+    /// The hazards section: each tricky input reads the way the document says.
     #[test]
-    fn escaped_names_are_fields_whatever_they_say() {
-        assert!(
-            matches!(parse_item("\"Sales in Store\" > 5"), Ok(Item::Filter(f)) if f["field"] == "Sales in Store" && f["predicate"] == "greater_than")
-        );
-        assert!(
-            matches!(parse_item("month([Date between])"), Ok(Item::Projection(p)) if p["field"] == "Date between" && p["decorators"].as_array().unwrap().len() == 1)
-        );
-        assert!(
-            matches!(parse_item("[Net Paid] as \"Paid\" desc"), Ok(Item::Projection(p)) if p["alias"] == "Paid" && p["order_by"] == "desc")
-        );
-        assert!(matches!(parse_item("Share = [A]@m / [B]@m"), Ok(Item::Calculation(c)) if c["sql"] == "[A]@m / [B]@m"));
-        assert!(matches!(parse_item("max([gross sales]@m)"), Ok(Item::Calculation(c)) if c["alias"] == "max([gross sales]@m)"));
-        assert!(matches!(parse_item("[gross sales]@m > 100"), Ok(Item::Filter(f)) if f["field"] == "gross sales@m"));
-        assert!(matches!(parse_item("[Date]@d"), Ok(Item::Projection(p)) if p["field"] == "Date@d"));
-        let moving = parse_item("moving_avg(paid, 7)").unwrap();
-        assert!(matches!(&moving, Item::Projection(p) if p["decorators"][0]["type"] == "window"), "{moving:?}");
+    fn hazards_read_as_documented() {
+        let s = spec("running_sum(x by order date), rank(x by region order by order date desc)");
+        assert_eq!(s["projections"][0]["decorators"][0]["partition_refs"], json!(["order date"]));
+        assert_eq!(s["projections"][1]["decorators"][0]["order_by"], json!({"order date": "desc"}));
+        let s = spec("date between 1y and 0d and country = Canada");
+        assert_eq!(s["filters"].as_array().unwrap().len(), 2);
+        let s = spec("name contains made in china, description keyword (a, b)");
+        assert_eq!(s["filters"][0]["value"], "made in china");
+        let s = spec("created by, order date, null count, x in (Rock and Roll, Jazz)");
+        assert_eq!(s["projections"].as_array().unwrap().len(), 3);
+        assert_eq!(s["filters"][0]["value"], "Rock and Roll, Jazz");
+        let s = spec("name = 'Rock and Roll', title = 'Toys, games (new)', who = O'Brien, mail = a@b.c");
+        assert_eq!(s["filters"][0]["value"], "Rock and Roll");
+        assert_eq!(s["filters"][1]["value"], "Toys, games (new)");
+        assert_eq!(s["filters"][2]["value"], "O'Brien");
+        assert_eq!(s["filters"][3]["value"], "a@b.c");
+        let s = spec("calc(coalesce([A]@m, 0) / 'a, b') as X");
+        assert_eq!(s["calculations"][0]["sql"], "coalesce([A]@m, 0) / 'a, b'");
+        let s = spec("\"Net Paid\"@m, [Net Paid]@d, revenue > -5, limit, include tax, month, P&L, Avg. Price, Größe as Size");
+        assert_eq!(s["projections"][0], json!({"field": "Net Paid", "field_type": "measure"}));
+        assert_eq!(s["projections"][1]["field_type"], "dimension");
+        assert_eq!(s["filters"][0]["value"], -5);
+        let names: Vec<&str> = s["projections"].as_array().unwrap()[2..].iter().map(|p| p["field"].as_str().unwrap()).collect();
+        assert_eq!(names, ["limit", "include tax", "month", "P&L", "Avg. Price", "Größe"]);
+        assert_eq!(s["projections"][7]["alias"], "Size");
+        let s = spec("x = 02134, y = 1.10, z = '2024', w = 1.5, v = TRUE");
+        assert_eq!(s["filters"][0]["value"], "02134");
+        assert_eq!(s["filters"][1]["value"], 1.1);
+        assert_eq!(s["filters"][2]["value"], "2024");
+        assert_eq!(s["filters"][3]["value"], 1.5);
+        assert_eq!(s["filters"][4]["value"], true);
+        let s = spec("a = 1 and b = 2, c = 3");
+        assert_eq!(s["filters"].as_array().unwrap().len(), 3);
+        let s = spec("\"Say \"\"hi\"\"\", country=Canada, x>=3, x<>4, x in(a,b)");
+        assert_eq!(s["projections"][0]["field"], "Say \"hi\"");
+        assert_eq!(s["filters"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn errors_say_what_is_wrong() {
+        let cases = [
+            ("Is Active = true", "reserved word"),
+            ("x as Row in region", "reserved word and ends the name"),
+            ("monthly(order date)", "unknown function `monthly`"),
+            ("extract(dow, order date)", "extract needs a part"),
+            ("country not = Canada", "write != instead of not ="),
+            ("name = Rock and Roll", "after `and`"),
+            ("share(x by created by)", "holding `by` is bracketed"),
+            ("calc(a, b) as X", "expected a result type"),
+            ("calc(a as X", "never closed"),
+            ("[Sign In Date >= 7d", "never closed"),
+            ("store net paid@x", "expected @d or @m"),
+            ("store net paid@month", "expected @d or @m"),
+            ("country = 'Canada", "never closed"),
+            ("country = \"Canada\"", "single-quoted"),
+            ("x in ('Toys, games')", "cannot hold a comma"),
+            ("moving_avg(x, 1)", "at least two rows"),
+            ("lag(x)", "needs the number of rows"),
+            ("yoy(x by region)", "takes no `by`"),
+            ("limit 10x", "whole number"),
+            ("limit 10 {\"a\": 1}", "cannot follow a setting"),
+            ("x == 5", "not an operator"),
+            ("month(order date) = 5", "applies to a field, not to a function"),
+            ("x asc desc", "direction is given twice"),
+            ("x not between 1 and 2", "no `not between`"),
+            ("expand (customer id) left", "followed by with"),
+            ("include (customer id) left", "apply to expand"),
+            ("x = 1 or", "after `or`"),
+            ("{\"a\": }", "does not parse"),
+            ("", "nothing to plan"),
+            ("category top five", "top needs a count"),
+        ];
+        for (line, expected) in cases {
+            let e = err(line);
+            assert!(e.contains(expected), "{line}: {e}");
+        }
+        assert!(err("x\ny = ").contains("line 2"));
     }
 }
