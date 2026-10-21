@@ -446,22 +446,43 @@ what makes the remaining adapters cheap instead of frightening.
       slim build (`--no-default-features`, which CI checks) still compiles
       — tokio enters it here, which is a measurable change and not a free
       one.
-- [ ] **B2 — the containers, and the other two transports.** Landed so
-      far: the compose file and the CI job; the HTTP transport on the ureq
-      the CLI already had, proved against the public ClickHouse playground
-      (which found that `readonly=1` forbids every setting in a request,
-      so a connection asks its mode on open); SQLite in-process, read-only
-      by the file's own flag; the catalogue read for Postgres, ClickHouse
-      and SQLite, assembled once from per-adapter statements; and `zsql
-      introspect`, writing `catalogue/<datasource>.json` — one file per
-      datasource rather than the single `catalogue.json` first proposed,
-      so re-reading one never rewrites another. Measured with three
-      transports linked: 15.2 MB stripped, +1.4 MB, and a clean release
-      build of 77 s against the survey's 69 s, +8 s; the slim build still
-      compiles with tokio in it. Still to land: MySQL, SQL Server and
-      Trino, which need the containers to prove them, and CI has not yet
-      run the job because `ci.yml` triggers only on `main` and on pull
-      requests. *Gate:* the same catalogue assertions pass against every
+- [ ] **B2 — the containers, and the other two transports.** Landed:
+      the compose file and the CI job, with the environment for every
+      adapter; the HTTP transport on the ureq the CLI already had, proved
+      against the public ClickHouse playground (which found that
+      `readonly=1` forbids every setting in a request, so a connection asks
+      its mode on open); SQLite in-process, read-only by the file's own
+      flag; MySQL and SQL Server on the wire and Trino over HTTP, written
+      against the containers and **not yet run against a server**; the
+      catalogue read for all six, assembled once from per-adapter
+      statements; and `zsql introspect`, writing
+      `catalogue/<datasource>.json` — one file per datasource rather than
+      the single `catalogue.json` first proposed, so re-reading one never
+      rewrites another. Measured with six adapters linked: 16.5 MB
+      stripped, +2.7 MB over the baseline, under the survey's +3 MB for
+      the wire-and-HTTP set alone; a clean release build of 77 s against
+      69 s; the slim build compiles with tokio in it; `cargo deny` passes
+      and ring is the only crypto provider.
+
+      **TLS is off on MySQL and SQL Server, and `sslmode` is the item
+      that turns it on.** This is a decision, not an omission, taken
+      three times for the same reason: a container on loopback presents a
+      certificate nothing signed and there is no flag to trust one;
+      tiberius's rustls feature pulls rustls's default provider, aws-lc,
+      in beside ring — a second provider, C and assembly in the build, a
+      run-time panic unless a process default is installed — and TDS 8.0
+      refuses to build without TLS because it is TLS-first by definition,
+      so the transport speaks 7.3; and mysql's rustls feature drags in the
+      old `webpki` and the unmaintained `rustls-pemfile`, which cargo-deny
+      refuses under RUSTSEC-2025-0134. The `sslmode` change takes all of
+      that once, with a measurement. Until it lands, Azure SQL and any
+      MySQL that requires TLS are unreachable, and Postgres is `Prefer`.
+
+      Still to do: run the three against the containers, which needs
+      either the containers on this machine or a pull request, since
+      `ci.yml` triggers only on `main` and on pull requests; prove
+      ClickHouse's `readonly=0` path, which the playground cannot; then
+      the gate. *Gate:* the same catalogue assertions pass against every
       container, so a thirteenth adapter is a file and not a project.
 - [ ] **C — model from catalogue.** Generation with marked inferences;
       diff-and-patch on re-run with `--dry-run` the default for an existing
