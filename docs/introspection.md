@@ -552,11 +552,32 @@ what makes the remaining adapters cheap instead of frightening.
 
       Remaining: `zsql check` against a catalogue with dialect-correct
       folding, and a drift report between two catalogues.
-- [ ] **D — sampling.** Column and plain-`sql` dimensions only, the rest
-      skipped with a reason; partitioned tables requiring an explicit
-      window; batched distinct counts; the long-text warning; `sample_sql`,
-      never executed from a deployed project; and the governance rules
-      below written into the command and the file's documentation.
+- [ ] **D — sampling.** `zsql sample` landed: every dimension with
+      `enable_sampling`, through the generated query — the column or plain
+      expression through the dialect, `COUNT(*)` ordered descending, the
+      dialect's own row limit at `sample_size` — or the author's
+      `sample_sql` as written, value in the first column and an optional
+      count in the second. Distinct counts come one scan per table, so a
+      record says whether its list is complete; `sample_size` rides on
+      every record. Hidden dimensions, policy-named ones, lookups, arrays
+      and calculated dimensions are skipped with their reasons, and the
+      command says its plan — dimensions, tables, queries — before running,
+      with `--dry-run` to stop there, `--budget` to refuse past a count,
+      and `--only` for one dimension or table, keeping the rest of the
+      file. The long-text warning fires on what came back and on what the
+      catalogue declared. Writing it found the Postgres transport's one
+      real bug: binary cells read as strings came back null, so every
+      non-text value was lost; it speaks the simple-query protocol now,
+      and the transport test asserts an integer, a boolean, a numeric and
+      a date arrive as text.
+
+      Two numbers are placeholders until ruled on: a partitioned table is
+      skipped with a reason rather than scanned, and the long-text warning
+      fires past an average of 100 characters or a declared width past
+      255. Both are one constant each.
+
+      Remaining: the governance rules written into the command's output and
+      the sample file's documentation; proof on the Postgres fixture.
 - [ ] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
       Athena, on the HTTP transport B2 built, plus SigV4 for the two AWS
       ones. Each is a request type, a catalogue query and a comments query;

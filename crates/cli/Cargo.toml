@@ -24,6 +24,7 @@ server = ["dep:zsql-server"]
 zsql-server = { workspace = true, optional = true }
 zsql-service.workspace = true
 zsql-source.workspace = true
+zsql-semantic.workspace = true
 zsql-project.workspace = true
 zsql-shorthand.workspace = true
 zsql-dialect.workspace = true
@@ -43,4 +44,5 @@ libc = "0.2"
 workspace = true
 
 [dev-dependencies]
+zsql-project.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }

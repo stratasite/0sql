@@ -30,6 +30,11 @@ pub struct DimensionValues {
     pub table: String,
     /// RFC 3339.
     pub sampled_at: String,
+    /// The limit the sampling query ran with. With `distinct` it says
+    /// whether the list is complete; without `distinct`, a list as long
+    /// as this is the only sign that it was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_size: Option<i64>,
     /// Distinct values in the column, when counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinct: Option<i64>,

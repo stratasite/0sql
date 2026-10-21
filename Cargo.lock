@@ -3080,6 +3080,7 @@ dependencies = [
  "ureq",
  "zsql-dialect",
  "zsql-project",
+ "zsql-semantic",
  "zsql-server",
  "zsql-service",
  "zsql-shorthand",

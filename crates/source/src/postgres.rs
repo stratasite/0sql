@@ -84,31 +84,39 @@ impl Postgres {
 impl Source for Postgres {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        let fail = |e: tokio_postgres::Error| SourceError::Query(self.uid.clone(), crate::chain(&e));
-        // One row past the cap, so a result at the cap can be told from one
-        // over it and the caller is refused rather than quietly trimmed.
-        let statement = self.runtime.block_on(self.client.prepare(sql)).map_err(fail)?;
-        let rows = self
+        // The simple-query protocol: every value arrives as the server's
+        // own text, whatever its type, which is what a catalogue and a
+        // sample want. The extended protocol sends binary, and reading a
+        // boolean or a number as a string there yields nothing at all —
+        // which is how every non-text cell was null until a test asked
+        // pg_stat_ssl a yes-or-no question.
+        let uid = self.uid.clone();
+        let messages = self
             .runtime
-            .block_on(async { tokio::time::timeout(self.timeout, self.client.query(&statement, &[])).await })
-            .map_err(|_| SourceError::Query(self.uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
-            .map_err(|e| SourceError::Query(self.uid.clone(), crate::chain(&e)))?;
-        if rows.len() > max_rows {
-            return Err(SourceError::TooManyRows(self.uid.clone(), max_rows));
-        }
-
-        let columns: Vec<String> = statement.columns().iter().map(|c| c.name().to_string()).collect();
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut cells = Vec::with_capacity(columns.len());
-            for i in 0..columns.len() {
-                // Everything comes back as text: the catalogue is strings,
-                // and a sampled value is the string a consumer matches on.
-                cells.push(row.try_get::<_, Option<String>>(i).unwrap_or(None));
+            .block_on(async { tokio::time::timeout(self.timeout, self.client.simple_query(sql)).await })
+            .map_err(|_| SourceError::Query(uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
+            .map_err(|e| SourceError::Query(uid.clone(), crate::chain(&e)))?;
+        let mut columns: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        for m in messages {
+            match m {
+                tokio_postgres::SimpleQueryMessage::RowDescription(cols) => {
+                    columns = cols.iter().map(|c| c.name().to_string()).collect();
+                }
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    if rows.len() == max_rows {
+                        // Past the cap: refuse rather than trim.
+                        return Err(SourceError::TooManyRows(uid, max_rows));
+                    }
+                    if columns.is_empty() {
+                        columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    }
+                    rows.push((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect());
+                }
+                _ => {}
             }
-            out.push(cells);
         }
-        Ok(Rows { columns, rows: out })
+        Ok(Rows { columns, rows })
     }
 
     fn adapter(&self) -> &str {

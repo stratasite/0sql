@@ -189,11 +189,19 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
     let mut src = postgres::Postgres::open(&conn, Some(Secret(password))).expect("connects");
 
-    let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three", 10).expect("reads");
-    assert_eq!(rows.columns, ["one", "two", "three"]);
+    let rows = src
+        .query("SELECT 1 AS one, 'two' AS two, NULL AS three, true AS four, 1.50::numeric AS five, DATE '2026-01-02' AS six", 10)
+        .expect("reads");
+    assert_eq!(rows.columns, ["one", "two", "three", "four", "five", "six"]);
     assert_eq!(rows.rows.len(), 1);
+    // Every type as the server's own text, not only the text ones: the
+    // extended protocol's binary values once came back as null here.
+    assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
     assert_eq!(rows.get(&rows.rows[0], "two"), Some("two"));
     assert_eq!(rows.get(&rows.rows[0], "three"), None);
+    assert_eq!(rows.get(&rows.rows[0], "four"), Some("t"));
+    assert_eq!(rows.get(&rows.rows[0], "five"), Some("1.50"));
+    assert_eq!(rows.get(&rows.rows[0], "six"), Some("2026-01-02"));
 
     assert!(src.query("DROP TABLE IF EXISTS zsql_should_not_exist", 1).is_err(), "a write is refused before it is sent");
 

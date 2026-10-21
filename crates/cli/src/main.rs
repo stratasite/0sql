@@ -18,6 +18,7 @@ mod local;
 mod project;
 mod remote;
 mod repl;
+mod sample;
 mod scaffold;
 #[cfg(feature = "server")]
 mod serve;
@@ -199,6 +200,20 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sample the values of every dimension with enable_sampling into samples/values.jsonl.gz. Local only.
+    Sample {
+        /// Which datasource; every one when unsaid.
+        datasource: Option<String>,
+        /// Only this dimension or table, by name or uid.
+        #[arg(long)]
+        only: Option<String>,
+        /// Say what would be run and run nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse before running when more queries than this are needed.
+        #[arg(long)]
+        budget: Option<usize>,
+    },
     /// Read a datasource's tables and columns into catalogue/{datasource}.json. Local only.
     Introspect {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
@@ -355,6 +370,10 @@ fn run(command: Command, at: Where) -> Result<()> {
         }
         Command::Deploy { dry_run, watch } => deploy::deploy(at, dry_run, watch),
         Command::Introspect { datasource, schema } => introspect::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
+        Command::Sample { datasource, only, dry_run, budget } => sample::run(
+            at.project.as_deref(),
+            sample::Options { datasource: datasource.as_deref(), only: only.as_deref(), dry_run, budget },
+        ),
         Command::Generate { datasource, schema, table, columns, new, dry_run } => generate::run(
             at.project.as_deref(),
             generate::Options {
