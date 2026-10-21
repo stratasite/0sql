@@ -265,3 +265,107 @@ fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
     // The guard refuses first; the server's readonly mode would refuse second.
     assert!(src.query("CREATE TABLE zsql_no (a UInt8) ENGINE = Memory", 1).is_err());
 }
+
+#[test]
+fn a_sqlite_catalogue_has_its_tables_views_and_columns_in_order() {
+    let dir = temp("cat-sqlite");
+    let file = dir.join("c.db");
+    {
+        let db = rusqlite::Connection::open(&file).unwrap();
+        db.execute_batch(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, placed TEXT NOT NULL, note TEXT);\
+             CREATE VIEW recent AS SELECT id FROM orders;",
+        )
+        .unwrap();
+    }
+    let conn = Connection { uid: "local".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
+    let mut src = open(&conn, None).unwrap();
+    let cat = Catalogue::read(src.as_mut(), "local", None).unwrap();
+
+    assert_eq!(cat.datasource, "local");
+    assert_eq!(cat.adapter, "sqlite");
+    assert!(cat.read_at.ends_with('Z') && cat.read_at.len() == 20, "RFC 3339 to the second: {}", cat.read_at);
+    let names: Vec<(&str, &str)> = cat.tables.iter().map(|t| (t.name.as_str(), t.kind.as_str())).collect();
+    assert_eq!(names, [("orders", "table"), ("recent", "view")]);
+
+    let orders = cat.table(None, "orders").unwrap();
+    let cols: Vec<(&str, &str, bool, i64)> =
+        orders.columns.iter().map(|c| (c.name.as_str(), c.data_type.as_str(), c.nullable, c.position)).collect();
+    assert_eq!(cols, [("id", "INTEGER", true, 1), ("placed", "TEXT", false, 2), ("note", "TEXT", true, 3)]);
+    assert_eq!(orders.physical_name(), "orders", "no schema, so no qualifier");
+    assert!(orders.rows.is_none() && orders.comment.is_none(), "SQLite keeps neither");
+
+    let json = serde_json::to_string(&cat).unwrap();
+    let back: Catalogue = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.tables.len(), 2, "the file round-trips");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Postgres catalogue, scoped to `pg_catalog` because that schema is
+/// in every server and needs no fixture written: its tables have a row
+/// estimate, typed columns in order, and the odd comment.
+#[test]
+#[ignore]
+fn a_real_postgres_catalogue_reads_pg_catalog() {
+    let conn = Connection {
+        uid: "test".into(),
+        adapter: "postgres".into(),
+        host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
+        username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
+        ..Default::default()
+    };
+    let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
+    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let cat = Catalogue::read(src.as_mut(), "test", Some("pg_catalog")).expect("reads");
+
+    let class = cat.table(Some("pg_catalog"), "pg_class").expect("pg_class is in every server");
+    assert_eq!(class.kind, "table");
+    assert_eq!(class.physical_name(), "pg_catalog.pg_class");
+    assert!(class.rows.is_some(), "reltuples gives an estimate");
+    let relname = class.columns.iter().find(|c| c.name == "relname").expect("relname");
+    assert_eq!(relname.data_type, "name");
+    assert!(!relname.nullable);
+    assert!(class.columns.windows(2).all(|w| w[0].position < w[1].position), "columns in ordinal order");
+    assert!(cat.tables.iter().any(|t| t.kind == "view"), "pg_catalog has views too");
+    assert!(cat.tables.iter().all(|t| t.schema.as_deref() == Some("pg_catalog")), "the scope held");
+}
+
+/// The ClickHouse catalogue, scoped to the playground's `blogs` database
+/// by default: real tables with row counts from `system.tables`, and
+/// ClickHouse's own type spellings kept as they are.
+#[test]
+#[ignore]
+fn a_real_clickhouse_catalogue_reads_a_database() {
+    let conn = Connection {
+        uid: "ch".into(),
+        adapter: "clickhouse".into(),
+        url: Some(std::env::var("ZSQL_TEST_CLICKHOUSE_URL").expect("ZSQL_TEST_CLICKHOUSE_URL")),
+        username: std::env::var("ZSQL_TEST_CLICKHOUSE_USER").ok(),
+        ..Default::default()
+    };
+    let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
+    let mut src = open(&conn, secret).expect("opens");
+    // The playground has `blogs`; a container has `default`, empty but
+    // real. Either way the read works and the scope holds.
+    let scope = std::env::var("ZSQL_TEST_CLICKHOUSE_DB").unwrap_or_else(|_| "blogs".into());
+    let cat = Catalogue::read(src.as_mut(), "ch", Some(&scope)).expect("reads");
+    assert_eq!(cat.adapter, "clickhouse");
+    assert!(cat.tables.iter().all(|t| t.schema.as_deref() == Some(scope.as_str())), "the scope held");
+    if let Some(countries) = cat.table(Some("blogs"), "countries") {
+        assert_eq!(countries.kind, "table");
+        assert!(countries.rows.unwrap_or(0) > 0, "total_rows is read");
+        assert_eq!(countries.physical_name(), "blogs.countries");
+        let name = countries.columns.iter().find(|c| c.name == "name").expect("name");
+        assert_eq!(name.data_type, "String", "ClickHouse's spelling, kept");
+        assert!(!name.nullable);
+        assert_eq!(name.position, 1);
+    }
+    // Nothing from the system schemas leaks in when there is no scope.
+    let all = Catalogue::read(src.as_mut(), "ch", None).expect("reads");
+    assert!(all
+        .tables
+        .iter()
+        .all(|t| !["system", "INFORMATION_SCHEMA", "information_schema"].contains(&t.schema.as_deref().unwrap_or(""))));
+}
