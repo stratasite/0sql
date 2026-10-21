@@ -738,7 +738,14 @@ error messages above are each a commit point plus a sentence, which
 hand-written code states directly and pest or nom cannot. Spans are
 byte offsets, turned into line and column only when an error is
 rendered. The PEG in this document is the specification and the
-goldens are the proof that the code agrees with it. The spec lowering
+goldens are the proof that the code agrees with it. The crate also
+answers where a cursor stands: `complete::context` reads the frames a
+half-typed line is inside and says what the grammar can take there, a
+field of a kind, a function, a keyword, a projected dimension after
+`by`, a value after a predicate, a table after `via`, a part or a type.
+The repl's line helper maps those offers to the model for tab
+completion, the dimmed hint as you type, bold keywords, and a red
+unclosed opener that keeps the line open for another line. The spec lowering
 in `crates/spec` now resolves partition and order references by uid,
 name or alias against the projected dimensions and refuses a miss,
 which `crates/golden/tests/spec.rs` pins. The lowering is
