@@ -44,7 +44,7 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Warehouses
-        run: docker compose -f harness/sources/compose.yml up -d --wait --wait-timeout 180
+        run: docker compose -f harness/sources/compose.yml up -d --wait --wait-timeout 540
       - name: Transports against them
         env:
           ZSQL_TEST_PG_HOST: localhost
