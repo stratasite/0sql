@@ -220,7 +220,7 @@ pub fn decorator_family(func: &str) -> Option<&'static str> {
 }
 
 pub fn parse(line: &str) -> R<Vec<Item>> {
-    let mut p = P { s: line, i: 0, depth: 0, last_bare: None, pred_start: 0 };
+    let mut p = P { s: line, i: 0, depth: 0, last_bare: None, pred_start: 0, nest: 0 };
     let mut items = Vec::new();
     loop {
         p.any_ws();
@@ -257,7 +257,13 @@ struct P<'a> {
     /// Where the field of the filter being read began, for the hint that a
     /// reserved word inside a name wants brackets.
     pred_start: usize,
+    /// How many parentheses of functions and filter groups are open:
+    /// bounded, so a line cannot exhaust the stack.
+    nest: usize,
 }
+
+/// Parentheses nested deeper than this are refused.
+const MAX_NEST: usize = 64;
 
 fn is_word_char(c: char) -> bool {
     !c.is_whitespace() && !STRUCTURAL.contains(c)
@@ -564,7 +570,7 @@ impl<'a> P<'a> {
 
     /// Whether the cursor is at `order` with `by` after it.
     fn order_by_follows(&self) -> bool {
-        let mut q = P { s: self.s, i: self.i, depth: self.depth, last_bare: None, pred_start: 0 };
+        let mut q = P { s: self.s, i: self.i, depth: self.depth, last_bare: None, pred_start: 0, nest: 0 };
         q.kw("order") && q.sp() && q.at_kw("by")
     }
 
@@ -686,10 +692,22 @@ impl<'a> P<'a> {
 
     fn inner_expr(&mut self, func: &str) -> R<Expr> {
         let at = self.i;
-        match self.expr(Mode::Args)? {
+        self.enter(at)?;
+        let inner = self.expr(Mode::Args);
+        self.nest -= 1;
+        match inner? {
             Some(e) => Ok(e),
             None => self.err(at, format!("{func}() needs a field inside it")),
         }
+    }
+
+    /// One level deeper, or the refusal that keeps the stack finite.
+    fn enter(&mut self, at: usize) -> R<()> {
+        self.nest += 1;
+        if self.nest > MAX_NEST {
+            return self.err(at, format!("nested deeper than {MAX_NEST} levels"));
+        }
+        Ok(())
     }
 
     /// The closing parenthesis of a function, with the messages for what
@@ -977,9 +995,12 @@ impl<'a> P<'a> {
     fn pred(&mut self) -> Soft<FilterNode> {
         let start = self.i;
         if self.eat("(") {
+            self.enter(start)?;
             self.any_ws();
             let at = self.i;
-            let Some(f) = self.filter()? else { return self.err(at, "expected a filter inside the parentheses") };
+            let inner = self.filter();
+            self.nest -= 1;
+            let Some(f) = inner? else { return self.err(at, "expected a filter inside the parentheses") };
             self.any_ws();
             if !self.eat(")") {
                 return self.err(self.i, "expected ) to close the filter group");
@@ -1133,7 +1154,7 @@ impl<'a> P<'a> {
                         break;
                     }
                     if c.is_whitespace() {
-                        let mut q = P { s: self.s, i: self.i + pos, depth: self.depth, last_bare: None, pred_start: 0 };
+                        let mut q = P { s: self.s, i: self.i + pos, depth: self.depth, last_bare: None, pred_start: 0, nest: 0 };
                         q.ws();
                         if q.at_kw("and") || q.at_kw("or") {
                             end = pos;

@@ -401,6 +401,22 @@ fn quoting_and_odd_characters_in_names() {
     assert_eq!(spec("Men's Wear, x = Men's")["filters"][0]["value"], "Men's");
 }
 
+/// A line cannot nest deeper than the parser's limit, so the stack is
+/// never the thing that gives out.
+#[test]
+fn deep_nesting_is_refused_not_overflowed() {
+    let deep = format!("{}x = 1{}", "(".repeat(5000), ")".repeat(5000));
+    assert!(err(&deep).contains("nested deeper than 64 levels"));
+    let deep = format!("{}x{}", "yoy(".repeat(5000), ")".repeat(5000));
+    assert!(err(&deep).contains("nested deeper than 64 levels"));
+    let deep = format!("include ({}x = 1{})", "(".repeat(5000), ")".repeat(5000));
+    assert!(err(&deep).contains("nested deeper than 64 levels"));
+    let fine = format!("{}x = 1{}", "(".repeat(60), ")".repeat(60));
+    assert_eq!(spec(&fine)["filters"][0]["field"], "x");
+    let fine = format!("{}x{}", "yoy(".repeat(60), ")".repeat(60));
+    assert_eq!(spec(&fine)["projections"][0]["decorators"].as_array().unwrap().len(), 60);
+}
+
 #[test]
 fn errors_carry_a_position_in_characters() {
     assert!(err("Größe = \"x\"").ends_with("(column 9)"), "{}", err("Größe = \"x\""));
