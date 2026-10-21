@@ -110,6 +110,11 @@ for h in sorted(used):
         snap = json.load(f)
     for policy in snap.get("security_policies", []):
         policy["unresolved"] = "allow"
+    # Keys the model no longer has. strata still writes them, so they are
+    # dropped on the way in rather than being reintroduced by a re-import.
+    for field in snap.get("fields", []):
+        for gone in ("display_type", "secure", "disable_listing", "disable_value_listing", "value_list_size", "values", "value_sampling"):
+            field.pop(gone, None)
     with gzip.open(os.path.join(dst, "universes", h + ".json.gz"), "wt") as f:
         json.dump(snap, f)
 manifest = json.load(open(os.path.join(src, "fixtures/golden/manifest.json")))

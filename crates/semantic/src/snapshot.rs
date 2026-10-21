@@ -253,6 +253,7 @@ pub struct Field {
     #[serde(rename = "type")]
     pub kind: FieldKind,
     pub data_type: Option<DataType>,
+    #[serde(default)]
     pub display_type: String,
     #[serde(default)]
     pub hidden: bool,
@@ -271,6 +272,7 @@ pub struct Field {
     pub secure: bool,
     #[serde(default)]
     pub disable_listing: bool,
+    #[serde(default)]
     pub value_list_size: i64,
     /// How `zsql values sample` treats the field: the top `value_list_size`
     /// values by row count, every value, or none.
