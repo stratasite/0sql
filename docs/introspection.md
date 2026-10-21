@@ -511,17 +511,47 @@ what makes the remaining adapters cheap instead of frightening.
       to hold 5432. *Gate, held:* the same catalogue assertions pass
       against every container, so a thirteenth adapter is a file and not
       a project.
-- [ ] **C — model from catalogue.** Groundwork in: the catalogue reads
-      primary and foreign keys on all six adapters — `pg_constraint`,
-      MySQL's `key_column_usage` with its referenced side, SQL Server's
-      `sys.foreign_key_columns`, SQLite's two pragmas, ClickHouse's sorting
-      key under the name it gives it, nothing from Trino since its
-      `information_schema` has no constraints — proven on fixtures with a
-      real foreign key in the Postgres and MySQL containers. Remaining:
-      generation with marked inferences;
-      diff-and-patch on re-run with `--dry-run` the default for an existing
-      project; `zsql check` against a catalogue with dialect-correct
-      folding; a drift report between two catalogues.
+- [ ] **C — model from catalogue.** `zsql generate` landed, on four
+      decisions taken as follows.
+
+      *Never overwrite.* A table is matched to an existing model by
+      `physical_name`; when one exists, `generate` lists the columns the
+      catalogue has and the model lacks, with the exact command to add
+      them — `--columns a,b` for some, `--new` for all — and adding
+      appends field entries to the file's `fields:` block and touches
+      nothing else, or prints them to paste when the file is not shaped
+      for that. A column with no 0sql type is named once as such and never
+      counted as new. Flags and a listing rather than a prompt, since
+      agents and CI run it too.
+
+      *Sampling from width.* `enable_sampling: true` on a string declared
+      255 or narrower, with the width on the line; nothing else touched.
+      The loader stays rule-free; generation is a different layer, and
+      this is the judgement `AGENTS.md` asks a modeller to make.
+
+      *Types.* Known types mapped per adapter; the text-shaped unknowns —
+      `uuid`, `json`, `jsonb`, `xml`, enums, `inet` and kin — to `string`
+      and said so; anything else, arrays and intervals and geometry,
+      skipped and listed in the file's header and the command's output,
+      so the hole is never silent. The warehouse's own spelling rides on
+      every `data_type` line.
+
+      *Measures.* Numeric columns whose names look additive become `sum`
+      measures; keys — the primary key, foreign-key columns, anything
+      called `id` — stay dimensions; everything else is a dimension.
+
+      "Marked as inferred" is a trailing YAML comment on the line, which
+      the never-overwrite rule is what makes safe: comments survive
+      because nothing re-emits the file. Joins come from foreign keys
+      into one `rel.<schema>.yml` per schema, written once; a later run
+      names any join the file lacks. `cost` is bucketed from the row
+      estimate. The planner queries a generated model unaided — a `sum`
+      across two generated tables on the warehouse's foreign key — and
+      the real loader validates every draft the SQLite and Postgres
+      fixtures produce.
+
+      Remaining: `zsql check` against a catalogue with dialect-correct
+      folding, and a drift report between two catalogues.
 - [ ] **D — sampling.** Column and plain-`sql` dimensions only, the rest
       skipped with a reason; partitioned tables requiring an explicit
       window; batched distinct counts; the long-text warning; `sample_sql`,

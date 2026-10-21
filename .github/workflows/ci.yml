@@ -77,7 +77,9 @@ jobs:
           ZSQL_TEST_MSSQL_DB: master
           ZSQL_TEST_TRINO_URL: http://localhost:8080
           ZSQL_TEST_TRINO_DB: tpch
-        run: cargo test --locked -p zsql-source -- --ignored
+        run: |
+          cargo test --locked -p zsql-source -- --ignored
+          cargo test --locked -p zsql-cli --test generate -- --ignored
       # When a container never comes up, say which and why before it is
       # torn down: the runner has two cores and seven gigabytes, and five
       # warehouses can exhaust either.

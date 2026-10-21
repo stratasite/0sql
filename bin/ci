@@ -52,7 +52,7 @@ sources() {
     ZSQL_TEST_MYSQL_HOST=localhost ZSQL_TEST_MYSQL_USER=root ZSQL_TEST_MYSQL_PASSWORD=zsql ZSQL_TEST_MYSQL_DB=zsql \
     ZSQL_TEST_MSSQL_HOST=localhost ZSQL_TEST_MSSQL_USER=sa ZSQL_TEST_MSSQL_PASSWORD=Zsql-test-1 ZSQL_TEST_MSSQL_DB=master \
     ZSQL_TEST_TRINO_URL=http://localhost:8080 ZSQL_TEST_TRINO_DB=tpch \
-      cargo test --locked -p zsql-source -- --ignored || rc=$?
+      sh -c 'cargo test --locked -p zsql-source -- --ignored && cargo test --locked -p zsql-cli --test generate -- --ignored' || rc=$?
   else
     $compose ps -a
   fi

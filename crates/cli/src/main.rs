@@ -11,6 +11,7 @@ mod assist;
 mod config;
 mod deploy;
 mod failure;
+mod generate;
 mod introspect;
 mod local;
 mod project;
@@ -177,6 +178,26 @@ enum Command {
     },
     /// Load and validate the project here, and run its tests; with -r, validate on the server.
     Check,
+    /// Model files from catalogue/{datasource}.json: a draft per table, joins from its foreign keys. Never rewrites a file.
+    Generate {
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        datasource: Option<String>,
+        /// Only this schema (ClickHouse, MySQL: database).
+        #[arg(long)]
+        schema: Option<String>,
+        /// Only this table, by physical name or name.
+        #[arg(long)]
+        table: Option<String>,
+        /// For a table that has a model: add fields for these columns, comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        columns: Vec<String>,
+        /// For a table that has a model: add fields for every column it lacks.
+        #[arg(long)]
+        new: bool,
+        /// Say what would be written and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Read a datasource's tables and columns into catalogue/{datasource}.json. Local only.
     Introspect {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
@@ -333,6 +354,17 @@ fn run(command: Command, at: Where) -> Result<()> {
         }
         Command::Deploy { dry_run, watch } => deploy::deploy(at, dry_run, watch),
         Command::Introspect { datasource, schema } => introspect::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
+        Command::Generate { datasource, schema, table, columns, new, dry_run } => generate::run(
+            at.project.as_deref(),
+            generate::Options {
+                datasource: datasource.as_deref(),
+                schema: schema.as_deref(),
+                table: table.as_deref(),
+                columns: &columns,
+                new,
+                dry_run,
+            },
+        ),
         Command::Check => {
             let t0 = Instant::now();
             let mut side = at.mode()?.side()?;

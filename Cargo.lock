@@ -3071,6 +3071,7 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "rusqlite",
  "rustyline",
  "serde",
  "serde_json",
