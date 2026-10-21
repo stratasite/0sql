@@ -1,15 +1,24 @@
-# A certificate for the test containers
+# Certificates for the test containers
 
-`server.crt` and `server.key` are a self-signed pair for `localhost`,
-valid for ten years, made with
+A private CA and a server certificate it signed, the shape an enterprise
+warehouse actually has, made with
 
-    openssl req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt \
-      -days 3650 -subj "/CN=localhost/O=zsql test" \
-      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 \
+      -subj "/CN=zsql test CA/O=zsql test" \
+      -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+    openssl req -new -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
+      -subj "/CN=localhost/O=zsql test"
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+      -out server.crt -days 3650 -extfile <(printf 'basicConstraints=critical,CA:FALSE\n\
+      keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n\
+      subjectAltName=DNS:localhost,IP:127.0.0.1\n')
 
-They let the Postgres container offer TLS, so that `sslmode: require`,
-`verify-full` and `ca_file` can be proven rather than parsed: `require`
-accepts the pair as it is, `verify-full` refuses it as signed by nobody,
-and `verify-full` with `ca_file: server.crt` accepts it. The key is
-committed on purpose and protects nothing: it is for a throwaway
-container on loopback and nothing else.
+The Postgres container serves `server.crt` and `server.key`, so that
+`sslmode` can be proven rather than parsed: `require` accepts the
+certificate as it is, `verify-full` refuses it as signed by a CA nobody
+trusts, and `verify-full` with `ca_file: ca.crt` accepts it. A single
+self-signed certificate will not do: a verifier rightly refuses a
+`CA:TRUE` certificate presented as a server's (`CaUsedAsEndEntity`).
+
+Both keys are committed on purpose and protect nothing: they are for a
+throwaway container on loopback and nothing else.

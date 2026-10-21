@@ -522,7 +522,7 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
 }
 
 fn test_cert() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness/sources/tls/server.crt")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness/sources/tls/ca.crt")
 }
 
 #[test]
@@ -671,8 +671,8 @@ fn a_real_postgres_with_tls_proves_every_rung() {
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
     let err = open(&with(SslMode::VerifyFull, None), secret()).err().expect("verify-full refuses a self-signed certificate").to_string();
     assert!(err.contains("certificate") || err.contains("Certificate") || err.contains("tls") || err.contains("TLS"), "{err}");
-    let mut s = open(&with(SslMode::VerifyFull, Some(ca.clone())), secret()).expect("verify-full with the pair as the CA");
+    let mut s = open(&with(SslMode::VerifyFull, Some(ca.clone())), secret()).expect("verify-full with the private CA trusted");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
-    let mut s = open(&with(SslMode::VerifyCa, Some(ca)), secret()).expect("verify-ca with the pair as the CA");
+    let mut s = open(&with(SslMode::VerifyCa, Some(ca)), secret()).expect("verify-ca with the private CA trusted");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
 }

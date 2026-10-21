@@ -64,7 +64,7 @@ jobs:
           ZSQL_TEST_PG_DB: postgres
           ZSQL_TEST_PG_PASSWORD: zsql
           ZSQL_TEST_PG_TLS: "1"
-          ZSQL_TEST_PG_CA: harness/sources/tls/server.crt
+          ZSQL_TEST_PG_CA: harness/sources/tls/ca.crt
           ZSQL_TEST_CLICKHOUSE_URL: http://localhost:8123
           ZSQL_TEST_CLICKHOUSE_USER: default
           ZSQL_TEST_CLICKHOUSE_PASSWORD: zsql
