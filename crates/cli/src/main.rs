@@ -211,7 +211,7 @@ enum Command {
     /// Print the query spec an expression line makes, and how each item was read.
     #[command(long_about = zsql_shorthand::ABOUT, after_long_help = zsql_shorthand::FORMS)]
     Spec {
-        /// The line: projections, filters, calculations, segments and settings, comma-separated.
+        /// The line: projections, filters, calculations, segments and settings, comma-separated. Several arguments are joined with spaces, so quoting the line is optional.
         #[arg(trailing_var_arg = true, required = true)]
         line: Vec<String>,
     },

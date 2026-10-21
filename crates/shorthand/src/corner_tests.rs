@@ -323,7 +323,7 @@ fn segments_at_their_edges() {
         ("expand (a) with (b) left inner", "join is given twice"),
         ("expand (a) with (b) dedupe x", "neq, lt or none"),
         ("expand (a) with (b) for m", "`for` does not apply"),
-        ("include (a) {\"x\": 1} as N", "`as` is a reserved word and cannot continue the item"),
+        ("include (a) {\"x\": 1} as N", "spec JSON comes last on an item"),
         ("include (month(a))", "unknown function `month`"),
     ]);
 }
@@ -355,7 +355,7 @@ fn settings_and_raw_json() {
         ("{\"a\": \"}", "never closed"),
         ("{\"a\"}", "does not parse"),
         ("x {\"a\": 1} {\"b\": 2}", "spec JSON attaches once per item"),
-        ("x {\"a\": 1} desc", "`desc` is a reserved word and cannot continue the item"),
+        ("x {\"a\": 1} desc", "spec JSON comes last on an item"),
         ("a = 1 or b = 2 {\"x\": 1}", "attaches to one filter"),
         ("x = 1 {1}", "does not parse"),
     ]);
@@ -393,7 +393,7 @@ fn quoting_and_odd_characters_in_names() {
         ("'a'", "single quote opens a value"),
         ("x@", "expected @d or @m"),
         ("x@x", "expected @d or @m"),
-        ("x @m", "expected @d or @m"),
+        ("x @m", "no space before it"),
         ("x@dd", "expected @d or @m"),
         ("x\"y\"", "a quote opens a name or a value only at the start of a word"),
     ]);
@@ -415,6 +415,27 @@ fn deep_nesting_is_refused_not_overflowed() {
     assert_eq!(spec(&fine)["filters"][0]["field"], "x");
     let fine = format!("{}x{}", "yoy(".repeat(60), ")".repeat(60));
     assert_eq!(spec(&fine)["projections"][0]["decorators"].as_array().unwrap().len(), 60);
+}
+
+/// The messages an exploratory test found wanting, each now saying
+/// what the user meant to do.
+#[test]
+fn messages_found_by_trying_the_cli() {
+    errs(&[
+        ("not (a = 1)", "the spec has no `not (...)`"),
+        ("monthly(x)", "the help lists the functions"),
+        ("x @m", "no space before it"),
+        ("limit 99999999999999999999999", "too large a number"),
+        ("moving_avg(x, 99999999999999999999999)", "too large a number"),
+        ("x top 99999999999999999999999", "too large a number"),
+        ("moving_avg(x, 7 order by month(d))", "`order by` takes a projected dimension's name, not an expression"),
+        ("share(x by month(d))", "`by` takes a projected dimension's name, not an expression"),
+        ("x {\"alias\": \"X\"} as Y", "spec JSON comes last on an item"),
+        ("limit 10, {\"limit\": 5}", "limit is given twice"),
+        ("{\"limit\": 5}, limit 10", "limit is given twice"),
+    ]);
+    let s = spec("{\"projections\": [{\"field\": \"x\"}]}, department");
+    assert_eq!(fields(&s), ["department", "x"], "raw JSON merges after the written items");
 }
 
 #[test]

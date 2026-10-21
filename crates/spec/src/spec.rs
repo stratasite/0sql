@@ -465,6 +465,20 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
             Some((uid, name, display_alias(&cx, p).trim().to_lowercase()))
         })
         .collect();
+    let measures: Vec<(String, String, String)> = projections
+        .iter()
+        .filter(|p| p.field_kind == Some(FieldKind::Measure) || p.is_calculation())
+        .map(|p| {
+            let uid = p.field_uid.clone().unwrap_or_default().to_lowercase();
+            let name = p
+                .field_uid
+                .as_deref()
+                .and_then(|u| cx.universe.field_by_uid(u, Some(FieldKind::Measure)))
+                .map(|f| f.name.to_lowercase())
+                .unwrap_or_default();
+            (uid, name, display_alias(&cx, p).trim().to_lowercase())
+        })
+        .collect();
     let owners: Vec<String> = projections.iter().map(|p| display_alias(&cx, p)).collect();
     for (p, owner) in projections.iter_mut().zip(owners) {
         for d in p.decorators.iter_mut() {
@@ -475,10 +489,17 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
                     .find(|(uid, name, alias)| uid.to_lowercase() == want || *name == want || *alias == want)
                     .map(|(uid, _, _)| uid.clone())
                     .ok_or_else(|| {
-                        record_invalid(format!(
-                            "{label} on {owner}: '{}' is not a projected dimension; partition and order refs name a dimension the query projects",
-                            r.trim()
-                        ))
+                        if measures.iter().any(|(uid, name, alias)| (!uid.is_empty() && *uid == want) || *name == want || *alias == want) {
+                            record_invalid(format!(
+                                "{label} on {owner}: '{}' is a measure; a window partitions and orders only by a projected dimension",
+                                r.trim()
+                            ))
+                        } else {
+                            record_invalid(format!(
+                                "{label} on {owner}: '{}' is not a projected dimension; partition and order refs name a dimension the query projects",
+                                r.trim()
+                            ))
+                        }
                     })
             };
             if let Some(Value::Array(refs)) = d.attrs.get_mut("partition_refs") {

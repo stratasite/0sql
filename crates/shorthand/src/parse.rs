@@ -346,11 +346,16 @@ impl<'a> P<'a> {
     fn reserved_at(&self) -> Option<&'a str> {
         self.peek_word().filter(|w| RESERVED.iter().any(|r| w.eq_ignore_ascii_case(r)))
     }
-    fn int(&mut self) -> Option<i64> {
-        let w = self.peek_word()?;
-        let n = w.parse::<i64>().ok()?;
+    /// A whole number at the cursor: none when the word is not one, an
+    /// error when it is one too large to hold.
+    fn int(&mut self) -> Soft<i64> {
+        let Some(w) = self.peek_word() else { return Ok(None) };
+        if !w.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let Ok(n) = w.parse::<i64>() else { return self.err(self.i, format!("{w} is too large a number")) };
         self.i += w.len();
-        Some(n)
+        Ok(Some(n))
     }
 
     // ------------------------------------------------------------- items
@@ -390,6 +395,13 @@ impl<'a> P<'a> {
     }
 
     fn item_start_error<T>(&self) -> R<T> {
+        if self.at_kw("not") {
+            let mut q = P { s: self.s, i: self.i + 3, depth: self.depth, last_bare: None, pred_start: 0, nest: 0 };
+            q.ws();
+            if q.peek() == Some('(') {
+                return self.err(self.i, "the spec has no `not (...)`; negate each filter inside");
+            }
+        }
         if let Some(w) = self.reserved_at() {
             let tail = self.name_tail(self.i);
             return self.err(self.i, format!("`{w}` is a reserved word and cannot start a name; write [{tail}] or \"{tail}\""));
@@ -414,6 +426,9 @@ impl<'a> P<'a> {
     fn item_end_error(&self, item: &Item) -> ParseError {
         let at = self.i;
         let fail = |msg: String| ParseError { msg, at };
+        if item.raw.is_some() && self.reserved_at().is_some_and(|w| ["as", "asc", "desc"].iter().any(|k| w.eq_ignore_ascii_case(k))) {
+            return fail("spec JSON comes last on an item, after its alias and direction".into());
+        }
         if self.depth > 0 && self.peek() == Some(')') {
             return fail("a ) with nothing open before it".into());
         }
@@ -430,12 +445,12 @@ impl<'a> P<'a> {
                 if let Some((start, end)) = self.last_bare {
                     let name = &self.s[start..end];
                     return fail(format!(
-                        "unknown function `{name}`; a field whose name holds a parenthesis is bracketed. See .help for the functions"
+                        "unknown function `{name}`; the help lists the functions, and a field whose name holds a parenthesis is bracketed"
                     ));
                 }
                 fail("unexpected ( here".into())
             }
-            Some('@') => fail("expected @d or @m after the name".into()),
+            Some('@') => fail("@d or @m attaches to the name with no space before it".into()),
             Some('\'') | Some('"') => fail("a quote opens a name or a value only at the start of a word".into()),
             Some('=' | '<' | '>' | '!') => match &item.kind {
                 ItemKind::Projection(p) if !matches!(p.expr, Expr::Ref(_)) => {
@@ -455,8 +470,8 @@ impl<'a> P<'a> {
         let save = self.i;
         if self.kw("limit") && self.sp() {
             let at = self.i;
-            return match self.int() {
-                Some(n) if n >= 0 && !self.peek().is_some_and(is_word_char) => Ok(Some(ItemKind::Limit(n))),
+            return match self.int()? {
+                Some(n) if !self.peek().is_some_and(is_word_char) => Ok(Some(ItemKind::Limit(n))),
                 _ => self.err(at, "limit needs a whole number of rows"),
             };
         }
@@ -739,7 +754,7 @@ impl<'a> P<'a> {
         if self.eat(",") {
             self.any_ws();
             let at = self.i;
-            match self.int() {
+            match self.int()? {
                 Some(v) => n = Some(v),
                 None => return self.err(at, format!("after the comma in {func}(...), expected a number")),
             }
@@ -754,6 +769,10 @@ impl<'a> P<'a> {
             loop {
                 let at = self.i;
                 let Some(f) = self.field(Mode::Args)? else { return self.err(at, "`by` needs a projected dimension after it") };
+                if self.peek() == Some('(') {
+                    return self
+                        .err(at, "`by` takes a projected dimension's name, not an expression; project the expression and name it here");
+                }
                 by.push(f);
                 let save = self.i;
                 self.any_ws();
@@ -778,6 +797,12 @@ impl<'a> P<'a> {
             loop {
                 let at = self.i;
                 let Some(f) = self.field(Mode::Args)? else { return self.err(at, "`order by` needs a projected dimension after it") };
+                if self.peek() == Some('(') {
+                    return self.err(
+                        at,
+                        "`order by` takes a projected dimension's name, not an expression; project the expression and name it here",
+                    );
+                }
                 let mut dir = "asc".to_string();
                 let s = self.i;
                 if self.sp() && (self.at_kw("asc") || self.at_kw("desc")) {
@@ -1108,7 +1133,7 @@ impl<'a> P<'a> {
         }
         if self.kw("top") {
             self.ws();
-            let Some(n) = self.int() else {
+            let Some(n) = self.int()? else {
                 return self.err(
                     at,
                     format!(

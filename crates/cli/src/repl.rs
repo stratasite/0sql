@@ -76,6 +76,10 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
         let (word, rest) = line.split_once(' ').map(|(c, r)| (c, r.trim())).unwrap_or((line, ""));
         let names_a_field = |w: &str| field_names.iter().any(|n| n == &w.to_lowercase());
         let cmd = match word.strip_prefix('.') {
+            Some("") => {
+                println!("a dot alone is no command; .help lists them");
+                continue;
+            }
             Some(c) => c,
             None if matches!(word, "help" | "?" | "quit" | "exit" | "q") && rest.is_empty() && !names_a_field(word) => word,
             None => "",

@@ -371,8 +371,9 @@ Inside a list a value runs to the next comma or the closing
 parenthesis, so `in (Rock and Roll, Jazz)` is two values without
 quotes. The grammar reads every value as text; the lowering writes a
 value that is wholly an integer or a decimal as a JSON number, `true`
-and `false` as booleans, and everything else as the text written, so
-`02134` or `1.10` are single-quoted when they must stay strings. A
+and `false` as booleans, and everything else as the text written. A
+leading zero keeps a value text, so `02134` stays a code; `1.10`
+becomes the number 1.1 and is single-quoted when it must stay text. A
 measure filter is a HAVING, as in the spec.
 
 `not` goes before the predicate word and only before the four that
@@ -432,7 +433,10 @@ and a uid naming no table is ignored. Everything else the spec carries, and any
 attribute a future spec adds, goes through braces: a `{...}` item is
 merged into the query object, and a `{...}` directly after an item,
 with no comma between, is merged into that item's object. Merging is
-deep for objects, appends for arrays and replaces scalars. The hatch
+deep for objects, appends for arrays and replaces scalars. Raw JSON is
+merged after the native items wherever it stands in the line, so its
+projections follow the written ones, and a `limit` given both ways is
+refused rather than overridden. The hatch
 is what makes parity complete without a keyword per attribute. The
 spec's `axis` and `hidden` are not handled at all: both are leaving the
 spec, and the planner's one use of `axis`, choosing an automatic

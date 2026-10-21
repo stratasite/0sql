@@ -56,8 +56,14 @@ pub fn to_spec(items: &[Item]) -> Result<Value, String> {
     if !hints.is_empty() {
         spec.insert("hints".into(), Value::Array(hints));
     }
+    // Raw JSON merges after the native items, whatever its position in
+    // the line, so its projections follow the written ones; a limit on
+    // both sides is a contradiction, not a quiet override.
     let mut spec = Value::Object(spec);
     for raw in raws {
+        if limit.is_some() && raw.contains_key("limit") {
+            return Err("limit is given twice: once as a setting and once in the spec JSON".into());
+        }
         merge(&mut spec, Value::Object(raw));
     }
     Ok(spec)

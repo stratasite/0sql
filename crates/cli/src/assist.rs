@@ -197,11 +197,13 @@ impl<L: Lookup> Assist<L> {
 fn matching<'a>(prefix: &str, pool: impl Iterator<Item = &'a str>, within: bool) -> Vec<String> {
     let want = prefix.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let pool: Vec<&str> = pool.collect();
-    let starts: Vec<String> = pool.iter().filter(|c| c.to_lowercase().starts_with(&want)).map(|c| c.to_string()).collect();
+    // What is typed in full is not a completion of itself.
+    let starts: Vec<String> =
+        pool.iter().filter(|c| c.to_lowercase().starts_with(&want) && c.to_lowercase() != want).map(|c| c.to_string()).collect();
     if !starts.is_empty() || want.is_empty() || !within {
         return starts;
     }
-    pool.iter().filter(|c| c.to_lowercase().contains(&want)).map(|c| c.to_string()).collect()
+    pool.iter().filter(|c| c.to_lowercase().contains(&want) && c.to_lowercase() != want).map(|c| c.to_string()).collect()
 }
 
 /// A value the grammar would read wrongly bare is single-quoted.
@@ -374,7 +376,17 @@ impl<L: Lookup> Validator for Assist<L> {
         if input.trim_start().starts_with('.') {
             return Ok(ValidationResult::Valid(None));
         }
-        Ok(if unclosed(input).is_some() { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
+        if unclosed(input).is_none() {
+            return Ok(ValidationResult::Valid(None));
+        }
+        // A dot command on a continuation line cannot run until the line
+        // is closed; say so rather than swallow it.
+        if input.rsplit('\n').next().is_some_and(|last| last.trim_start().starts_with('.')) {
+            return Ok(ValidationResult::Invalid(Some(
+                "\n  an opener is still unclosed above; close it, or press Ctrl-C to clear the line".into(),
+            )));
+        }
+        Ok(ValidationResult::Incomplete)
     }
 }
 
@@ -424,6 +436,7 @@ mod tests {
         let (start, c) = names("country ");
         assert_eq!(start, 0, "the name may continue, so the span is the whole item");
         assert!(c.iter().any(|x| x == "country in (") && c.iter().any(|x| x == "country desc"));
+        assert!(!c.iter().any(|x| x.eq_ignore_ascii_case("country")), "a field typed in full is not offered again");
         let (_, c) = names("country i");
         assert_eq!(c, ["country in (", "country is null", "country is not null"]);
         let (_, c) = names("Store Net Paid d");

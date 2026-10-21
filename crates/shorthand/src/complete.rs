@@ -424,8 +424,9 @@ fn item(text: &str, mode: Mode) -> Vec<Offer> {
     let words = words_of(text);
     let ends_in_space = text.ends_with(char::is_whitespace);
     if text.is_empty() {
-        let mut offers = vec![Offer::Fields { prefix: String::new(), kinds: Kinds::Any }, Offer::Functions { prefix: String::new() }];
+        let mut offers = vec![Offer::Fields { prefix: String::new(), kinds: Kinds::Any }];
         if mode == Mode::Top {
+            offers.push(Offer::Functions { prefix: String::new() });
             offers.push(Offer::Keywords { prefix: String::new(), words: ITEM_WORDS.to_vec() });
         }
         return offers;
@@ -477,11 +478,9 @@ fn item(text: &str, mode: Mode) -> Vec<Offer> {
     let Some((at, word)) = pred else {
         // Only the field so far: continue it, or follow it.
         let mut offers = vec![Offer::Fields { prefix: text.to_string(), kinds: Kinds::Any }];
-        if !text.contains(char::is_whitespace) {
+        if !text.contains(char::is_whitespace) && mode == Mode::Top {
             offers.push(Offer::Functions { prefix: text.to_string() });
-            if mode == Mode::Top {
-                offers.push(Offer::Keywords { prefix: text.to_string(), words: ITEM_WORDS.to_vec() });
-            }
+            offers.push(Offer::Keywords { prefix: text.to_string(), words: ITEM_WORDS.to_vec() });
         }
         // After a complete field, a predicate or a modifier: whole, or
         // half-typed as the last word.
@@ -742,6 +741,9 @@ mod tests {
         let o = at("include (country ");
         let (_, words) = keywords(&o).unwrap();
         assert!(words.contains(&"= ") && !words.contains(&"as "), "no modifiers inside a segment");
+        assert!(!at("include (").iter().any(|x| matches!(x, Offer::Functions { .. })), "no functions inside a segment");
+        assert!(!at("include (yo").iter().any(|x| matches!(x, Offer::Functions { .. })));
+        assert!(!at("x = 1 and yo").iter().any(|x| matches!(x, Offer::Functions { .. })), "no functions after and");
     }
 
     #[test]
@@ -752,10 +754,7 @@ mod tests {
         assert_eq!(at("[net paid]@m > 1"), vec![Offer::Values { prefix: "1".into(), field: "net paid".into() }]);
         assert_eq!(at("country = 'Can"), vec![], "inside a string nothing is offered");
         assert_eq!(keywords(&at("country = Canada ")).map(|(_, w)| w.to_vec()), Some(vec!["and ", "or "]));
-        assert_eq!(
-            at("country = Canada and reg"),
-            at("reg").into_iter().filter(|o| !matches!(o, Offer::Keywords { .. })).collect::<Vec<_>>()
-        );
+        assert_eq!(at("country = Canada and reg"), vec![Offer::Fields { prefix: "reg".into(), kinds: Kinds::Any }]);
         assert_eq!(at("x in (a) and reg")[0], Offer::Fields { prefix: "reg".into(), kinds: Kinds::Any });
         assert_eq!(at("x between 1 and 2 or reg")[0], Offer::Fields { prefix: "reg".into(), kinds: Kinds::Any });
         assert_eq!(fields(&at("x = 1 and ")), Some(("", Kinds::Any)));
@@ -785,7 +784,7 @@ mod tests {
         assert_eq!(at("include (a) for (m1, sto"), vec![Offer::Fields { prefix: "sto".into(), kinds: Kinds::Measure }]);
         assert_eq!(at("include (a) as Na"), vec![]);
         assert_eq!(at("expand (a) with (ite"), vec![Offer::Fields { prefix: "ite".into(), kinds: Kinds::Dimension }]);
-        assert_eq!(at("include (a, b > 1\n  c"), at("c").into_iter().filter(|o| !matches!(o, Offer::Keywords { .. })).collect::<Vec<_>>());
+        assert_eq!(at("include (a, b > 1\n  c"), vec![Offer::Fields { prefix: "c".into(), kinds: Kinds::Any }]);
     }
 
     #[test]
