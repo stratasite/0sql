@@ -66,6 +66,20 @@ jobs:
           ZSQL_TEST_TRINO_URL: http://localhost:8080
           ZSQL_TEST_TRINO_DB: tpch
         run: cargo test --locked -p zsql-source -- --ignored
+      # When a container never comes up, say which and why before it is
+      # torn down: the runner has two cores and seven gigabytes, and five
+      # warehouses can exhaust either.
+      - name: What the warehouses said
+        if: failure()
+        run: |
+          docker compose -f harness/sources/compose.yml ps -a
+          free -m
+          for s in postgres mysql sqlserver clickhouse trino; do
+            echo "::group::$s"
+            docker compose -f harness/sources/compose.yml logs --no-color --tail=60 "$s"
+            docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{end}}' "sources-$s-1" || true
+            echo "::endgroup::"
+          done
       - name: Warehouses down
         if: always()
         run: docker compose -f harness/sources/compose.yml down -v
