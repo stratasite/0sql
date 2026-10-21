@@ -1,5 +1,5 @@
-//! The interactive loop, over either side: a line of the shorthand, or
-//! a dot command, until `.quit`.
+//! The interactive loop, over either side: a line of the expression
+//! language, or a dot command, until `.quit`.
 
 use crate::failure::Refusal;
 use crate::side::{bold, dim, Query, Side};
@@ -11,7 +11,7 @@ use std::time::Instant;
 
 pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
     let mut field_names = side.announce()?;
-    println!("{}", dim("type a line of projections and filters; .help for the forms, .quit to leave"));
+    println!("{}", dim("type a line: projections, filters, calculations, segments; .help for the forms, .quit to leave"));
 
     let mut editor: Option<rustyline::DefaultEditor> =
         if std::io::stdin().is_terminal() { rustyline::DefaultEditor::new().ok() } else { None };
@@ -62,7 +62,7 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
         }
         let outcome: Result<()> = (|| {
             match cmd {
-                "help" | "?" => println!("{}", zsql_shorthand::HELP),
+                "help" | "?" => println!("{}", zsql_shorthand::help()),
                 "tables" => show::print_tables(&side.tables()?),
                 "fields" => show::print_fields(&side.fields(rest, false)?),
                 "values" => {
@@ -91,7 +91,7 @@ pub fn run(mut side: impl Side, context: Option<Value>) -> Result<()> {
                     Err(e) => println!("error: {e}"),
                 },
                 "" | "json" | "explain" | "explore" => {
-                    // A query: the shorthand, or a JSON spec after .json or
+                    // A query: an expression line, or a JSON spec after .json or
                     // starting with a brace. .explain and .explore take
                     // either; .explore narrows by a term after ` ? `.
                     let text = if cmd.is_empty() { line } else { rest };

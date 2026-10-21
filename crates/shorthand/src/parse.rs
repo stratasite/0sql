@@ -220,7 +220,7 @@ pub fn decorator_family(func: &str) -> Option<&'static str> {
 }
 
 pub fn parse(line: &str) -> R<Vec<Item>> {
-    let mut p = P { s: line, i: 0, depth: 0, last_bare: None };
+    let mut p = P { s: line, i: 0, depth: 0, last_bare: None, pred_start: 0 };
     let mut items = Vec::new();
     loop {
         p.any_ws();
@@ -254,6 +254,9 @@ struct P<'a> {
     /// The span of the last bare name read, for the message that says how
     /// to bracket it.
     last_bare: Option<(usize, usize)>,
+    /// Where the field of the filter being read began, for the hint that a
+    /// reserved word inside a name wants brackets.
+    pred_start: usize,
 }
 
 fn is_word_char(c: char) -> bool {
@@ -434,7 +437,7 @@ impl<'a> P<'a> {
                 }
                 _ => fail("a filter is `field predicate value`; the predicate must follow the field directly".into()),
             },
-            Some('{') => fail("spec JSON attaches directly after an item, before any alias or direction".into()),
+            Some('{') => fail("spec JSON attaches once per item, after its alias and direction; merge two blocks into one, or start a new item after a comma".into()),
             Some(c) => fail(format!("expected a comma or a new line after `{}`, found `{c}`", item.text)),
             None => fail("expected a comma or a new line".into()),
         }
@@ -561,7 +564,7 @@ impl<'a> P<'a> {
 
     /// Whether the cursor is at `order` with `by` after it.
     fn order_by_follows(&self) -> bool {
-        let mut q = P { s: self.s, i: self.i, depth: self.depth, last_bare: None };
+        let mut q = P { s: self.s, i: self.i, depth: self.depth, last_bare: None, pred_start: 0 };
         q.kw("order") && q.sp() && q.at_kw("by")
     }
 
@@ -595,9 +598,7 @@ impl<'a> P<'a> {
             }
             let at = self.i;
             if self.kw("as") {
-                if !self.sp() {
-                    return self.err(self.i, "`as` needs a space and then the alias");
-                }
+                self.ws();
                 let at = self.i;
                 let Some(f) = self.field(Mode::Top)? else { return self.err(at, "`as` needs an alias after it") };
                 if f.kind.is_some() {
@@ -731,9 +732,7 @@ impl<'a> P<'a> {
         let save = self.i;
         self.any_ws();
         if self.kw("by") {
-            if !self.sp() {
-                return self.err(self.i, "`by` needs a space and then the dimension");
-            }
+            self.ws();
             loop {
                 let at = self.i;
                 let Some(f) = self.field(Mode::Args)? else { return self.err(at, "`by` needs a projected dimension after it") };
@@ -757,9 +756,7 @@ impl<'a> P<'a> {
             if !(self.sp() && self.kw("by")) {
                 return self.err(self.i, "`order` is followed by `by` and then the dimension");
             }
-            if !self.sp() {
-                return self.err(self.i, "`order by` needs a space and then the dimension");
-            }
+            self.ws();
             loop {
                 let at = self.i;
                 let Some(f) = self.field(Mode::Args)? else { return self.err(at, "`order by` needs a projected dimension after it") };
@@ -989,6 +986,7 @@ impl<'a> P<'a> {
             }
             return Ok(Some(f));
         }
+        self.pred_start = start;
         let Some(field) = self.field(Mode::Top)? else { return Ok(None) };
         self.ws();
         match self.test()? {
@@ -1037,6 +1035,15 @@ impl<'a> P<'a> {
         }
         if self.kw("in") {
             self.ws();
+            if self.peek() != Some('(') {
+                return self.err(
+                    at,
+                    format!(
+                        "`in` takes a parenthesised list, as in `x in (a, b)`; a name holding `in` is bracketed: [{}]",
+                        self.name_tail(self.pred_start)
+                    ),
+                );
+            }
             return Ok(Some(Pred::In { negated, values: self.list()? }));
         }
         for (kw, which) in [("contains", "contains"), ("starts", "starts_with"), ("ends", "ends_with")] {
@@ -1065,21 +1072,30 @@ impl<'a> P<'a> {
             return Ok(Some(Pred::Between { low, high }));
         }
         if self.kw("is") {
-            if !self.sp() {
-                return self.err(self.i, "expected `is null` or `is not null`");
-            }
+            self.ws();
             let negated = self.kw("not") && self.sp();
             if !self.kw("null") {
-                return self.err(self.i, "expected `is null` or `is not null`");
+                return self.err(
+                    at,
+                    format!(
+                        "`is` is followed by `null` or `not null`; a name holding `is` is bracketed: [{}]",
+                        self.name_tail(self.pred_start)
+                    ),
+                );
             }
             return Ok(Some(Pred::Null { negated }));
         }
         if self.kw("top") {
-            if !self.sp() {
-                return self.err(self.i, "top needs a count, as in `category top 10 by revenue`");
-            }
-            let at = self.i;
-            let Some(n) = self.int() else { return self.err(at, "top needs a count, as in `category top 10 by revenue`") };
+            self.ws();
+            let Some(n) = self.int() else {
+                return self.err(
+                    at,
+                    format!(
+                        "top needs a count, as in `category top 10 by revenue`; a name holding `top` is bracketed: [{}]",
+                        self.name_tail(self.pred_start)
+                    ),
+                );
+            };
             if n < 1 {
                 return self.err(at, "top needs a count of at least 1");
             }
@@ -1119,10 +1135,9 @@ impl<'a> P<'a> {
                         break;
                     }
                     if c.is_whitespace() {
-                        let q = P { s: self.s, i: self.i + pos, depth: self.depth, last_bare: None };
-                        let mut q2 = P { s: q.s, i: q.i, depth: q.depth, last_bare: None };
-                        q2.ws();
-                        if q2.at_kw("and") || q2.at_kw("or") {
+                        let mut q = P { s: self.s, i: self.i + pos, depth: self.depth, last_bare: None, pred_start: 0 };
+                        q.ws();
+                        if q.at_kw("and") || q.at_kw("or") {
                             end = pos;
                             break;
                         }
@@ -1233,6 +1248,7 @@ impl<'a> P<'a> {
             match self.peek() {
                 Some(',') | Some('\n') | Some('\r') => self.i += 1,
                 Some(')') => {}
+                None => return self.err(opened_at, "the segment's ( is never closed"),
                 _ => {
                     let last = Item { kind: ItemKind::Limit(0), raw: None, text: self.s[at..self.i].trim().to_string() };
                     return Err(self.item_end_error(&last));
@@ -1285,9 +1301,7 @@ impl<'a> P<'a> {
             }
             let at = self.i;
             if self.kw("as") {
-                if !self.sp() {
-                    return self.err(self.i, "`as` needs a space and then the segment's name");
-                }
+                self.ws();
                 let at = self.i;
                 let Some(f) = self.field(Mode::Tail)? else { return self.err(at, "`as` needs the segment's name after it") };
                 if name.replace(f.name).is_some() {
@@ -1297,9 +1311,7 @@ impl<'a> P<'a> {
                 if kind == SegmentKind::Expand {
                     return self.err(at, "an expanding segment constrains the whole query; `for` does not apply");
                 }
-                if !self.sp() {
-                    return self.err(self.i, "`for` needs a space and then the measure it applies to");
-                }
+                self.ws();
                 let at = self.i;
                 let Some(names) = self.names(Mode::Tail)? else { return self.err(at, "`for` needs a measure or a list of them") };
                 apply_to.extend(names);

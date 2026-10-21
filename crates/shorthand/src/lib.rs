@@ -18,6 +18,8 @@
 //! `expand (...) with (...)`. `limit N` and `via table` are the settings,
 //! and `{...}` merges spec JSON into the query or the item before it.
 
+#[cfg(test)]
+mod corner_tests;
 mod lower;
 mod parse;
 
@@ -53,8 +55,18 @@ fn located(line: &str, e: ParseError) -> String {
     }
 }
 
-pub const HELP: &str = "\
-Type comma-separated items; a newline separates items too. Each item is read from its shape:
+/// What the language is, in a sentence or two: the long help of `zsql spec`.
+pub const ABOUT: &str = "\
+Print the query spec an expression line makes, and how each item was read.
+
+A line is comma-separated items (a newline separates items too), each read from its shape: a field, or a
+function around one, projects; a field followed by a predicate filters; calc(sql) as Alias calculates;
+include, exclude and expand (...) are segments; limit N and via TABLE are settings; {json} merges spec JSON.
+Fields are bare words, [bracketed] or \"quoted\"; values are bare text or 'single-quoted'.";
+
+/// The forms of the language, one block per kind of item.
+pub const FORMS: &str = "\
+Forms:
   projection   item category | month(order date) | yoy(store net paid) | store net paid as Paid desc
                truncate: hour day week month quarter year (also raw minute second millisecond)
                extract(part, x): minute hour day_of_month day_of_week day_of_year week_of_year month quarter year
@@ -75,10 +87,18 @@ Type comma-separated items; a newline separates items too. Each item is read fro
   settings     limit 100 | via store-sales | {\"name\": \"...\"} merges spec JSON; after an item it merges into that item
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
 [Name] or \"Name\" is always a field, 'text' is always a value. Reserved words, which end a bare name:
-  and or not in is between top contains starts ends keyword as asc desc
+  and or not in is between top contains starts ends keyword as asc desc";
+
+/// The repl's dot commands.
+pub const REPL_COMMANDS: &str = "\
 Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explore <line> [? term] (what the query can add),
 .fields [text], .tables, .values <dim>,
 .json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
+
+/// The repl's `.help`: the forms, then its dot commands.
+pub fn help() -> String {
+    format!("Type comma-separated items; a newline separates items too. Each item is read from its shape.\n{FORMS}\n{REPL_COMMANDS}")
+}
 
 #[cfg(test)]
 mod tests {

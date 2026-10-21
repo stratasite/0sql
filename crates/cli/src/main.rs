@@ -207,9 +207,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Print the query spec a shorthand line makes.
+    /// Print the query spec an expression line makes, and how each item was read.
+    #[command(long_about = zsql_shorthand::ABOUT, after_long_help = zsql_shorthand::FORMS)]
     Spec {
-        /// The line: projections, filters and calculations, comma-separated.
+        /// The line: projections, filters, calculations, segments and settings, comma-separated.
         #[arg(trailing_var_arg = true, required = true)]
         line: Vec<String>,
     },
@@ -413,13 +414,13 @@ fn run(command: Command, at: Where) -> Result<()> {
 }
 
 /// What `zsql sql`, `zsql explain` and `zsql explore` take: the query, as
-/// a spec file or a shorthand line, and the security context.
+/// a spec file or an expression line, and the security context.
 #[derive(clap::Args)]
 struct QueryArgs {
     /// A JSON file holding a query spec.
     #[arg(long, conflicts_with = "expr", required_unless_present = "expr")]
     spec: Option<PathBuf>,
-    /// A comma-separated line of projections, filters and calculations.
+    /// An expression line: projections, filters, calculations, segments and settings, comma-separated. `zsql spec --help` has the forms.
     #[arg(long, required_unless_present = "spec")]
     expr: Option<String>,
     /// A JSON file holding the security context.

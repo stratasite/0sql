@@ -16,7 +16,7 @@ pub fn datasource_line(v: &Value) -> String {
     format!("-- datasource: {}", v["datasource"].as_str().unwrap_or("?"))
 }
 
-/// How each shorthand item was read, when the query came from a line.
+/// How each item of an expression line was read, when the query came from one.
 pub fn items(v: &Value) -> Vec<String> {
     v["items"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
 }
