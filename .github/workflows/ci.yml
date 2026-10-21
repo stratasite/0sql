@@ -9,6 +9,11 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  # bin/ci runs the same steps here and signs the commit off with
+  # `gh signoff`. When hosted minutes run short, drop push and
+  # pull_request above and keep this one for manual reruns, as strata
+  # does; nothing else changes.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +36,12 @@ jobs:
         run: cargo run --release --locked -p zsql-devtool -- golden --strict
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
+      # The same list bin/ci runs; this is the step it had and CI did not,
+      # and the first local run caught an unclosed tag in a doc comment.
+      - name: Docs without warnings
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The transports in zsql-source against real servers, one container per
   # warehouse that can run without a cloud account. Its own job so a slow

@@ -177,7 +177,7 @@ enum Command {
     },
     /// Load and validate the project here, and run its tests; with -r, validate on the server.
     Check,
-    /// Read a datasource's tables and columns into catalogue/<datasource>.json. Local only.
+    /// Read a datasource's tables and columns into catalogue/{datasource}.json. Local only.
     Introspect {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         datasource: Option<String>,

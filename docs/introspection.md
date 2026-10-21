@@ -517,6 +517,12 @@ what makes the remaining adapters cheap instead of frightening.
 - Whether a batched `COUNT(DISTINCT …)` over every sampled column of a
   wide table beats one query per column. It should on a columnar
   warehouse and may not on a row store.
+- Hosted minutes are finite. `bin/ci` runs the whole verification set
+  here, the sources step included, and signs the commit off with
+  `gh signoff` when it all passes, as strata's `bin/ci` does; `ci.yml`
+  carries `workflow_dispatch` so the flip to local-only is one line. What
+  it still needs: the docker socket on this machine, and `gh signoff
+  install` once so `main` requires the sign-off.
 - The five images are `latest` or a major tag, which is how Trino's
   probe broke between one run and the next. Pin each to the version the
   green run pulled, and bump them on purpose; the diagnostics step prints

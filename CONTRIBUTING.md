@@ -53,3 +53,19 @@ refusal you got, and what you expected. `zsql explain --expr ...` and
 
 See [SECURITY.md](SECURITY.md). Please do not file security problems as
 issues.
+
+## Before a push: `bin/ci`
+
+Every check CI runs, run here, in the same order: format, clippy, the
+tests, the goldens strict, the CLI without its default features, the docs
+with warnings denied, `cargo deny`, and the transports against the five
+warehouses in `harness/sources/compose.yml`. When all of it passes,
+`gh signoff` posts a green status to the commit, which is what branch
+protection reads; `bin/ci --no-signoff` runs the same and only reports.
+
+The sources step needs the docker socket. There is no flag to skip it: a
+sign-off is a claim that everything passed. The macOS compile is the one
+step a Linux machine cannot run, and CI's `macos` job keeps it.
+
+`gh extension install basecamp/gh-signoff` once, and `gh signoff install`
+once per repository to make the sign-off required.
