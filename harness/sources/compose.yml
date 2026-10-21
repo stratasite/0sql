@@ -3,7 +3,8 @@
 # on the wire, ClickHouse and Trino over HTTP. SQLite needs no server.
 #
 #   docker compose -f harness/sources/compose.yml up -d --wait
-#   ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PASSWORD=zsql \
+#   ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PORT=5466 \
+#   ZSQL_TEST_PG_PASSWORD=zsql \
 #   ZSQL_TEST_CLICKHOUSE_URL=http://localhost:8123 \
 #     cargo test -p zsql-source -- --ignored
 #
@@ -14,7 +15,9 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_PASSWORD: zsql
-    ports: ["5432:5432"]
+    # 5432 is often taken on a development machine, so this one is
+    # published high and every caller is told the port.
+    ports: ["5466:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s

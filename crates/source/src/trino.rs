@@ -15,18 +15,21 @@ pub struct Trino {
     catalog: Option<String>,
     schema: Option<String>,
     conn: Connection,
+    warnings: Vec<String>,
 }
 
 impl Trino {
     pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Trino> {
+        let (base, note) = http::base_url(conn, 8080, "trino")?;
         Ok(Trino {
-            agent: http::agent(conn),
-            base: http::base_url(conn, 8080)?,
+            agent: http::agent(conn)?,
+            base,
             user: conn.username.clone().unwrap_or_else(|| "zsql".into()),
             password: secret,
             catalog: conn.database.clone(),
             schema: conn.schema.clone(),
             conn: conn.clone(),
+            warnings: note.into_iter().collect(),
         })
     }
 
@@ -63,7 +66,7 @@ impl Trino {
 impl Source for Trino {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        let fail = |e: ureq::Error| SourceError::Query(self.conn.uid.clone(), e.to_string());
+        let fail = |e: ureq::Error| SourceError::Query(self.conn.uid.clone(), crate::chain(&e));
         let first = self.headers(self.agent.post(&format!("{}/v1/statement", self.base))).send(sql.as_bytes()).map_err(fail)?;
         let mut v = self.page(http::text(&self.conn, first)?)?;
         let mut columns: Vec<String> = Vec::new();
@@ -95,6 +98,10 @@ impl Source for Trino {
 
     fn adapter(&self) -> &str {
         "trino"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 

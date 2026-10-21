@@ -1,19 +1,18 @@
-//! SQL Server over TDS, through `tiberius`, on the same current-thread
-//! runtime the Postgres transport uses.
+//! SQL Server over TDS, through `tiberius` with its rustls on the
+//! platform's roots, on the same current-thread runtime the Postgres
+//! transport uses.
 //!
-//! Built without a TLS feature, deliberately. Encryption is off until the
-//! `sslmode` key exists — a container on loopback presents a certificate
-//! nothing signed, and there is no flag here to trust one — and
-//! tiberius's `rustls` feature pulls rustls's default crypto provider,
-//! aws-lc, in beside the ring the rest of the tree uses: a second
-//! provider, C and assembly in the build, and a panic at run time unless
-//! a process default is installed. That is a decision for the `sslmode`
-//! change to take with a measurement, not one to take by accident here.
-//! Azure SQL requires encryption, so it waits for that key. TDS 7.3 rather
-//! than 8.0 for the same reason: 8.0 is TLS-first by definition, and the
-//! crate refuses to build it without a TLS feature.
-
-use crate::{read_only, Connection, Result, Rows, Secret, Source, SourceError};
+//! Microsoft's own ladder has three rungs — `Encrypt`, with and without
+//! `TrustServerCertificate` — and they map onto libpq's: `require` is
+//! encrypted and trusts whatever answered, `verify-full` checks the
+//! certificate against the roots or `ca_file`. There is no `verify-ca`
+//! rung on SQL Server, as there is none in Microsoft's drivers, so it is
+//! treated as `verify-full`. TDS 7.3 rather than 8.0: 8.0 is TLS-first by
+//! definition and refuses to build without it, and `strict` can come
+//! later with it. tiberius's rustls brings aws-lc in beside ring, which
+//! costs 2.7 MB of binary and is why `ring` is installed as the process
+//! default once, in `tls`.
+use crate::{read_only, tls, Connection, Result, Rows, Secret, Source, SourceError, SslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type Client = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -23,6 +22,7 @@ pub struct SqlServer {
     client: Client,
     uid: String,
     timeout: std::time::Duration,
+    warnings: Vec<String>,
 }
 
 impl SqlServer {
@@ -31,33 +31,77 @@ impl SqlServer {
         let user = conn.need(&conn.username, "username")?;
         let password =
             secret.ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
-        let mut config = tiberius::Config::new();
-        config.host(&host);
-        config.port(conn.port.unwrap_or(1433));
-        config.authentication(tiberius::AuthMethod::sql_server(&user, password.expose()));
-        if let Some(db) = &conn.database {
-            config.database(db);
-        }
-        config.application_name("zsql");
-        config.encryption(tiberius::EncryptionLevel::NotSupported);
+        tls::install_ring();
+        let configure = |encryption: tiberius::EncryptionLevel, trust: Trust| {
+            let mut config = tiberius::Config::new();
+            config.host(&host);
+            config.port(conn.port.unwrap_or(1433));
+            config.authentication(tiberius::AuthMethod::sql_server(&user, password.expose()));
+            if let Some(db) = &conn.database {
+                config.database(db);
+            }
+            config.application_name("zsql");
+            config.encryption(encryption);
+            match trust {
+                Trust::Anyone => config.trust_cert(),
+                Trust::File(path) => config.trust_cert_ca(path.display().to_string()),
+                Trust::Roots => {}
+            }
+            config
+        };
+        let trust = |verifies: bool| match (&conn.ca_file, verifies) {
+            (_, false) => Trust::Anyone,
+            (Some(path), true) => Trust::File(path.clone()),
+            (None, true) => Trust::Roots,
+        };
+        use tiberius::EncryptionLevel::{NotSupported, Required};
+        let plan: Vec<(tiberius::EncryptionLevel, Trust)> = match conn.sslmode {
+            SslMode::Disable => vec![(NotSupported, Trust::Anyone)],
+            // TLS if it can, plaintext if it cannot, and a warning when it falls.
+            SslMode::Prefer => vec![(Required, Trust::Anyone), (NotSupported, Trust::Anyone)],
+            SslMode::Require => vec![(Required, Trust::Anyone)],
+            SslMode::VerifyCa | SslMode::VerifyFull => vec![(Required, trust(true))],
+        };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
-        let connect = |e: String| SourceError::Connect(conn.uid.clone(), e);
-        let client = runtime
-            .block_on(async {
+        let mut warnings = Vec::new();
+        let mut last = String::new();
+        let mut client = None;
+        for (i, (encryption, trust)) in plan.iter().enumerate() {
+            let config = configure(*encryption, trust.clone());
+            let attempt = runtime.block_on(async {
                 let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::TcpStream::connect(config.get_addr()))
                     .await
                     .map_err(|_| "no connection within 10s".to_string())?
                     .map_err(|e| e.to_string())?;
                 tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                tiberius::Client::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())
-            })
-            .map_err(connect)?;
-        Ok(SqlServer { runtime, client, uid: conn.uid.clone(), timeout: conn.timeout() })
+                tiberius::Client::connect(config, tcp.compat_write()).await.map_err(|e| crate::chain(&e))
+            });
+            match attempt {
+                Ok(c) => {
+                    if i > 0 {
+                        warnings.push(format!("{}: sslmode is prefer and TLS failed ({last}), so nothing is encrypted", conn.uid));
+                    }
+                    client = Some(c);
+                    break;
+                }
+                Err(e) => last = e,
+            }
+        }
+        let client = client.ok_or_else(|| SourceError::Connect(conn.uid.clone(), last))?;
+        Ok(SqlServer { runtime, client, uid: conn.uid.clone(), timeout: conn.timeout(), warnings })
     }
+}
+
+/// Whose certificate is accepted.
+#[derive(Clone)]
+enum Trust {
+    Anyone,
+    File(std::path::PathBuf),
+    Roots,
 }
 
 impl Source for SqlServer {
@@ -88,6 +132,10 @@ impl Source for SqlServer {
 
     fn adapter(&self) -> &str {
         "sqlserver"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 

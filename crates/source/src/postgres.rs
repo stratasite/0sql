@@ -7,8 +7,7 @@
 //! being async. The crate stays free to grow an async twin if the server
 //! ever needs one.
 
-use crate::{read_only, Connection, Result, Rows, Secret, Source, SourceError};
-use std::sync::Arc;
+use crate::{read_only, tls, Connection, Result, Rows, Secret, Source, SourceError, SslMode};
 
 pub struct Postgres {
     runtime: tokio::runtime::Runtime,
@@ -16,6 +15,7 @@ pub struct Postgres {
     adapter: String,
     uid: String,
     timeout: std::time::Duration,
+    warnings: Vec<String>,
 }
 
 impl Postgres {
@@ -33,6 +33,15 @@ impl Postgres {
             options.push_str(&format!(" -c search_path={schema}"));
         }
 
+        // libpq's ladder maps onto tokio-postgres's three settings with the
+        // verification carried by the rustls configuration: Require with an
+        // unverifying config is libpq's `require`, Require with the roots
+        // is `verify-full`, and the chain-only verifier is `verify-ca`.
+        let ssl = match conn.sslmode {
+            SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+            SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+            _ => tokio_postgres::config::SslMode::Require,
+        };
         let mut config = tokio_postgres::Config::new();
         config
             .host(&host)
@@ -43,49 +52,39 @@ impl Postgres {
             .application_name("zsql")
             .options(&options)
             .connect_timeout(std::time::Duration::from_secs(10))
-            // `Prefer` so a container on loopback with no TLS is reachable
-            // while a warehouse that offers TLS gets it. It is the wrong
-            // default for a warehouse over the open internet, which wants
-            // `Require`; an `sslmode` key in datasources.yml is phase B2's,
-            // and until it exists this is the one setting here that a
-            // deployment should not be left to guess.
-            .ssl_mode(tokio_postgres::config::SslMode::Prefer);
+            .ssl_mode(ssl);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
 
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config());
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls::client_config(&conn.uid, conn.sslmode, conn.ca_file.as_deref())?);
         let (client, connection) =
-            runtime.block_on(config.connect(tls)).map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            runtime.block_on(config.connect(tls)).map_err(|e| SourceError::Connect(conn.uid.clone(), crate::chain(&e)))?;
         // The connection drives the socket and must be polled for the
         // client to work; it ends when the client is dropped.
         runtime.spawn(async move {
             let _ = connection.await;
         });
 
-        Ok(Postgres { runtime, client, adapter: conn.adapter.clone(), uid: conn.uid.clone(), timeout: conn.timeout() })
+        let mut pg =
+            Postgres { runtime, client, adapter: conn.adapter.clone(), uid: conn.uid.clone(), timeout: conn.timeout(), warnings: vec![] };
+        // `prefer` may have ended plaintext, and the server knows which.
+        if conn.sslmode == SslMode::Prefer {
+            let rows = pg.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", 1)?;
+            if rows.rows.first().and_then(|r| rows.get(r, "ssl")) != Some("t") {
+                pg.warnings.push(format!("{}: sslmode is prefer and the server offered no TLS, so nothing is encrypted", conn.uid));
+            }
+        }
+        Ok(pg)
     }
-}
-
-/// The platform's own roots, verified. There is deliberately no way to
-/// turn verification off: a warehouse with a private certificate is a
-/// support conversation, and a disabled verifier is a breach.
-fn tls_config() -> rustls::ClientConfig {
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("ring provides the default protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth()
 }
 
 impl Source for Postgres {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        let fail = |e: tokio_postgres::Error| SourceError::Query(self.uid.clone(), e.to_string());
+        let fail = |e: tokio_postgres::Error| SourceError::Query(self.uid.clone(), crate::chain(&e));
         // One row past the cap, so a result at the cap can be told from one
         // over it and the caller is refused rather than quietly trimmed.
         let statement = self.runtime.block_on(self.client.prepare(sql)).map_err(fail)?;
@@ -93,7 +92,7 @@ impl Source for Postgres {
             .runtime
             .block_on(async { tokio::time::timeout(self.timeout, self.client.query(&statement, &[])).await })
             .map_err(|_| SourceError::Query(self.uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
-            .map_err(|e| SourceError::Query(self.uid.clone(), e.to_string()))?;
+            .map_err(|e| SourceError::Query(self.uid.clone(), crate::chain(&e)))?;
         if rows.len() > max_rows {
             return Err(SourceError::TooManyRows(self.uid.clone(), max_rows));
         }
@@ -114,5 +113,9 @@ impl Source for Postgres {
 
     fn adapter(&self) -> &str {
         &self.adapter
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }

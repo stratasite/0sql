@@ -25,6 +25,7 @@ pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
 pub mod sqlserver;
+pub mod tls;
 pub mod trino;
 
 pub use catalogue::{Catalogue, Column, Table};
@@ -51,9 +52,94 @@ pub enum SourceError {
     Query(String, String),
     #[error("{0} returned more than the {1} rows asked for")]
     TooManyRows(String, usize),
+    #[error("sslmode {0} is not one of disable, prefer, require, verify-ca, verify-full")]
+    SslMode(String),
+    #[error("{0}: {1} requires TLS, and the url is plain http; use https, or say sslmode: disable")]
+    PlainUrl(String, &'static str),
+    #[error("reading ca_file {0}: {1}")]
+    CaFile(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, SourceError>;
+
+/// An error and everything underneath it, joined: a driver's outer
+/// message is often "error performing TLS handshake" while the reason —
+/// "server does not support TLS" — is the cause below it.
+pub fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(inner) = cur {
+        let s = inner.to_string();
+        if !out.contains(&s) {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        cur = inner.source();
+    }
+    out
+}
+
+// ------------------------------------------------------------------ sslmode
+
+/// How much TLS a connection insists on: libpq's five rungs, with libpq's
+/// meanings, because that is the ladder every warehouse client shares —
+/// MySQL's `--ssl-mode` is the same five with other names, and SQL
+/// Server's `Encrypt` and `TrustServerCertificate` map onto three of them.
+///
+/// `require` encrypts and does not verify, as it does in libpq; that is
+/// the rung a self-signed development server needs, and it is named
+/// rather than hidden behind a flag. The default is `verify-full`, which
+/// is where Microsoft moved its drivers' default in 2022 and which the
+/// PostgreSQL documentation recommends over its own historical `prefer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum SslMode {
+    /// Plaintext. For a container on loopback.
+    Disable,
+    /// TLS if the server offers it, plaintext if not, never verified. A
+    /// connection that ends up plaintext says so in its warnings.
+    Prefer,
+    /// TLS or nothing; the certificate is not checked.
+    Require,
+    /// TLS, the chain checked against the trust store, the name not.
+    VerifyCa,
+    /// TLS, chain and host name both checked.
+    #[default]
+    VerifyFull,
+}
+
+impl SslMode {
+    /// libpq's spellings, and MySQL's, in any case.
+    pub fn parse(s: &str) -> Result<SslMode> {
+        Ok(match s.trim().to_lowercase().replace('_', "-").as_str() {
+            "disable" | "disabled" | "off" | "false" => SslMode::Disable,
+            "prefer" | "preferred" | "allow" => SslMode::Prefer,
+            "require" | "required" | "on" | "true" => SslMode::Require,
+            "verify-ca" => SslMode::VerifyCa,
+            "verify-full" | "verify-identity" => SslMode::VerifyFull,
+            _ => return Err(SourceError::SslMode(s.trim().to_string())),
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        }
+    }
+
+    /// Whether a plaintext connection is refused outright.
+    pub fn insists(self) -> bool {
+        self >= SslMode::Require
+    }
+
+    /// Whether the server's certificate is checked at all.
+    pub fn verifies(self) -> bool {
+        self >= SslMode::VerifyCa
+    }
+}
 
 // ---------------------------------------------------------------- connection
 
@@ -78,6 +164,11 @@ pub struct Connection {
     /// Seconds. The same key the planner reads for its own purposes, used
     /// here as the statement timeout.
     pub query_timeout: Option<i64>,
+    /// How much TLS to insist on. `verify-full` unless said otherwise.
+    pub sslmode: SslMode,
+    /// A PEM file of certificates to trust in addition to the platform's:
+    /// libpq's `sslrootcert`, MySQL's `--ssl-ca`. For a private CA.
+    pub ca_file: Option<PathBuf>,
 }
 
 impl Connection {
@@ -103,6 +194,11 @@ impl Connection {
                 url: s("url").map(|u| u.trim_end_matches('/').to_string()),
                 file: s("file").map(PathBuf::from),
                 query_timeout: i("query_timeout"),
+                sslmode: match s("sslmode").or_else(|| s("ssl_mode")) {
+                    Some(m) => SslMode::parse(&m)?,
+                    None => SslMode::default(),
+                },
+                ca_file: s("ca_file").or_else(|| s("sslrootcert")).or_else(|| s("ssl_ca")).map(PathBuf::from),
             });
         }
         Ok(out)
@@ -233,6 +329,12 @@ pub trait Source {
 
     /// The adapter's name, for an error that says where it happened.
     fn adapter(&self) -> &str;
+
+    /// What a caller should be told about this connection that is not an
+    /// error: that `prefer` ended plaintext, for one.
+    fn warnings(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Refuses a statement that is not a read.

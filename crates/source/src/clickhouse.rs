@@ -24,18 +24,21 @@ pub struct ClickHouse {
     /// The session's `readonly` setting, read on open: which settings a
     /// request may carry depends on it.
     readonly: u8,
+    warnings: Vec<String>,
 }
 
 impl ClickHouse {
     pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<ClickHouse> {
+        let (base, note) = http::base_url(conn, 8123, "clickhouse")?;
         let mut ch = ClickHouse {
-            agent: http::agent(conn),
-            base: http::base_url(conn, 8123)?,
+            agent: http::agent(conn)?,
+            base,
             user: conn.username.clone().unwrap_or_else(|| "default".into()),
             password: secret,
             database: conn.database.clone(),
             conn: conn.clone(),
             readonly: 0,
+            warnings: note.into_iter().collect(),
         };
         // One plain request, no settings, to learn which settings are allowed.
         let rows = ch.send("SELECT value FROM system.settings WHERE name = 'readonly'", "", 1)?;
@@ -62,7 +65,7 @@ impl ClickHouse {
         if let Some(p) = &self.password {
             req = req.header("X-ClickHouse-Key", p.expose());
         }
-        let response = req.send(sql.as_bytes()).map_err(|e| SourceError::Query(self.conn.uid.clone(), e.to_string()))?;
+        let response = req.send(sql.as_bytes()).map_err(|e| SourceError::Query(self.conn.uid.clone(), crate::chain(&e)))?;
         let body = http::text(&self.conn, response)?;
         let compact: Compact =
             serde_json::from_str(&body).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
@@ -98,6 +101,10 @@ impl Source for ClickHouse {
 
     fn adapter(&self) -> &str {
         "clickhouse"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 

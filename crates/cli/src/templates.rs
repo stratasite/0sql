@@ -53,6 +53,8 @@ pub const DATASOURCES_YML: &str = "\
 #   database: analytics\n\
 #   username: analyst\n\
 #   schema: public\n\
+#   sslmode: verify-full          # disable | prefer | require | verify-ca | verify-full, libpq's meanings; verify-full unless said\n\
+#   ca_file: ./ca.pem             # a PEM of certificates to trust besides the platform's, for a private CA\n\
 #\n\
 # local:\n\
 #   name: Local DuckDB\n\

@@ -182,6 +182,7 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
         port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
@@ -246,6 +247,7 @@ fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
         adapter: "clickhouse".into(),
         url: Some(std::env::var("ZSQL_TEST_CLICKHOUSE_URL").expect("ZSQL_TEST_CLICKHOUSE_URL")),
         username: std::env::var("ZSQL_TEST_CLICKHOUSE_USER").ok(),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
@@ -314,6 +316,7 @@ fn a_real_postgres_catalogue_reads_pg_catalog() {
         port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
@@ -343,6 +346,7 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
         adapter: "clickhouse".into(),
         url: Some(std::env::var("ZSQL_TEST_CLICKHOUSE_URL").expect("ZSQL_TEST_CLICKHOUSE_URL")),
         username: std::env::var("ZSQL_TEST_CLICKHOUSE_USER").ok(),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
@@ -382,6 +386,7 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
         port: std::env::var("ZSQL_TEST_MYSQL_PORT").ok().and_then(|p| p.parse().ok()),
         database: std::env::var("ZSQL_TEST_MYSQL_DB").ok().or(Some("zsql".into())),
         username: std::env::var("ZSQL_TEST_MYSQL_USER").ok().or(Some("root".into())),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_MYSQL_PASSWORD").expect("ZSQL_TEST_MYSQL_PASSWORD");
@@ -394,6 +399,14 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
     assert!(src.query("CREATE TABLE zsql_no (a INT)", 1).is_err());
     let err = src.query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
+    // The container makes itself a self-signed certificate, which is
+    // exactly what `require` accepts and `verify-full` refuses.
+    let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
+    let pw = || Some(Secret(std::env::var("ZSQL_TEST_MYSQL_PASSWORD").unwrap()));
+    assert!(open(&tls(SslMode::Require), pw()).is_ok(), "require accepts a certificate signed by nobody");
+    assert!(open(&tls(SslMode::VerifyFull), pw()).is_err(), "verify-full refuses a self-signed certificate");
+    let p = open(&tls(SslMode::Prefer), pw()).expect("prefer connects");
+    assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
     // The catalogue of mysql's own schema: always there, never written to.
     let cat = Catalogue::read(src.as_mut(), "my", Some("mysql")).expect("reads");
     let user = cat.table(Some("mysql"), "user").expect("mysql.user is in every server");
@@ -414,6 +427,7 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
         port: std::env::var("ZSQL_TEST_MSSQL_PORT").ok().and_then(|p| p.parse().ok()),
         database: std::env::var("ZSQL_TEST_MSSQL_DB").ok().or(Some("master".into())),
         username: std::env::var("ZSQL_TEST_MSSQL_USER").ok().or(Some("sa".into())),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_MSSQL_PASSWORD").expect("ZSQL_TEST_MSSQL_PASSWORD");
@@ -427,6 +441,13 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
     // TOP, since this is the dialect with no LIMIT, and the cap still refuses.
     let err = src.query("SELECT TOP (5) object_id FROM sys.objects", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
+    // SQL Server also makes itself a self-signed certificate.
+    let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
+    let pw = || Some(Secret(std::env::var("ZSQL_TEST_MSSQL_PASSWORD").unwrap()));
+    assert!(open(&tls(SslMode::Require), pw()).is_ok(), "require accepts a certificate signed by nobody");
+    assert!(open(&tls(SslMode::VerifyFull), pw()).is_err(), "verify-full refuses a self-signed certificate");
+    let p = open(&tls(SslMode::Prefer), pw()).expect("prefer connects");
+    assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
     // sys.objects lists user objects, so the catalogue views themselves
     // are not in it, which is right for a model. master.dbo always holds
     // the spt_ tables setup leaves behind, and spt_values is a view.
@@ -450,6 +471,7 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
         url: Some(std::env::var("ZSQL_TEST_TRINO_URL").expect("ZSQL_TEST_TRINO_URL")),
         database: std::env::var("ZSQL_TEST_TRINO_DB").ok().or(Some("tpch".into())),
         username: Some("zsql".into()),
+        sslmode: SslMode::Disable,
         ..Default::default()
     };
     let mut src = open(&conn, None).expect("opens");
@@ -470,4 +492,149 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
     let name = nation.columns.iter().find(|c| c.name == "name").expect("name");
     assert!(name.data_type.starts_with("varchar"), "{}", name.data_type);
     assert!(nation.columns.windows(2).all(|w| w[0].position < w[1].position));
+}
+
+fn test_cert() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness/sources/tls/server.crt")
+}
+
+#[test]
+fn sslmode_is_libpqs_ladder_under_libpqs_names_and_mysqls() {
+    use SslMode::*;
+    for (s, want) in [
+        ("disable", Disable),
+        ("DISABLED", Disable),
+        ("off", Disable),
+        ("prefer", Prefer),
+        ("Preferred", Prefer),
+        ("allow", Prefer),
+        ("require", Require),
+        ("REQUIRED", Require),
+        ("on", Require),
+        ("verify-ca", VerifyCa),
+        ("VERIFY_CA", VerifyCa),
+        ("verify-full", VerifyFull),
+        ("verify_identity", VerifyFull),
+        (" Verify-Full ", VerifyFull),
+    ] {
+        assert_eq!(SslMode::parse(s).unwrap(), want, "{s}");
+    }
+    let err = SslMode::parse("yes please").err().unwrap().to_string();
+    assert!(err.contains("not one of disable, prefer, require, verify-ca, verify-full"), "{err}");
+
+    assert_eq!(SslMode::default(), VerifyFull, "secure by default, as the drivers moved to in 2022");
+    assert!(!Disable.insists() && !Prefer.insists() && Require.insists());
+    assert!(!Require.verifies(), "require encrypts and does not verify, as in libpq");
+    assert!(VerifyCa.verifies() && VerifyFull.verifies());
+    assert!(Disable < Prefer && Prefer < Require && Require < VerifyCa && VerifyCa < VerifyFull);
+}
+
+#[test]
+fn the_connection_reads_sslmode_and_ca_file_under_every_spelling() {
+    let dir = temp("sslkeys");
+    std::fs::write(
+        dir.join("datasources.yml"),
+        "a:\n  adapter: postgres\nb:\n  adapter: postgres\n  sslmode: require\n  ca_file: /x/ca.pem\n\
+         c:\n  adapter: mysql\n  ssl_mode: VERIFY_CA\n  ssl_ca: /y/ca.pem\nd:\n  adapter: postgres\n  sslrootcert: /z/root.crt\n",
+    )
+    .unwrap();
+    let all = Connection::read_all(&dir).unwrap();
+    let by = |u: &str| all.iter().find(|c| c.uid == u).unwrap().clone();
+    assert_eq!(by("a").sslmode, SslMode::VerifyFull, "unsaid is verify-full");
+    assert_eq!(by("a").ca_file, None);
+    assert_eq!(by("b").sslmode, SslMode::Require);
+    assert_eq!(by("b").ca_file, Some(PathBuf::from("/x/ca.pem")));
+    assert_eq!(by("c").sslmode, SslMode::VerifyCa, "MySQL's spelling and key");
+    assert_eq!(by("c").ca_file, Some(PathBuf::from("/y/ca.pem")));
+    assert_eq!(by("d").ca_file, Some(PathBuf::from("/z/root.crt")), "libpq's key");
+    std::fs::write(dir.join("datasources.yml"), "e:\n  adapter: postgres\n  sslmode: maybe\n").unwrap();
+    assert!(Connection::read_all(&dir).err().unwrap().to_string().contains("sslmode maybe"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plain_url_is_refused_when_the_mode_insists_and_noted_when_it_prefers() {
+    let conn = |mode: SslMode, url: &str| Connection {
+        uid: "ch".into(),
+        adapter: "clickhouse".into(),
+        url: Some(url.into()),
+        sslmode: mode,
+        ..Default::default()
+    };
+    // verify-full, the default, refuses http outright.
+    let err = open(&conn(SslMode::VerifyFull, "http://ch.internal:8123"), None).err().unwrap().to_string();
+    assert!(err.contains("requires TLS") && err.contains("plain http"), "{err}");
+    let err = open(&conn(SslMode::Require, "HTTP://ch.internal:8123"), None).err().unwrap().to_string();
+    assert!(err.contains("sslmode: disable"), "it says the way out: {err}");
+    // disable allows it and says nothing; prefer allows it and says so.
+    // (Neither reaches a server: ClickHouse's open probes, so they fail
+    // on connect, which is past the rule being tested.)
+    let e = open(&conn(SslMode::Disable, "http://127.0.0.1:1"), None).err().unwrap().to_string();
+    assert!(!e.contains("requires TLS"), "{e}");
+    // A host with no url builds https under an insisting mode and http otherwise.
+    let built = |mode: SslMode| {
+        let c = Connection { uid: "t".into(), adapter: "trino".into(), host: Some("h".into()), sslmode: mode, ..Default::default() };
+        crate::http::base_url(&c, 8080, "trino").map(|(u, note)| (u, note.is_some()))
+    };
+    assert_eq!(built(SslMode::VerifyFull).unwrap(), ("https://h:8080".to_string(), false));
+    assert_eq!(built(SslMode::Disable).unwrap(), ("http://h:8080".to_string(), false));
+    assert_eq!(built(SslMode::Prefer).unwrap(), ("http://h:8080".to_string(), true), "prefer over http is noted");
+}
+
+#[test]
+fn ca_file_is_read_and_an_empty_or_missing_one_is_named() {
+    let store = tls::roots("t", Some(&test_cert())).unwrap();
+    assert!(!store.is_empty());
+    let err = tls::roots("t", Some(Path::new("/nonexistent/ca.pem"))).err().unwrap().to_string();
+    assert!(err.starts_with("reading ca_file t: /nonexistent/ca.pem"), "{err}");
+    let dir = temp("ca-empty");
+    std::fs::write(dir.join("empty.pem"), "not a certificate\n").unwrap();
+    let err = tls::roots("t", Some(&dir.join("empty.pem"))).err().unwrap().to_string();
+    assert!(err.contains("no certificates"), "{err}");
+    for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+        tls::client_config("t", mode, Some(&test_cert())).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Postgres container offers TLS with harness/sources/tls's pair, so
+/// each rung can be proven: `ZSQL_TEST_PG_TLS=1`, with the usual
+/// `ZSQL_TEST_PG_*` and `ZSQL_TEST_PG_CA` naming the certificate.
+#[test]
+#[ignore]
+fn a_real_postgres_with_tls_proves_every_rung() {
+    if std::env::var("ZSQL_TEST_PG_TLS").is_err() {
+        eprintln!("ZSQL_TEST_PG_TLS unset; skipping");
+        return;
+    }
+    let base = Connection {
+        uid: "pg".into(),
+        adapter: "postgres".into(),
+        host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
+        username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
+        ..Default::default()
+    };
+    let secret = || Some(Secret(std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")));
+    let ca = std::env::var("ZSQL_TEST_PG_CA").map(PathBuf::from).unwrap_or_else(|_| test_cert());
+    let with = |mode: SslMode, ca_file: Option<PathBuf>| Connection { sslmode: mode, ca_file, ..base.clone() };
+    let ssl_of = |src: &mut Box<dyn Source>| {
+        let r = src.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", 1).unwrap();
+        r.rows[0][0].clone()
+    };
+
+    let mut s = open(&with(SslMode::Disable, None), secret()).expect("disable connects");
+    assert_eq!(ssl_of(&mut s).as_deref(), Some("f"));
+    let mut s = open(&with(SslMode::Prefer, None), secret()).expect("prefer connects");
+    assert_eq!(ssl_of(&mut s).as_deref(), Some("t"), "the server offers TLS, so prefer takes it");
+    assert!(s.warnings().is_empty(), "nothing to warn about: {:?}", s.warnings());
+    let mut s = open(&with(SslMode::Require, None), secret()).expect("require accepts a certificate signed by nobody");
+    assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
+    let err = open(&with(SslMode::VerifyFull, None), secret()).err().expect("verify-full refuses a self-signed certificate").to_string();
+    assert!(err.contains("certificate") || err.contains("Certificate") || err.contains("tls") || err.contains("TLS"), "{err}");
+    let mut s = open(&with(SslMode::VerifyFull, Some(ca.clone())), secret()).expect("verify-full with the pair as the CA");
+    assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
+    let mut s = open(&with(SslMode::VerifyCa, Some(ca)), secret()).expect("verify-ca with the pair as the CA");
+    assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
 }

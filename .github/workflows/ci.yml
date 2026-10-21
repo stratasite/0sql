@@ -59,6 +59,7 @@ jobs:
       - name: Transports against them
         env:
           ZSQL_TEST_PG_HOST: localhost
+          ZSQL_TEST_PG_PORT: 5466
           ZSQL_TEST_PG_USER: postgres
           ZSQL_TEST_PG_DB: postgres
           ZSQL_TEST_PG_PASSWORD: zsql

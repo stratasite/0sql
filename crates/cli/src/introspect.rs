@@ -40,6 +40,9 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
         let t0 = Instant::now();
         let secret = zsql_source::secret(Some(&project.dir), &conn.uid, "password");
         let mut src = zsql_source::open(conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
+        for w in src.warnings() {
+            eprintln!("warning: {w}");
+        }
         let scope = schema.map(str::to_string).or_else(|| conn.schema.clone()).or_else(|| {
             // ClickHouse's and MySQL's database is its schema; Postgres's
             // and SQL Server's hold schemas, and Trino's is the catalog the
