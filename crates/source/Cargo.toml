@@ -1,0 +1,23 @@
+[package]
+name = "zsql-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Reaching a datasource to read from it: the connection, its secret, and one read-only statement"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[lints]
+workspace = true
