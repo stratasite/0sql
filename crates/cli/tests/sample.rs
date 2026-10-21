@@ -111,3 +111,63 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
     assert!(ok && out.contains("paid"), "{out}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Sampling the Postgres fixture through a model `generate` drafted from
+/// it: the width it inferred sampling from, the real values most frequent
+/// first with their distinct total, and the warning the catalogue's
+/// declared type raises when a text column is turned on by hand.
+/// `ZSQL_TEST_PG_*` as the sources job sets them; ignored otherwise.
+#[test]
+#[ignore]
+fn sampling_a_postgres_fixture_through_a_generated_model() {
+    let root = std::env::temp_dir().join(format!("zsql-sample-pg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, project) = (root.join("home"), root.join("shop"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop"])).0);
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    std::fs::write(
+        project.join("datasources.yml"),
+        format!(
+            "wh:\n  adapter: postgres\n  tier: hot\n  host: {}\n  port: {}\n  database: {}\n  username: {}\n  schema: shop\n  sslmode: disable\n",
+            var("ZSQL_TEST_PG_HOST", "localhost"),
+            var("ZSQL_TEST_PG_PORT", "5432"),
+            var("ZSQL_TEST_PG_DB", "postgres"),
+            var("ZSQL_TEST_PG_USER", "postgres")
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".zsql"),
+        format!("wh:\n  password: {}\n", std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")),
+    )
+    .unwrap();
+    assert!(run(zsql(&home, &project).args(["introspect", "wh"])).0);
+    assert!(run(zsql(&home, &project).args(["generate", "wh"])).0);
+
+    // The draft turned sampling on for name (varchar(80)) and not for notes (text).
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "wh"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("sampled Name (Customers): 2 values of 2"), "{out}");
+    assert!(!out.contains("Notes"), "text was not turned on by the draft: {out}");
+    assert!(!out.contains("warning:"), "an 80-wide varchar raises nothing: {out}");
+    let cat = zsql_project::values::ValueCatalog::read(&project.join("samples/values.jsonl.gz")).unwrap().expect("written");
+    let name = cat.dimensions.iter().find(|d| d.name == "Name").expect("Name");
+    assert_eq!(name.values.iter().map(|v| (v.v.as_str(), v.n)).collect::<Vec<_>>(), [("Ann", 1), ("Bo", 1)], "ties by value");
+    assert_eq!(name.distinct, Some(2));
+    assert_eq!(name.sample_size, Some(1000));
+
+    // Turn the text column on by hand: the catalogue's declared type warns.
+    let path = project.join("models/shop/tbl.customers.yml");
+    let yml = std::fs::read_to_string(&path).unwrap();
+    let on = yml.replacen("    name: Notes\n", "    name: Notes\n    enable_sampling: true\n", 1);
+    assert_ne!(on, yml, "Notes is in the draft");
+    std::fs::write(&path, on).unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "wh", "--only", "notes"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("warning: Notes (Customers): declared text, unbounded text"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["values", "Name"]));
+    assert!(ok && out.contains("Ann"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}

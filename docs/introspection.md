@@ -502,10 +502,14 @@ what makes the remaining adapters cheap instead of frightening.
       `rustls-pemfile`, to `mysql_async`, whose tree is ring and the bundle
       alone. TDS stays 7.3; `strict` can come with 8.0.
 
-      Proven by the containers on CI: Postgres offers TLS with the pair in
-      `harness/sources/tls/`, so `require` is shown to accept a certificate
-      signed by nobody, `verify-full` to refuse it, and `verify-full` with
-      `ca_file` to accept it; MySQL and SQL Server make themselves such
+      Proven by the containers on CI, after a detour: the Postgres TLS test
+      had passed vacuously while its fixture was unmounted, and once run for
+      real it found the transport's one bug (binary cells read as null) and
+      a fixture that was a CA certificate presented as a server's. Postgres
+      now serves a certificate signed by a private CA in
+      `harness/sources/tls/`, so `require` is shown to accept it unverified,
+      `verify-full` to refuse it, and `verify-full` and `verify-ca` with
+      `ca_file: ca.crt` to accept it; MySQL and SQL Server make themselves such
       certificates, so the same two rungs are shown on each. The Postgres
       container publishes on 5466, since a developer's own Postgres tends
       to hold 5432. *Gate, held:* the same catalogue assertions pass
@@ -576,8 +580,13 @@ what makes the remaining adapters cheap instead of frightening.
       fires past an average of 100 characters or a declared width past
       255. Both are one constant each.
 
-      Remaining: the governance rules written into the command's output and
-      the sample file's documentation; proof on the Postgres fixture.
+      Proven on CI: the SQLite flow in the ordinary suite, and the
+      Postgres fixture through a model `generate` drafted from it — the
+      width it turned sampling on from, real values most frequent first
+      with their distinct total, and the warning the catalogue's declared
+      `text` raises when a column is turned on by hand. Remaining: the
+      governance rules written into the command's output and the sample
+      file's documentation.
 - [ ] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
       Athena, on the HTTP transport B2 built, plus SigV4 for the two AWS
       ones. Each is a request type, a catalogue query and a comments query;

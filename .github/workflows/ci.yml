@@ -82,6 +82,7 @@ jobs:
         run: |
           cargo test --locked -p zsql-source -- --ignored
           cargo test --locked -p zsql-cli --test generate -- --ignored
+          cargo test --locked -p zsql-cli --test sample -- --ignored
       # When a container never comes up, say which and why before it is
       # torn down: the runner has two cores and seven gigabytes, and five
       # warehouses can exhaust either.
