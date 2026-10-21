@@ -41,9 +41,10 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
         let secret = zsql_source::secret(Some(&project.dir), &conn.uid, "password");
         let mut src = zsql_source::open(conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
         let scope = schema.map(str::to_string).or_else(|| conn.schema.clone()).or_else(|| {
-            // ClickHouse's database is its schema; Postgres's database holds
-            // schemas and the scope is the schema alone.
-            (conn.adapter == "clickhouse").then(|| conn.database.clone()).flatten()
+            // ClickHouse's and MySQL's database is its schema; Postgres's
+            // and SQL Server's hold schemas, and Trino's is the catalog the
+            // transport already sends, so for those the scope is the schema.
+            matches!(conn.adapter.as_str(), "clickhouse" | "mysql").then(|| conn.database.clone()).flatten()
         });
         let cat = Catalogue::read(src.as_mut(), &conn.uid, scope.as_deref()).with_context(|| format!("reading {}", conn.uid))?;
 

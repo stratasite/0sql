@@ -369,3 +369,101 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
         .iter()
         .all(|t| !["system", "INFORMATION_SCHEMA", "information_schema"].contains(&t.schema.as_deref().unwrap_or(""))));
 }
+
+/// MySQL against a server the environment names, as CI's container does:
+/// `ZSQL_TEST_MYSQL_HOST`, `_USER`, `_PASSWORD`, `_DB`.
+#[test]
+#[ignore]
+fn a_real_mysql_answers_and_its_catalogue_reads() {
+    let conn = Connection {
+        uid: "my".into(),
+        adapter: "mysql".into(),
+        host: std::env::var("ZSQL_TEST_MYSQL_HOST").ok().or(Some("localhost".into())),
+        port: std::env::var("ZSQL_TEST_MYSQL_PORT").ok().and_then(|p| p.parse().ok()),
+        database: std::env::var("ZSQL_TEST_MYSQL_DB").ok().or(Some("zsql".into())),
+        username: std::env::var("ZSQL_TEST_MYSQL_USER").ok().or(Some("root".into())),
+        ..Default::default()
+    };
+    let password = std::env::var("ZSQL_TEST_MYSQL_PASSWORD").expect("ZSQL_TEST_MYSQL_PASSWORD");
+    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three, 1.5 AS four", 10).expect("reads");
+    assert_eq!(rows.columns, ["one", "two", "three", "four"]);
+    assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
+    assert_eq!(rows.get(&rows.rows[0], "two"), Some("two"));
+    assert_eq!(rows.get(&rows.rows[0], "three"), None);
+    assert!(src.query("CREATE TABLE zsql_no (a INT)", 1).is_err());
+    let err = src.query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    // The catalogue of mysql's own schema: always there, never written to.
+    let cat = Catalogue::read(src.as_mut(), "my", Some("mysql")).expect("reads");
+    let user = cat.table(Some("mysql"), "user").expect("mysql.user is in every server");
+    assert!(user.columns.iter().any(|c| c.name == "Host"), "typed columns");
+    assert!(user.columns.windows(2).all(|w| w[0].position < w[1].position));
+    assert!(user.columns.iter().any(|c| c.max_length.is_some()), "character_maximum_length is read");
+}
+
+/// SQL Server against a server the environment names: `ZSQL_TEST_MSSQL_HOST`,
+/// `_USER`, `_PASSWORD`, `_DB`. Encryption off, as the transport is built.
+#[test]
+#[ignore]
+fn a_real_sqlserver_answers_and_its_catalogue_reads() {
+    let conn = Connection {
+        uid: "ms".into(),
+        adapter: "sqlserver".into(),
+        host: std::env::var("ZSQL_TEST_MSSQL_HOST").ok().or(Some("localhost".into())),
+        port: std::env::var("ZSQL_TEST_MSSQL_PORT").ok().and_then(|p| p.parse().ok()),
+        database: std::env::var("ZSQL_TEST_MSSQL_DB").ok().or(Some("master".into())),
+        username: std::env::var("ZSQL_TEST_MSSQL_USER").ok().or(Some("sa".into())),
+        ..Default::default()
+    };
+    let password = std::env::var("ZSQL_TEST_MSSQL_PASSWORD").expect("ZSQL_TEST_MSSQL_PASSWORD");
+    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three", 10).expect("reads");
+    assert_eq!(rows.columns, ["one", "two", "three"]);
+    assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
+    assert_eq!(rows.get(&rows.rows[0], "two"), Some("two"));
+    assert_eq!(rows.get(&rows.rows[0], "three"), None);
+    assert!(src.query("CREATE TABLE zsql_no (a INT)", 1).is_err());
+    // TOP, since this is the dialect with no LIMIT, and the cap still refuses.
+    let err = src.query("SELECT TOP (5) object_id FROM sys.objects", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    // master's sys schema has views with typed columns; dbo may be empty.
+    let cat = Catalogue::read(src.as_mut(), "ms", Some("sys")).expect("reads");
+    let objects = cat.table(Some("sys"), "objects").expect("sys.objects is in every database");
+    assert_eq!(objects.kind, "view");
+    assert!(objects.columns.iter().any(|c| c.name == "object_id" && c.data_type == "int"));
+    assert!(objects.columns.windows(2).all(|w| w[0].position < w[1].position));
+}
+
+/// Trino against a coordinator the environment names: `ZSQL_TEST_TRINO_URL`,
+/// and the catalog as `_DB`, `tpch` by default since the image ships it.
+#[test]
+#[ignore]
+fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
+    let conn = Connection {
+        uid: "tr".into(),
+        adapter: "trino".into(),
+        url: Some(std::env::var("ZSQL_TEST_TRINO_URL").expect("ZSQL_TEST_TRINO_URL")),
+        database: std::env::var("ZSQL_TEST_TRINO_DB").ok().or(Some("tpch".into())),
+        username: Some("zsql".into()),
+        ..Default::default()
+    };
+    let mut src = open(&conn, None).expect("opens");
+    let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three", 10).expect("reads");
+    assert_eq!(rows.columns, ["one", "two", "three"]);
+    assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
+    assert_eq!(rows.get(&rows.rows[0], "three"), None);
+    // tiny.nation is 25 rows and arrives across pages; the cap cancels and refuses.
+    let err = src.query("SELECT name FROM tpch.tiny.nation", 10).err().unwrap().to_string();
+    assert!(err.contains("more than the 10 rows"), "{err}");
+    let all = src.query("SELECT name FROM tpch.tiny.nation", 100).expect("reads across pages");
+    assert_eq!(all.rows.len(), 25);
+    assert!(src.query("CREATE TABLE memory.default.zsql_no (a INT)", 1).is_err());
+    // The catalog is a header, so information_schema alone means tpch's.
+    let cat = Catalogue::read(src.as_mut(), "tr", Some("tiny")).expect("reads");
+    let nation = cat.table(Some("tiny"), "nation").expect("tpch.tiny.nation");
+    assert_eq!(nation.kind, "table");
+    let name = nation.columns.iter().find(|c| c.name == "name").expect("name");
+    assert!(name.data_type.starts_with("varchar"), "{}", name.data_type);
+    assert!(nation.columns.windows(2).all(|w| w[0].position < w[1].position));
+}

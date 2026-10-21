@@ -84,7 +84,8 @@ pub const MAX_TABLES: usize = 20_000;
 pub const MAX_COLUMNS: usize = 200_000;
 
 /// The schemas no model is built from: a warehouse's own bookkeeping.
-const SYSTEM_SCHEMAS: [&str; 5] = ["pg_catalog", "information_schema", "INFORMATION_SCHEMA", "system", "pg_toast"];
+const SYSTEM_SCHEMAS: [&str; 9] =
+    ["pg_catalog", "information_schema", "INFORMATION_SCHEMA", "system", "pg_toast", "mysql", "performance_schema", "sys", "guest"];
 
 impl Catalogue {
     /// Reads what `src` holds. `scope` narrows the read to one schema —
@@ -96,6 +97,9 @@ impl Catalogue {
         let tables = match adapter.as_str() {
             "postgres" | "redshift" => postgres(src, scope)?,
             "clickhouse" => clickhouse(src, scope)?,
+            "mysql" => mysql(src, scope)?,
+            "sqlserver" => sqlserver(src, scope)?,
+            "trino" | "athena" => trino(src, scope)?,
             "sqlite" => sqlite(src)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
         };
@@ -203,6 +207,79 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          toString(position) AS position, comment AS column_comment \
          FROM system.columns WHERE {} ORDER BY 1, 2, position",
         scope_clause("database", scope)
+    );
+    assemble(src, &tables, &columns)
+}
+
+/// `information_schema` has everything MySQL keeps: the type, the length,
+/// the comment on both table and column, and an estimate of rows. A
+/// schema is a database here, so the scope is the connection's database.
+fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT table_schema, table_name, IF(table_type = 'VIEW', 'view', 'table') AS table_kind, \
+         CAST(table_rows AS CHAR) AS row_estimate, table_comment FROM information_schema.tables \
+         WHERE {} ORDER BY 1, 2",
+        scope_clause("table_schema", scope)
+    );
+    let columns = format!(
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
+         CAST(character_maximum_length AS CHAR) AS max_length, CAST(ordinal_position AS CHAR) AS position, \
+         column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
+        scope_clause("table_schema", scope)
+    );
+    assemble(src, &tables, &columns)
+}
+
+/// `INFORMATION_SCHEMA` for the shape, `sys` for the rest: the row count
+/// from the partitions of the heap or clustered index, and comments from
+/// the `MS_Description` extended property, which is where SQL Server keeps
+/// a comment when anyone has written one.
+fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT s.name AS table_schema, o.name AS table_name, \
+         CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END AS table_kind, \
+         CAST((SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = o.object_id AND p.index_id IN (0, 1)) AS VARCHAR(20)) AS row_estimate, \
+         CAST(ep.value AS NVARCHAR(4000)) AS table_comment \
+         FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         LEFT JOIN sys.extended_properties ep ON ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' \
+         WHERE o.type IN ('U', 'V') AND {} ORDER BY 1, 2",
+        scope_clause("s.name", scope)
+    );
+    let columns = format!(
+        "SELECT c.TABLE_SCHEMA AS table_schema, c.TABLE_NAME AS table_name, c.COLUMN_NAME AS column_name, \
+         c.DATA_TYPE AS data_type, c.IS_NULLABLE AS is_nullable, \
+         CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR(20)) AS max_length, CAST(c.ORDINAL_POSITION AS VARCHAR(20)) AS position, \
+         CAST(ep.value AS NVARCHAR(4000)) AS column_comment \
+         FROM INFORMATION_SCHEMA.COLUMNS c \
+         JOIN sys.schemas s ON s.name = c.TABLE_SCHEMA \
+         JOIN sys.objects o ON o.schema_id = s.schema_id AND o.name = c.TABLE_NAME \
+         LEFT JOIN sys.columns sc ON sc.object_id = o.object_id AND sc.name = c.COLUMN_NAME \
+         LEFT JOIN sys.extended_properties ep ON ep.major_id = o.object_id AND ep.minor_id = sc.column_id AND ep.name = 'MS_Description' \
+         WHERE {} ORDER BY 1, 2, c.ORDINAL_POSITION",
+        scope_clause("c.TABLE_SCHEMA", scope)
+    );
+    assemble(src, &tables, &columns)
+}
+
+/// `information_schema` of the catalog the connection named, which the
+/// transport sets as a header so the schema name alone reaches here. Trino
+/// puts a column's comment in `information_schema.columns` and a table's
+/// in `system.metadata.table_comments`; it has no cheap row estimate.
+fn trino(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT t.table_schema, t.table_name, IF(t.table_type = 'VIEW', 'view', 'table') AS table_kind, \
+         CAST(NULL AS VARCHAR) AS row_estimate, c.comment AS table_comment \
+         FROM information_schema.tables t \
+         LEFT JOIN system.metadata.table_comments c \
+           ON c.catalog_name = t.table_catalog AND c.schema_name = t.table_schema AND c.table_name = t.table_name \
+         WHERE {} ORDER BY 1, 2",
+        scope_clause("t.table_schema", scope)
+    );
+    let columns = format!(
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
+         CAST(NULL AS VARCHAR) AS max_length, CAST(ordinal_position AS VARCHAR) AS position, comment AS column_comment \
+         FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
+        scope_clause("table_schema", scope)
     );
     assemble(src, &tables, &columns)
 }

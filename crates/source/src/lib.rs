@@ -21,8 +21,11 @@ use std::path::{Path, PathBuf};
 pub mod catalogue;
 pub mod clickhouse;
 mod http;
+pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
+pub mod sqlserver;
+pub mod trino;
 
 pub use catalogue::{Catalogue, Column, Table};
 
@@ -312,6 +315,9 @@ pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Box<dyn Source>
     match conn.adapter.as_str() {
         "postgres" | "redshift" => Ok(Box::new(postgres::Postgres::open(conn, secret)?)),
         "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
+        "mysql" => Ok(Box::new(mysql::MySql::open(conn, secret)?)),
+        "trino" | "athena" => Ok(Box::new(trino::Trino::open(conn, secret)?)),
+        "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret)?)),
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),
     }
