@@ -35,6 +35,9 @@ services:
       interval: 2s
       timeout: 3s
       retries: 40
+    # The shop schema with keys, run once on first start against MYSQL_DATABASE.
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/shop.sql:ro
 
   # The image is large and its licence is for development. If it is the
   # one that makes CI slow, it moves to a nightly job and the wire
