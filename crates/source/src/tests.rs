@@ -427,12 +427,16 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
     // TOP, since this is the dialect with no LIMIT, and the cap still refuses.
     let err = src.query("SELECT TOP (5) object_id FROM sys.objects", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
-    // master's sys schema has views with typed columns; dbo may be empty.
-    let cat = Catalogue::read(src.as_mut(), "ms", Some("sys")).expect("reads");
-    let objects = cat.table(Some("sys"), "objects").expect("sys.objects is in every database");
-    assert_eq!(objects.kind, "view");
-    assert!(objects.columns.iter().any(|c| c.name == "object_id" && c.data_type == "int"));
-    assert!(objects.columns.windows(2).all(|w| w[0].position < w[1].position));
+    // sys.objects lists user objects, so the catalogue views themselves
+    // are not in it, which is right for a model. master.dbo always holds
+    // the spt_ tables setup leaves behind, and spt_values is a view.
+    let cat = Catalogue::read(src.as_mut(), "ms", Some("dbo")).expect("reads");
+    let monitor = cat.table(Some("dbo"), "spt_monitor").expect("master.dbo.spt_monitor is on every server");
+    assert_eq!(monitor.kind, "table");
+    assert_eq!(monitor.physical_name(), "dbo.spt_monitor");
+    assert!(monitor.columns.iter().any(|c| c.name == "lastrun" && c.data_type == "datetime"), "{:?}", monitor.columns);
+    assert!(monitor.columns.windows(2).all(|w| w[0].position < w[1].position));
+    assert_eq!(cat.table(Some("dbo"), "spt_values").map(|t| t.kind.as_str()), Some("view"));
 }
 
 /// Trino against a coordinator the environment names: `ZSQL_TEST_TRINO_URL`,

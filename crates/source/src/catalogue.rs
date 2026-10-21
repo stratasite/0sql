@@ -214,17 +214,21 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// `information_schema` has everything MySQL keeps: the type, the length,
 /// the comment on both table and column, and an estimate of rows. A
 /// schema is a database here, so the scope is the connection's database.
+/// Every column is aliased, because MySQL answers an unaliased
+/// `information_schema` column under its defined, upper-case name.
 fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     let tables = format!(
-        "SELECT table_schema, table_name, IF(table_type = 'VIEW', 'view', 'table') AS table_kind, \
-         CAST(table_rows AS CHAR) AS row_estimate, table_comment FROM information_schema.tables \
-         WHERE {} ORDER BY 1, 2",
+        "SELECT table_schema AS table_schema, table_name AS table_name, \
+         IF(table_type = 'VIEW', 'view', 'table') AS table_kind, \
+         CAST(table_rows AS CHAR) AS row_estimate, table_comment AS table_comment \
+         FROM information_schema.tables WHERE {} ORDER BY 1, 2",
         scope_clause("table_schema", scope)
     );
     let columns = format!(
-        "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
+        "SELECT table_schema AS table_schema, table_name AS table_name, column_name AS column_name, \
+         data_type AS data_type, is_nullable AS is_nullable, \
          CAST(character_maximum_length AS CHAR) AS max_length, CAST(ordinal_position AS CHAR) AS position, \
-         column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
+         column_comment AS column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", scope)
     );
     assemble(src, &tables, &columns)
