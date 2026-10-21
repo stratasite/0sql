@@ -64,6 +64,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
     write("project.yml", &templates::project_yml(&name, &uid))?;
     write("datasources.yml", templates::DATASOURCES_YML)?;
     write("security.yml", templates::SECURITY_YML)?;
+    write("AGENTS.md", templates::AGENTS_MD)?;
     write("models/.keep", "")?;
     write("tests/.keep", "")?;
     let gi = dir.join(".gitignore");

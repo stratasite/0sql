@@ -19,7 +19,6 @@ fields:
     name: Campaign Start Day Index
     description: Day index the campaign started (join key to the calendar; mirrors Campaign Start Day)
     data_type: integer
-    disable_listing: true
     expression:
       primary_key: true
       lookup: true

@@ -11,7 +11,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use zsql_semantic::ValueSampling;
 
 pub const FILE_NAME: &str = "values.jsonl.gz";
 /// The most the file may hold once inflated: a thousand values for
@@ -31,7 +30,6 @@ pub struct DimensionValues {
     pub table: String,
     /// RFC 3339.
     pub sampled_at: String,
-    pub mode: ValueSampling,
     /// Distinct values in the column, when counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinct: Option<i64>,

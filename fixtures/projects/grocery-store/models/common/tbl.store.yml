@@ -10,7 +10,6 @@ fields:
     name: Store ID
     description: Anonymized store identifier
     data_type: integer
-    disable_listing: true
     expression:
       primary_key: true
       sql: STORE_ID

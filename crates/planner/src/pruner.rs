@@ -184,8 +184,8 @@ mod tests {
     fn field(data_type: &str) -> Field {
         serde_json::from_value(serde_json::json!({
             "id": 1, "uid": "region", "name": "Region", "type": "Semantic::Dimension", "data_type": data_type,
-            "display_type": "", "format": null, "exclusion_type": null, "inclusions": null,
-            "extended_blend_group": null, "snapshot": null, "value_list_size": 0, "description": null
+            "format": null, "exclusion_type": null, "inclusions": null,
+            "extended_blend_group": null, "snapshot": null, "description": null
         }))
         .unwrap()
     }

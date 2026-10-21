@@ -331,12 +331,7 @@ const FIELD_KEYS: &[&str] = &[
     "hidden",
     "grains",
     "data_type",
-    "display_type",
     "format",
-    "secure",
-    "disable_listing",
-    "disable_value_listing",
-    "value_list_size",
     "snapshot",
     "exclusion_type",
     "exclusions",
@@ -345,7 +340,9 @@ const FIELD_KEYS: &[&str] = &[
     "synonyms",
     "tags",
     "expression",
-    "values",
+    "enable_sampling",
+    "sample_size",
+    "sample_sql",
 ];
 const EXPRESSION_KEYS: &[&str] = &["sql", "array", "lookup", "primary_key"];
 const JOIN_KEYS: &[&str] = &["left", "right", "sql", "cardinality", "join", "allow_measure_expansion", "description"];
@@ -745,9 +742,10 @@ impl<'d> Builder<'d> {
                 .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list (one of: string, integer, decimal, date, date_time, boolean, bigint, binary)")))?,
             None => return Err(invalid(file, format!("Field {name} errors: Data type can't be blank"))),
         };
-        let display_type = str_of(fm, "display_type").map(|d| d.to_lowercase()).unwrap_or_else(|| "default".into());
-        if !["default", "html", "url", "email", "phone_number", "image"].contains(&display_type.as_str()) {
-            return Err(invalid(file, format!("Field {name} errors: Display type '{display_type}' is not included in the list (one of: default, html, url, email, phone_number, image)")));
+        let sample_size = int_of(fm, "sample_size").unwrap_or_else(zsql_semantic::default_sample_size);
+        if !(1..=zsql_semantic::MAX_SAMPLE_SIZE).contains(&sample_size) {
+            let most = zsql_semantic::MAX_SAMPLE_SIZE;
+            return Err(invalid(file, format!("Field {name} errors: sample_size {sample_size} is not between 1 and {most}")));
         }
         let grains = strs_of(fm, "grains").into_iter().map(|g| g.to_lowercase()).collect::<Vec<_>>();
         if let Some(bad) = grains.iter().find(|g| !DATE_GRAINS.contains(&g.as_str())) {
@@ -802,7 +800,6 @@ impl<'d> Builder<'d> {
                     name: name.clone(),
                     kind,
                     data_type: Some(data_type),
-                    display_type: display_type.clone(),
                     hidden: false,
                     tags: vec![],
                     grains: vec![],
@@ -812,10 +809,9 @@ impl<'d> Builder<'d> {
                     inclusions: None,
                     extended_blend_group: None,
                     snapshot: None,
-                    secure: false,
-                    disable_listing: false,
-                    value_list_size: 1000,
-                    value_sampling: ValueSampling::Sample,
+                    enable_sampling: false,
+                    sample_size,
+                    sample_sql: None,
                     synonyms: vec![],
                     description: None,
                     rank: 0,
@@ -830,7 +826,6 @@ impl<'d> Builder<'d> {
             let f = &mut self.fields[field_index];
             f.name = name.clone();
             f.data_type = Some(data_type);
-            f.display_type = display_type;
             f.hidden = bool_of(fm, "hidden").unwrap_or(false);
             f.tags = strs_of(fm, "tags");
             f.grains = grains;
@@ -840,15 +835,9 @@ impl<'d> Builder<'d> {
             f.inclusions = inclusions;
             f.extended_blend_group = str_of(fm, "extended_blend_group").map(|g| g.to_lowercase());
             f.snapshot = snapshot;
-            f.secure = bool_of(fm, "secure").unwrap_or(false);
-            f.disable_listing = bool_of(fm, "disable_listing").or_else(|| bool_of(fm, "disable_value_listing")).unwrap_or(false);
-            f.value_list_size = int_of(fm, "value_list_size").unwrap_or(1000);
-            f.value_sampling = match str_of(fm, "values").map(|v| v.to_lowercase()).as_deref() {
-                None | Some("sample") => ValueSampling::Sample,
-                Some("full") => ValueSampling::Full,
-                Some("none") | Some("false") => ValueSampling::None,
-                Some(other) => return Err(invalid(file, format!("Field {name} errors: values '{other}' should be sample, full or none"))),
-            };
+            f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
+            f.sample_size = sample_size;
+            f.sample_sql = str_of(fm, "sample_sql");
             f.synonyms = strs_of(fm, "synonyms");
             f.description = str_of(fm, "description");
         }

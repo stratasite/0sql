@@ -117,7 +117,10 @@ fields:\n\
   #   data_type: string               # string | integer | bigint | decimal | date | date_time | boolean\n\
   #   synonyms: [dept]\n\
   #   tags: []                        # policy triggers, e.g. [pii]\n\
-  #   values: sample                  # sample | full | none: whether samples/values.jsonl.gz lists this dimension\n\
+  #   enable_sampling: true           # collect this dimension's values into samples/values.jsonl.gz\n\
+  #   sample_size: 1000               # how many values, most frequent first; at most 20000\n\
+  #   sample_sql: |                   # your own query instead of the generated one\n\
+  #     SELECT category, COUNT(*) FROM products GROUP BY 1 ORDER BY 2 DESC\n\
   #   expression:\n\
   #     sql: category\n\
   #     primary_key: false\n\
@@ -159,6 +162,86 @@ projections:\n\
 assert_regex: SELECT\n"
     )
 }
+
+/// Guidance for an agent working on a project's model, written into the
+/// project by `zsql init`. The sampling rule lives here rather than in the
+/// loader: the modeller decides, and `enable_sampling: true` is obeyed
+/// whatever the field looks like. A raw string, because the `\n\`
+/// continuation the other templates use eats the leading whitespace that
+/// markdown lists need.
+pub const AGENTS_MD: &str = r#"# Working on this 0sql model
+
+This project is a semantic model. 0sql resolves a request in business terms
+against it and returns one SQL statement, or a refusal that says why. The
+model is the source of truth: if a question cannot be answered, the model is
+what to change.
+
+## Layout
+
+- `project.yml` — the project's name, uid and production branch.
+- `datasources.yml` — one entry per warehouse: `adapter` picks the SQL
+  dialect, `tier` ranks datasources when more than one could answer.
+  **Never put a password, token or key in this file.** Secrets belong in
+  `.zsql`, which is gitignored and never deployed.
+- `models/<domain>/tbl.<name>.yml` — a table with its dimensions and
+  measures. `models/<domain>/rel.<domain>.yml` — the joins between them.
+- `security.yml` — row-level policies.
+- `tests/*.yml` — planner tests, run on every deploy.
+- `samples/values.jsonl.gz` — sampled dimension values. Customer data;
+  gitignored by default, and deployed with the model.
+
+## Commands
+
+    zsql check            # load the model and report problems
+    zsql test             # run tests/*.yml
+    zsql sql 'revenue by category last month'
+    zsql fields -q cost   # find a field
+    zsql repl             # explore interactively
+
+Run `zsql check` after every edit. A model that does not load cannot be
+deployed.
+
+## Authoring fields
+
+Give every field a `name` a person would use, a `description`, and
+`synonyms` for the other words people say. Those three are what makes a
+request resolve, and they deserve more care than anything else here.
+
+A measure's `expression.sql` carries its aggregate (`sum(revenue)`). A
+dimension's does not.
+
+## Sampling: enable it only for short string dimensions
+
+Sampled values let a request name a value and have it resolve: knowing that
+`Region` holds "California" is what connects a question to a filter.
+
+**Enable sampling only on a string dimension whose values are short — under
+255 characters, and in practice far shorter: a status, a category, a region,
+a channel, a product name.**
+
+Leave it off everywhere else.
+
+- **Long or unbounded text** — `notes`, `comments`, `description`,
+  `varchar(max)`, `text`, `clob`. Sampling these fills the catalogue with
+  prose that matches every request a little and nothing well, which makes
+  resolution worse than no samples at all. This is the mistake to avoid.
+- **High-cardinality keys and identifiers** — an id, an order number, an
+  email, an account number. Millions of values nobody will ever name, and
+  customer data you did not need to copy.
+- **Numbers, dates and booleans.** A request filters these by range, not by
+  value.
+- **Anything a security policy covers, and anything sensitive.** A sample
+  leaves the warehouse and travels with the model.
+
+Nothing enforces this. `enable_sampling: true` is obeyed whatever the field
+is, because you know the data and the loader does not. `zsql sample` warns
+when what it collected looks like long text, and a warning there means the
+field wants turning off, or a `sample_sql` that trims and filters what it
+returns.
+
+`sample_size` defaults to 1000 and may not exceed 20000. Values come back
+most frequent first, so a smaller number keeps the ones that matter.
+"#;
 
 pub const GITIGNORE: &str = "\
 # zsql: local secrets and sampled data\n\
