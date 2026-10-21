@@ -1101,9 +1101,7 @@ impl<'a> P<'a> {
             }
             let save = self.i;
             let by = if self.sp() && self.kw("by") {
-                if !self.sp() {
-                    return self.err(self.i, "`by` needs a space and then the measure");
-                }
+                self.ws();
                 let at = self.i;
                 let Some(f) = self.field(Mode::Top)? else { return self.err(at, "`top N by` needs a measure after it") };
                 Some(f)
