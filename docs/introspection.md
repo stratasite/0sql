@@ -456,7 +456,8 @@ what makes the remaining adapters cheap instead of frightening.
       introspect`, writing `catalogue/<datasource>.json` — one file per
       datasource rather than the single `catalogue.json` first proposed,
       so re-reading one never rewrites another. Measured with three
-      transports linked: 15.2 MB stripped, +1.4 MB; the slim build still
+      transports linked: 15.2 MB stripped, +1.4 MB, and a clean release
+      build of 77 s against the survey's 69 s, +8 s; the slim build still
       compiles with tokio in it. Still to land: MySQL, SQL Server and
       Trino, which need the containers to prove them, and CI has not yet
       run the job because `ci.yml` triggers only on `main` and on pull
