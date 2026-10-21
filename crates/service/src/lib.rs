@@ -376,8 +376,9 @@ impl Model {
 
     pub fn sql(&self, req: SqlRequest, check: ShapeCheck) -> Result<SqlResponse> {
         let p = self.plan_request(req, false, check)?;
+        let dialect = self.dialects.get(&p.plan.adapter)?;
         Ok(SqlResponse {
-            sql: p.plan.sql_with_limit(p.limit),
+            sql: p.plan.sql_with_limit(p.limit, &dialect)?,
             datasource: p.plan.datasource,
             datasource_uid: p.plan.datasource_uid,
             adapter: p.plan.adapter,
@@ -390,7 +391,8 @@ impl Model {
     pub fn explain(&self, req: SqlRequest, check: ShapeCheck) -> Result<ExplainResponse> {
         let p = self.plan_request(req, true, check)?;
         // Before taking `explain` out of the plan, which moves part of it.
-        let sql = p.plan.sql_with_limit(p.limit);
+        let dialect = self.dialects.get(&p.plan.adapter)?;
+        let sql = p.plan.sql_with_limit(p.limit, &dialect)?;
         let x = p.plan.explain.unwrap_or_else(|| zsql_planner::Explain { phases: vec![], nodes: vec![] });
         Ok(ExplainResponse {
             sql,
