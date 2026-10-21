@@ -423,7 +423,12 @@ store net paid {"format": {"type": "currency"}}
 ```
 
 `limit` and `via` (table hints) are the two settings that change the
-plan and earn a keyword. Everything else the spec carries, and any
+plan and earn a keyword. `via` names table uids the resolver should
+prefer: when more than one join route reaches the query's fields, a
+route through a named table outranks one that does not, ahead of
+coverage and cost. It is a preference, not a constraint; a route that
+cannot pass through the table is still taken when nothing else can,
+and a uid naming no table is ignored. Everything else the spec carries, and any
 attribute a future spec adds, goes through braces: a `{...}` item is
 merged into the query object, and a `{...}` directly after an item,
 with no comma between, is merged into that item's object. Merging is

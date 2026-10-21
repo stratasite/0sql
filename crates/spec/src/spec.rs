@@ -131,7 +131,8 @@ pub struct Spec {
     /// Per-query dialect overrides (`final_pass_measure_join_type`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_settings: Option<Attrs>,
-    /// Table uids the resolver must route through.
+    /// Table uids the resolver prefers to route through: the first key
+    /// when it ranks the join routes, never a constraint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,
 }
