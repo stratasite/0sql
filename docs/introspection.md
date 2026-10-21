@@ -511,7 +511,14 @@ what makes the remaining adapters cheap instead of frightening.
       to hold 5432. *Gate, held:* the same catalogue assertions pass
       against every container, so a thirteenth adapter is a file and not
       a project.
-- [ ] **C — model from catalogue.** Generation with marked inferences;
+- [ ] **C — model from catalogue.** Groundwork in: the catalogue reads
+      primary and foreign keys on all six adapters — `pg_constraint`,
+      MySQL's `key_column_usage` with its referenced side, SQL Server's
+      `sys.foreign_key_columns`, SQLite's two pragmas, ClickHouse's sorting
+      key under the name it gives it, nothing from Trino since its
+      `information_schema` has no constraints — proven on fixtures with a
+      real foreign key in the Postgres and MySQL containers. Remaining:
+      generation with marked inferences;
       diff-and-patch on re-run with `--dry-run` the default for an existing
       project; `zsql check` against a catalogue with dialect-correct
       folding; a drift report between two catalogues.

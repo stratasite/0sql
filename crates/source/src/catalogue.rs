@@ -34,6 +34,29 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub columns: Vec<Column>,
+    /// The primary key's columns in order, when one is declared. On
+    /// ClickHouse this is the sorting key, which is what it calls its
+    /// primary key and is not a uniqueness promise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_key: Vec<String>,
+    /// Declared foreign keys, which is where join inference starts. The
+    /// warehouses that enforce them (Postgres, MySQL, SQL Server, SQLite)
+    /// answer here; the ones that only record them as hints will when
+    /// phase E reaches them; Trino and ClickHouse have none to give.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// One foreign key: these columns reference those, on that table.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForeignKey {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references_schema: Option<String>,
+    pub references_table: String,
+    pub references_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -129,6 +152,8 @@ fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result
             rows: t.get(r, "row_estimate").and_then(|n| n.parse::<f64>().ok()).map(|n| n.max(0.0) as i64).filter(|n| *n > 0),
             comment: t.get(r, "table_comment").map(str::to_string).filter(|c| !c.trim().is_empty()),
             columns: vec![],
+            primary_key: vec![],
+            foreign_keys: vec![],
         })
         .collect();
     let c = src.query(columns_sql, MAX_COLUMNS)?;
@@ -149,6 +174,46 @@ fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result
         t.columns.sort_by_key(|c| c.position);
     }
     Ok(tables)
+}
+
+/// The third shared read: one row per key column. `key_kind` is
+/// `primary` or `foreign`; a foreign row also names what it references.
+/// Rows arrive in any order and are grouped here by table, kind and
+/// constraint name, each group's columns put in `position` order.
+fn keys(src: &mut dyn Source, tables: &mut [Table], keys_sql: &str) -> Result<()> {
+    let k = src.query(keys_sql, MAX_COLUMNS)?;
+    // (schema, table, kind, name) -> rows, keeping first-seen order.
+    let mut groups: Vec<((Option<String>, String, String, Option<String>), Vec<&Vec<Option<String>>>)> = Vec::new();
+    for r in &k.rows {
+        let id = (
+            k.get(r, "table_schema").map(str::to_string),
+            k.get(r, "table_name").unwrap_or_default().to_string(),
+            k.get(r, "key_kind").unwrap_or("primary").to_lowercase(),
+            k.get(r, "key_name").map(str::to_string),
+        );
+        match groups.iter_mut().find(|(g, _)| *g == id) {
+            Some((_, rows)) => rows.push(r),
+            None => groups.push((id, vec![r])),
+        }
+    }
+    for ((schema, name, kind, key_name), mut rows) in groups {
+        rows.sort_by_key(|r| k.get(r, "position").and_then(|n| n.parse::<i64>().ok()).unwrap_or(0));
+        let Some(table) = tables.iter_mut().find(|t| t.name == name && t.schema.as_deref() == schema.as_deref()) else { continue };
+        let columns: Vec<String> = rows.iter().filter_map(|r| k.get(r, "column_name")).map(str::to_string).collect();
+        if kind == "foreign" {
+            let first = rows[0];
+            table.foreign_keys.push(ForeignKey {
+                name: key_name,
+                columns,
+                references_schema: k.get(first, "ref_schema").map(str::to_string),
+                references_table: k.get(first, "ref_table").unwrap_or_default().to_string(),
+                references_columns: rows.iter().filter_map(|r| k.get(r, "ref_column")).map(str::to_string).collect(),
+            });
+        } else if table.primary_key.is_empty() {
+            table.primary_key = columns;
+        }
+    }
+    Ok(())
 }
 
 /// A schema predicate for a `WHERE`, over a column holding the schema
@@ -185,7 +250,28 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          WHERE {} ORDER BY 1, 2, col.ordinal_position",
         scope_clause("col.table_schema", scope)
     );
-    assemble(src, &tables, &columns)
+    let mut tables = assemble(src, &tables, &columns)?;
+    // pg_constraint holds the key columns as attribute numbers; unnest
+    // them with their ordinality so each row is one column in order, and
+    // for a foreign key the referenced column at the same ordinal.
+    let keys_sql = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, \
+         CASE con.contype WHEN 'p' THEN 'primary' ELSE 'foreign' END AS key_kind, con.conname AS key_name, \
+         a.attname AS column_name, k.ord::text AS position, \
+         rn.nspname AS ref_schema, rc.relname AS ref_table, ra.attname AS ref_column \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum \
+         LEFT JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+         LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+         LEFT JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[k.ord] \
+         WHERE con.contype IN ('p', 'f') AND {} ORDER BY 1, 2, 4, k.ord",
+        scope_clause("n.nspname", scope)
+    );
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
 }
 
 /// `system.tables` and `system.columns`, which carry comments and a row
@@ -208,7 +294,18 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          FROM system.columns WHERE {} ORDER BY 1, 2, position",
         scope_clause("database", scope)
     );
-    assemble(src, &tables, &columns)
+    let mut tables = assemble(src, &tables, &columns)?;
+    // system.tables.primary_key is one expression string, "a, b"; split
+    // it into its columns. ClickHouse has no foreign keys.
+    let keys_sql = format!(
+        "SELECT database AS table_schema, name AS table_name, 'primary' AS key_kind, '' AS key_name, \
+         trim(col) AS column_name, toString(pos) AS position, '' AS ref_schema, '' AS ref_table, '' AS ref_column \
+         FROM system.tables ARRAY JOIN splitByChar(',', primary_key) AS col, arrayEnumerate(splitByChar(',', primary_key)) AS pos \
+         WHERE primary_key != '' AND {} ORDER BY 1, 2, pos",
+        scope_clause("database", scope)
+    );
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
 }
 
 /// `information_schema` has everything MySQL keeps: the type, the length,
@@ -231,7 +328,21 @@ fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          column_comment AS column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", scope)
     );
-    assemble(src, &tables, &columns)
+    let mut tables = assemble(src, &tables, &columns)?;
+    let keys_sql = format!(
+        "SELECT kcu.table_schema AS table_schema, kcu.table_name AS table_name, \
+         IF(tc.constraint_type = 'PRIMARY KEY', 'primary', 'foreign') AS key_kind, kcu.constraint_name AS key_name, \
+         kcu.column_name AS column_name, CAST(kcu.ordinal_position AS CHAR) AS position, \
+         kcu.referenced_table_schema AS ref_schema, kcu.referenced_table_name AS ref_table, kcu.referenced_column_name AS ref_column \
+         FROM information_schema.key_column_usage kcu \
+         JOIN information_schema.table_constraints tc \
+           ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name \
+          AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name \
+         WHERE tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') AND {} ORDER BY 1, 2, 4, kcu.ordinal_position",
+        scope_clause("kcu.table_schema", scope)
+    );
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
 }
 
 /// `INFORMATION_SCHEMA` for the shape, `sys` for the rest: the row count
@@ -262,7 +373,34 @@ fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          WHERE {} ORDER BY 1, 2, c.ORDINAL_POSITION",
         scope_clause("c.TABLE_SCHEMA", scope)
     );
-    assemble(src, &tables, &columns)
+    let mut tables = assemble(src, &tables, &columns)?;
+    let keys_sql = format!(
+        "SELECT s.name AS table_schema, t.name AS table_name, 'primary' AS key_kind, kc.name AS key_name, \
+         col.name AS column_name, CAST(ic.key_ordinal AS VARCHAR(10)) AS position, \
+         NULL AS ref_schema, NULL AS ref_table, NULL AS ref_column \
+         FROM sys.key_constraints kc \
+         JOIN sys.tables t ON t.object_id = kc.parent_object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         JOIN sys.index_columns ic ON ic.object_id = t.object_id AND ic.index_id = kc.unique_index_id \
+         JOIN sys.columns col ON col.object_id = t.object_id AND col.column_id = ic.column_id \
+         WHERE kc.type = 'PK' AND {} \
+         UNION ALL \
+         SELECT s.name, t.name, 'foreign', fk.name, pc.name, CAST(fkc.constraint_column_id AS VARCHAR(10)), \
+         rs.name, rt.name, rc.name \
+         FROM sys.foreign_keys fk \
+         JOIN sys.tables t ON t.object_id = fk.parent_object_id \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+         JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+         JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id \
+         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+         JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+         WHERE {} ORDER BY 1, 2, 4, 6",
+        scope_clause("s.name", scope),
+        scope_clause("s.name", scope)
+    );
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
 }
 
 /// `information_schema` of the catalog the connection named, which the
@@ -311,6 +449,34 @@ fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
                 comment: None,
             })
             .collect();
+        // table_info's pk column is the column's position in the primary
+        // key, zero when it is not part of it.
+        let mut pk: Vec<(i64, String)> = c
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let pos = c.get(r, "pk")?.parse::<i64>().ok().filter(|p| *p > 0)?;
+                Some((pos, c.get(r, "name")?.to_string()))
+            })
+            .collect();
+        pk.sort();
+        let f = src.query(&format!("PRAGMA foreign_key_list(\"{}\")", name.replace('"', "\"\"")), MAX_COLUMNS)?;
+        let mut fks: Vec<(i64, ForeignKey)> = Vec::new();
+        for r in &f.rows {
+            let id: i64 = f.get(r, "id").and_then(|n| n.parse().ok()).unwrap_or(0);
+            let entry = match fks.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, fk)) => fk,
+                None => {
+                    fks.push((
+                        id,
+                        ForeignKey { references_table: f.get(r, "table").unwrap_or_default().to_string(), ..Default::default() },
+                    ));
+                    &mut fks.last_mut().unwrap().1
+                }
+            };
+            entry.columns.push(f.get(r, "from").unwrap_or_default().to_string());
+            entry.references_columns.push(f.get(r, "to").unwrap_or_default().to_string());
+        }
         tables.push(Table {
             schema: None,
             name,
@@ -318,6 +484,8 @@ fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
             rows: None,
             comment: None,
             columns,
+            primary_key: pk.into_iter().map(|(_, n)| n).collect(),
+            foreign_keys: fks.into_iter().map(|(_, fk)| fk).collect(),
         });
     }
     Ok(tables)

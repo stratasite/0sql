@@ -4,6 +4,7 @@
 //! B2's containers are where they get one.
 
 use super::*;
+use crate::catalogue::ForeignKey;
 
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zsql-source-{name}-{}", std::process::id()));
@@ -413,6 +414,24 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
     assert!(user.columns.iter().any(|c| c.name == "Host"), "typed columns");
     assert!(user.columns.windows(2).all(|w| w[0].position < w[1].position));
     assert!(user.columns.iter().any(|c| c.max_length.is_some()), "character_maximum_length is read");
+    assert_eq!(user.primary_key, ["Host", "User"], "a composite key, in order");
+    // The container's shop schema, from harness/sources/mysql-init.sql.
+    let shop = Catalogue::read(src.as_mut(), "my", Some("zsql")).expect("reads zsql");
+    let customers = shop.table(Some("zsql"), "customers").expect("customers");
+    assert_eq!(customers.comment.as_deref(), Some("Who buys"));
+    assert_eq!(customers.columns.iter().find(|c| c.name == "name").unwrap().comment.as_deref(), Some("As they sign"));
+    let orders = shop.table(Some("zsql"), "orders").expect("orders");
+    assert_eq!(orders.primary_key, ["id"]);
+    assert_eq!(
+        orders.foreign_keys,
+        [ForeignKey {
+            name: Some("orders_customer".into()),
+            columns: vec!["customer_id".into()],
+            references_schema: Some("zsql".into()),
+            references_table: "customers".into(),
+            references_columns: vec!["id".into()],
+        }]
+    );
 }
 
 /// SQL Server against a server the environment names: `ZSQL_TEST_MSSQL_HOST`,
