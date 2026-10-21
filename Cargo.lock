@@ -2608,6 +2608,7 @@ dependencies = [
  "zsql-server",
  "zsql-service",
  "zsql-shorthand",
+ "zsql-source",
  "zsql-spec",
 ]
 

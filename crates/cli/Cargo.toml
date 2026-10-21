@@ -23,6 +23,7 @@ server = ["dep:zsql-server"]
 [dependencies]
 zsql-server = { workspace = true, optional = true }
 zsql-service.workspace = true
+zsql-source.workspace = true
 zsql-project.workspace = true
 zsql-shorthand.workspace = true
 zsql-dialect.workspace = true
