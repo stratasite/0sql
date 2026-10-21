@@ -77,36 +77,71 @@ treated as off**, because the alternative is guessing from
 wants a non-string dimension sampled says so by giving it a
 `sample_sql`, which is an explicit act.
 
-Two existing flags stay as exclusions, and are named here so they are
-not forgotten when `values:` goes away: a `secure` field is not
-sampled, and neither is a field a security policy names as a trigger,
-by tag or by name. The sample file's own documentation already said the
-second one; nothing enforced it, because nothing wrote the file.
+Three existing properties stay as exclusions, and are named here so
+they are not forgotten when `values:` goes away: a `hidden` field, a
+`secure` field, and a field a security policy names as a trigger, by
+tag or by name. `crates/project/src/values.rs:8` already named all
+three; nothing enforced any of them, because nothing wrote the file.
 
-**`sample_size` and the total, so completeness is inferred.** Each
-record carries the `sample_size` the query ran with and the column's
-total distinct count. A sample is complete when the total is known and
-no greater than `sample_size`. Recording both, rather than a declared
-mode, means the file says what happened instead of what was asked for.
+`hidden` is the one most easily missed, and it is not redundant:
+`Model::values_of` serves hidden dimensions deliberately
+(`crates/service/src/lib.rs:526`, "hidden ones included"), so excluding
+them at collection is the only place it happens.
+
+And a gap worth stating rather than discovering: **`values_of` applies
+no security policy.** A sampled field that a `mask_data` policy would
+mask is served verbatim to any caller with read access on the branch.
+Excluding policy *trigger* fields at collection does not cover a field
+whose values a policy filters or masks for some callers. Closing that
+means evaluating policies on the values read path, which is not this
+plan's work, but collection should not make it worse — so a field named
+by any policy, in any role, is excluded until that path exists.
+
+**`sample_size`, and completeness inferred from what is already
+there.** The record format already carries most of this:
+`DimensionValues.distinct` is the column's total distinct count, and
+`values.len()` is how many came back — `crates/cli/src/show.rs:196`
+already prints "N of M values" from exactly those two. So the only new
+field is `sample_size`, the limit the query ran with, and it earns its
+place in one case: when the total was refused by budget, `distinct` is
+absent and `values.len() == sample_size` is the only thing that says
+the sample is truncated rather than complete.
+
+A sample is complete when the total is known and no greater than
+`sample_size`; truncated when the list is as long as the limit; and of
+unknown completeness otherwise. The file says what happened instead of
+what was asked for, which is the point of dropping the declared mode.
 
 Getting an exact total costs a `COUNT(DISTINCT …)`, so it is batched:
-one query per table computing the distinct count of every sampled
-column at once, which is one scan rather than one per column. Where a
-total is refused by budget, the record carries the sample with the
-total absent, and completeness reads as unknown rather than as
-complete. The cheap alternative — ask for `sample_size + 1` rows and
-infer truncation from getting them — is noted because it costs nothing,
-but it answers "is it complete" without answering "how many are there",
-and the second answer is the one a consumer wants.
+one query per table over every sampled column at once, which is one
+scan rather than one per column. The cheap alternative — ask for
+`sample_size + 1` rows and infer truncation from getting them — costs
+nothing but answers "is it complete" without answering "how many are
+there", and the second answer is the one a consumer wants.
+
+**`mode` leaves the record and `range` stays unwritten.** `mode` had
+no source once `values:` is gone, so it comes out of
+`DimensionValues`; the struct is not `deny_unknown_fields`, so a sample
+file written by the old external tooling still loads with its `mode`
+ignored. `range` stays in the struct and is simply never written,
+because `show.rs:183` branches on it and an existing file that has one
+should keep rendering. That keeps the change to `GET /values/{dim}` and
+the `values` MCP tool additive, which matters more than tidiness:
+`crates/server/src/parity_tests.rs:239` asserts that response equals
+`Model::values_of` over more than forty specs, so the record is a
+tested public contract, not an internal format.
+
+**`sample_size` needs a ceiling, because the failure mode is total.**
+`ValueCatalog::write` enforces no size limit, `read` refuses past
+`INFLATED_LIMIT` (256 MB inflated), and
+`crates/project/src/lib.rs:1616` turns that refusal into a *warning*
+with `values: None` — so one dimension with an enormous
+`sample_size` silently costs every other dimension its values. The cap
+belongs at write time, as a refusal naming the dimension, not at read
+time as a warning about the file.
 
 **The generated sampling query.** When a dimension has no
-`sample_sql`, 0sql writes it with the SQL layer it already has —
-`crates/planner/src/sql/expr.rs` to render the field's expression and
-`crates/planner/src/sql/builder.rs` to assemble the statement — so the
-dialect, the quoting and the expression are the planner's, not a
-`format!`. A dimension may be an expression rather than a bare column
-(`expression: {sql: …}`, a lookup, an array), which is exactly why the
-rendering has to go through that layer:
+`sample_sql`, 0sql writes the statement for it:
 
 ```sql
 SELECT <rendered expression> AS v, COUNT(*) AS n
@@ -117,81 +152,145 @@ ORDER BY n DESC
 LIMIT <sample_size>
 ```
 
-Most frequent first, which is what the record format already stores and
-what every consumer wants. Two things about it that are easy to miss:
+Most frequent first, which is what the record format already stores
+and what every consumer wants. Four things about it are harder than
+they look.
 
-- **The partition predicate is not optional.** `Partition` on a table
-  carries a dimension, a predicate and filter values, and a `GROUP BY`
-  over a partitioned fact table with no partition filter is a full
-  scan of the whole history. The model already holds what is needed to
-  avoid that, so sampling applies it, and a table whose partition
-  cannot be satisfied is skipped with a reason rather than scanned.
-- **This is the first feature that runs generated SQL, so the row
-  limit has to be dialect-correct first.** `Plan::sql_with_limit`,
-  `crates/planner/src/dag.rs` and `crates/planner/src/sql/builder.rs`
-  each append `"LIMIT n"` with no dialect indirection, and
-  `dialects/sqlserver.yml` has no limit, offset or fetch template
-  because SQL Server has no `LIMIT`. Nothing catches it today: the
-  goldens compare text and nothing executes. A dialect-rendered limit
-  is a prerequisite for sampling, not a follow-up, and it is its own
-  commit.
+**There is no reusable expression renderer, and the first draft of this
+plan was wrong to claim one.** `crates/planner/src/sql/expr.rs` is
+`qualify`, `column_gsub` and `entity_gsub` — string rewrites over an
+SQL fragment that is already known. The real renderer is
+`expression_sql` in `crates/planner/src/visitors/sql.rs:651`, it is
+private, and its `Ctx` holds a `&Graph`, a `&Universe` and an `&RQuery`
+— a planned query graph, which a sampling command does not have.
+`sql::builder::Builder` carries no dialect at all; `to_sql` is
+dialect-free assembly. So what sampling can actually reuse is
+`expr::qualify` plus `Dialect::quote`, which covers a dimension that is
+a column or a plain `expression: {sql: …}` over its own table. That is
+the honest scope of phase D.
+
+**Which means calculated, lookup and array dimensions are out of
+scope.** A calculated dimension resolves through
+`ref_to_sql_on_node` (`visitors/sql.rs:657`), which needs sibling nodes
+that a one-table sampling query does not have. An `array` expression
+needs `dialect.array_unnest_join` via the private `unnest_array`
+(`visitors/sql.rs:243`), and `GROUP BY` over an array or variant column
+is invalid on BigQuery and Snowflake anyway. These dimensions are
+skipped with a reason, and `sample_sql` is how an author samples one.
+That is a large part of what `sample_sql` is for, and a better
+justification for it than "a custom query".
+
+**Partition filters cannot be taken from the model, and the first
+draft was wrong about this too.** The planner never emits a partition
+predicate: `partition_score` in `crates/planner/src/pruner.rs:101` only
+*ranks* candidate tables by whether the caller's own filters fall
+inside a partition, and `within_partition` is a comparison, not a
+renderer. Worse, `Partition.filter_value` is an authoring default
+rather than the current partition — across the golden universes the
+partitions are all `between`, with values like `1980-01-01` to
+`1995-01-01`, and `crates/cli/src/templates.rs` documents relative
+tokens such as `2y` that need `sql/dates.rs` to become dates.
+Rendering those verbatim would sample a stale historical window and
+silently bias every sampled dimension on a partitioned table, which is
+worse than not sampling it. So: a partitioned table is sampled only
+with an explicit window — `--since`, or the author's own `sample_sql` —
+and is otherwise skipped with a reason. "Skip when the partition cannot
+be satisfied" was no protection, because every partition in every
+fixture has a value.
+
+**`COUNT(*)` counts the rows of the table the dimension lives on.** On
+a dimension table that is dimension rows, so a near-unique column
+returns `n = 1` for every value and "most frequent first" degenerates
+to arbitrary order — which `show.rs:196` and
+`crates/cli/src/assist.rs:54` both present as meaningful. Weighting by
+the fact table needs a join this template cannot express. The
+frequency is therefore documented as "rows of this dimension's own
+table", and a fact-weighted count is a later question.
 
 **`sample_sql`, and what it is allowed to be.** The author's query is
 used as given, in their dialect, against their warehouse, from their
-machine. Its contract: it returns the value in the first column and,
-optionally, a count in a second; it applies its own limit, and 0sql
-records the `sample_size` it was configured with so the record stays
-readable. Raw SQL in a model is not a new idea here —
-`expression: {sql: …}` is already a field key — but `sample_sql` is
-different in one way that matters: it is *executed*, and it travels in
-the deploy archive. So if a server-side sampling path is ever built, a
-deployed `sample_sql` must not run with server credentials. It is
-stripped from the archive, or refused there; decided now, while there
-is no such path to forget about.
+machine. Its contract: the value is the first column and an optional
+count is the second; it applies its own limit, and 0sql records the
+`sample_size` it was configured with so the record stays readable.
 
-### The rename has two mechanical consequences
+It is not stripped from the deploy archive, and it should not be.
+`crates/cli/src/project.rs:120` adds every `models/**/*.yml`
+byte-for-byte; only `datasources.yml` is parsed, stripped and
+re-serialized. Stripping a key inside a model file would mean parsing
+and re-emitting all of them, which destroys comments and key order in
+files that `zsql init` writes as mostly comments. So the rule is the
+other way round: **a deployed `sample_sql` is never executed.** There
+is no server-side sampling path today, and if one is ever built it
+ignores `sample_sql` entirely and samples only what it can generate
+itself. That is a one-line rule in the right place instead of an
+archive rewrite, and it is decided here rather than left open.
+
+### The rename has four mechanical consequences
+
+**The snapshot format number must be raised to 2.**
+`crates/semantic/src/snapshot.rs:13` holds `FORMAT: u32 = 1`, and its
+own doc comment says to raise it "in the same change that makes a
+snapshot a reader of the previous number could not understand: a field
+added without a serde default, or one renamed or removed, since every
+struct here is `deny_unknown_fields`." This change renames one field
+and removes another, which is both cases at once. Aliases fix only the
+read direction; the new build *writes* `sample_size`, and
+`crates/service/src/lib.rs` writes a real `snapshot.json.gz` per
+deployed branch. Without the bump, a rollback to the previous server —
+which `docs/releasing.md` and the last two releases treat as the
+standard recovery — reads a snapshot it cannot parse and reports a raw
+serde error instead of the "deploy it again from its project" message
+that the `Newer` branch exists to give. `FORMAT = 2` is part of phase
+A, not an afterthought.
 
 **The goldens carry the old names, and the goldens are never edited.**
 `fixtures/golden/universes/*.json.gz` hold serialized snapshots whose
 fields include `disable_listing` and `value_list_size` —
 `value_list_size` appears 24,034 times — and `zsql_semantic::Field` is
-`#[serde(deny_unknown_fields)]`. So renaming the Rust fields without
+`#[serde(deny_unknown_fields)]` with `value_list_size` carrying no
+serde default, so it is load-bearing. Renaming without
 `#[serde(alias = "value_list_size")]` and
 `#[serde(alias = "disable_listing")]` breaks the deserialization of
-every golden universe and takes the whole scoreboard with it. The
-aliases are mandatory, not a courtesy.
+every golden universe and takes the scoreboard with it. `alias` does
+compose with `deny_unknown_fields`. `value_sampling` is absent from
+every golden universe, so removing it is deserialization-safe.
 
-The same courtesy is owed to projects in the wild, where the YAML keys
-are the ones people typed: the loader keeps `disable_listing`,
-`disable_value_listing` and `value_list_size` in `FIELD_KEYS` as
-accepted spellings that load with a warning, and `values:` likewise —
-accepted, ignored, warned — rather than becoming an unknown-key
-refusal on someone's existing model.
+**Dropping a YAML key loses the author's setting quietly, not loudly.**
+`unknown_keys` in `crates/project/src/lib.rs:453` warns and ignores, so
+removing `disable_listing`, `disable_value_listing` and `value_list_size`
+from `FIELD_KEYS` would not refuse a project — it would silently
+discard what the author wrote and emit a line in a warnings list
+nobody reads. That is worse than a refusal. So the old spellings stay
+in `FIELD_KEYS` and keep working, mapped onto the new fields, with a
+deprecation warning that names the new key. `values:` stays accepted
+too, ignored with a warning, because its declaration has never had any
+effect: nothing reads `value_sampling` today, and nothing writes the
+sample file, so an author who set `values: full` loses nothing real
+when it goes.
 
-**One literal needs renaming in lockstep.** `crates/planner/src/
-pruner.rs` emits `"value_list_size": 0` inside a synthetic field it
-builds as JSON. It is the only place outside the loader and the
-snapshot that names the key.
-
-**And a note on what these keys do today: nothing.** Neither
-`disable_listing` nor `value_list_size` is read anywhere.
-`Model::values_of` serves whatever the sample file holds and consults
-neither. So the rename is free of behaviour change, and it is worth
-being clear that `disable_sampling` governs *collection* only. If
-controlling *exposure* of already-collected values is ever wanted,
-that is a different key, and conflating the two would be the easy
-mistake.
+**Two literals and eight fixtures.** `crates/planner/src/pruner.rs:188`
+emits `"value_list_size": 0` inside a synthetic field it builds as
+JSON, and `docs/ossie.md:117` names the key in prose. Eight files under
+`fixtures/projects/grocery-store/models/` set `disable_listing:`, so
+the repository's own fixture project starts warning in phase A unless
+they are updated — and they are fixtures, not goldens, so updating them
+is allowed.
 
 ### What the authoring surface has to say
 
 The change is not done when the code compiles. Three places speak to
 people and to agents, and all three name the old keys:
 
-- `crates/cli/src/templates.rs` — the commented field block that
-  `zsql init` writes shows `values: sample  # sample | full | none`.
-  It becomes `sample_size`, `disable_sampling` and `sample_sql`, with
-  the string-only default stated in the comment, since this template
-  is where most authors learn the key exists.
+- `crates/cli/src/templates.rs` — two separate edits. The commented
+  field block shows `values: sample  # sample | full | none`, and
+  becomes `sample_size`, `disable_sampling` and `sample_sql` with the
+  string-only default stated, since this template is where most
+  authors learn a key exists. And the `datasources.yml` preamble says
+  of `host`, `port`, `database` and `username` that "every one of those
+  keys is ignored and none of them is kept" — which `zsql introspect`
+  makes false. It has to say instead that 0sql reads them locally to
+  connect, that the deploy still uploads them, and that only the
+  secret-shaped names are stripped.
 - `crates/server/src/mcp_prompts.json` — the `values` tool description
   says values come back "when the project uploaded samples". Uploading
   is no longer the only way they arrive, and an agent should be told
@@ -229,6 +328,15 @@ things follow from that separation, and they are the reason for it:
   contradicts — without running a query.
 - **Drift becomes a report**, and with the catalogue committed, a pull
   request.
+
+The comparison is not string equality. `crates/planner/src/sql/expr.rs`
+already encodes the asymmetry that makes this hard: a bare identifier
+matches case-insensitively while a quoted one matches exactly, per the
+dialect's own quote pair. So `check` folds the way the datasource's
+dialect folds — Snowflake upper, Postgres lower, BigQuery and
+ClickHouse case-sensitive — and a `physical_name` the author quoted is
+compared verbatim. Getting this wrong produces a wall of false
+positives on the first run, which is how a checker gets turned off.
 
 **What generation infers, and how loudly.** A generated model is a
 draft for a human, so every inference is annotated in the YAML with
@@ -353,15 +461,27 @@ the dialect layer that already exists, pointed at two fixed statements.
 
 ## Phases
 
-- [ ] **A — the keys.** The dialect-rendered row limit and its goldens,
-      first and on its own. Then `disable_sampling`, `sample_size`,
-      `sample_sql`, the removal of `values:`, the string-only default,
-      the serde aliases the goldens need, the `pruner.rs` literal, the
-      loader's accepted-with-a-warning spellings, and the three
-      authoring surfaces. No connection yet, so this phase is pure
-      refactor and ships behind nothing. *Gate:* the golden scoreboard
-      unchanged, and a test that loads a project using every old
-      spelling and warns on each.
+Phase A is the only one with a hard internal order, because the limit
+fix and the format bump both have to land before anything writes a
+snapshot or runs a statement.
+
+- [ ] **A1 — the dialect-rendered row limit.** `LIMIT`, `TOP n` in the
+      `SELECT` clause, and `OFFSET … FETCH` where an `ORDER BY` exists,
+      through the dialect rather than three `format!` calls.
+      `crates/golden/tests/limit.rs` becomes a per-dialect assertion.
+      *Gate:* the golden scoreboard unchanged **and** `limit.rs`
+      covering every adapter.
+- [ ] **A2 — the keys.** `disable_sampling`, `sample_size`,
+      `sample_sql`; `values:` and `ValueSampling` removed; the
+      string-only default with an absent `data_type` off; `hidden`,
+      `secure` and policy-named fields excluded; `FORMAT = 2`; the
+      serde aliases the goldens need; the `pruner.rs` literal; the old
+      YAML spellings kept in `FIELD_KEYS` and deprecation-warned; the
+      eight grocery-store fixtures; `docs/ossie.md`; the three
+      authoring surfaces. *Gate:* the scoreboard unchanged; a test that
+      loads a project using every old spelling and warns once per key
+      while still applying the setting; a snapshot round-trip test that
+      a `FORMAT = 1` snapshot still reads.
 - [ ] **B — connect and read.** The connection from `datasources.yml`,
       `.zsql` and `ZSQL_DS_<KEY>_*`; a `Catalogue` type;
       `zsql introspect` writing `catalogue.json` for two adapters
@@ -370,13 +490,15 @@ the dialect layer that already exists, pointed at two fixed statements.
       build time measured against `docs/execution-engine.md`'s table.
 - [ ] **C — model from catalogue.** Generation with marked inferences;
       diff-and-patch on re-run with `--dry-run` the default for an
-      existing project; `zsql check` against a catalogue; a drift
-      report between two catalogues.
-- [ ] **D — sampling.** The generated query through the planner's SQL
-      layer, partition predicates applied, batched distinct counts, the
-      budget and the estimate, `sample_sql`, and the governance rules
-      above written into the command, the template and the file's
-      documentation.
+      existing project; `zsql check` against a catalogue with
+      dialect-correct folding; a drift report between two catalogues.
+- [ ] **D — sampling.** Column and plain-`sql` dimensions only, with
+      calculated, lookup and array dimensions skipped with a reason;
+      partitioned tables requiring an explicit window; batched distinct
+      counts; the `sample_size` ceiling enforced at write; the budget,
+      the estimate and `--dry-run`; `sample_sql`, never executed from a
+      deployed project; and the governance rules written into the
+      command, the template and the file's documentation.
 - [ ] **E — the rest of the adapters**, ordered by who asks.
 - [ ] **F — the corpus**, as its own decision and its own document,
       drawing on the goldens, the refusals and the corrections as much
@@ -396,6 +518,10 @@ the dialect layer that already exists, pointed at two fixed statements.
 - Whether a batched `COUNT(DISTINCT …)` over every sampled column of a
   wide table beats one query per column. It should on a columnar
   warehouse and may not on a row store.
-- Whether any project in the wild sets `values: full`, since that
-  declaration disappears and those authors get the inferred answer
-  instead.
+- Whether any deployed project has a `samples/values.jsonl.gz` from
+  the old external tooling, and whether any of those records carry a
+  `range`. If none do, `range` can leave the record rather than
+  staying unwritten, and `show.rs` simplifies with it.
+- Whether a deployed snapshot anywhere predates `FORMAT = 1`, which
+  decides whether the bump needs a migration path or only the `Newer`
+  message.
