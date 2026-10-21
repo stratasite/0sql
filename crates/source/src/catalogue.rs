@@ -508,3 +508,82 @@ fn now() -> String {
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
+
+// --------------------------------------------------------------------- drift
+
+/// What changed between two reads of the same datasource: the schema's
+/// drift, which is what a committed catalogue is for.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Drift {
+    pub tables_added: Vec<String>,
+    pub tables_dropped: Vec<String>,
+    /// (table, column)
+    pub columns_added: Vec<(String, String)>,
+    pub columns_dropped: Vec<(String, String)>,
+    /// (table, column, was, now)
+    pub columns_retyped: Vec<(String, String, String, String)>,
+}
+
+impl Drift {
+    pub fn is_empty(&self) -> bool {
+        self.tables_added.is_empty()
+            && self.tables_dropped.is_empty()
+            && self.columns_added.is_empty()
+            && self.columns_dropped.is_empty()
+            && self.columns_retyped.is_empty()
+    }
+
+    /// From `before` to `after`, by qualified table name and column name.
+    pub fn between(before: &Catalogue, after: &Catalogue) -> Drift {
+        let key = |t: &Table| t.physical_name().to_lowercase();
+        let mut d = Drift::default();
+        for t in &after.tables {
+            match before.tables.iter().find(|b| key(b) == key(t)) {
+                None => d.tables_added.push(t.physical_name()),
+                Some(b) => {
+                    for c in &t.columns {
+                        match b.columns.iter().find(|bc| bc.name.eq_ignore_ascii_case(&c.name)) {
+                            None => d.columns_added.push((t.physical_name(), c.name.clone())),
+                            Some(bc) if !bc.data_type.eq_ignore_ascii_case(&c.data_type) => {
+                                d.columns_retyped.push((t.physical_name(), c.name.clone(), bc.data_type.clone(), c.data_type.clone()))
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    for bc in &b.columns {
+                        if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bc.name)) {
+                            d.columns_dropped.push((t.physical_name(), bc.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for b in &before.tables {
+            if !after.tables.iter().any(|t| key(t) == key(b)) {
+                d.tables_dropped.push(b.physical_name());
+            }
+        }
+        d
+    }
+
+    /// One line per change, in the order a reader wants them.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in &self.tables_added {
+            out.push(format!("table added:    {t}"));
+        }
+        for t in &self.tables_dropped {
+            out.push(format!("table dropped:  {t}"));
+        }
+        for (t, c) in &self.columns_added {
+            out.push(format!("column added:   {t}.{c}"));
+        }
+        for (t, c) in &self.columns_dropped {
+            out.push(format!("column dropped: {t}.{c}"));
+        }
+        for (t, c, was, now) in &self.columns_retyped {
+            out.push(format!("column retyped: {t}.{c}: {was} -> {now}"));
+        }
+        out
+    }
+}

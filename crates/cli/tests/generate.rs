@@ -82,7 +82,12 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
 
     // The warehouse grows two columns: listed with the command to add them.
     db.execute_batch("ALTER TABLE orders ADD COLUMN status VARCHAR(20); ALTER TABLE orders ADD COLUMN discount NUMERIC(6,2);").unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    let (ok, out) = run(zsql(&home, &project).args(["introspect", "local"]));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("column added:   orders.status") && out.contains("column added:   orders.discount"),
+        "drift is reported before the catalogue is replaced:\n{out}"
+    );
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
     assert!(ok && out.contains("2 new columns: status, discount"), "{out}");
     assert!(out.contains("--table orders --columns status,discount"), "the exact command is printed: {out}");
@@ -105,12 +110,19 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
 
     // The warehouse changes under the model: check names what is gone.
     db.execute_batch("ALTER TABLE orders DROP COLUMN status; ALTER TABLE customers RENAME TO clients;").unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    let (ok, out) = run(zsql(&home, &project).args(["introspect", "local"]));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("column dropped: orders.status")
+            && out.contains("table dropped:  customers")
+            && out.contains("table added:    clients"),
+        "{out}"
+    );
     let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(!ok, "a missing table and column fail the check:\n{out}");
     assert!(out.contains("table Customers names customers, which the warehouse does not have"), "{out}");
     assert!(out.contains("orders has no column status"), "{out}");
-    assert!(out.contains("tables checked against catalogue"), "{out}");
+    assert!(out.contains("checked against catalogue"), "{out}");
     db.execute_batch("ALTER TABLE clients RENAME TO customers; ALTER TABLE orders ADD COLUMN status VARCHAR(20);").unwrap();
     assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
     let (ok, out) = run(zsql(&home, &project).arg("check"));

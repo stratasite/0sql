@@ -5,7 +5,7 @@ use crate::config;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::time::Instant;
-use zsql_source::{Catalogue, Connection};
+use zsql_source::{Catalogue, Connection, Drift};
 
 /// Where a datasource's catalogue is written: one file per datasource,
 /// so re-reading one never rewrites another, and committed rather than
@@ -52,6 +52,16 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
         let cat = Catalogue::read(src.as_mut(), &conn.uid, scope.as_deref()).with_context(|| format!("reading {}", conn.uid))?;
 
         let out = path(&project.dir, &conn.uid);
+        // What moved since the committed catalogue, said before it is replaced.
+        if let Some(before) = std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<Catalogue>(&t).ok()) {
+            let drift = Drift::between(&before, &cat);
+            if !drift.is_empty() {
+                println!("{}: since the catalogue read {}:", conn.uid, before.read_at.get(..10).unwrap_or(&before.read_at));
+                for line in drift.lines() {
+                    println!("  {line}");
+                }
+            }
+        }
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }

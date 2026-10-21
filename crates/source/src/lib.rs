@@ -28,7 +28,7 @@ pub mod sqlserver;
 pub mod tls;
 pub mod trino;
 
-pub use catalogue::{Catalogue, Column, Table};
+pub use catalogue::{Catalogue, Column, Drift, ForeignKey, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
