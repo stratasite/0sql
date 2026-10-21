@@ -23,6 +23,12 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    # The pair in tls/ so it offers TLS, and the shop schema with keys;
+    # both run once, on first start, from docker-entrypoint-initdb.d.
+    volumes:
+      - ./tls:/tls:ro
+      - ./postgres-tls.sh:/docker-entrypoint-initdb.d/tls.sh:ro
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/shop.sql:ro
 
   mysql:
     image: mysql:8
