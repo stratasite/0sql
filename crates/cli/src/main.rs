@@ -7,6 +7,7 @@
 //! the same reads against what the server holds. `--server` and
 //! `--uid` imply `-r`; `ZSQL_SERVER` in the environment does not.
 
+mod assist;
 mod config;
 mod deploy;
 mod failure;

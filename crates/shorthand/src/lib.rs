@@ -18,6 +18,7 @@
 //! `expand (...) with (...)`. `limit N` and `via table` are the settings,
 //! and `{...}` merges spec JSON into the query or the item before it.
 
+pub mod complete;
 #[cfg(test)]
 mod corner_tests;
 mod lower;
