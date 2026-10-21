@@ -1,12 +1,15 @@
 //! Sampled dimension values: what a dimension's column actually holds,
 //! so a question like "shoes" can be matched to a value before any
-//! warehouse probe. Written by the project's own tooling to
-//! `samples/values.jsonl.gz`, one JSON object per line, gzipped, and
-//! shipped with the model; 0sql never runs SQL to make it.
+//! warehouse probe. `zsql sample` writes it to `samples/values.jsonl.gz`,
+//! one JSON object per line, gzipped, from the warehouse, for every
+//! dimension whose model says `enable_sampling: true` — never a hidden
+//! dimension, never one a security policy names — and it ships with the
+//! model on deploy.
 //!
-//! The file is customer data: gitignored by default, and best kept to
-//! dimensions that are listable (not hidden, listing not disabled, not
-//! named by a security policy's triggers).
+//! The file is customer data. It is gitignored by default, and committing
+//! it is a decision about where those values may go. Collecting it for a
+//! project's own model is one consent; pooling it into anything beyond
+//! that project is a second, separate one, and nothing here does that.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
