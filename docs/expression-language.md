@@ -1,8 +1,9 @@
 # The expression language, rewritten
 
-A proposal. The current shorthand (`crates/shorthand`) reads each comma
-item by keyword search and covers four shapes of the spec. This replaces
-it with a small formal grammar that reaches every attribute of the
+Implemented 2026-10-20 in `crates/shorthand` (parser, lowering, tests)
+and released as 0.6.1; the request field is still `expr`. The shorthand
+this replaced read each comma item by keyword search and covered four
+shapes of the spec. This is a small formal grammar that reaches every attribute of the
 query spec, written to be cheap in tokens for a model and to read like
 SQL for a person at a prompt. Nothing here is backward compatible with
 the shorthand, by design.
@@ -645,7 +646,7 @@ item category, orders, expand (customer id, item category = Books) with (item ca
 {"projections": [{"field": "item category"}, {"field": "orders"}],
  "segments": [{"name": "Book pairs", "keys": ["customer id"],
                "filters": [{"field": "item category", "predicate": "equals", "value": "Books"}],
-               "expanding": [{"field": "item category", "as": "Also bought"}],
+               "expanding": [{"field": "item category", "alias": "Also bought"}],
                "join": "left", "pair_dedupe": "none"}]}
 ```
 
@@ -720,8 +721,9 @@ bare multi-word names and the planner substitutes by name.
 
 ## Implementation sketch
 
-A new crate replaces `zsql-shorthand`: a hand-written recursive-descent
-parser over the input bytes, with no separate lexer and no parser
+`zsql-shorthand` is rewritten in place, keeping its name and its two
+entry points: a hand-written recursive-descent parser over the input
+bytes, with no separate lexer and no parser
 library, producing a typed AST whose every node carries a byte span,
 then a lowering to the spec `Value`, and `describe` from the AST rather
 than the JSON. No lexer because the grammar is scannerless and
@@ -736,7 +738,10 @@ error messages above are each a commit point plus a sentence, which
 hand-written code states directly and pest or nom cannot. Spans are
 byte offsets, turned into line and column only when an error is
 rendered. The PEG in this document is the specification and the
-goldens are the proof that the code agrees with it. The lowering is
+goldens are the proof that the code agrees with it. The spec lowering
+in `crates/spec` now resolves partition and order references by uid,
+name or alias against the projected dimensions and refuses a miss,
+which `crates/golden/tests/spec.rs` pins. The lowering is
 model-free: it emits names as written, lowers `@d`/`@m` to
 `field_type`, turns a moving frame's row count into `size`, and flattens
 a tree with no `or` into the array form. Resolution of partition and

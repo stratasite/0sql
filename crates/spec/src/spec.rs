@@ -450,25 +450,58 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
         projections.insert(at, calc);
     }
 
-    // Rails `Decorator#cleanup_partition_and_order_by`: a window's or
-    // contribution's partition and order refs keep only projected dimensions.
-    let dim_uids: Vec<String> = projections
+    // Rails `Decorator#cleanup_partition_and_order_by`, resolved rather
+    // than pruned: a window's or contribution's partition and order refs
+    // name projected dimensions, by uid, name or alias, and are rewritten
+    // to the uid. One that names no projected dimension is an error, where
+    // Rails dropped it and planned a different query without a word.
+    let dims: Vec<(String, String, String)> = projections
         .iter()
         .filter(|p| p.field_kind == Some(FieldKind::Dimension) && !p.is_calculation())
-        .filter_map(|p| p.field_uid.clone())
+        .filter_map(|p| {
+            let uid = p.field_uid.clone()?;
+            let name = cx.universe.field_by_uid(&uid, Some(FieldKind::Dimension)).map(|f| f.name.to_lowercase()).unwrap_or_default();
+            Some((uid, name, display_alias(&cx, p).trim().to_lowercase()))
+        })
         .collect();
-    for p in projections.iter_mut() {
+    let owners: Vec<String> = projections.iter().map(|p| display_alias(&cx, p)).collect();
+    for (p, owner) in projections.iter_mut().zip(owners) {
         for d in p.decorators.iter_mut() {
+            let label = decorator_type_key(d.kind);
+            let resolve = |r: &str| -> Result<String> {
+                let want = r.trim().to_lowercase();
+                dims.iter()
+                    .find(|(uid, name, alias)| uid.to_lowercase() == want || *name == want || *alias == want)
+                    .map(|(uid, _, _)| uid.clone())
+                    .ok_or_else(|| {
+                        record_invalid(format!(
+                            "{label} on {owner}: '{}' is not a projected dimension; partition and order refs name a dimension the query projects",
+                            r.trim()
+                        ))
+                    })
+            };
             if let Some(Value::Array(refs)) = d.attrs.get_mut("partition_refs") {
                 // `-1` (auto partition) may be written as a number or a string.
-                refs.retain(|r| match r {
-                    Value::String(s) => s == "-1" || dim_uids.iter().any(|u| u == s),
-                    Value::Number(n) => n.as_i64() == Some(-1),
-                    _ => false,
-                });
+                let mut resolved = Vec::with_capacity(refs.len());
+                for r in refs.iter() {
+                    match r {
+                        Value::String(s) if s == "-1" => resolved.push(r.clone()),
+                        Value::Number(n) if n.as_i64() == Some(-1) => resolved.push(r.clone()),
+                        Value::String(s) => resolved.push(Value::String(resolve(s)?)),
+                        other => {
+                            return Err(invalid(format!("{label} on {owner}: partition_refs holds {other}, not a dimension reference")))
+                        }
+                    }
+                }
+                *refs = resolved;
             }
             if let Some(Value::Object(order)) = d.attrs.get_mut("order_by") {
-                order.retain(|k, _| k == "-1" || dim_uids.contains(k));
+                let mut resolved = serde_json::Map::new();
+                for (k, v) in order.iter() {
+                    let key = if k == "-1" { k.clone() } else { resolve(k)? };
+                    resolved.insert(key, v.clone());
+                }
+                *order = resolved;
             }
         }
     }
