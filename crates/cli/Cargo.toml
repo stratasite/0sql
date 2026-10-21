@@ -35,7 +35,7 @@ serde_yaml.workspace = true
 flate2.workspace = true
 tar = "0.4"
 ureq = { version = "3", features = ["json"] }
-rustyline = "15"
+rustyline = "19"
 libc = "0.2"
 
 [lints]
