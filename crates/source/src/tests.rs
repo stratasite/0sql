@@ -198,3 +198,70 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
     let err = src.query("SELECT * FROM generate_series(1, 100)", 10).unwrap_err().to_string();
     assert!(err.contains("more than the 10 rows"), "the cap refuses rather than truncates: {err}");
 }
+
+/// SQLite needs no server, so this is the one transport the ordinary test
+/// run proves end to end: a read, a null, the row cap, and a write refused
+/// by the file's own read-only flag before the guard is even consulted.
+#[test]
+fn sqlite_reads_its_file_and_cannot_write_it() {
+    let dir = temp("sqlite");
+    let file = dir.join("t.db");
+    {
+        let db = rusqlite::Connection::open(&file).unwrap();
+        db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, note TEXT); INSERT INTO t VALUES (1, 'a', NULL), (2, 'b', 'x'), (3, 'c', 'y');")
+            .unwrap();
+    }
+    let conn = Connection { uid: "local".into(), adapter: "sqlite".into(), file: Some(file.clone()), ..Default::default() };
+    let mut src = open(&conn, None).expect("opens");
+    assert_eq!(src.adapter(), "sqlite");
+
+    let rows = src.query("SELECT id, name, note FROM t ORDER BY id", 10).unwrap();
+    assert_eq!(rows.columns, ["id", "name", "note"]);
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.get(&rows.rows[0], "name"), Some("a"));
+    assert_eq!(rows.get(&rows.rows[0], "note"), None, "null is none, not the word null");
+    assert_eq!(rows.get(&rows.rows[1], "id"), Some("2"), "numbers come back as text");
+
+    let err = src.query("SELECT id FROM t", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "the cap refuses rather than trims: {err}");
+
+    // Refused by the guard, and if it ever were not, by the file.
+    assert!(src.query("DELETE FROM t", 1).is_err());
+    let missing = Connection { uid: "none".into(), adapter: "sqlite".into(), ..Default::default() };
+    let err = open(&missing, None).err().unwrap().to_string();
+    assert!(err.contains("has no file"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The HTTP transport against a ClickHouse the environment names:
+/// `ZSQL_TEST_CLICKHOUSE_URL` (and `_USER`, `_PASSWORD` when it wants
+/// them). Ignored otherwise. The public playground at
+/// `https://play.clickhouse.com` with user `play` is enough to run it by
+/// hand; CI points it at a container.
+#[test]
+#[ignore]
+fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
+    let conn = Connection {
+        uid: "ch".into(),
+        adapter: "clickhouse".into(),
+        url: Some(std::env::var("ZSQL_TEST_CLICKHOUSE_URL").expect("ZSQL_TEST_CLICKHOUSE_URL")),
+        username: std::env::var("ZSQL_TEST_CLICKHOUSE_USER").ok(),
+        ..Default::default()
+    };
+    let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
+    let mut src = open(&conn, secret).expect("opens");
+
+    let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three, 1.5 AS four", 10).expect("reads");
+    assert_eq!(rows.columns, ["one", "two", "three", "four"]);
+    assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
+    assert_eq!(rows.get(&rows.rows[0], "two"), Some("two"));
+    assert_eq!(rows.get(&rows.rows[0], "three"), None);
+    assert_eq!(rows.get(&rows.rows[0], "four"), Some("1.5"));
+
+    // Past the cap the server throws, which is what result_overflow_mode asks.
+    let err = src.query("SELECT number FROM system.numbers LIMIT 100", 10).err().unwrap().to_string();
+    assert!(err.contains("ch"), "named: {err}");
+
+    // The guard refuses first; the server's readonly mode would refuse second.
+    assert!(src.query("CREATE TABLE zsql_no (a UInt8) ENGINE = Memory", 1).is_err());
+}

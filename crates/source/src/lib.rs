@@ -19,7 +19,10 @@
 use std::path::{Path, PathBuf};
 
 pub mod catalogue;
+pub mod clickhouse;
+mod http;
 pub mod postgres;
+pub mod sqlite;
 
 pub use catalogue::{Catalogue, Column, Table};
 
@@ -63,6 +66,10 @@ pub struct Connection {
     pub database: Option<String>,
     pub schema: Option<String>,
     pub username: Option<String>,
+    /// For an adapter reached over HTTP: the base URL, scheme included, when
+    /// `host` and `port` are not enough to say it — a cloud endpoint, or
+    /// TLS on a port that does not imply it.
+    pub url: Option<String>,
     /// For an in-process adapter: the file it opens.
     pub file: Option<PathBuf>,
     /// Seconds. The same key the planner reads for its own purposes, used
@@ -90,6 +97,7 @@ impl Connection {
                 database: s("database"),
                 schema: s("schema"),
                 username: s("username"),
+                url: s("url").map(|u| u.trim_end_matches('/').to_string()),
                 file: s("file").map(PathBuf::from),
                 query_timeout: i("query_timeout"),
             });
@@ -303,6 +311,8 @@ fn skeleton(sql: &str) -> String {
 pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Box<dyn Source>> {
     match conn.adapter.as_str() {
         "postgres" | "redshift" => Ok(Box::new(postgres::Postgres::open(conn, secret)?)),
+        "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
+        "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),
     }
 }

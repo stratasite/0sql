@@ -2754,6 +2754,7 @@ dependencies = [
 name = "zsql-source"
 version = "0.6.1"
 dependencies = [
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -2762,6 +2763,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "ureq",
  "webpki-roots",
 ]
 

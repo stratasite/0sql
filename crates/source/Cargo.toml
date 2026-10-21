@@ -18,6 +18,8 @@ tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+ureq = { version = "3", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 
 [lints]
 workspace = true
