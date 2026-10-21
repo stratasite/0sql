@@ -16,3 +16,9 @@ CREATE TABLE shop.orders (
   total       numeric(12, 2) NOT NULL
 );
 CREATE VIEW shop.recent AS SELECT id, customer_id FROM shop.orders WHERE placed > DATE '2026-01-01';
+-- A few rows and an ANALYZE, so pg_class carries a row estimate: a table
+-- never analysed reports -1, which the catalogue rightly reads as none.
+INSERT INTO shop.customers VALUES (1, 'Ann', NULL), (2, 'Bo', 'vip');
+INSERT INTO shop.orders VALUES (1, 1, DATE '2026-03-01', 10.50), (2, 2, DATE '2026-03-02', 4.25), (3, 1, DATE '2026-03-03', 7.00);
+ANALYZE shop.customers;
+ANALYZE shop.orders;
