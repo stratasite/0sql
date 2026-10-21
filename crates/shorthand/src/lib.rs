@@ -15,7 +15,7 @@
 //! and `asc`/`desc`. A filter is a field, a predicate and a value, joined
 //! into trees with `and`, `or` and parentheses. A calculation is
 //! `calc(sql) as Alias`. A segment is `include (...)`, `exclude (...)` or
-//! `expand (...) with (...)`. `limit N` and `via table` are the settings,
+//! `expand (...) with (...)`. `limit N` and `hints table` are the settings,
 //! and `{...}` merges spec JSON into the query or the item before it.
 
 pub mod complete;
@@ -62,7 +62,7 @@ Print the query spec an expression line makes, and how each item was read.
 
 A line is comma-separated items (a newline separates items too), each read from its shape: a field, or a
 function around one, projects; a field followed by a predicate filters; calc(sql) as Alias calculates;
-include, exclude and expand (...) are segments; limit N and via TABLE are settings; {json} merges spec JSON.
+include, exclude and expand (...) are segments; limit N and hints TABLE are settings; {json} merges spec JSON.
 Fields are bare words, [bracketed] or \"quoted\"; values are bare text or 'single-quoted'.";
 
 /// The forms of the language, one block per kind of item.
@@ -85,7 +85,7 @@ Forms:
                (country = Canada or region = West) and store net paid > 10
   segment      include (customer id, catalog net paid > 0) as Buyers | exclude (customer id, net paid > 1000) for net paid
                expand (customer id, item = Books) with (item as Also bought) left dedupe none
-  settings     limit 100 | via store-sales | {\"name\": \"...\"} merges spec JSON; after an item it merges into that item
+  settings     limit 100 | hints store-sales | {\"name\": \"...\"} merges spec JSON; after an item it merges into that item
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
 [Name] or \"Name\" is always a field, 'text' is always a value. Reserved words, which end a bare name:
   and or not in is between top contains starts ends keyword as asc desc";
@@ -209,7 +209,7 @@ mod tests {
             "month(order date), yoy_pct(calc(sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m))) as Mix growth desc",
             "item category, store net paid, item category not in (Toys, Games), item category not starts with X",
             "\"Is Active\" = true, customer id, store net paid@m > 100",
-            "store net paid, order date >= 28d, limit 10, via store-sales",
+            "store net paid, order date >= 28d, limit 10, hints store-sales",
             "country, store net paid {\"format\": {\"type\": \"currency\"}}, {\"name\": \"Paid by country\"}",
         ];
         for line in lines {
@@ -221,7 +221,7 @@ mod tests {
         let s = spec("month(order date), yoy_pct(calc(sum([A]@m) / sum([B]@m))) as Mix growth desc");
         assert_eq!(s["calculations"][0]["decorators"][0]["type"], "temporalize");
         assert_eq!(s["calculations"][0]["order_by"], "desc");
-        let s = spec("store net paid, order date >= 28d, limit 10, via store-sales");
+        let s = spec("store net paid, order date >= 28d, limit 10, hints store-sales");
         assert_eq!(s["limit"], 10);
         assert_eq!(s["hints"], json!(["store-sales"]));
         assert_eq!(s["filters"][0]["value"], "28d");

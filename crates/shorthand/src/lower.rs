@@ -36,7 +36,7 @@ pub fn to_spec(items: &[Item]) -> Result<Value, String> {
                     return Err("limit is given twice".into());
                 }
             }
-            ItemKind::Via(names) => hints.extend(names.iter().map(|f| Value::String(f.name.clone()))),
+            ItemKind::Hint(names) => hints.extend(names.iter().map(|f| Value::String(f.name.clone()))),
             ItemKind::Raw(m) => raws.push(m.clone()),
         }
     }
@@ -386,7 +386,7 @@ pub fn describe(items: &[Item]) -> Vec<String> {
                 ItemKind::Filter(f) => ("filter", filter(f, false)),
                 ItemKind::Segment(s) => ("segment", segment_text(s)),
                 ItemKind::Limit(n) => ("setting", format!("limit {n}")),
-                ItemKind::Via(names) => ("setting", format!("via ({})", names.iter().map(field).collect::<Vec<_>>().join(", "))),
+                ItemKind::Hint(names) => ("setting", format!("hints ({})", names.iter().map(field).collect::<Vec<_>>().join(", "))),
                 ItemKind::Raw(m) => ("spec", Value::Object(m.clone()).to_string()),
             };
             let raw = it.raw.as_ref().map(|m| format!(" {}", Value::Object(m.clone()))).unwrap_or_default();

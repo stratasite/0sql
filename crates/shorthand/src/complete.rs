@@ -86,7 +86,7 @@ pub const PREDICATES: [&str; 15] = [
     "top ",
 ];
 const MODIFIERS: [&str; 3] = ["as ", "asc", "desc"];
-const ITEM_WORDS: [&str; 5] = ["include (", "exclude (", "expand (", "limit ", "via "];
+const ITEM_WORDS: [&str; 5] = ["include (", "exclude (", "expand (", "limit ", "hints "];
 
 /// Every function name the grammar reads before a `(`.
 pub fn functions() -> Vec<String> {
@@ -134,9 +134,9 @@ enum Frame {
     },
     /// `with (...)` after `expand`.
     Carry,
-    /// `for (...)` or `via (...)`.
+    /// `for (...)` or `hints (...)`.
     Names {
-        via: bool,
+        hint: bool,
     },
     /// A filter group's `(`.
     Paren,
@@ -220,8 +220,8 @@ pub fn context(line: &str, pos: usize) -> Vec<Offer> {
                         "calc" => Frame::Sql { comma: None, depth: 0 },
                         "in" | "keyword" => Frame::List,
                         "with" => Frame::Carry,
-                        "for" => Frame::Names { via: false },
-                        "via" => Frame::Names { via: true },
+                        "for" => Frame::Names { hint: false },
+                        "hints" => Frame::Names { hint: true },
                         "include" | "exclude" => Frame::Group { expand: false },
                         "expand" => Frame::Group { expand: true },
                         "extract" | "custom" => Frame::Args { func: word.clone() },
@@ -270,8 +270,8 @@ pub fn context(line: &str, pos: usize) -> Vec<Offer> {
                 vec![Offer::Fields { prefix: text.to_string(), kinds: Kinds::Dimension }]
             }
         }
-        Frame::Names { via: true } => vec![Offer::Tables { prefix: text.to_string() }],
-        Frame::Names { via: false } => vec![Offer::Fields { prefix: text.to_string(), kinds: Kinds::Measure }],
+        Frame::Names { hint: true } => vec![Offer::Tables { prefix: text.to_string() }],
+        Frame::Names { hint: false } => vec![Offer::Fields { prefix: text.to_string(), kinds: Kinds::Measure }],
         Frame::Args { func } => args(func, text, &projected(line, item_start)),
         Frame::Group { .. } => item(text, Mode::Group),
         Frame::Paren => item(text, Mode::Filter),
@@ -437,7 +437,7 @@ fn item(text: &str, mode: Mode) -> Vec<Offer> {
     if mode == Mode::Top && (words.len() > 1 || ends_in_space) {
         match first.as_str() {
             "limit" => return vec![],
-            "via" => return vec![Offer::Tables { prefix: text[words[0].len()..].trim_start().to_string() }],
+            "hints" => return vec![Offer::Tables { prefix: text[words[0].len()..].trim_start().to_string() }],
             "include" | "exclude" | "expand" => return segment_tail(text, first == "expand"),
             _ => {}
         }
@@ -823,8 +823,8 @@ mod tests {
         assert_eq!(at("limit 1"), vec![]);
         assert_eq!(at("x as Al"), vec![]);
         assert_eq!(at("x desc "), vec![]);
-        assert_eq!(at("via sto"), vec![Offer::Tables { prefix: "sto".into() }]);
-        assert_eq!(at("via (a, sto"), vec![Offer::Tables { prefix: "sto".into() }]);
+        assert_eq!(at("hints sto"), vec![Offer::Tables { prefix: "sto".into() }]);
+        assert_eq!(at("hints (a, sto"), vec![Offer::Tables { prefix: "sto".into() }]);
     }
 
     #[test]

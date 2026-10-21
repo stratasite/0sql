@@ -40,7 +40,7 @@ leading structure:
 
 | Starts with | Item |
 |---|---|
-| `limit`, `via` | a query setting |
+| `limit`, `hints` | a query setting |
 | `include`, `exclude`, `expand` | a segment |
 | `{` | raw spec JSON merged into the query |
 | `(` | a filter group |
@@ -61,7 +61,7 @@ and or not in is between top contains starts ends keyword as asc desc
 ```
 
 Five item-leading words are keywords only at the start of an item:
-`limit`, `via`, `include`, `exclude`, `expand`, and only when what the
+`limit`, `hints`, `include`, `exclude`, `expand`, and only when what the
 keyword needs follows, a number or a parenthesis. `include tax` is a
 projection of a field with that name.
 
@@ -102,7 +102,7 @@ Sep         <- WS (',' / NL) _                          # a comma or a newline b
 ItemEnd     <- &(WS (',' / NL / ')' / EOF))              # or one of the error guards listed below
 
 Setting     <- LIMIT SP Int
-             / VIA SP Names
+             / HINTS SP Names
 Names       <- '(' _ Field (_ ',' _ Field)* _ ')' / Field
 
 Raw         <- '{' JsonBody '}'                          # balanced braces; the text must parse as a JSON object
@@ -238,7 +238,7 @@ ASC <- 'asc'i WB      DESC <- 'desc'i WB
 BY <- 'by'i WB        ORDER <- 'order'i WB    WITH <- 'with'i WB      NULL <- 'null'i WB
 FOR <- 'for'i WB      LEFT <- 'left'i WB      INNER <- 'inner'i WB    DEDUPE <- 'dedupe'i WB
 NEQ <- 'neq'i WB      LT <- 'lt'i WB          NONE <- 'none'i WB
-LIMIT <- 'limit'i WB  VIA <- 'via'i WB        INCLUDE <- 'include'i WB EXCLUDE <- 'exclude'i WB
+LIMIT <- 'limit'i WB  HINTS <- 'hints'i WB        INCLUDE <- 'include'i WB EXCLUDE <- 'exclude'i WB
 EXPAND <- 'expand'i WB  CALC <- 'calc'i WB    EXTRACT <- 'extract'i WB CUSTOM <- 'custom'i WB
 ```
 
@@ -417,13 +417,13 @@ quoted.
 
 ```
 limit 100
-via (store-sales, store)
+hints (store-sales, store)
 {"name": "Monthly growth", "db_settings": {"week_start_day": 1}}
 store net paid {"format": {"type": "currency"}}
 ```
 
-`limit` and `via` (table hints) are the two settings that change the
-plan and earn a keyword. `via` names table uids the resolver should
+`limit` and `hints` are the two settings that change the
+plan and earn a keyword. `hints` names table uids the resolver should
 prefer: when more than one join route reaches the query's fields, a
 route through a named table outranks one that does not, ahead of
 coverage and cost. It is a preference, not a constraint; a route that
@@ -669,7 +669,7 @@ item category, orders, item category keyword (book, music)
 month(order date), yoy_pct(calc(sum([Store Net Paid]@m) / sum([Catalog Net Paid]@m))) as Mix growth desc
 item category, store net paid, item category not in (Toys, Games), item category not starts with X
 "Is Active" = true, customer id, store net paid@m > 100
-store net paid, order date >= 28d, limit 10, via store-sales
+store net paid, order date >= 28d, limit 10, hints store-sales
 country, store net paid {"format": {"type": "currency"}}, {"name": "Paid by country"}
 ```
 
@@ -705,7 +705,7 @@ postfix form, no `pct(x)` alias for share, no `dow` beside
 `day_of_week`, no `does not contain` beside `not contains`.
 
 Lists after a keyword are one name or several in parentheses (`for
-revenue`, `for (revenue, orders)`, `via (a, b)`), so a trailing list
+revenue`, `for (revenue, orders)`, `hints (a, b)`), so a trailing list
 never runs into the next item. Lists of values, after `in` and
 `keyword`, are always parenthesised.
 
@@ -747,7 +747,7 @@ goldens are the proof that the code agrees with it. The crate also
 answers where a cursor stands: `complete::context` reads the frames a
 half-typed line is inside and says what the grammar can take there, a
 field of a kind, a function, a keyword, a projected dimension after
-`by`, a value after a predicate, a table after `via`, a part or a type.
+`by`, a value after a predicate, a table after `hints`, a part or a type.
 The repl's line helper maps those offers to the model for tab
 completion, the dimmed hint as you type, bold keywords, and a red
 unclosed opener that keeps the line open for another line. The spec lowering

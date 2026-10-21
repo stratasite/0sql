@@ -284,7 +284,7 @@ pub fn unclosed(line: &str) -> Option<usize> {
 const RESERVED: [&str; 14] =
     ["and", "or", "not", "in", "is", "between", "top", "contains", "starts", "ends", "keyword", "as", "asc", "desc"];
 const CONTEXTUAL: [&str; 17] = [
-    "by", "with", "for", "left", "inner", "dedupe", "neq", "lt", "none", "null", "limit", "via", "include", "exclude", "expand", "order",
+    "by", "with", "for", "left", "inner", "dedupe", "neq", "lt", "none", "null", "limit", "hints", "include", "exclude", "expand", "order",
     "pct",
 ];
 
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(c, ["desc"], "after a closed call only the half-typed word is replaced");
         let (_, c) = names("category top 5 by ");
         assert_eq!(c, ["Store Net Paid", "Catalog Net Paid", "Orders"]);
-        let (_, c) = names("via st");
+        let (_, c) = names("hints st");
         assert_eq!(c, ["store-sales", "store"]);
         let (_, c) = names("extract(d");
         assert_eq!(c, ["day_of_month", "day_of_week", "day_of_year", "day_name"]);

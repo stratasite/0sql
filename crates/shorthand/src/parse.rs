@@ -138,7 +138,7 @@ pub enum ItemKind {
     Filter(FilterNode),
     Segment(Segment),
     Limit(i64),
-    Via(Vec<Field>),
+    Hint(Vec<Field>),
     Raw(Map<String, Value>),
 }
 
@@ -369,7 +369,7 @@ impl<'a> P<'a> {
         let save = self.i;
         self.ws();
         let raw = if self.peek() == Some('{') {
-            if matches!(kind, ItemKind::Limit(_) | ItemKind::Via(_)) {
+            if matches!(kind, ItemKind::Limit(_) | ItemKind::Hint(_)) {
                 return self.err(self.i, "spec JSON cannot follow a setting; write it as its own item");
             }
             if matches!(&kind, ItemKind::Filter(f) if !matches!(f, FilterNode::Leaf(_))) {
@@ -455,9 +455,9 @@ impl<'a> P<'a> {
             };
         }
         self.i = save;
-        if self.kw("via") && self.sp() {
+        if self.kw("hints") && self.sp() {
             if let Some(names) = self.names(Mode::Top)? {
-                return Ok(Some(ItemKind::Via(names)));
+                return Ok(Some(ItemKind::Hint(names)));
             }
         }
         self.i = save;

@@ -59,10 +59,10 @@ fn keywords_are_case_insensitive_and_names_keep_their_case() {
 
 #[test]
 fn item_leading_and_function_words_fall_through_to_fields() {
-    let s = spec("limit, via, include, expand tax, exclude, calc, extract, custom, month, year to date, rank, share");
+    let s = spec("limit, hints, include, expand tax, exclude, calc, extract, custom, month, year to date, rank, share");
     assert_eq!(
         fields(&s),
-        ["limit", "via", "include", "expand tax", "exclude", "calc", "extract", "custom", "month", "year to date", "rank", "share"]
+        ["limit", "hints", "include", "expand tax", "exclude", "calc", "extract", "custom", "month", "year to date", "rank", "share"]
     );
     assert_eq!(spec("[top], [in], \"as\", [and], [order by status]")["projections"].as_array().unwrap().len(), 5);
     assert_eq!(fields(&spec("created by, order date, null count")), ["created by", "order date", "null count"]);
@@ -330,7 +330,7 @@ fn segments_at_their_edges() {
 
 #[test]
 fn settings_and_raw_json() {
-    let s = spec("limit 0, via a, via (b, c), {\"name\": \"n\"}, {\"db_settings\": {\"week_start_day\": 1}}, {\"hints\": [\"d\"]}");
+    let s = spec("limit 0, hints a, hints (b, c), {\"name\": \"n\"}, {\"db_settings\": {\"week_start_day\": 1}}, {\"hints\": [\"d\"]}");
     assert_eq!(s["limit"], 0);
     assert_eq!(s["hints"], json!(["a", "b", "c", "d"]), "arrays append");
     assert_eq!(s["name"], "n");
@@ -350,7 +350,7 @@ fn settings_and_raw_json() {
         ("limit -1", "whole number"),
         ("limit 1.5", "whole number"),
         ("limit 5, limit 6", "given twice"),
-        ("via (a", "expected , or )"),
+        ("hints (a", "expected , or )"),
         ("{", "never closed"),
         ("{\"a\": \"}", "never closed"),
         ("{\"a\"}", "does not parse"),
@@ -359,7 +359,7 @@ fn settings_and_raw_json() {
         ("a = 1 or b = 2 {\"x\": 1}", "attaches to one filter"),
         ("x = 1 {1}", "does not parse"),
     ]);
-    assert_eq!(fields(&spec("limit, via")), ["limit", "via"], "a setting word without its operand is a field");
+    assert_eq!(fields(&spec("limit, hints")), ["limit", "hints"], "a setting word without its operand is a field");
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn describe_reads_back_to_the_same_spec() {
         "s is null, t is not null, q top 3 by m, p keyword (k, l), (a = 1 or b = 2) and (c = 3 or d = 4), e = 1 or f = 2",
         "calc(sum([A]@m) / 'x, )') as \"Share for\", yoy_pct(calc(count(*), integer)) as G desc",
         "include (k, m@m, f > 1 or g = 2) for (m1, m2) as \"For keeps\", expand (k, f = 1) with (c as \"Also, bought\", d) left dedupe none as E",
-        "limit 5, via (t1, t2), {\"name\": \"n\"}, x {\"format\": {\"type\": \"pct\"}}",
+        "limit 5, hints (t1, t2), {\"name\": \"n\"}, x {\"format\": {\"type\": \"pct\"}}",
         "rank(x by order date order by order date desc, [created by] asc) as [Row in region], custom('lower(@expression)', y)",
     ];
     for line in lines {
@@ -426,7 +426,7 @@ fn describe_reads_back_to_the_same_spec() {
         let (second, _) = parse_line(&again).unwrap_or_else(|e| panic!("{line}\n  read back as {again}\n  {e}"));
         assert_eq!(first, second, "{line}\n  read back as {again}");
     }
-    let (_, items) = parse_line("x, y = 1, calc(a) as B, include (k), limit 1, via t, {\"a\": 1}").unwrap();
+    let (_, items) = parse_line("x, y = 1, calc(a) as B, include (k), limit 1, hints t, {\"a\": 1}").unwrap();
     let kinds: Vec<String> = describe(&items).iter().map(|d| d[..12].trim().to_string()).collect();
     assert_eq!(kinds, ["projection", "filter", "calculation", "segment", "setting", "setting", "spec"]);
 }
