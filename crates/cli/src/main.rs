@@ -8,6 +8,7 @@
 //! `--uid` imply `-r`; `ZSQL_SERVER` in the environment does not.
 
 mod assist;
+mod catalogue_check;
 mod config;
 mod deploy;
 mod failure;

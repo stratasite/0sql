@@ -20,7 +20,7 @@ pub struct Options<'a> {
 
 /// What a warehouse type becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mapped {
+pub(crate) enum Mapped {
     Known(&'static str),
     /// Text-shaped but not text: a uuid, a json document, an enum. A
     /// string, and said so on the line.
@@ -53,7 +53,7 @@ fn normalise(data_type: &str) -> (String, bool) {
     (t, array)
 }
 
-fn map_type(data_type: &str) -> Mapped {
+pub(crate) fn map_type(data_type: &str) -> Mapped {
     let (t, array) = normalise(data_type);
     if array {
         return Mapped::Skip;

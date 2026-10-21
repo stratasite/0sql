@@ -78,5 +78,7 @@ pub fn check(m: &Model) -> Result<Value> {
     let mut out = m.summary();
     out["test_results"] = m.run_tests().map_err(Refusal::from)?;
     out["validated_only"] = json!(true);
+    // Against the warehouse's catalogue too, for every datasource that has one.
+    out["catalogue"] = crate::catalogue_check::findings(m);
     Ok(out)
 }

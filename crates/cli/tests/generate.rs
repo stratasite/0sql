@@ -103,6 +103,19 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
     assert!(ok && out.contains("nothing to do"), "{out}");
 
+    // The warehouse changes under the model: check names what is gone.
+    db.execute_batch("ALTER TABLE orders DROP COLUMN status; ALTER TABLE customers RENAME TO clients;").unwrap();
+    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(!ok, "a missing table and column fail the check:\n{out}");
+    assert!(out.contains("table Customers names customers, which the warehouse does not have"), "{out}");
+    assert!(out.contains("orders has no column status"), "{out}");
+    assert!(out.contains("tables checked against catalogue"), "{out}");
+    db.execute_batch("ALTER TABLE clients RENAME TO customers; ALTER TABLE orders ADD COLUMN status VARCHAR(20);").unwrap();
+    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok, "put back, the check passes again:\n{out}");
+
     // --dry-run writes nothing, for a new table too.
     db.execute_batch("CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT);").unwrap();
     assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
