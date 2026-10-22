@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 const STATEMENTS: &str = "/api/2.0/sql/statements";
 const USER_AGENT: &str = concat!("zsql/", env!("CARGO_PKG_VERSION"));
-/// How long the first request itself waits before the API hands back a
-/// pending statement: the API's own maximum.
-const WAIT: &str = "30s";
+/// The longest the first request itself may wait before the API hands
+/// back a pending statement: the API allows `0s` or five to fifty seconds.
+const MAX_WAIT_SECS: u64 = 50;
 
 pub struct Databricks {
     agent: ureq::Agent,
@@ -31,6 +31,7 @@ pub struct Databricks {
     /// A minted token and when it stops being good.
     token: Option<(String, Instant)>,
     warehouse: String,
+    warnings: Vec<String>,
 }
 
 enum Auth {
@@ -77,9 +78,7 @@ impl Databricks {
         if !missing.is_empty() {
             return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
-        if base.to_lowercase().starts_with("http://") && conn.sslmode.insists() {
-            return Err(SourceError::PlainUrl(conn.uid.clone(), "databricks"));
-        }
+        let note = http::plain(conn, &base, "databricks")?;
         Ok(Databricks {
             agent: http::agent(conn)?,
             base: base.trim_end_matches('/').to_string(),
@@ -87,6 +86,7 @@ impl Databricks {
             auth: auth.expect("checked"),
             token: None,
             warehouse: conn.warehouse.clone().expect("checked"),
+            warnings: note.into_iter().collect(),
         })
     }
 
@@ -103,33 +103,15 @@ impl Databricks {
                 }
                 let basic = base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{}", secret.expose()));
                 let body = http::form(&[("grant_type", "client_credentials"), ("scope", "all-apis")]);
-                let auth = format!("Basic {basic}");
-                let headers = [
-                    ("Authorization", auth.as_str()),
-                    ("Content-Type", "application/x-www-form-urlencoded"),
-                    ("Accept", "application/json"),
-                    ("User-Agent", USER_AGENT),
-                ];
                 let url = format!("{}/oidc/v1/token", self.base);
-                let (status, text) = http::call(&self.conn, &self.agent, "POST", &url, &headers, Some(body.as_bytes()))?;
-                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                if status != 200 {
-                    let why = v.get("error_description").or_else(|| v.get("error")).and_then(|e| e.as_str()).unwrap_or(text.trim());
-                    return Err(SourceError::Connect(self.conn.uid.clone(), format!("token: {status}: {why}")));
-                }
-                let token = v
-                    .get("access_token")
-                    .and_then(|t| t.as_str())
-                    .map(str::to_string)
-                    .ok_or_else(|| SourceError::Connect(self.conn.uid.clone(), "token: the answer carried no access_token".into()))?;
-                let secs = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
-                self.token = Some((token.clone(), Instant::now() + Duration::from_secs(secs)));
+                let (token, until) = http::token(&self.conn, &self.agent, &url, Some(&format!("Basic {basic}")), &body)?;
+                self.token = Some((token.clone(), until));
                 Ok(token)
             }
         }
     }
 
-    fn request(&mut self, method: &str, url: &str, body: Option<String>) -> Result<(u16, String)> {
+    fn request(&mut self, method: http::Method, url: &str, body: Option<String>) -> Result<(u16, String)> {
         let bearer = format!("Bearer {}", self.bearer()?);
         let headers = [
             ("Authorization", bearer.as_str()),
@@ -141,9 +123,7 @@ impl Databricks {
     }
 
     fn refused(&self, status: u16, text: &str) -> SourceError {
-        let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
-        let why = v.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| text.trim().chars().take(400).collect());
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {why}"))
+        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn parse(&self, text: &str) -> Result<Answer> {
@@ -151,10 +131,14 @@ impl Databricks {
     }
 
     fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        // The request's own wait: the statement timeout, within what the
+        // API allows, and under the HTTP call's own limit.
+        let wait = self.conn.timeout().as_secs().min(MAX_WAIT_SECS);
+        let wait = if wait < 5 { "0s".to_string() } else { format!("{wait}s") };
         let mut body = serde_json::json!({
             "statement": sql,
             "warehouse_id": self.warehouse,
-            "wait_timeout": WAIT,
+            "wait_timeout": wait,
             "on_wait_timeout": "CONTINUE",
             "format": "JSON_ARRAY",
             "disposition": "INLINE",
@@ -167,7 +151,7 @@ impl Databricks {
             body["schema"] = serde_json::Value::String(s.clone());
         }
         let url = format!("{}{STATEMENTS}", self.base);
-        let (status, text) = self.request("POST", &url, Some(body.to_string()))?;
+        let (status, text) = self.request(http::Method::Post, &url, Some(body.to_string()))?;
         if status != 200 {
             return Err(self.refused(status, &text));
         }
@@ -193,7 +177,7 @@ impl Databricks {
         let mut wait = Duration::from_secs(1);
         loop {
             if Instant::now() >= deadline {
-                let _ = self.request("POST", &format!("{url}/cancel"), None);
+                let _ = self.request(http::Method::Post, &format!("{url}/cancel"), None);
                 return Err(SourceError::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
@@ -201,7 +185,7 @@ impl Databricks {
             }
             std::thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
             wait = (wait * 2).min(Duration::from_secs(5));
-            let (status, text) = self.request("GET", &url, None)?;
+            let (status, text) = self.request(http::Method::Get, &url, None)?;
             if status != 200 {
                 return Err(self.refused(status, &text));
             }
@@ -226,13 +210,13 @@ impl Databricks {
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut result = answer.result;
         while let Some(r) = result.take() {
-            rows.extend(r.data_array.into_iter().map(|row| row.into_iter().map(cell).collect::<Vec<_>>()));
+            rows.extend(r.data_array.into_iter().map(|row| row.into_iter().map(http::cell).collect::<Vec<_>>()));
             if rows.len() > max_rows {
                 return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
             }
             let Some(next) = r.next_chunk_index else { break };
             let url = format!("{}{STATEMENTS}/{}/result/chunks/{next}", self.base, answer.statement_id);
-            let (status, text) = self.request("GET", &url, None)?;
+            let (status, text) = self.request(http::Method::Get, &url, None)?;
             if status != 200 {
                 return Err(self.refused(status, &text));
             }
@@ -293,16 +277,6 @@ struct Chunk {
     next_chunk_index: Option<i64>,
 }
 
-/// `JSON_ARRAY` sends every value as a string already; this is for the
-/// null and for anything that arrives bare.
-fn cell(v: serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s),
-        other => Some(other.to_string()),
-    }
-}
-
 impl Source for Databricks {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
@@ -311,5 +285,9 @@ impl Source for Databricks {
 
     fn adapter(&self) -> &str {
         "databricks"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }

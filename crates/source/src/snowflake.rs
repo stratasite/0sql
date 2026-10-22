@@ -33,6 +33,7 @@ pub struct Snowflake {
     auth: Auth,
     jwt: Option<(String, Instant)>,
     context: Context,
+    warnings: Vec<String>,
 }
 
 enum Auth {
@@ -57,7 +58,17 @@ impl Snowflake {
         let mut missing: Vec<String> = Vec::new();
         let base = match (&conn.url, &conn.account) {
             (Some(u), _) => u.clone(),
-            (None, Some(a)) => format!("https://{}.snowflakecomputing.com", a.trim()),
+            // The account becomes a host name, so it may only hold what a
+            // host name does; anything else would send the bearer elsewhere.
+            (None, Some(a))
+                if !a.trim().is_empty() && a.trim().chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) =>
+            {
+                format!("https://{}.snowflakecomputing.com", a.trim())
+            }
+            (None, Some(a)) => {
+                missing.push(format!("account: {a:?} is not an account identifier (letters, digits, dots and dashes)"));
+                String::new()
+            }
             (None, None) => {
                 missing.push("account (the account identifier, as in <account>.snowflakecomputing.com) or url".into());
                 String::new()
@@ -76,9 +87,7 @@ impl Snowflake {
         if !missing.is_empty() {
             return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
-        if base.to_lowercase().starts_with("http://") && conn.sslmode.insists() {
-            return Err(SourceError::PlainUrl(conn.uid.clone(), "snowflake"));
-        }
+        let note = http::plain(conn, &base, "snowflake")?;
         Ok(Snowflake {
             agent: http::agent(conn)?,
             base: base.trim_end_matches('/').to_string(),
@@ -91,6 +100,7 @@ impl Snowflake {
                 warehouse: conn.warehouse.as_deref().map(ident),
                 role: conn.role.as_deref().map(ident),
             },
+            warnings: note.into_iter().collect(),
         })
     }
 
@@ -123,7 +133,7 @@ impl Snowflake {
         }
     }
 
-    fn request(&mut self, method: &str, url: &str, body: Option<String>) -> Result<(u16, String)> {
+    fn request(&mut self, method: http::Method, url: &str, body: Option<String>) -> Result<(u16, String)> {
         let (token, kind) = self.bearer()?;
         let bearer = format!("Bearer {token}");
         let headers = [
@@ -139,9 +149,7 @@ impl Snowflake {
     /// A refusal, as the server put it: the `message` of its JSON when
     /// there is one, the body otherwise.
     fn refused(&self, status: u16, text: &str) -> SourceError {
-        let why =
-            serde_json::from_str::<Answer>(text).ok().and_then(|a| a.message).unwrap_or_else(|| text.trim().chars().take(400).collect());
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {why}"))
+        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
@@ -170,7 +178,7 @@ impl Snowflake {
             other => other,
         };
         let url = format!("{}{STATEMENTS}", self.base);
-        let (status, text) = self.request("POST", &url, Some(body.to_string()))?;
+        let (status, text) = self.request(http::Method::Post, &url, Some(body.to_string()))?;
         let answer = match status {
             200 => self.parse(&text)?,
             202 => {
@@ -191,7 +199,7 @@ impl Snowflake {
         let mut wait = Duration::from_millis(250);
         loop {
             if Instant::now() >= deadline {
-                let _ = self.request("POST", &format!("{url}/cancel"), None);
+                let _ = self.request(http::Method::Post, &format!("{url}/cancel"), None);
                 return Err(SourceError::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
@@ -199,7 +207,7 @@ impl Snowflake {
             }
             std::thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
             wait = (wait * 2).min(Duration::from_secs(5));
-            let (status, text) = self.request("GET", &url, None)?;
+            let (status, text) = self.request(http::Method::Get, &url, None)?;
             match status {
                 200 => return self.parse(&text),
                 202 => continue,
@@ -221,16 +229,17 @@ impl Snowflake {
             return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let columns: Vec<String> = meta.row_type.into_iter().map(|c| c.name).collect();
-        let mut rows: Vec<Vec<Option<String>>> = answer.data.into_iter().flatten().map(|r| r.into_iter().map(cell).collect()).collect();
+        let mut rows: Vec<Vec<Option<String>>> =
+            answer.data.into_iter().flatten().map(|r| r.into_iter().map(http::cell).collect()).collect();
         if let Some(handle) = answer.handle.filter(|_| meta.partitions.len() > 1) {
             for p in 1..meta.partitions.len() {
                 let url = format!("{}{STATEMENTS}/{handle}?partition={p}", self.base);
-                let (status, text) = self.request("GET", &url, None)?;
+                let (status, text) = self.request(http::Method::Get, &url, None)?;
                 if status != 200 {
                     return Err(self.refused(status, &text));
                 }
                 let part = self.parse(&text)?;
-                rows.extend(part.data.into_iter().flatten().map(|r| r.into_iter().map(cell).collect::<Vec<_>>()));
+                rows.extend(part.data.into_iter().flatten().map(|r| r.into_iter().map(http::cell).collect::<Vec<_>>()));
                 if rows.len() > max_rows {
                     return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
                 }
@@ -308,7 +317,6 @@ struct Answer {
     data: Option<Vec<Vec<serde_json::Value>>>,
     #[serde(rename = "statementHandle")]
     handle: Option<String>,
-    message: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -326,16 +334,6 @@ struct RowType {
     name: String,
 }
 
-/// A cell as text: Snowflake sends every value as a string already, so
-/// this is for the null and for a number that arrives bare.
-fn cell(v: serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s),
-        other => Some(other.to_string()),
-    }
-}
-
 impl Source for Snowflake {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
@@ -344,5 +342,9 @@ impl Source for Snowflake {
 
     fn adapter(&self) -> &str {
         "snowflake"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }

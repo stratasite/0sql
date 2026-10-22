@@ -13,6 +13,17 @@
 
 use crate::{Connection, Result, SourceError, SslMode};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// The most a response body may be. A catalogue read of two hundred
+/// thousand columns, or one Snowflake partition, can pass ureq's own
+/// ten-megabyte default by a distance.
+const MAX_BODY: u64 = 256 * 1024 * 1024;
+
+/// How much longer than the statement timeout a single HTTP call may
+/// take: the APIs hold a request open while a statement runs, up to
+/// their own ceilings, and the poll loops own the budget after that.
+const CALL_MARGIN: Duration = Duration::from_secs(60);
 
 /// An agent with the connection's statement timeout as its whole-call
 /// limit, a connect timeout short of it, and the TLS its mode asks for.
@@ -28,7 +39,7 @@ pub(crate) fn agent(conn: &Connection) -> Result<ureq::Agent> {
     Ok(ureq::Agent::new_with_config(
         ureq::config::Config::builder()
             .timeout_connect(Some(std::time::Duration::from_secs(10)))
-            .timeout_global(Some(conn.timeout()))
+            .timeout_global(Some(conn.timeout() + CALL_MARGIN))
             .http_status_as_error(false)
             .tls_config(tls_config.build())
             .build(),
@@ -80,12 +91,7 @@ pub(crate) fn base_url(conn: &Connection, default_port: u16, what: &'static str)
             format!("{scheme}://{host}:{}", conn.port.unwrap_or(default_port))
         }
     };
-    let plain = url.to_lowercase().starts_with("http://");
-    if plain && conn.sslmode.insists() {
-        return Err(SourceError::PlainUrl(conn.uid.clone(), what));
-    }
-    let note = (plain && conn.sslmode == SslMode::Prefer)
-        .then(|| format!("{}: sslmode is prefer and the url is plain http, so nothing is encrypted", conn.uid));
+    let note = plain(conn, &url, what)?;
     Ok((url, note))
 }
 
@@ -93,7 +99,8 @@ pub(crate) fn base_url(conn: &Connection, default_port: u16, what: &'static str)
 /// when the warehouse refused: a refusal's body is where it says why.
 pub(crate) fn text(conn: &Connection, r: ureq::http::Response<ureq::Body>) -> Result<String> {
     let status = r.status();
-    let body = r.into_body().read_to_string().map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
+    let body =
+        r.into_body().with_config().limit(MAX_BODY).read_to_string().map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
     if status.is_success() {
         Ok(body)
     } else {
@@ -102,34 +109,34 @@ pub(crate) fn text(conn: &Connection, r: ureq::http::Response<ureq::Body>) -> Re
     }
 }
 
+/// What a call is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Method {
+    Get,
+    Post,
+}
+
 /// One call, the status and body back as they came: for an API whose
 /// refusals carry a JSON message the adapter wants to read rather than
-/// have folded. `method` is GET, POST or DELETE.
+/// have folded.
 pub(crate) fn call(
     conn: &Connection,
     agent: &ureq::Agent,
-    method: &str,
+    method: Method,
     url: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<(u16, String)> {
     let fail = |e: ureq::Error| SourceError::Query(conn.uid.clone(), crate::chain(&e));
     let response = match method {
-        "POST" => {
+        Method::Post => {
             let mut req = agent.post(url);
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
             req.send(body.unwrap_or_default()).map_err(fail)?
         }
-        "DELETE" => {
-            let mut req = agent.delete(url);
-            for (k, v) in headers {
-                req = req.header(*k, *v);
-            }
-            req.call().map_err(fail)?
-        }
-        _ => {
+        Method::Get => {
             let mut req = agent.get(url);
             for (k, v) in headers {
                 req = req.header(*k, *v);
@@ -138,8 +145,79 @@ pub(crate) fn call(
         }
     };
     let status = response.status().as_u16();
-    let text = response.into_body().read_to_string().map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
+    let text = response
+        .into_body()
+        .with_config()
+        .limit(MAX_BODY)
+        .read_to_string()
+        .map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
     Ok((status, text))
+}
+
+/// A refusal's reason: the body's `message` (or `error_description`,
+/// `error`, or `error.message`) when it is JSON, else the body, cut to
+/// a line's worth.
+pub(crate) fn reason(text: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    let found = [v.get("message"), v.get("error_description"), v.pointer("/error/message"), v.get("error"), v.get("Message")]
+        .into_iter()
+        .flatten()
+        .find_map(|m| m.as_str().map(str::to_string));
+    found.unwrap_or_else(|| text.trim().chars().take(400).collect())
+}
+
+/// An OAuth token endpoint: the form POSTed, the access token and when
+/// it stops being good. A lifetime the answer does not say, or says
+/// absurdly, is an hour.
+pub(crate) fn token(
+    conn: &Connection,
+    agent: &ureq::Agent,
+    url: &str,
+    authorization: Option<&str>,
+    form_body: &str,
+) -> Result<(String, Instant)> {
+    let mut headers = vec![
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Accept", "application/json"),
+        ("User-Agent", concat!("zsql/", env!("CARGO_PKG_VERSION"))),
+    ];
+    if let Some(a) = authorization {
+        headers.push(("Authorization", a));
+    }
+    let (status, text) = call(conn, agent, Method::Post, url, &headers, Some(form_body.as_bytes()))?;
+    if status != 200 {
+        return Err(SourceError::Connect(conn.uid.clone(), format!("token: {status}: {}", reason(&text))));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let token = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| SourceError::Connect(conn.uid.clone(), "token: the answer carried no access_token".into()))?;
+    let secs = v.get("expires_in").and_then(|e| e.as_u64()).filter(|s| (1..=86_400).contains(s)).unwrap_or(3600);
+    Ok((token, Instant::now() + Duration::from_secs(secs)))
+}
+
+/// Whether a base URL may be plain `http`: refused when the mode insists
+/// on TLS, noted when the mode is `prefer`.
+pub(crate) fn plain(conn: &Connection, url: &str, what: &'static str) -> Result<Option<String>> {
+    let plain = url.to_lowercase().starts_with("http://");
+    if plain && conn.sslmode.insists() {
+        return Err(SourceError::PlainUrl(conn.uid.clone(), what));
+    }
+    Ok((plain && conn.sslmode == SslMode::Prefer)
+        .then(|| format!("{}: sslmode is prefer and the url is plain http, so nothing is encrypted", conn.uid)))
+}
+
+/// A JSON cell as the text a consumer will match on: strings as they
+/// are, numbers and booleans as they print, null as none, and anything
+/// nested as its JSON.
+pub(crate) fn cell(v: serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        other => Some(other.to_string()),
+    }
 }
 
 /// A URL-encoded form body, for a token endpoint.

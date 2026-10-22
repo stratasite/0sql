@@ -107,7 +107,7 @@ pub const DATASOURCES_YML: &str = "\
 #   tier: cold\n\
 #   region: us-east-1             # or AWS_REGION, or the profile's config\n\
 #   database: default             # the Glue database; introspect reads it\n\
-#   catalog: awsdatacatalog       # optional\n\
+#   catalog: AwsDataCatalog       # optional\n\
 #   workgroup: primary            # optional\n\
 #   output_location: s3://my-athena-results/zsql/   # unless the workgroup sets one\n\
 #   # keys: access_key_id and secret_access_key in .zsql (session_token too), or AWS_ACCESS_KEY_ID and\n\

@@ -29,7 +29,10 @@ pub struct Request<'a> {
 /// `YYYYMMDDTHHMMSSZ`.
 pub fn sign(creds: &Credentials, region: &str, service: &str, req: &Request<'_>, now: &str) -> Vec<(String, String)> {
     let date = &now[..8];
-    let mut headers: Vec<(String, String)> = req.headers.iter().map(|(k, v)| (k.to_lowercase(), v.trim().to_string())).collect();
+    // Names lower-cased, values trimmed with runs of spaces collapsed, as
+    // the canonical form asks.
+    let mut headers: Vec<(String, String)> =
+        req.headers.iter().map(|(k, v)| (k.to_lowercase(), v.split_whitespace().collect::<Vec<_>>().join(" "))).collect();
     headers.push(("x-amz-date".into(), now.to_string()));
     if let Some(t) = &creds.session_token {
         headers.push(("x-amz-security-token".into(), t.expose().to_string()));

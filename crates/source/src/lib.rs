@@ -472,11 +472,25 @@ pub fn read_only(sql: &str) -> Result<()> {
     }
     let first: String = trimmed.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
     const READS: [&str; 5] = ["SELECT", "WITH", "SHOW", "DESCRIBE", "PRAGMA"];
-    if READS.contains(&first.to_uppercase().as_str()) {
-        Ok(())
-    } else {
-        Err(refuse())
+    if !READS.contains(&first.to_uppercase().as_str()) {
+        return Err(refuse());
     }
+    // A read can still carry a write: a data-modifying CTE, `SELECT …
+    // INTO`, `INSERT … SELECT` behind a `WITH`. None of these words has a
+    // place in a read, so any of them as a bare word refuses. A quoted
+    // identifier was blanked with the literals, so a column called
+    // `update` in quotes is not caught by this.
+    const WRITES: [&str; 16] = [
+        "INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "CREATE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL",
+        "COPY", "UNLOAD",
+    ];
+    let words = trimmed.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty());
+    for w in words {
+        if WRITES.contains(&w.to_uppercase().as_str()) {
+            return Err(refuse());
+        }
+    }
+    Ok(())
 }
 
 /// The statement with its comments removed and the inside of every string

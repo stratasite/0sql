@@ -19,7 +19,13 @@ type Client = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>
 
 pub struct SqlServer {
     runtime: tokio::runtime::Runtime,
-    client: Client,
+    /// None after a statement timed out: the TDS stream still holds the
+    /// rows that were never read, and tiberius sends no attention on
+    /// drop, so the next statement would read them as its own answer.
+    /// The next query reconnects instead.
+    client: Option<Client>,
+    conn: Connection,
+    secret: Option<Secret>,
     uid: String,
     timeout: std::time::Duration,
     warnings: Vec<String>,
@@ -29,8 +35,9 @@ impl SqlServer {
     pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<SqlServer> {
         let host = conn.need(&conn.host, "host")?;
         let user = conn.need(&conn.username, "username")?;
-        let password =
-            secret.ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+        let password = secret
+            .clone()
+            .ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
         tls::install_ring();
         let configure = |encryption: tiberius::EncryptionLevel, trust: Trust| {
             let mut config = tiberius::Config::new();
@@ -92,7 +99,15 @@ impl SqlServer {
             }
         }
         let client = client.ok_or_else(|| SourceError::Connect(conn.uid.clone(), last))?;
-        Ok(SqlServer { runtime, client, uid: conn.uid.clone(), timeout: conn.timeout(), warnings })
+        Ok(SqlServer {
+            runtime,
+            client: Some(client),
+            conn: conn.clone(),
+            secret,
+            uid: conn.uid.clone(),
+            timeout: conn.timeout(),
+            warnings,
+        })
     }
 }
 
@@ -109,18 +124,29 @@ impl Source for SqlServer {
         read_only(sql)?;
         let uid = self.uid.clone();
         let timeout = self.timeout;
-        let client = &mut self.client;
-        let sets = self
-            .runtime
-            .block_on(async {
-                tokio::time::timeout(timeout, async {
-                    let stream = client.simple_query(sql).await.map_err(|e| e.to_string())?;
-                    stream.into_results().await.map_err(|e| e.to_string())
-                })
-                .await
-                .map_err(|_| format!("no answer within {}s", timeout.as_secs()))?
+        if self.client.is_none() {
+            let fresh = SqlServer::open(&self.conn, self.secret.clone())?;
+            self.client = fresh.client;
+        }
+        let client = self.client.as_mut().expect("reopened");
+        let timed_out = format!("no answer within {}s", timeout.as_secs());
+        let sets = self.runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let stream = client.simple_query(sql).await.map_err(|e| e.to_string())?;
+                stream.into_results().await.map_err(|e| e.to_string())
             })
-            .map_err(|e| SourceError::Query(uid.clone(), e))?;
+            .await
+            .map_err(|_| timed_out.clone())?
+        });
+        let sets = match sets {
+            Ok(s) => s,
+            Err(e) => {
+                if e == timed_out {
+                    self.client = None;
+                }
+                return Err(SourceError::Query(uid, e));
+            }
+        };
         let rows_in = sets.into_iter().next().unwrap_or_default();
         if rows_in.len() > max_rows {
             return Err(SourceError::TooManyRows(uid, max_rows));

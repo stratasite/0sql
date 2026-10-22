@@ -27,6 +27,7 @@ pub struct Athena {
     creds: sigv4::Credentials,
     catalog: String,
     database: Option<String>,
+    warnings: Vec<String>,
 }
 
 impl Athena {
@@ -48,8 +49,15 @@ impl Athena {
         if region.is_none() {
             missing.push("region (in datasources.yml, AWS_REGION, or the profile's config)".into());
         }
-        let creds = credentials(conn, secrets, env, &profile, shared("credentials", "AWS_SHARED_CREDENTIALS_FILE"));
-        if creds.is_none() {
+        // Half an explicit credential is a mistake to name, not a reason to
+        // sign as whoever the next link in the chain is.
+        match (&secrets.access_key_id, &secrets.secret_access_key) {
+            (Some(_), None) => missing.push(format!("secret_access_key, beside the access_key_id in .zsql under {}", conn.uid)),
+            (None, Some(_)) => missing.push(format!("access_key_id, beside the secret_access_key in .zsql under {}", conn.uid)),
+            _ => {}
+        }
+        let creds = credentials(secrets, env, &profile, shared("credentials", "AWS_SHARED_CREDENTIALS_FILE"));
+        if creds.is_none() && missing.iter().all(|m| !m.contains("beside the")) {
             missing.push(format!(
                 "credentials: access_key_id and secret_access_key in .zsql under {uid} or in {a} and {s}, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or the profile '{profile}' in ~/.aws/credentials",
                 uid = conn.uid,
@@ -62,9 +70,7 @@ impl Athena {
         }
         let region = region.expect("checked");
         let base = conn.url.clone().unwrap_or_else(|| format!("https://athena.{region}.amazonaws.com"));
-        if base.to_lowercase().starts_with("http://") && conn.sslmode.insists() {
-            return Err(SourceError::PlainUrl(conn.uid.clone(), "athena"));
-        }
+        let note = http::plain(conn, &base, "athena")?;
         let host = base.split("://").nth(1).unwrap_or(&base).split('/').next().unwrap_or_default().to_string();
         Ok(Athena {
             agent: http::agent(conn)?,
@@ -73,8 +79,9 @@ impl Athena {
             conn: conn.clone(),
             region,
             creds: creds.expect("checked"),
-            catalog: conn.catalog.clone().unwrap_or_else(|| "awsdatacatalog".into()),
+            catalog: conn.catalog.clone().unwrap_or_else(|| "AwsDataCatalog".into()),
             database: conn.schema.clone().or_else(|| conn.database.clone()),
+            warnings: note.into_iter().collect(),
         })
     }
 
@@ -91,12 +98,15 @@ impl Athena {
         let mut headers: Vec<(&str, &str)> = plain.iter().map(|(k, v)| (k.as_str(), v.as_str())).filter(|(k, _)| *k != "host").collect();
         headers.extend(signed.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         headers.push(("User-Agent", USER_AGENT));
-        let (status, text) = http::call(&self.conn, &self.agent, "POST", &format!("{}/", self.base), &headers, Some(body.as_bytes()))?;
+        let (status, text) =
+            http::call(&self.conn, &self.agent, http::Method::Post, &format!("{}/", self.base), &headers, Some(body.as_bytes()))?;
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         if status != 200 {
             let kind = v.get("__type").and_then(|t| t.as_str()).unwrap_or("");
-            let why = v.get("message").or_else(|| v.get("Message")).and_then(|m| m.as_str()).unwrap_or(text.trim());
-            return Err(SourceError::Query(self.conn.uid.clone(), format!("{status}: {kind} {why}").replace(":  ", ": ")));
+            return Err(SourceError::Query(
+                self.conn.uid.clone(),
+                format!("{status}: {kind} {}", http::reason(&text)).replace(":  ", ": "),
+            ));
         }
         Ok(v)
     }
@@ -198,13 +208,11 @@ impl Athena {
 
 /// The first three links of the credential chain, in their order.
 fn credentials(
-    conn: &Connection,
     secrets: Secrets,
     env: &dyn Fn(&str) -> Option<String>,
     profile: &str,
     shared_file: Option<PathBuf>,
 ) -> Option<sigv4::Credentials> {
-    let _ = conn;
     if let (Some(id), Some(key)) = (&secrets.access_key_id, &secrets.secret_access_key) {
         return Some(sigv4::Credentials {
             access_key_id: id.expose().to_string(),
@@ -268,5 +276,9 @@ impl Source for Athena {
 
     fn adapter(&self) -> &str {
         "athena"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }

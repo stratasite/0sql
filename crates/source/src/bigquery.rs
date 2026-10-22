@@ -28,6 +28,7 @@ pub struct BigQuery {
     project: String,
     credential: Credential,
     token: Option<(String, Instant)>,
+    warnings: Vec<String>,
 }
 
 /// What the credentials file held.
@@ -77,9 +78,7 @@ impl BigQuery {
             return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
         let base = conn.url.clone().unwrap_or_else(|| DEFAULT_BASE.into());
-        if base.to_lowercase().starts_with("http://") && conn.sslmode.insists() {
-            return Err(SourceError::PlainUrl(conn.uid.clone(), "bigquery"));
-        }
+        let note = http::plain(conn, &base, "bigquery")?;
         Ok(BigQuery {
             agent: http::agent(conn)?,
             base: base.trim_end_matches('/').to_string(),
@@ -87,6 +86,7 @@ impl BigQuery {
             project: conn.project.clone().expect("checked"),
             credential: credential.expect("checked"),
             token: None,
+            warnings: note.into_iter().collect(),
         })
     }
 
@@ -124,24 +124,12 @@ impl BigQuery {
                 ]),
             ),
         };
-        let headers = [("Content-Type", "application/x-www-form-urlencoded"), ("Accept", "application/json"), ("User-Agent", USER_AGENT)];
-        let (status, text) = http::call(&self.conn, &self.agent, "POST", &token_uri, &headers, Some(body.as_bytes()))?;
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-        if status != 200 {
-            let why = v.get("error_description").or_else(|| v.get("error")).and_then(|e| e.as_str()).unwrap_or(text.trim());
-            return Err(SourceError::Connect(self.conn.uid.clone(), format!("token: {status}: {why}")));
-        }
-        let token = v
-            .get("access_token")
-            .and_then(|t| t.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| SourceError::Connect(self.conn.uid.clone(), "token: the answer carried no access_token".into()))?;
-        let secs = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
-        self.token = Some((token.clone(), Instant::now() + Duration::from_secs(secs)));
+        let (token, until) = http::token(&self.conn, &self.agent, &token_uri, None, &body)?;
+        self.token = Some((token.clone(), until));
         Ok(token)
     }
 
-    fn request(&mut self, method: &str, url: &str, body: Option<String>) -> Result<(u16, String)> {
+    fn request(&mut self, method: http::Method, url: &str, body: Option<String>) -> Result<(u16, String)> {
         let bearer = format!("Bearer {}", self.bearer()?);
         let headers = [
             ("Authorization", bearer.as_str()),
@@ -153,13 +141,7 @@ impl BigQuery {
     }
 
     fn refused(&self, status: u16, text: &str) -> SourceError {
-        let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
-        let why = v
-            .pointer("/error/message")
-            .and_then(|m| m.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| text.trim().chars().take(400).collect());
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {why}"))
+        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn parse(&self, text: &str) -> Result<Answer> {
@@ -180,12 +162,18 @@ impl BigQuery {
             body["location"] = serde_json::Value::String(l.clone());
         }
         let url = format!("{}/bigquery/v2/projects/{}/queries", self.base, http::urlencode(&self.project));
-        let (status, text) = self.request("POST", &url, Some(body.to_string()))?;
+        let (status, text) = self.request(http::Method::Post, &url, Some(body.to_string()))?;
         if status != 200 {
             return Err(self.refused(status, &text));
         }
         let mut answer = self.parse(&text)?;
         let job = answer.job_reference.clone().unwrap_or_default();
+        if job.job_id.is_empty() && !answer.job_complete {
+            return Err(SourceError::Query(
+                self.conn.uid.clone(),
+                "the job is not complete and the answer names no job to wait for".into(),
+            ));
+        }
         let base = self.base.clone();
         let project = http::urlencode(&self.project);
         let results_url = |page: Option<&str>| {
@@ -210,20 +198,26 @@ impl BigQuery {
                     http::urlencode(&job.job_id),
                     job.location.as_deref().map(|l| format!("?location={}", http::urlencode(l))).unwrap_or_default()
                 );
-                let _ = self.request("POST", &cancel, Some("{}".into()));
+                let _ = self.request(http::Method::Post, &cancel, Some("{}".into()));
                 return Err(SourceError::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
                 ));
             }
-            let (status, text) = self.request("GET", &results_url(None), None)?;
+            let (status, text) = self.request(http::Method::Get, &results_url(None), None)?;
             if status != 200 {
                 return Err(self.refused(status, &text));
             }
             answer = self.parse(&text)?;
         }
+        // `errors` on a completed job are its warnings as often as its
+        // failure, the API says; without a result they are the failure.
         if let Some(e) = answer.errors.first() {
-            return Err(SourceError::Query(self.conn.uid.clone(), e.message.clone().unwrap_or_else(|| "query failed".into())));
+            let message = e.message.clone().unwrap_or_else(|| "query failed".into());
+            if answer.schema.is_none() {
+                return Err(SourceError::Query(self.conn.uid.clone(), message));
+            }
+            self.warnings.push(format!("{}: the job reported: {message}", self.conn.uid));
         }
         // The total is known from the first page, so a result over the cap
         // is refused before any other page is fetched.
@@ -233,12 +227,12 @@ impl BigQuery {
         let columns: Vec<String> = answer.schema.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         loop {
-            rows.extend(answer.rows.iter().map(|r| r.f.iter().map(|c| cell(&c.v)).collect::<Vec<_>>()));
+            rows.extend(answer.rows.into_iter().map(|r| r.f.into_iter().map(|c| http::cell(c.v)).collect::<Vec<_>>()));
             if rows.len() > max_rows {
                 return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
             }
             let Some(token) = answer.page_token.take() else { break };
-            let (status, text) = self.request("GET", &results_url(Some(&token)), None)?;
+            let (status, text) = self.request(http::Method::Get, &results_url(Some(&token)), None)?;
             if status != 200 {
                 return Err(self.refused(status, &text));
             }
@@ -337,16 +331,6 @@ struct ApiError {
     message: Option<String>,
 }
 
-/// A value as text: the API sends scalars as strings and null as null; a
-/// record or an array arrives nested and is kept as its JSON.
-fn cell(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
-    }
-}
-
 impl Source for BigQuery {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
@@ -355,6 +339,10 @@ impl Source for BigQuery {
 
     fn adapter(&self) -> &str {
         "bigquery"
+    }
+
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     fn connection(&self) -> Option<&Connection> {

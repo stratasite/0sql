@@ -1,10 +1,11 @@
-//! Trino over its client protocol, and Athena when it is reached the
-//! same way: POST a statement to `/v1/statement`, then follow `nextUri`
-//! until there is none, collecting rows as they come. The catalog and
-//! schema go in headers, so a statement can say `information_schema.tables`
-//! and mean this catalog's.
+//! Trino over its client protocol: POST a statement to `/v1/statement`,
+//! then follow `nextUri` until there is none, collecting rows as they
+//! come. The catalog and schema go in headers, so a statement can say
+//! `information_schema.tables` and mean this catalog's. Athena has its
+//! own transport; it is not reached this way.
 
 use crate::{http, read_only, Connection, Result, Rows, Secret, Source, SourceError};
+use base64::Engine;
 use serde_json::Value;
 
 pub struct Trino {
@@ -45,7 +46,7 @@ impl Trino {
         }
         if let Some(p) = &self.password {
             // Basic over HTTPS; Trino refuses it over plain HTTP, which is right.
-            let token = base64(format!("{}:{}", self.user, p.expose()).as_bytes());
+            let token = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", self.user, p.expose()));
             req = req.header("Authorization", &format!("Basic {token}"));
         }
         req
@@ -86,11 +87,21 @@ impl Source for Trino {
                         }
                         return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
                     }
-                    rows.push(r.as_array().map(|cells| cells.iter().cloned().map(cell).collect()).unwrap_or_default());
+                    rows.push(r.as_array().map(|cells| cells.iter().cloned().map(http::cell).collect()).unwrap_or_default());
                 }
             }
             let Some(next) = v.get("nextUri").and_then(Value::as_str).map(str::to_string) else { break };
-            let r = self.headers(self.agent.get(&next)).call().map_err(fail)?;
+            // The protocol says a 503 on nextUri is "try again", not a refusal.
+            let mut tries = 0;
+            let r = loop {
+                let r = self.headers(self.agent.get(&next)).call().map_err(fail)?;
+                if r.status().as_u16() == 503 && tries < 10 {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * tries));
+                    continue;
+                }
+                break r;
+            };
             v = self.page(http::text(&self.conn, r)?)?;
         }
         Ok(Rows { columns, rows })
@@ -103,25 +114,4 @@ impl Source for Trino {
     fn warnings(&self) -> &[String] {
         &self.warnings
     }
-}
-
-fn cell(v: Value) -> Option<String> {
-    match v {
-        Value::Null => None,
-        Value::String(s) => Some(s),
-        other => Some(other.to_string()),
-    }
-}
-
-/// Standard base64, for one header; not worth a crate.
-fn base64(bytes: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
-        for i in 0..4 {
-            out.push(if i <= chunk.len() { T[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
 }

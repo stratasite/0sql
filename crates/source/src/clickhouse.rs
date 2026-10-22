@@ -75,7 +75,7 @@ impl ClickHouse {
             return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let columns = compact.meta.into_iter().map(|m| m.name).collect();
-        let rows = compact.data.into_iter().map(|row| row.into_iter().map(cell).collect()).collect();
+        let rows = compact.data.into_iter().map(|row| row.into_iter().map(http::cell).collect()).collect();
         Ok(Rows { columns, rows })
     }
 }
@@ -105,15 +105,5 @@ impl Source for ClickHouse {
 
     fn warnings(&self) -> &[String] {
         &self.warnings
-    }
-}
-
-/// A JSON cell as the text a consumer will match on: strings as they are,
-/// numbers and booleans as they print, null as none.
-fn cell(v: serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(s) => Some(s),
-        other => Some(other.to_string()),
     }
 }

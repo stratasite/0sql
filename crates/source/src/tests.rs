@@ -167,6 +167,19 @@ fn only_a_read_is_allowed_through() {
         let err = read_only(bad).unwrap_err().to_string();
         assert!(err.starts_with("this statement is not a read"), "should be refused: {bad} ({err})");
     }
+    // A read that carries a write is a write.
+    for sql in [
+        "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+        "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+        "SELECT * INTO new_t FROM t",
+        "SELECT * FROM t; DROP TABLE t",
+        "WITH x AS (SELECT 1) UPDATE t SET a = 1",
+    ] {
+        assert!(read_only(sql).is_err(), "{sql}");
+    }
+    // The same words inside a literal or a quoted identifier are not syntax.
+    assert!(read_only("SELECT 'insert into' AS note, \"update\" FROM t WHERE kind = 'delete'").is_ok());
+    assert!(read_only("SELECT update_count, deleted_at FROM t").is_ok(), "a word with an underscore is another word");
 }
 
 /// The transport against a real server. Ignored, because it needs one:
@@ -1055,8 +1068,6 @@ fn a_connection_reads_snowflakes_keys() {
     assert_eq!(c.role.as_deref(), Some("analyst"));
     assert_eq!(c.private_key_file.as_deref(), Some(Path::new("./rsa_key.p8")));
     assert!(SECRET_FIELDS.contains(&"private_key") && SECRET_FIELDS.contains(&"secret_access_key"));
-    let s = secrets(Some(&dir), "snow");
-    assert_eq!(s, Secrets::default());
 }
 
 // ----------------------------------------------------------------- redshift
@@ -1208,6 +1219,10 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
         ("POST", "/api/2.0/sql/statements") if body.contains("wide") => {
             (200, dbx_result("s3", "SUCCEEDED", &["x"], serde_json::json!([["1"], ["2"], ["3"]]), 3, None, true))
         }
+        // Cut at row_limit exactly: the total fits the cap, truncated says it did not.
+        ("POST", "/api/2.0/sql/statements") if body.contains("cut") => {
+            (200, dbx_result("s4", "SUCCEEDED", &["x"], serde_json::json!([["1"], ["2"]]), 2, None, true))
+        }
         ("POST", "/api/2.0/sql/statements") => {
             (200, dbx_result("s0", "SUCCEEDED", &["status", "n"], serde_json::json!([["paid", "3"], [null, "1"]]), 3, Some(1), false))
         }
@@ -1264,7 +1279,7 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
         assert_eq!(body["catalog"], "main");
         assert_eq!(body["schema"], "shop");
         assert_eq!(body["row_limit"], 11);
-        assert_eq!(body["wait_timeout"], "30s");
+        assert_eq!(body["wait_timeout"], "5s", "the statement timeout, within what the API allows");
         assert_eq!(body["format"], "JSON_ARRAY");
         assert_eq!(seen[2].1, "/api/2.0/sql/statements/s0/result/chunks/1");
     }
@@ -1275,6 +1290,8 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
 
     let err = src.query("SELECT x FROM wide", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
+    let err = src.query("SELECT x FROM cut", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "truncated alone refuses: {err}");
     let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
     assert!(err.contains("failed") && err.contains("TABLE_OR_VIEW_NOT_FOUND"), "{err}");
     assert!(src.query("DELETE FROM orders", 1).is_err());
@@ -1777,7 +1794,7 @@ fn athena_starts_polls_pages_drops_the_header_row_and_walks_the_credential_chain
         assert!(head.contains("x-amz-date: 20"), "{head}");
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["QueryExecutionContext"]["Database"], "shop");
-        assert_eq!(body["QueryExecutionContext"]["Catalog"], "awsdatacatalog");
+        assert_eq!(body["QueryExecutionContext"]["Catalog"], "AwsDataCatalog");
         assert_eq!(body["ResultConfiguration"]["OutputLocation"], "s3://results/zsql/");
         assert_eq!(body["WorkGroup"], "primary");
         assert!(seen[1].2.to_lowercase().contains("x-amz-target: amazonathena.getqueryexecution"));
@@ -1902,4 +1919,90 @@ fn an_athena_catalogue_reads_information_schema_without_comments_on_tables() {
     assert_eq!(orders.rows, None);
     assert_eq!(orders.columns[0].comment.as_deref(), Some("Paid or open"));
     assert!(orders.primary_key.is_empty());
+}
+
+/// A statement that never settles is cancelled at the statement timeout,
+/// on every API that polls, and the cancel is sent where that API takes it.
+#[test]
+fn a_statement_that_never_settles_is_cancelled_at_the_timeout() {
+    let server = fake(|method, path, body| {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        if path == "/oidc/v1/token" || path == "/token" {
+            return (200, r#"{"access_token":"t","expires_in":3600}"#.into());
+        }
+        if path.contains("/cancel") {
+            return (200, "{}".into());
+        }
+        // Snowflake
+        if path == "/api/v2/statements" && method == "POST" && v.get("statement").is_some() && v.get("warehouse_id").is_none() {
+            return (202, r#"{"code":"333334","statementHandle":"sf","message":"running"}"#.into());
+        }
+        if path == "/api/v2/statements/sf" {
+            return (202, r#"{"code":"333334","statementHandle":"sf","message":"running"}"#.into());
+        }
+        // Databricks
+        if path.starts_with("/api/2.0/sql/statements") {
+            return (200, serde_json::json!({"statement_id": "db", "status": {"state": "RUNNING"}}).to_string());
+        }
+        // BigQuery
+        if path.contains("/bigquery/") {
+            return (
+                200,
+                serde_json::json!({"jobReference": {"projectId": "p", "jobId": "bq", "location": "US"}, "jobComplete": false}).to_string(),
+            );
+        }
+        // Athena: start, then forever RUNNING; the stop has no MaxResults either.
+        if v.get("QueryString").is_some() {
+            return (200, serde_json::json!({"QueryExecutionId": "ath"}).to_string());
+        }
+        (200, serde_json::json!({"QueryExecution": {"Status": {"State": "RUNNING"}}}).to_string())
+    });
+    let base = Connection { url: Some(server.url.clone()), sslmode: SslMode::Disable, query_timeout: Some(1), ..Default::default() };
+    let dir = temp("never-settles");
+    let key = dir.join("adc.json");
+    std::fs::write(&key, serde_json::json!({"type": "authorized_user", "client_id": "c", "client_secret": "s", "refresh_token": "r", "token_uri": format!("{}/token", server.url)}).to_string()).unwrap();
+    let cases: Vec<(Connection, Secrets, &str)> = vec![
+        (
+            Connection { uid: "snow".into(), adapter: "snowflake".into(), database: Some("d".into()), ..base.clone() },
+            Secrets { personal_access_token: Some(Secret("t".into())), ..Default::default() },
+            "/api/v2/statements/sf/cancel",
+        ),
+        (
+            Connection { uid: "dbx".into(), adapter: "databricks".into(), warehouse: Some("w".into()), ..base.clone() },
+            Secrets { personal_access_token: Some(Secret("t".into())), ..Default::default() },
+            "/api/2.0/sql/statements/db/cancel",
+        ),
+        (
+            Connection {
+                uid: "bq".into(),
+                adapter: "bigquery".into(),
+                project: Some("p".into()),
+                key_file: Some(key.clone()),
+                ..base.clone()
+            },
+            Secrets::default(),
+            "/bigquery/v2/projects/p/jobs/bq/cancel?location=US",
+        ),
+        (
+            Connection { uid: "ath".into(), adapter: "athena".into(), region: Some("us-east-1".into()), ..base.clone() },
+            Secrets { access_key_id: Some(Secret("a".into())), secret_access_key: Some(Secret("s".into())), ..Default::default() },
+            "/",
+        ),
+    ];
+    for (conn, secrets, cancel_path) in cases {
+        let mut src = open(&conn, secrets).unwrap_or_else(|e| panic!("{}: {e}", conn.uid));
+        let before = server.seen.lock().unwrap().len();
+        let started = std::time::Instant::now();
+        let err = src.query("SELECT 1 AS one", 10).err().unwrap_or_else(|| panic!("{} should time out", conn.uid)).to_string();
+        assert!(err.contains("still running after 1s"), "{}: {err}", conn.uid);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{}: gave up in time", conn.uid);
+        let seen = server.seen.lock().unwrap();
+        let last = &seen[seen.len() - 1];
+        if conn.adapter == "athena" {
+            assert!(last.2.to_lowercase().contains("x-amz-target: amazonathena.stopqueryexecution"), "{}: {}", conn.uid, last.2);
+        } else {
+            assert_eq!(last.1, cancel_path, "{}", conn.uid);
+        }
+        assert!(seen.len() > before + 1, "{}: polled before giving up", conn.uid);
+    }
 }

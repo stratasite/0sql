@@ -88,11 +88,23 @@ impl Source for MySql {
         self.runtime.block_on(async {
             let mut result = conn.query_iter(sql).await.map_err(fail)?;
             let columns: Vec<String> = result.columns().map(|c| c.iter().map(|c| c.name_str().to_string()).collect()).unwrap_or_default();
+            // Which columns are dates without a time: the value alone
+            // cannot say, since a DATETIME at midnight looks the same.
+            let dates: Vec<bool> = result
+                .columns()
+                .map(|c| c.iter().map(|c| c.column_type() == mysql_async::consts::ColumnType::MYSQL_TYPE_DATE).collect())
+                .unwrap_or_default();
             let rows: Vec<mysql_async::Row> = result.collect().await.map_err(fail)?;
             if rows.len() > max_rows {
                 return Err(SourceError::TooManyRows(uid.clone(), max_rows));
             }
-            Ok(Rows { columns, rows: rows.into_iter().map(|r| r.unwrap().into_iter().map(cell).collect()).collect() })
+            Ok(Rows {
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|r| r.unwrap().into_iter().enumerate().map(|(i, v)| cell(v, dates.get(i).copied().unwrap_or(false))).collect())
+                    .collect(),
+            })
         })
     }
 
@@ -105,8 +117,9 @@ impl Source for MySql {
     }
 }
 
-/// A MySQL value as text. Bytes are what strings and decimals arrive as.
-fn cell(v: mysql_async::Value) -> Option<String> {
+/// A MySQL value as text. Bytes are what strings and decimals arrive as;
+/// `date_only` says the column is a DATE, so its value has no time to print.
+fn cell(v: mysql_async::Value, date_only: bool) -> Option<String> {
     use mysql_async::Value::*;
     match v {
         NULL => None,
@@ -115,8 +128,10 @@ fn cell(v: mysql_async::Value) -> Option<String> {
         UInt(n) => Some(n.to_string()),
         Float(f) => Some(f.to_string()),
         Double(f) => Some(f.to_string()),
-        Date(y, m, d, h, i, s, _) => Some(if h == 0 && i == 0 && s == 0 {
+        Date(y, m, d, h, i, s, micro) => Some(if date_only {
             format!("{y:04}-{m:02}-{d:02}")
+        } else if micro > 0 {
+            format!("{y:04}-{m:02}-{d:02} {h:02}:{i:02}:{s:02}.{micro:06}")
         } else {
             format!("{y:04}-{m:02}-{d:02} {h:02}:{i:02}:{s:02}")
         }),
