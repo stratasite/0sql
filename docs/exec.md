@@ -1,6 +1,6 @@
 # Query execution: the `exec` endpoint and the plane behind it
 
-A survey, written 2026-10-21 on branch `exec` and set aside the same day: the plan of record is `docs/introspection.md`, and execution is future matter. It rests on the survey in
+A survey, written 2026-10-21 on branch `exec` and set aside the same day. The plan of record for introspection and sampling is `docs/introspection.md`; the plan for running a query from the command line is `docs/run.md` (2026-10-22). The server endpoint this document describes is still future matter. It rests on the survey in
 `docs/execution-engine.md`, which was paused on 2026-10-18 after
 weighing thirteen adapters against a static binary; that document
 answers "which library connects to Snowflake". This one answers a
