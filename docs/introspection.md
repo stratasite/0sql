@@ -578,14 +578,105 @@ what makes the remaining adapters cheap instead of frightening.
       governance rules written into the command's output and the sample
       file's documentation.
 - [ ] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
-      Athena, on the HTTP transport B2 built, plus SigV4 for the two AWS
-      ones. Each is a request type, a catalogue query and a comments query;
-      what they are waiting for is credentials to verify them against, not
-      code. DuckDB sits here too, behind its own decision about the musl
-      C++ toolchain.
+      Athena. The shape below comes from reading how strata and its `dwh`
+      gem connect to four of them (see "What strata and dwh do"); the
+      plan's earlier line, "the HTTP transport plus SigV4 for the two AWS
+      ones", was half right. Redshift is Postgres on the wire and gets the
+      Postgres transport; only Athena needs SigV4. Each of the rest is one
+      request type over the HTTP client B2 built, a poll loop, a result
+      pager, a catalogue query and a comments query. What they are waiting
+      for is accounts to verify against, not code. DuckDB sits here too,
+      behind its own decision about the musl C++ toolchain.
+
+      The proposed shape, one line each:
+
+      | adapter | wire | auth the CLI offers | catalogue |
+      |---|---|---|---|
+      | Snowflake | `POST /api/v2/statements`, 202 + `statementHandle` poll, `?partition=N` pages | `personal_access_token`; `username` + `private_key` (RS256 JWT, 1 h) | `<database>.information_schema`, comments on tables and columns |
+      | Databricks | `POST /api/2.0/sql/statements` with `warehouse_id`, `wait_timeout 30s`, `on_wait_timeout CONTINUE`, `JSON_ARRAY` inline, `/result/chunks/N` | `personal_access_token`; `oauth_client_id` + `oauth_client_secret` (client credentials at `/oidc/v1/token`, scope `all-apis`) | `<catalog>.information_schema`, comments present |
+      | BigQuery | `POST /bigquery/v2/projects/<p>/queries`, `jobs.getQueryResults` pages, `useLegacySql false` | `key_file` (service-account JSON: RS256 JWT bearer grant); `application_default_credentials.json` (refresh token) | `<project>.<dataset>.INFORMATION_SCHEMA`, `OPTIONS` descriptions |
+      | Redshift | Postgres transport, port 5439, `sslmode` as today | `password`; later IAM temporary credentials | `svv_table_info` for rows, `pg_description` for comments, `svv_columns` for widths |
+      | Athena | SigV4 to `athena.<region>.amazonaws.com`: `StartQueryExecution`, `GetQueryExecution` poll, `GetQueryResults` pages (first row is the header; every cell is `VarCharValue`) | `access_key_id` + `secret_access_key` (+ `session_token`); the `AWS_*` variables; a profile in `~/.aws/credentials` | `information_schema` over Glue, `s3_output_location` and `workgroup` required |
+
+      Decisions the shape rests on, each of which is the user's:
+      1. Redshift over the Postgres wire, not the Data API. It is what
+         dwh does, it reuses a transport that is proven, and it leaves
+         SigV4 to Athena alone.
+      2. No browser OAuth in the CLI. Snowflake and Databricks offer a
+         token and a machine credential; the authorization-code flow that
+         strata runs in a web app is a server feature, not a CLI one.
+      3. Athena reads the standard credential chain in its first three
+         links only — explicit keys, the environment, a profile file. No
+         instance metadata and no SSO cache until someone needs them.
+      4. BigQuery is 0sql's own: neither strata nor dwh has it, so there is
+         no prior art to copy and the two credential files are the design.
+      5. Verification needs an account on each. None exists in CI today;
+         which of the five the user can provide decides the order.
 - [ ] **F — the corpus**, as its own decision and its own document, drawing
       on the goldens, the refusals and the corrections as much as on the
       samples.
+## What strata and dwh do
+
+Strata is a Rails app whose connections run through the `dwh` gem, and
+the strata CLI writes the same connection YAML for it. Four of the cloud
+five are there; BigQuery is not. What transfers, and what does not.
+
+**The transport pattern is the one B2 chose.** Snowflake, Databricks and
+Athena are HTTP in dwh too: submit, poll with a backoff from a quarter
+second to thirty, page the result. Snowflake pins every date and time
+output format in the request's `parameters` so cells arrive as text, which
+is the same decision the Postgres transport made with the simple-query
+protocol. Athena's `GetQueryResults` returns every cell as a `VarCharValue`
+with the header as the first row of the first page. Databricks' result
+comes as a manifest of chunks fetched one by one. None of this needs an
+SDK except Athena, where dwh leans on `aws-sdk-athena` for signing and for
+the credential chain; 0sql signs by hand, so the chain is the cost.
+
+**Redshift is a Postgres subclass**, forty lines: port 5439, the `pg`
+driver, a `date_add` override. The plan had it on the Data API with SigV4;
+the wire is simpler and already built. What Redshift needs of its own is
+the catalogue: `reltuples` is not maintained, `svv_table_info` is, and
+`pg_stat_ssl` does not exist for the `prefer` warning.
+
+**Credentials are per adapter, by name.** The strata CLI's `ds auth` asks
+for a different set per adapter and writes it under the datasource's key
+in `.strata`, chmod 600: Snowflake `auth_mode` with a
+`personal_access_token` or a `username` and `private_key` path; Databricks
+`oauth_client_id` and `oauth_client_secret`; Athena `access_key_id` and
+`secret_access_key`, with `session_token` through the passthrough map;
+everyone else a `password`. `.zsql` is already that file, and `secret(dir,
+uid, field)` is already field-generic, so phase E is new field names, not a
+new mechanism; the `ZSQL_DS_<UID>_<FIELD>` variable extends the same way.
+The server side stores each as an encrypted column and keys its connection
+pool on a digest of the config with rotating tokens excluded, which is the
+right split for `zsqld` if it ever connects.
+
+**Validation up front, with the whole list.** dwh declares each adapter's
+keys with `required`, `allowed` and a message, and strata's model reports
+every missing one at once rather than the first. `open()` should do the
+same per adapter: the full list of what is missing for this `adapter` and
+`auth_mode`, in one error.
+
+**Key-pair auth is a JWT.** Snowflake's is RS256 with `iss` of
+`ACCOUNT.USER.SHA256:<base64 of the public key's DER digest>`, `sub` of
+`ACCOUNT.USER`, an hour's `exp`; BigQuery's service-account grant is the
+same machinery with different claims. One signer serves both, and `ring`
+is already in the tree.
+
+**OAuth is where the copy stops.** dwh's `OpenAuthorizable` carries the
+authorization-code flow with PKCE, a refresh loop and a token store the
+host app persists on the datasource row. That is a web app's shape: a
+redirect URI, a callback, a session. A CLI mints a client-credentials
+token per process and is done; the token store has nothing to store. The
+strata CLI reached the same conclusion, offering only `oauth_m2m` for
+Databricks.
+
+**Not worth copying.** dwh interpolates identifiers into its catalogue
+queries and upper-cases Snowflake names itself, where 0sql's dialect
+already knows the fold; the retry wrapper on `execute` re-runs a query
+that may have cost money; `ssl: true` on Redshift is a boolean where the
+rest of 0sql spells `sslmode`.
+
 ## To verify before building
 
 - Which of the thirteen expose column and table comments through
