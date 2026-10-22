@@ -3079,6 +3079,7 @@ dependencies = [
  "tar",
  "ureq",
  "zsql-dialect",
+ "zsql-exec",
  "zsql-project",
  "zsql-semantic",
  "zsql-server",
@@ -3113,6 +3114,21 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror",
+]
+
+[[package]]
+name = "zsql-exec"
+version = "0.6.1"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "zsql-semantic",
+ "zsql-service",
+ "zsql-source",
+ "zsql-spec",
 ]
 
 [[package]]

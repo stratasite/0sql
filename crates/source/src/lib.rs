@@ -210,6 +210,9 @@ pub struct Connection {
     pub output_location: Option<String>,
     /// A named profile in the AWS shared credentials file.
     pub profile: Option<String>,
+    /// Seconds a stored result from this datasource answers for; `0`
+    /// keeps nothing. Read by `zsql run`, ignored by the loader.
+    pub cache_ttl: Option<i64>,
 }
 
 impl Connection {
@@ -253,6 +256,7 @@ impl Connection {
                 workgroup: s("workgroup"),
                 output_location: s("output_location").or_else(|| s("s3_output_location")),
                 profile: s("profile"),
+                cache_ttl: i("cache_ttl"),
             });
         }
         Ok(out)

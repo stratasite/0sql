@@ -10,6 +10,7 @@ members = [
   "crates/accounts",
   "crates/shorthand",
   "crates/source",
+  "crates/exec",
   "crates/service",
   "crates/server",
   "crates/golden",
@@ -49,6 +50,7 @@ zsql-project = { path = "crates/project" }
 zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
 zsql-source = { path = "crates/source" }
+zsql-exec = { path = "crates/exec" }
 zsql-service = { path = "crates/service" }
 zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }

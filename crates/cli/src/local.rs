@@ -43,7 +43,7 @@ impl Local {
 }
 
 /// The security context, from the JSON a `--context` file holds.
-fn context_of(v: Option<&Value>) -> Result<Option<SecurityContext>> {
+pub fn context_of(v: Option<&Value>) -> Result<Option<SecurityContext>> {
     match v {
         Some(v) => Ok(Some(serde_json::from_value(v.clone()).context("the security context does not parse")?)),
         None => Ok(None),

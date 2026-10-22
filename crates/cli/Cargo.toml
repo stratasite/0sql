@@ -24,6 +24,7 @@ server = ["dep:zsql-server"]
 zsql-server = { workspace = true, optional = true }
 zsql-service.workspace = true
 zsql-source.workspace = true
+zsql-exec.workspace = true
 zsql-semantic.workspace = true
 zsql-project.workspace = true
 zsql-shorthand.workspace = true

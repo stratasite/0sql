@@ -303,7 +303,8 @@ most frequent first, so a smaller number keeps the ones that matter.
 "#;
 
 pub const GITIGNORE: &str = "\
-# zsql: local secrets and sampled data\n\
+# zsql: local secrets, sampled data, and query results exported here\n\
 .zsql\n\
 .strata\n\
-samples/values.jsonl.gz\n";
+samples/values.jsonl.gz\n\
+results/\n";

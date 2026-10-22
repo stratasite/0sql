@@ -18,6 +18,7 @@ mod local;
 mod project;
 mod remote;
 mod repl;
+mod run;
 mod sample;
 mod scaffold;
 #[cfg(feature = "server")]
@@ -214,6 +215,40 @@ enum Command {
         #[arg(long)]
         budget: Option<usize>,
     },
+    /// Run a query on the datasource the planner chooses and keep its rows under ~/.zsql/results. Local only.
+    Run {
+        #[command(flatten)]
+        query: QueryArgs,
+        /// Keep at most this many rows, pushed into the statement; the default cap is 10,000.
+        #[arg(long, conflicts_with = "all")]
+        limit: Option<u64>,
+        /// No limit: every row, held in memory.
+        #[arg(long)]
+        all: bool,
+        /// Run it even when a result within its TTL is stored, and replace that result.
+        #[arg(long)]
+        fresh: bool,
+        /// Statement timeout in seconds for this run.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// table (default), json, jsonl or csv; never changes with where stdout goes.
+        #[arg(long)]
+        format: Option<String>,
+        /// Write the rows to this file, in the format its extension says.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print at most this many rows; a table on a terminal shows 50 unless said.
+        #[arg(long)]
+        head: Option<usize>,
+        /// No footer, no warnings.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// What `zsql run` kept: list them, show one, export, the SQL, remove, purge.
+    Results {
+        #[command(subcommand)]
+        what: Option<ResultsWhat>,
+    },
     /// Read a datasource's tables and columns into catalogue/{datasource}.json. Local only.
     Introspect {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
@@ -369,6 +404,33 @@ fn run(command: Command, at: Where) -> Result<()> {
             Ok(())
         }
         Command::Deploy { dry_run, watch } => deploy::deploy(at, dry_run, watch),
+        Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
+            if at.wants_remote() {
+                bail!("zsql run runs here, with the credentials on this machine; it does not take -r");
+            }
+            let (mode, q, context) = query.resolve(at)?;
+            let Mode::Local(local) = mode else { bail!("zsql run runs here, with the credentials on this machine; it does not take -r") };
+            run::run(
+                &local,
+                &q,
+                context.as_ref(),
+                run::Options { limit, all, fresh, timeout, format: format.as_deref(), out: out.as_deref(), head, quiet },
+            )
+        }
+        Command::Results { what } => {
+            let project = at.project_dir()?;
+            let cmd = match &what {
+                None | Some(ResultsWhat::List) => run::ResultsCommand::List,
+                Some(ResultsWhat::Show { id, format, head, offset }) => {
+                    run::ResultsCommand::Show { id, format: format.as_deref(), head: *head, offset: *offset }
+                }
+                Some(ResultsWhat::Export { id, out }) => run::ResultsCommand::Export { id, out },
+                Some(ResultsWhat::Sql { id }) => run::ResultsCommand::Sql { id },
+                Some(ResultsWhat::Rm { id }) => run::ResultsCommand::Remove { id },
+                Some(ResultsWhat::Purge) => run::ResultsCommand::Purge,
+            };
+            run::results(&project, cmd)
+        }
         Command::Introspect { datasource, schema } => introspect::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
         Command::Sample { datasource, only, dry_run, budget } => sample::run(
             at.project.as_deref(),
@@ -534,6 +596,34 @@ impl QueryArgs {
         }
         Ok(())
     }
+}
+
+#[derive(Subcommand)]
+enum ResultsWhat {
+    /// Every stored result, newest first.
+    List,
+    /// One result's rows.
+    Show {
+        id: String,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        head: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// One result's rows to a file, in the format its extension says.
+    Export {
+        id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The statement a result ran.
+    Sql { id: String },
+    /// Remove one result.
+    Rm { id: String },
+    /// Remove every result of this project.
+    Purge,
 }
 
 /// A JSON file, named in any error: the read and the parse alike.

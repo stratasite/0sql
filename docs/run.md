@@ -507,7 +507,14 @@ Each phase ships on its own and is proven without a cloud account: the
 SQLite fixture in the ordinary suite, the Postgres container on CI, and
 the fakes in `crates/source/src/tests.rs`.
 
-1. **`zsql run` and the store.** The crate with `Store`, `Manifest`,
+1. **`zsql run` and the store.** *Landed 2026-10-22: `crates/exec`, `zsql
+   run`, the store under `~/.zsql/results/<project>`, the key, the
+   twenty-four-hour TTL with `cache_ttl` per datasource, `--fresh`, the
+   cap pushed one past into the statement, the four formats, `--out`,
+   and `zsql results` list, show, export, sql, rm and purge, proven on
+   the SQLite fixture end to end. Lineage records the line's items, the
+   fields the columns resolved to and the tables the statement names.*
+   The crate with `Store`, `Manifest`,
    JSONL rows, `Engine::run` over `Source::query` under the default cap,
    `cap + 1` pushed into the SQL, `--limit`, the table printer, the
    three machine formats, `--out`. The cache with the full key, the
@@ -538,3 +545,10 @@ introspection plan left them; nothing in these phases needs one.
 scratch binary (less inside zsql, which already compiles most of the
 shared dependencies); or JSON lines now, at no cost, and a conversion
 of every stored result the day the cache is asked to be anything else.
+*Decided 2026-10-22: JSON lines for this implementation; Parquet,
+DuckDB and DataFusion are a decision for another day.* The rest of the
+second pass stands: the lineage block, the table versions, the layout,
+the lease and the index are format-independent, and the manifest
+records `rows_format: "jsonl.gz"` so a later converter knows what it
+is reading. The other three were taken as recommended: the user-level
+directory, truncate-and-flag, and a twenty-four-hour default TTL.

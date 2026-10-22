@@ -1,0 +1,23 @@
+[package]
+name = "zsql-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Running a planned query and keeping its rows: the result store and the cache over it"
+
+[dependencies]
+zsql-service.workspace = true
+zsql-source.workspace = true
+zsql-semantic.workspace = true
+zsql-spec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+sha2 = "0.10"
+
+[lints]
+workspace = true
