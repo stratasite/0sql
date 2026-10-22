@@ -57,6 +57,14 @@ pub const DATASOURCES_YML: &str = "\
 #   sslmode: verify-full          # disable | prefer | require | verify-ca | verify-full, libpq's meanings; verify-full unless said\n\
 #   ca_file: ./ca.pem             # a PEM of certificates to trust besides the platform's, for a private CA\n\
 #\n\
+# redshift:\n\
+#   name: Redshift\n\
+#   adapter: redshift             # Postgres on the wire: host, port 5439, database, username, password in .zsql, sslmode\n\
+#   tier: warm\n\
+#   host: cluster.abc123.us-east-1.redshift.amazonaws.com\n\
+#   database: analytics\n\
+#   username: zsql\n\
+\n\
 # snow:\n\
 #   name: Snowflake\n\
 #   adapter: snowflake\n\

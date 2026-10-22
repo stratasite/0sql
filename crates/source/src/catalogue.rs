@@ -118,7 +118,8 @@ impl Catalogue {
     pub fn read(src: &mut dyn Source, datasource: &str, scope: Option<&str>) -> Result<Catalogue> {
         let adapter = src.adapter().to_string();
         let tables = match adapter.as_str() {
-            "postgres" | "redshift" => postgres(src, scope)?,
+            "postgres" => postgres(src, scope)?,
+            "redshift" => redshift(src, scope)?,
             "clickhouse" => clickhouse(src, scope)?,
             "mysql" => mysql(src, scope)?,
             "sqlserver" => sqlserver(src, scope)?,
@@ -189,7 +190,7 @@ fn keys(src: &mut dyn Source, tables: &mut [Table], keys_sql: &str) -> Result<()
 
 /// The key rows applied to the tables, for an adapter whose keys arrive
 /// in that shape from somewhere other than one statement.
-fn apply_keys(tables: &mut [Table], k: &Rows) {
+pub(crate) fn apply_keys(tables: &mut [Table], k: &Rows) {
     // (schema, table, kind, name) -> rows, keeping first-seen order.
     let mut groups: Vec<((Option<String>, String, String, Option<String>), Vec<&Vec<Option<String>>>)> = Vec::new();
     for r in &k.rows {
@@ -279,6 +280,114 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
+}
+
+/// The three statements of a Redshift read. Redshift is Postgres 8 with
+/// its own bookkeeping: `reltuples` is not maintained there, so the row
+/// count is `svv_table_info`'s; `information_schema.columns` does not see
+/// a late-binding view, so the columns come from `pg_attribute`; and
+/// there is no `unnest … WITH ORDINALITY`, so a constraint's attribute
+/// numbers arrive as the array's text and are expanded here against the
+/// columns already read. Every statement but the first is also valid
+/// Postgres, which is how two of the three are proven on the fixture.
+pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
+    let tables = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, \
+         CASE c.relkind WHEN 'v' THEN 'view' ELSE 'table' END AS table_kind, \
+         CAST(t.tbl_rows AS VARCHAR) AS row_estimate, d.description AS table_comment \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN svv_table_info t ON t.schema = n.nspname AND t.\"table\" = c.relname \
+         LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = 0 \
+         WHERE c.relkind IN ('r', 'v') AND {} ORDER BY 1, 2",
+        scope_clause("n.nspname", scope)
+    );
+    let columns = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, \
+         format_type(a.atttypid, a.atttypmod) AS data_type, \
+         CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, \
+         CAST(CASE WHEN a.atttypid IN (1042, 1043) AND a.atttypmod > 4 THEN a.atttypmod - 4 END AS VARCHAR) AS max_length, \
+         CAST(a.attnum AS VARCHAR) AS position, d.description AS column_comment \
+         FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum \
+         WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'v') AND {} ORDER BY 1, 2, a.attnum",
+        scope_clause("n.nspname", scope)
+    );
+    let keys = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, \
+         CASE con.contype WHEN 'p' THEN 'primary' ELSE 'foreign' END AS key_kind, con.conname AS key_name, \
+         CAST(con.conkey AS VARCHAR) AS key_attnums, \
+         rn.nspname AS ref_schema, rc.relname AS ref_table, CAST(con.confkey AS VARCHAR) AS ref_attnums \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
+         LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
+         WHERE con.contype IN ('p', 'f') AND {} ORDER BY 1, 2, 4",
+        scope_clause("n.nspname", scope)
+    );
+    (tables, columns, keys)
+}
+
+fn redshift(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let (tables_sql, columns_sql, keys_sql) = redshift_sql(scope);
+    let mut tables = assemble(src, &tables_sql, &columns_sql)?;
+    let k = src.query(&keys_sql, MAX_COLUMNS)?;
+    let expanded = expand_attnums(&tables, &k);
+    apply_keys(&mut tables, &expanded);
+    Ok(tables)
+}
+
+/// Key rows with attribute-number arrays (`{1,3}`) turned into one row per
+/// column in the shared shape, the names looked up by position among the
+/// columns already read; a foreign key pairs each with the referenced
+/// array's entry at the same index.
+pub(crate) fn expand_attnums(tables: &[Table], k: &Rows) -> Rows {
+    let nums = |s: Option<&str>| -> Vec<i64> {
+        s.unwrap_or_default().trim_matches(|c| c == '{' || c == '}').split(',').filter_map(|n| n.trim().parse().ok()).collect()
+    };
+    let name_at = |schema: Option<&str>, table: &str, attnum: i64| -> Option<String> {
+        tables
+            .iter()
+            .find(|t| t.name == table && t.schema.as_deref() == schema)?
+            .columns
+            .iter()
+            .find(|c| c.position == attnum)
+            .map(|c| c.name.clone())
+    };
+    let mut out = Rows {
+        columns: ["table_schema", "table_name", "key_kind", "key_name", "column_name", "position", "ref_schema", "ref_table", "ref_column"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: vec![],
+    };
+    for r in &k.rows {
+        let g = |c: &str| k.get(r, c).map(str::to_string);
+        let (schema, table) = (g("table_schema"), g("table_name").unwrap_or_default());
+        let (ref_schema, ref_table) = (g("ref_schema"), g("ref_table"));
+        let refs = nums(k.get(r, "ref_attnums"));
+        for (i, attnum) in nums(k.get(r, "key_attnums")).into_iter().enumerate() {
+            let Some(column) = name_at(schema.as_deref(), &table, attnum) else { continue };
+            let ref_column = match (&ref_table, refs.get(i)) {
+                (Some(rt), Some(n)) => name_at(ref_schema.as_deref(), rt, *n),
+                _ => None,
+            };
+            out.rows.push(vec![
+                schema.clone(),
+                Some(table.clone()),
+                g("key_kind"),
+                g("key_name"),
+                Some(column),
+                Some((i + 1).to_string()),
+                ref_schema.clone(),
+                ref_table.clone(),
+                ref_column,
+            ]);
+        }
+    }
+    out
 }
 
 /// `system.tables` and `system.columns`, which carry comments and a row

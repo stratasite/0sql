@@ -27,10 +27,16 @@ impl Postgres {
             secret.ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
 
         // The statement timeout is the warehouse's to enforce, so it is set
-        // on the session rather than trusted from this side alone.
+        // on the session rather than trusted from this side alone. Redshift
+        // takes no `options` at startup, so there the same two are SET on
+        // the session once it is open.
+        let redshift = conn.adapter == "redshift";
         let mut options = format!("-c statement_timeout={}", conn.timeout().as_millis());
         if let Some(schema) = &conn.schema {
             options.push_str(&format!(" -c search_path={schema}"));
+        }
+        if redshift {
+            options.clear();
         }
 
         // libpq's ladder maps onto tokio-postgres's three settings with the
@@ -45,7 +51,7 @@ impl Postgres {
         let mut config = tokio_postgres::Config::new();
         config
             .host(&host)
-            .port(conn.port.unwrap_or(5432))
+            .port(conn.port.unwrap_or(if redshift { 5439 } else { 5432 }))
             .user(&user)
             .dbname(&database)
             .password(password.expose())
@@ -70,11 +76,25 @@ impl Postgres {
 
         let mut pg =
             Postgres { runtime, client, adapter: conn.adapter.clone(), uid: conn.uid.clone(), timeout: conn.timeout(), warnings: vec![] };
-        // `prefer` may have ended plaintext, and the server knows which.
+        if redshift {
+            let mut session = format!("SET statement_timeout TO {}", conn.timeout().as_millis());
+            if let Some(schema) = &conn.schema {
+                session.push_str(&format!("; SET search_path TO {schema}"));
+            }
+            pg.runtime.block_on(pg.client.simple_query(&session)).map_err(|e| SourceError::Connect(conn.uid.clone(), crate::chain(&e)))?;
+        }
+        // `prefer` may have ended plaintext, and the server knows which —
+        // Postgres through pg_stat_ssl; Redshift has no such view, so there
+        // the mode is not confirmed and the warning says so.
         if conn.sslmode == SslMode::Prefer {
-            let rows = pg.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", 1)?;
-            if rows.rows.first().and_then(|r| rows.get(r, "ssl")) != Some("t") {
-                pg.warnings.push(format!("{}: sslmode is prefer and the server offered no TLS, so nothing is encrypted", conn.uid));
+            if redshift {
+                pg.warnings
+                    .push(format!("{}: sslmode is prefer, which Redshift gives no way to confirm; say require to be sure", conn.uid));
+            } else {
+                let rows = pg.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()", 1)?;
+                if rows.rows.first().and_then(|r| rows.get(r, "ssl")) != Some("t") {
+                    pg.warnings.push(format!("{}: sslmode is prefer and the server offered no TLS, so nothing is encrypted", conn.uid));
+                }
             }
         }
         Ok(pg)

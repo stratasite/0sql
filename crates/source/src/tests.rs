@@ -4,7 +4,7 @@
 //! B2's containers are where they get one.
 
 use super::*;
-use crate::catalogue::ForeignKey;
+use crate::catalogue::{self, Column, ForeignKey, Table};
 
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zsql-source-{name}-{}", std::process::id()));
@@ -1059,4 +1059,111 @@ fn a_connection_reads_snowflakes_keys() {
     assert_eq!(SECRET_FIELDS, ["password", "personal_access_token", "private_key"]);
     let s = secrets(Some(&dir), "snow");
     assert_eq!(s, Secrets::default());
+}
+
+// ----------------------------------------------------------------- redshift
+
+#[test]
+fn redshift_key_arrays_expand_against_the_columns_read() {
+    let col = |name: &str, position: i64| Column {
+        name: name.into(),
+        data_type: "integer".into(),
+        nullable: true,
+        max_length: None,
+        position,
+        comment: None,
+    };
+    let table = |schema: &str, name: &str, columns: Vec<Column>| Table {
+        schema: Some(schema.into()),
+        name: name.into(),
+        kind: "table".into(),
+        rows: None,
+        comment: None,
+        columns,
+        primary_key: vec![],
+        foreign_keys: vec![],
+    };
+    // Attribute numbers have gaps where a column was dropped.
+    let mut tables = vec![
+        table("shop", "customers", vec![col("id", 1), col("name", 3)]),
+        table("shop", "orders", vec![col("id", 1), col("customer_id", 2), col("region", 4)]),
+    ];
+    let k = Rows {
+        columns: ["table_schema", "table_name", "key_kind", "key_name", "key_attnums", "ref_schema", "ref_table", "ref_attnums"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: vec![
+            vec![
+                Some("shop".into()),
+                Some("orders".into()),
+                Some("primary".into()),
+                Some("orders_pkey".into()),
+                Some("{1}".into()),
+                None,
+                None,
+                None,
+            ],
+            vec![
+                Some("shop".into()),
+                Some("orders".into()),
+                Some("foreign".into()),
+                Some("orders_customer_fk".into()),
+                Some("{4,2}".into()),
+                Some("shop".into()),
+                Some("customers".into()),
+                Some("{3,1}".into()),
+            ],
+            vec![Some("shop".into()), Some("nowhere".into()), Some("primary".into()), None, Some("{1}".into()), None, None, None],
+        ],
+    };
+    let expanded = catalogue::expand_attnums(&tables, &k);
+    assert_eq!(expanded.rows.len(), 3, "one row per key column; a table not read contributes none");
+    catalogue::apply_keys(&mut tables, &expanded);
+    let orders = &tables[1];
+    assert_eq!(orders.primary_key, ["id"]);
+    assert_eq!(
+        orders.foreign_keys,
+        [ForeignKey {
+            name: Some("orders_customer_fk".into()),
+            columns: vec!["region".into(), "customer_id".into()],
+            references_schema: Some("shop".into()),
+            references_table: "customers".into(),
+            references_columns: vec!["name".into(), "id".into()],
+        }],
+        "columns paired by index, in the array's order"
+    );
+}
+
+/// Two of Redshift's three statements are valid Postgres, so the fixture
+/// proves them: the columns from pg_attribute and the keys as arrays.
+#[test]
+#[ignore]
+fn redshifts_column_and_key_statements_hold_on_postgres() {
+    let conn = Connection {
+        uid: "test".into(),
+        adapter: "postgres".into(),
+        host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
+        username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
+    let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
+    let (_, columns_sql, keys_sql) = catalogue::redshift_sql(Some("shop"));
+    let c = src.query(&columns_sql, 1000).expect("the column statement runs on Postgres");
+    let name = c
+        .rows
+        .iter()
+        .find(|r| c.get(r, "table_name") == Some("customers") && c.get(r, "column_name") == Some("name"))
+        .expect("customers.name");
+    assert_eq!(c.get(name, "column_comment"), Some("As they sign"));
+    assert_eq!(c.get(name, "is_nullable"), Some("NO"));
+    let k = src.query(&keys_sql, 1000).expect("the key statement runs on Postgres");
+    let fk = k.rows.iter().find(|r| k.get(r, "key_kind") == Some("foreign")).expect("orders references customers");
+    assert_eq!(k.get(fk, "table_name"), Some("orders"));
+    assert_eq!(k.get(fk, "ref_table"), Some("customers"));
+    assert!(k.get(fk, "key_attnums").unwrap().starts_with('{'), "arrays arrive as their text");
 }
