@@ -83,15 +83,19 @@ pub fn findings(model: &Model) -> Value {
             }
         }
         if outside > 0 {
+            let scopes: Vec<String> = cat.scopes.iter().map(|s| s.schema.clone().unwrap_or_else(|| "every schema".into())).collect();
             unchecked.push(format!(
                 "{} ({outside} table{} outside the catalog's scope {})",
                 ds.uid,
                 if outside == 1 { "" } else { "s" },
-                cat.scope.as_deref().unwrap_or("")
+                scopes.join(", ")
             ));
         }
+        if let Some(days) = age_days(&cat.read_at).filter(|d| *d >= 7) {
+            unchecked.push(format!("{} (catalog read {days} days ago)", ds.uid));
+        }
         out.push(json!({
-            "datasource": ds.uid, "read_at": cat.read_at, "tables_checked": checked, "scope": cat.scope,
+            "datasource": ds.uid, "read_at": cat.read_at, "tables_checked": checked, "scopes": cat.scopes, "added": cat.added,
             "missing_tables": missing_tables, "missing_columns": missing_columns, "type_mismatches": type_mismatches,
         }));
     }
@@ -158,10 +162,8 @@ fn resolve<'a>(cat: &'a Catalog, physical: &str, quotes: &(String, String)) -> (
     // A catalog with no schemas at all (SQLite's) cannot contradict a
     // schema part, so `main.orders` is `orders` there.
     let schema = schema.map(|s| unquote(s, quotes)).filter(|_| cat.tables.iter().any(|t| t.schema.is_some()));
-    if let (Some(scope), Some((sname, _))) = (&cat.scope, schema) {
-        if !sname.eq_ignore_ascii_case(scope) {
-            return (None, true);
-        }
+    if !cat.covers(schema.map(|(s, _)| s), tname) {
+        return (None, true);
     }
     let found = cat.tables.iter().find(|t| {
         same(&t.name, tname, texact)
@@ -225,10 +227,34 @@ pub fn print(v: &Value) -> bool {
     for u in v["unchecked"].as_array().into_iter().flatten() {
         let u = s(u);
         if u.contains("outside the catalog's scope") {
-            println!("catalog: {u}; `zsql catalog {}` without a schema would read them", u.split(' ').next().unwrap_or(""));
+            println!(
+                "catalog: {u}; `zsql catalog {} --schema <name>` or `zsql catalog add <table>` would read them",
+                u.split(' ').next().unwrap_or("")
+            );
+        } else if u.contains("catalog read") {
+            println!("catalog: {u}; `zsql catalog {}` re-reads it", u.split(' ').next().unwrap_or(""));
         } else {
             println!("catalog: {u} not checked; `zsql catalog {}` would make that possible", u.split(' ').next().unwrap_or(""));
         }
     }
     !v["fails"].as_bool().unwrap_or(false)
+}
+
+/// Whole days since an RFC 3339 timestamp, by the date alone.
+fn age_days(read_at: &str) -> Option<i64> {
+    let date = read_at.get(..10)?;
+    let mut parts = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (parts.next()??, parts.next()??, parts.next()??);
+    let days_from_civil = |y: i64, m: i64, d: i64| -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let mp = if m > 2 { m - 3 } else { m + 9 };
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    };
+    let then = days_from_civil(y, m, d);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64 / 86_400;
+    Some(now - then)
 }

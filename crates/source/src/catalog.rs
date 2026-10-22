@@ -18,11 +18,30 @@ pub struct Catalog {
     pub read_at: String,
     /// The version of `zsql` that read it: a catalog outlives a build.
     pub read_by: String,
-    /// The one schema this read was narrowed to, when it was: a table
-    /// outside it is unread, not absent, and `check` and drift say so.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+    /// The schemas read whole, each with when; a schema of `None` is
+    /// every non-system one. A table outside every scope and not added
+    /// by name is unread, not absent, and `check` and drift say so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<Scope>,
+    /// Tables read one by one, outside any scope read whole.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<Added>,
     pub tables: Vec<Table>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Scope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub read_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Added {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub name: String,
+    pub read_at: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -120,30 +139,147 @@ impl Catalog {
     /// without one every schema but the system ones is read. The queries
     /// are per adapter; the shape they fill is not.
     pub fn read(src: &mut dyn Source, datasource: &str, scope: Option<&str>) -> Result<Catalog> {
+        Catalog::read_filtered(src, datasource, &Filter::schema(scope))
+    }
+
+    /// Reads what the filter admits: a schema, every non-system schema,
+    /// one table by name, or the tables whose names hold a pattern. The
+    /// catalog that comes back records what it covers, which is how a
+    /// merge knows what a read can replace and what it cannot speak to.
+    pub fn read_filtered(src: &mut dyn Source, datasource: &str, f: &Filter) -> Result<Catalog> {
         let adapter = src.adapter().to_string();
         let tables = match adapter.as_str() {
-            "postgres" => postgres(src, scope)?,
-            "redshift" => redshift(src, scope)?,
-            "clickhouse" => clickhouse(src, scope)?,
-            "mysql" => mysql(src, scope)?,
-            "sqlserver" => sqlserver(src, scope)?,
-            "trino" => trino(src, scope)?,
-            "athena" => athena(src, scope)?,
-            "snowflake" => snowflake(src, scope)?,
-            "databricks" => databricks(src, scope)?,
-            "bigquery" => bigquery(src, scope)?,
-            "sqlite" => sqlite(src)?,
-            "duckdb" => duckdb(src, scope)?,
+            "postgres" => postgres(src, f)?,
+            "redshift" => redshift(src, f)?,
+            "clickhouse" => clickhouse(src, f)?,
+            "mysql" => mysql(src, f)?,
+            "sqlserver" => sqlserver(src, f)?,
+            "trino" => trino(src, f)?,
+            "athena" => athena(src, f)?,
+            "snowflake" => snowflake(src, f)?,
+            "databricks" => databricks(src, f)?,
+            "bigquery" => bigquery(src, f)?,
+            "sqlite" => sqlite(src, f)?,
+            "duckdb" => duckdb(src, f)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
+        };
+        let read_at = now();
+        let (scopes, added) = match &f.name {
+            Names::Any => (vec![Scope { schema: f.schema.clone(), read_at: read_at.clone() }], vec![]),
+            // A read by name covers the tables it found and nothing else.
+            Names::Exact(_) | Names::Like(_) => (
+                vec![],
+                tables.iter().map(|t| Added { schema: t.schema.clone(), name: t.name.clone(), read_at: read_at.clone() }).collect(),
+            ),
         };
         Ok(Catalog {
             datasource: datasource.to_string(),
             adapter,
-            read_at: now(),
+            read_at,
             read_by: env!("CARGO_PKG_VERSION").to_string(),
-            scope: scope.map(str::to_string),
+            scopes,
+            added,
             tables,
         })
+    }
+
+    /// Whether this catalog can speak to a table: it is inside a schema
+    /// that was read whole, or it was read by name. A name with no
+    /// schema is answered by the whole file.
+    pub fn covers(&self, schema: Option<&str>, name: &str) -> bool {
+        let same = |a: Option<&str>, b: Option<&str>| match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.scopes.iter().any(|s| s.schema.is_none() || schema.is_none() || same(s.schema.as_deref(), schema))
+            || self.added.iter().any(|a| a.name.eq_ignore_ascii_case(name) && (schema.is_none() || same(a.schema.as_deref(), schema)))
+    }
+
+    /// Folds a fresh read into this catalog: what the read covers is
+    /// replaced by what it found, what it does not cover is kept, and
+    /// the provenance records the read. A read of every schema subsumes
+    /// every narrower scope.
+    pub fn merge(&mut self, fresh: Catalog) {
+        self.adapter = fresh.adapter.clone();
+        self.read_at = fresh.read_at.clone();
+        self.read_by = fresh.read_by.clone();
+        self.tables.retain(|t| !fresh_covers(&fresh, t));
+        self.tables.extend(fresh.tables);
+        for s in fresh.scopes {
+            if s.schema.is_none() {
+                self.scopes.clear();
+                self.added.clear();
+            }
+            self.scopes.retain(|x| x.schema.as_deref().map(str::to_lowercase) != s.schema.as_deref().map(str::to_lowercase));
+            self.scopes.push(s);
+        }
+        for a in fresh.added {
+            self.added.retain(|x| {
+                !(x.name.eq_ignore_ascii_case(&a.name)
+                    && x.schema.as_deref().map(str::to_lowercase) == a.schema.as_deref().map(str::to_lowercase))
+            });
+            // A table inside a scope read whole needs no entry of its own.
+            if !self
+                .scopes
+                .iter()
+                .any(|s| s.schema.is_none() || s.schema.as_deref().map(str::to_lowercase) == a.schema.as_deref().map(str::to_lowercase))
+            {
+                self.added.push(a);
+            }
+        }
+        self.tables.sort_by(|a, b| {
+            (a.schema.as_deref().map(str::to_lowercase), a.name.to_lowercase())
+                .cmp(&(b.schema.as_deref().map(str::to_lowercase), b.name.to_lowercase()))
+        });
+    }
+
+    /// Forgets a table read by name that a re-read found gone.
+    pub fn forget(&mut self, schema: Option<&str>, name: &str) {
+        let same = |s: Option<&str>| s.map(str::to_lowercase) == schema.map(str::to_lowercase);
+        self.tables.retain(|t| !(t.name.eq_ignore_ascii_case(name) && same(t.schema.as_deref())));
+        self.added.retain(|a| !(a.name.eq_ignore_ascii_case(name) && same(a.schema.as_deref())));
+    }
+}
+
+/// Whether a fresh read's provenance speaks to this table.
+fn fresh_covers(fresh: &Catalog, t: &Table) -> bool {
+    fresh
+        .scopes
+        .iter()
+        .any(|s| s.schema.is_none() || s.schema.as_deref().map(str::to_lowercase) == t.schema.as_deref().map(str::to_lowercase))
+        || fresh.added.iter().any(|a| {
+            a.name.eq_ignore_ascii_case(&t.name) && a.schema.as_deref().map(str::to_lowercase) == t.schema.as_deref().map(str::to_lowercase)
+        })
+}
+
+/// What a read is narrowed to.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    /// One schema, or every non-system one.
+    pub schema: Option<String>,
+    pub name: Names,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum Names {
+    #[default]
+    Any,
+    /// One table, by its exact name, in any case.
+    Exact(String),
+    /// Tables whose name holds this, in any case.
+    Like(String),
+}
+
+impl Filter {
+    pub fn schema(schema: Option<&str>) -> Filter {
+        Filter { schema: schema.map(str::to_string), name: Names::Any }
+    }
+    pub fn table(schema: Option<&str>, name: &str) -> Filter {
+        Filter { schema: schema.map(str::to_string), name: Names::Exact(name.to_string()) }
+    }
+    pub fn like(schema: Option<&str>, pattern: &str) -> Filter {
+        Filter { schema: schema.map(str::to_string), name: Names::Like(pattern.to_string()) }
     }
 }
 
@@ -260,30 +396,38 @@ pub(crate) fn apply_keys(tables: &mut [Table], k: &Rows) {
 /// A schema predicate for a `WHERE`, over a column holding the schema
 /// name: the scope when there is one, else everything but the system
 /// schemas.
-fn scope_clause(column: &str, scope: Option<&str>) -> String {
-    match scope {
-        Some(s) => format!("{column} = '{}'", s.replace('\'', "''")),
+fn scope_clause(schema_col: &str, table_col: &str, f: &Filter) -> String {
+    let lit = |s: &str| s.replace('\'', "''");
+    let schema = match &f.schema {
+        Some(s) => format!("{schema_col} = '{}'", lit(s)),
         None => {
             let list: Vec<String> = SYSTEM_SCHEMAS.iter().map(|s| format!("'{s}'")).collect();
-            format!("{column} NOT IN ({})", list.join(", "))
+            format!("{schema_col} NOT IN ({})", list.join(", "))
+        }
+    };
+    match &f.name {
+        Names::Any => schema,
+        Names::Exact(n) => format!("{schema} AND LOWER({table_col}) = '{}'", lit(&n.to_lowercase())),
+        Names::Like(p) => {
+            format!("{schema} AND LOWER({table_col}) LIKE '%{}%'", lit(&p.to_lowercase().replace('%', "").replace('_', "\\_")))
         }
     }
 }
 
 /// `information_schema` for the shape, `pg_catalog` for what it lacks:
 /// the planner's row estimate and the comments.
-fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn postgres(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, \
          CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view' ELSE 'table' END AS table_kind, \
          c.reltuples::text AS row_estimate, obj_description(c.oid, 'pg_class') AS table_comment \
          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {} ORDER BY 1, 2",
-        scope_clause("n.nspname", scope)
+        scope_clause("n.nspname", "c.relname", f)
     );
     // Columns from pg_attribute rather than information_schema.columns,
     // which does not list a materialized view's.
-    let columns = pg_columns_sql(scope, "('r', 'p', 'v', 'm', 'f')");
+    let columns = pg_columns_sql(f, "('r', 'p', 'v', 'm', 'f')");
     let mut tables = assemble(src, &tables, &columns)?;
     // pg_constraint holds the key columns as attribute numbers; unnest
     // them with their ordinality so each row is one column in order, and
@@ -302,7 +446,7 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
          LEFT JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[k.ord] \
          WHERE con.contype IN ('p', 'f') AND {} ORDER BY 1, 2, 4, k.ord",
-        scope_clause("n.nspname", scope)
+        scope_clause("n.nspname", "c.relname", f)
     );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
@@ -311,7 +455,7 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// The columns of every relation of the given kinds, from `pg_attribute`,
 /// the type without its modifier and the width from the modifier. Shared
 /// by Postgres and Redshift; the fixture proves it.
-fn pg_columns_sql(scope: Option<&str>, relkinds: &str) -> String {
+fn pg_columns_sql(f: &Filter, relkinds: &str) -> String {
     format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, \
          format_type(a.atttypid, NULL) AS data_type, \
@@ -323,7 +467,7 @@ fn pg_columns_sql(scope: Option<&str>, relkinds: &str) -> String {
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum \
          WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN {relkinds} AND {} ORDER BY 1, 2, a.attnum",
-        scope_clause("n.nspname", scope)
+        scope_clause("n.nspname", "c.relname", f)
     )
 }
 
@@ -336,7 +480,7 @@ fn pg_columns_sql(scope: Option<&str>, relkinds: &str) -> String {
 /// text and are expanded here against the columns already read. Every
 /// statement but the first is also valid Postgres, which is how two of
 /// the three are proven on the fixture.
-pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
+pub(crate) fn redshift_sql(f: &Filter) -> (String, String, String) {
     let tables = format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, \
          CASE c.relkind WHEN 'v' THEN 'view' ELSE 'table' END AS table_kind, \
@@ -345,9 +489,9 @@ pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
          LEFT JOIN svv_table_info t ON t.schema = n.nspname AND t.\"table\" = c.relname \
          LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = 0 \
          WHERE c.relkind IN ('r', 'v') AND {} ORDER BY 1, 2",
-        scope_clause("n.nspname", scope)
+        scope_clause("n.nspname", "c.relname", f)
     );
-    let columns = pg_columns_sql(scope, "('r', 'v')");
+    let columns = pg_columns_sql(f, "('r', 'v')");
     let keys = format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, \
          CASE con.contype WHEN 'p' THEN 'primary' ELSE 'foreign' END AS key_kind, con.conname AS key_name, \
@@ -359,13 +503,13 @@ pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
          LEFT JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
          LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
          WHERE con.contype IN ('p', 'f') AND {} ORDER BY 1, 2, 4",
-        scope_clause("n.nspname", scope)
+        scope_clause("n.nspname", "c.relname", f)
     );
     (tables, columns, keys)
 }
 
-fn redshift(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
-    let (tables_sql, columns_sql, keys_sql) = redshift_sql(scope);
+fn redshift(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
+    let (tables_sql, columns_sql, keys_sql) = redshift_sql(f);
     let mut tables = assemble(src, &tables_sql, &columns_sql)?;
     let k = src.query(&keys_sql, MAX_COLUMNS)?;
     let expanded = expand_attnums(&tables, &k);
@@ -428,13 +572,13 @@ pub(crate) fn expand_attnums(tables: &[Table], k: &Rows) -> Rows {
 /// count that `INFORMATION_SCHEMA` here does not. ClickHouse has no
 /// nullable flag; the type says `Nullable(…)`. `FixedString(N)` is the
 /// only bounded string, so `max_length` is taken from it and nothing else.
-fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn clickhouse(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT database AS table_schema, name AS table_name, \
          if(engine LIKE '%View', 'view', 'table') AS table_kind, \
          toString(total_rows) AS row_estimate, comment AS table_comment \
          FROM system.tables WHERE {} ORDER BY 1, 2",
-        scope_clause("database", scope)
+        scope_clause("database", "name", f)
     );
     let columns = format!(
         "SELECT database AS table_schema, table AS table_name, name AS column_name, type AS data_type, \
@@ -442,7 +586,7 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          if(startsWith(type, 'FixedString('), extract(type, '\\\\((\\\\d+)\\\\)'), '') AS max_length, \
          toString(position) AS position, comment AS column_comment \
          FROM system.columns WHERE {} ORDER BY 1, 2, position",
-        scope_clause("database", scope)
+        scope_clause("database", "table", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
     // system.tables.primary_key is one expression string, "a, b"; split
@@ -452,7 +596,7 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          trim(col) AS column_name, toString(pos) AS position, '' AS ref_schema, '' AS ref_table, '' AS ref_column \
          FROM system.tables ARRAY JOIN splitByChar(',', primary_key) AS col, arrayEnumerate(splitByChar(',', primary_key)) AS pos \
          WHERE primary_key != '' AND {} ORDER BY 1, 2, pos",
-        scope_clause("database", scope)
+        scope_clause("database", "name", f)
     );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
@@ -463,20 +607,20 @@ fn clickhouse(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// schema is a database here, so the scope is the connection's database.
 /// Every column is aliased, because MySQL answers an unaliased
 /// `information_schema` column under its defined, upper-case name.
-fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn mysql(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT table_schema AS table_schema, table_name AS table_name, \
          IF(table_type = 'VIEW', 'view', 'table') AS table_kind, \
          CAST(table_rows AS CHAR) AS row_estimate, NULLIF(table_comment, 'VIEW') AS table_comment \
          FROM information_schema.tables WHERE {} ORDER BY 1, 2",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     let columns = format!(
         "SELECT table_schema AS table_schema, table_name AS table_name, column_name AS column_name, \
          data_type AS data_type, is_nullable AS is_nullable, \
          CAST(character_maximum_length AS CHAR) AS max_length, CAST(ordinal_position AS CHAR) AS position, \
          column_comment AS column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
     let keys_sql = format!(
@@ -489,7 +633,7 @@ fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
            ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name \
           AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name \
          WHERE tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') AND {} ORDER BY 1, 2, 4, kcu.ordinal_position",
-        scope_clause("kcu.table_schema", scope)
+        scope_clause("kcu.table_schema", "kcu.table_name", f)
     );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
@@ -499,7 +643,7 @@ fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// from the partitions of the heap or clustered index, and comments from
 /// the `MS_Description` extended property, which is where SQL Server keeps
 /// a comment when anyone has written one.
-fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn sqlserver(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT s.name AS table_schema, o.name AS table_name, \
          CASE o.type WHEN 'V' THEN 'view' ELSE 'table' END AS table_kind, \
@@ -508,7 +652,7 @@ fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
          LEFT JOIN sys.extended_properties ep ON ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' \
          WHERE o.type IN ('U', 'V') AND {} ORDER BY 1, 2",
-        scope_clause("s.name", scope)
+        scope_clause("s.name", "o.name", f)
     );
     let columns = format!(
         "SELECT c.TABLE_SCHEMA AS table_schema, c.TABLE_NAME AS table_name, c.COLUMN_NAME AS column_name, \
@@ -521,7 +665,7 @@ fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          LEFT JOIN sys.columns sc ON sc.object_id = o.object_id AND sc.name = c.COLUMN_NAME \
          LEFT JOIN sys.extended_properties ep ON ep.major_id = o.object_id AND ep.minor_id = sc.column_id AND ep.name = 'MS_Description' \
          WHERE {} ORDER BY 1, 2, c.ORDINAL_POSITION",
-        scope_clause("c.TABLE_SCHEMA", scope)
+        scope_clause("c.TABLE_SCHEMA", "c.TABLE_NAME", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
     let keys_sql = format!(
@@ -546,8 +690,8 @@ fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
          JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
          WHERE {} ORDER BY 1, 2, 4, 6",
-        scope_clause("s.name", scope),
-        scope_clause("s.name", scope)
+        scope_clause("s.name", "t.name", f),
+        scope_clause("s.name", "t.name", f)
     );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
@@ -557,7 +701,7 @@ fn sqlserver(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// transport sets as a header so the schema name alone reaches here. Trino
 /// puts a column's comment in `information_schema.columns` and a table's
 /// in `system.metadata.table_comments`; it has no cheap row estimate.
-fn trino(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn trino(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT t.table_schema, t.table_name, IF(t.table_type = 'VIEW', 'view', 'table') AS table_kind, \
          CAST(NULL AS VARCHAR) AS row_estimate, c.comment AS table_comment \
@@ -565,13 +709,13 @@ fn trino(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          LEFT JOIN system.metadata.table_comments c \
            ON c.catalog_name = t.table_catalog AND c.schema_name = t.table_schema AND c.table_name = t.table_name \
          WHERE {} ORDER BY 1, 2",
-        scope_clause("t.table_schema", scope)
+        scope_clause("t.table_schema", "t.table_name", f)
     );
     let columns = format!(
         "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
          CAST(NULL AS VARCHAR) AS max_length, CAST(ordinal_position AS VARCHAR) AS position, comment AS column_comment \
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     assemble(src, &tables, &columns)
 }
@@ -582,15 +726,16 @@ fn trino(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// no `KEY_COLUMN_USAGE`. Every column is aliased in quotes because an
 /// unquoted alias comes back upper-cased, and the scope is folded the
 /// way Snowflake folds an unquoted name.
-fn snowflake(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
-    let scope = scope.map(crate::snowflake::ident);
+fn snowflake(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
+    let scope = f.schema.as_deref().map(crate::snowflake::ident);
+    let f = &Filter { schema: scope.clone(), name: f.name.clone() };
     let tables = format!(
         "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", \
          CASE WHEN table_type LIKE '%VIEW' THEN 'view' ELSE 'table' END AS \"table_kind\", \
          CAST(row_count AS VARCHAR) AS \"row_estimate\", comment AS \"table_comment\" \
          FROM INFORMATION_SCHEMA.TABLES \
          WHERE {} AND table_type IN ('BASE TABLE', 'VIEW', 'MATERIALIZED VIEW', 'EXTERNAL TABLE') ORDER BY 1, 2",
-        scope_clause("table_schema", scope.as_deref())
+        scope_clause("table_schema", "table_name", f)
     );
     let columns = format!(
         "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", column_name AS \"column_name\", \
@@ -598,7 +743,7 @@ fn snowflake(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          CAST(character_maximum_length AS VARCHAR) AS \"max_length\", CAST(ordinal_position AS VARCHAR) AS \"position\", \
          comment AS \"column_comment\" \
          FROM INFORMATION_SCHEMA.COLUMNS WHERE {} ORDER BY 1, 2, ordinal_position",
-        scope_clause("table_schema", scope.as_deref())
+        scope_clause("table_schema", "table_name", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
     let within = match &scope {
@@ -650,18 +795,18 @@ fn snowflake(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// Athena's `information_schema`, which is Trino's without the comment
 /// view: the column comments are there, a table's are not, and nothing
 /// counts rows or declares a key. The scope is the Athena database.
-fn athena(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn athena(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT table_schema, table_name, CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS table_kind, \
          CAST(NULL AS VARCHAR) AS row_estimate, CAST(NULL AS VARCHAR) AS table_comment \
          FROM information_schema.tables WHERE {} ORDER BY 1, 2",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     let columns = format!(
         "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
          CAST(NULL AS VARCHAR) AS max_length, CAST(ordinal_position AS VARCHAR) AS position, comment AS column_comment \
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     assemble(src, &tables, &columns)
 }
@@ -670,23 +815,23 @@ fn athena(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// resolves: comments on tables and columns, widths, and the keys through
 /// the standard four views, a foreign key's referenced columns paired by
 /// `position_in_unique_constraint`.
-fn databricks(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn databricks(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT table_schema, table_name, \
          CASE WHEN table_type IN ('VIEW', 'MATERIALIZED_VIEW') THEN 'view' ELSE 'table' END AS table_kind, \
          CAST(NULL AS STRING) AS row_estimate, comment AS table_comment \
          FROM information_schema.tables WHERE {} ORDER BY 1, 2",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     let columns = format!(
         "SELECT table_schema, table_name, column_name, full_data_type AS data_type, is_nullable, \
          CAST(character_maximum_length AS STRING) AS max_length, CAST(ordinal_position AS STRING) AS position, \
          comment AS column_comment \
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
-        scope_clause("table_schema", scope)
+        scope_clause("table_schema", "table_name", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
-    let keys_sql = format!("{} AND {}", standard_keys_sql("information_schema", false), scope_clause("k.table_schema", scope));
+    let keys_sql = format!("{} AND {}", standard_keys_sql("information_schema", false), scope_clause("k.table_schema", "k.table_name", f));
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
 }
@@ -728,10 +873,10 @@ fn standard_keys_sql(prefix: &str, upper: bool) -> String {
 /// live in `TABLE_OPTIONS` as quoted literals and in `COLUMN_FIELD_PATHS`
 /// for a column; a parameterized `STRING(n)` carries its width in the
 /// type's spelling.
-fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn bigquery(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let conn = src.connection().ok_or_else(|| SourceError::Missing("bigquery".into(), "project"))?;
     let project = conn.project.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "project"))?;
-    let (qualifier, rows_join, rows_expr) = match scope {
+    let (qualifier, rows_join, rows_expr) = match f.schema.as_deref() {
         Some(dataset) => (
             format!("`{project}`.`{dataset}`"),
             format!("LEFT JOIN `{project}`.`{dataset}`.__TABLES__ s ON s.table_id = t.table_name"),
@@ -753,7 +898,7 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
            ON o.table_schema = t.table_schema AND o.table_name = t.table_name AND o.option_name = 'description' \
          {rows_join} \
          WHERE {} ORDER BY 1, 2",
-        scope_clause("t.table_schema", scope)
+        scope_clause("t.table_schema", "t.table_name", f)
     );
     let columns = format!(
         "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, \
@@ -763,11 +908,14 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          LEFT JOIN {qualifier}.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS f \
            ON f.table_schema = c.table_schema AND f.table_name = c.table_name AND f.field_path = c.column_name \
          WHERE {} ORDER BY 1, 2, c.ordinal_position",
-        scope_clause("c.table_schema", scope)
+        scope_clause("c.table_schema", "c.table_name", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
-    let keys_sql =
-        format!("{} AND {}", standard_keys_sql(&format!("{qualifier}.INFORMATION_SCHEMA"), true), scope_clause("k.table_schema", scope));
+    let keys_sql = format!(
+        "{} AND {}",
+        standard_keys_sql(&format!("{qualifier}.INFORMATION_SCHEMA"), true),
+        scope_clause("k.table_schema", "k.table_name", f)
+    );
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
 }
@@ -777,7 +925,7 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 /// `duckdb_views()`, `duckdb_columns()` and `duckdb_constraints()`. A
 /// key's columns arrive as one string joined on a unit separator and are
 /// paired here by index.
-fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+fn duckdb(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT schema_name AS table_schema, table_name, 'table' AS table_kind, \
          CAST(estimated_size AS VARCHAR) AS row_estimate, comment AS table_comment \
@@ -785,8 +933,8 @@ fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          UNION ALL \
          SELECT schema_name, view_name, 'view', NULL, comment \
          FROM duckdb_views() WHERE NOT internal AND {} ORDER BY 1, 2",
-        scope_clause("schema_name", scope),
-        scope_clause("schema_name", scope)
+        scope_clause("schema_name", "table_name", f),
+        scope_clause("schema_name", "view_name", f)
     );
     let columns = format!(
         "SELECT schema_name AS table_schema, table_name, column_name, data_type, \
@@ -794,7 +942,7 @@ fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          CAST(character_maximum_length AS VARCHAR) AS max_length, CAST(column_index AS VARCHAR) AS position, \
          comment AS column_comment \
          FROM duckdb_columns() WHERE NOT internal AND {} ORDER BY 1, 2, column_index",
-        scope_clause("schema_name", scope)
+        scope_clause("schema_name", "table_name", f)
     );
     let mut tables = assemble(src, &tables, &columns)?;
     let keys_sql = format!(
@@ -804,7 +952,7 @@ fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          array_to_string(constraint_column_names, chr(31)) AS key_columns, \
          referenced_table AS ref_table, array_to_string(referenced_column_names, chr(31)) AS ref_columns \
          FROM duckdb_constraints() WHERE constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') AND {} ORDER BY 1, 2, constraint_index",
-        scope_clause("schema_name", scope)
+        scope_clause("schema_name", "table_name", f)
     );
     let k = src.query(&keys_sql, MAX_COLUMNS)?;
     let mut out = Rows {
@@ -838,7 +986,10 @@ fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
 
 /// `sqlite_master` for the tables and `PRAGMA table_info` per table for
 /// the columns. No schema, no comments, no row estimate: SQLite keeps none.
-fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
+fn sqlite(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
+    if f.schema.is_some() {
+        return Err(SourceError::NoSchemas("SQLite"));
+    }
     let t = src.query(
         "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
         MAX_TABLES,
@@ -846,6 +997,14 @@ fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
     let mut tables = Vec::new();
     for r in &t.rows {
         let name = t.get(r, "name").unwrap_or_default().to_string();
+        let wanted = match &f.name {
+            Names::Any => true,
+            Names::Exact(n) => name.eq_ignore_ascii_case(n),
+            Names::Like(p) => name.to_lowercase().contains(&p.to_lowercase()),
+        };
+        if !wanted {
+            continue;
+        }
         let c = src.query(&format!("PRAGMA table_info(\"{}\")", name.replace('"', "\"\"")), MAX_COLUMNS)?;
         let columns = c
             .rows
@@ -914,9 +1073,6 @@ pub fn now() -> String {
 /// drift, which is what a committed catalog is for.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Drift {
-    /// (was, now): the two reads were narrowed differently, so what is
-    /// compared is only what both saw.
-    pub scope_changed: Option<(Option<String>, Option<String>)>,
     pub tables_added: Vec<String>,
     pub tables_dropped: Vec<String>,
     /// (table, column)
@@ -928,27 +1084,19 @@ pub struct Drift {
 
 impl Drift {
     pub fn is_empty(&self) -> bool {
-        self.scope_changed.is_none()
-            && self.tables_added.is_empty()
+        self.tables_added.is_empty()
             && self.tables_dropped.is_empty()
             && self.columns_added.is_empty()
             && self.columns_dropped.is_empty()
             && self.columns_retyped.is_empty()
     }
 
-    /// From `before` to `after`, by qualified table name and column name.
-    pub fn between(before: &Catalog, after: &Catalog) -> Drift {
+    /// From `before` to a fresh read, over what the read covers: a table
+    /// the read could not have seen is not dropped, only unread.
+    pub fn between(before: &Catalog, fresh: &Catalog) -> Drift {
         let key = |t: &Table| t.physical_name().to_lowercase();
         let mut d = Drift::default();
-        // A table outside the other read's scope was not read, not dropped.
-        let within = |t: &Table, scope: &Option<String>| match scope {
-            Some(s) => t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s)),
-            None => true,
-        };
-        if before.scope != after.scope {
-            d.scope_changed = Some((before.scope.clone(), after.scope.clone()));
-        }
-        for t in after.tables.iter().filter(|t| within(t, &before.scope)) {
+        for t in &fresh.tables {
             match before.tables.iter().find(|b| key(b) == key(t)) {
                 None => d.tables_added.push(t.physical_name()),
                 Some(b) => {
@@ -969,8 +1117,8 @@ impl Drift {
                 }
             }
         }
-        for b in before.tables.iter().filter(|b| within(b, &after.scope)) {
-            if !after.tables.iter().any(|t| key(t) == key(b)) {
+        for b in before.tables.iter().filter(|b| fresh_covers(fresh, b)) {
+            if !fresh.tables.iter().any(|t| key(t) == key(b)) {
                 d.tables_dropped.push(b.physical_name());
             }
         }
@@ -980,10 +1128,6 @@ impl Drift {
     /// One line per change, in the order a reader wants them.
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if let Some((was, now)) = &self.scope_changed {
-            let say = |s: &Option<String>| s.clone().unwrap_or_else(|| "every schema".into());
-            out.push(format!("scope changed:  {} -> {}; only what both reads saw is compared", say(was), say(now)));
-        }
         for t in &self.tables_added {
             out.push(format!("table added:    {t}"));
         }

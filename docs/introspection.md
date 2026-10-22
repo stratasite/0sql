@@ -670,6 +670,52 @@ what makes the remaining adapters cheap instead of frightening.
 - [ ] **F — the corpus**, as its own decision and its own document, drawing
       on the goldens, the refusals and the corrections as much as on the
       samples.
+## The catalog as a union, with its provenance
+
+Decided 2026-10-22, after the question of a warehouse with a million
+tables and of a Trino query that spans schemas. The file is no longer
+one read of one scope; it is a union that records how each part was
+read, and a sync re-reads exactly that.
+
+- **Provenance.** `scopes` lists the schemas read whole, each with
+  when; a schema of none is every non-system schema. `added` lists the
+  tables read one by one, each with when. A table inside a scope read
+  whole needs no entry of its own, and a read of every schema subsumes
+  everything narrower.
+- **Sync.** `zsql catalog <ds>` with nothing else re-reads every
+  recorded scope and every added table and replaces what each read
+  covers; `--schema a --schema b` reads those and adds them to the
+  union; the file is never replaced wholesale. The connection's
+  `schema:` is its search path for unqualified names, not a limit on
+  the catalog, so the old default that narrowed the read to it is gone.
+- **Drift and dropping.** Drift is computed over what a read covers, so
+  a re-read of one schema cannot report another's tables as dropped. A
+  table inside a re-read scope that the read did not list, or a table
+  added by name whose re-read came back empty, is reported as dropped
+  and removed: the warehouse was asked and answered. A read that fails
+  keeps what the file held for it, says so, and the command exits
+  non-zero. Nothing is removed on a failure, only on an answer.
+- **Search and add.** `zsql catalog search <pattern>` looks in the
+  file; `--live` asks the warehouse, every non-system schema, for names
+  holding the pattern and says which are not yet in the file. `zsql
+  catalog add schema.table …` reads those tables by name and folds them
+  in. `-r` keeps its one meaning, the 0sql server, which is why the
+  warehouse flag is `--live`.
+- **`check`.** A table outside every scope and not added by name is
+  unchecked, with the command that would read it; a catalog older than
+  a week is said to be, with the sync that refreshes it. Syncing is the
+  user's to ask for: `generate` and `check` stay offline, so CI and a
+  laptop without credentials can run them, and the drift report stays
+  where someone is reading.
+- **Trino.** Its `information_schema` is per Trino catalog and the
+  transport sends the connection's `database` as that catalog, so a
+  query across two Trino catalogs plans (the planner passes three-part
+  names through) but the file holds one Trino catalog's tables until a
+  `--catalog` scope exists. Noted, not built.
+
+Proven on the SQLite fixture end to end; the schema scopes on the
+Postgres fixture.
+
 ## What strata and dwh do
 
 Strata is a Rails app whose connections run through the `dwh` gem, and

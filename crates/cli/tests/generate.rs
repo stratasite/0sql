@@ -164,8 +164,9 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
     )
     .unwrap();
 
-    let (ok, out) = run(zsql(&home, &project).args(["catalog", "wh"]));
-    assert!(ok && out.contains("in shop"), "{out}");
+    // The connection's schema is its search path, not the catalog's scope: the scope is said.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "wh", "--schema", "shop"]));
+    assert!(ok && out.contains("(shop)"), "{out}");
     if !out.contains("2 tables, 1 views") {
         // Say what this connection can see at all, so a miss explains itself.
         let ds = std::fs::read_to_string(project.join("datasources.yml")).unwrap().replace("  schema: shop\n", "");

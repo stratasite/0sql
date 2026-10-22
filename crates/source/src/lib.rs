@@ -35,7 +35,7 @@ pub mod sqlserver;
 pub mod tls;
 pub mod trino;
 
-pub use catalog::{Catalog, Column, Drift, ForeignKey, Table};
+pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Names, Scope, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -67,6 +67,8 @@ pub enum SourceError {
     CaFile(String, String),
     #[error("datasource {0} is missing: {1}")]
     NoCredentials(String, String),
+    #[error("{0} has no schemas; read it without --schema")]
+    NoSchemas(&'static str),
     #[error("{0}: private key: {1}")]
     PrivateKey(String, String),
 }

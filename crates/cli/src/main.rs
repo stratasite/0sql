@@ -249,14 +249,16 @@ enum Command {
         #[command(subcommand)]
         what: Option<ResultsWhat>,
     },
-    /// Read a datasource's tables and columns into catalog/{datasource}.json. Local only.
-    #[command(alias = "introspect")]
+    /// Read a datasource's tables and columns into catalog/{datasource}.json, or re-read what it holds. Local only.
+    #[command(alias = "introspect", args_conflicts_with_subcommands = true)]
     Catalog {
+        #[command(subcommand)]
+        what: Option<CatalogWhat>,
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         datasource: Option<String>,
-        /// Read one schema (ClickHouse: one database) instead of every non-system one.
+        /// Read this schema (ClickHouse: this database); repeatable. Without it: what the file records, else every non-system schema.
         #[arg(long)]
-        schema: Option<String>,
+        schema: Vec<String>,
     },
     /// Run tests/*.yml here; with -r, the deployed branch's tests on the server.
     Test,
@@ -434,7 +436,13 @@ fn run(command: Command, at: Where) -> Result<()> {
             };
             run::results(&project, cmd)
         }
-        Command::Catalog { datasource, schema } => catalog::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
+        Command::Catalog { what, datasource, schema } => match what {
+            None => catalog::run(at.project.as_deref(), datasource.as_deref(), &schema),
+            Some(CatalogWhat::Search { pattern, live, datasource }) => {
+                catalog::search(at.project.as_deref(), datasource.as_deref(), &pattern, live)
+            }
+            Some(CatalogWhat::Add { tables, datasource }) => catalog::add(at.project.as_deref(), datasource.as_deref(), &tables),
+        },
         Command::Sample { datasource, only, dry_run, budget } => sample::run(
             at.project.as_deref(),
             sample::Options { datasource: datasource.as_deref(), only: only.as_deref(), dry_run, budget },
@@ -599,6 +607,25 @@ impl QueryArgs {
         }
         Ok(())
     }
+}
+
+#[derive(Subcommand)]
+enum CatalogWhat {
+    /// Tables whose name holds the pattern: in the file, or in the warehouse with --live.
+    Search {
+        pattern: String,
+        /// Ask the warehouse, every non-system schema, rather than the file.
+        #[arg(long)]
+        live: bool,
+        #[arg(long)]
+        datasource: Option<String>,
+    },
+    /// Read these tables by name (schema.table or table) and add them to the file.
+    Add {
+        tables: Vec<String>,
+        #[arg(long)]
+        datasource: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1161,7 +1161,7 @@ fn redshifts_column_and_key_statements_hold_on_postgres() {
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
     let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
-    let (_, columns_sql, keys_sql) = catalog::redshift_sql(Some("shop"));
+    let (_, columns_sql, keys_sql) = catalog::redshift_sql(&Filter::schema(Some("shop")));
     let c = src.query(&columns_sql, 1000).expect("the column statement runs on Postgres");
     let name = c
         .rows

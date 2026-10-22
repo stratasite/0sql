@@ -150,7 +150,7 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
         format!("wh:\n  password: {}\n", std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")),
     )
     .unwrap();
-    assert!(run(zsql(&home, &project).args(["catalog", "wh"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "wh", "--schema", "shop"])).0);
     assert!(run(zsql(&home, &project).args(["generate", "wh"])).0);
 
     // The draft turned sampling on for name (varchar(80)) and not for notes (text).
