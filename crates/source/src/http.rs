@@ -101,3 +101,57 @@ pub(crate) fn text(conn: &Connection, r: ureq::http::Response<ureq::Body>) -> Re
         Err(SourceError::Query(conn.uid.clone(), format!("{status}: {why}")))
     }
 }
+
+/// One call, the status and body back as they came: for an API whose
+/// refusals carry a JSON message the adapter wants to read rather than
+/// have folded. `method` is GET, POST or DELETE.
+pub(crate) fn call(
+    conn: &Connection,
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<(u16, String)> {
+    let fail = |e: ureq::Error| SourceError::Query(conn.uid.clone(), crate::chain(&e));
+    let response = match method {
+        "POST" => {
+            let mut req = agent.post(url);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.send(body.unwrap_or_default()).map_err(fail)?
+        }
+        "DELETE" => {
+            let mut req = agent.delete(url);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call().map_err(fail)?
+        }
+        _ => {
+            let mut req = agent.get(url);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            req.call().map_err(fail)?
+        }
+    };
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
+    Ok((status, text))
+}
+
+/// A URL-encoded form body, for a token endpoint.
+pub(crate) fn form(fields: &[(&str, &str)]) -> String {
+    fields.iter().map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v))).collect::<Vec<_>>().join("&")
+}
+
+pub(crate) fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

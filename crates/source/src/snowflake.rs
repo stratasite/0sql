@@ -125,30 +125,15 @@ impl Snowflake {
 
     fn request(&mut self, method: &str, url: &str, body: Option<String>) -> Result<(u16, String)> {
         let (token, kind) = self.bearer()?;
-        let send = |req: ureq::RequestBuilder<ureq::typestate::WithBody>| req.send(body.unwrap_or_default().as_bytes());
-        let response = match method {
-            "POST" => send(
-                self.agent
-                    .post(url)
-                    .header("Authorization", &format!("Bearer {token}"))
-                    .header("X-Snowflake-Authorization-Token-Type", kind)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json")
-                    .header("User-Agent", USER_AGENT),
-            ),
-            _ => self
-                .agent
-                .get(url)
-                .header("Authorization", &format!("Bearer {token}"))
-                .header("X-Snowflake-Authorization-Token-Type", kind)
-                .header("Accept", "application/json")
-                .header("User-Agent", USER_AGENT)
-                .call(),
-        }
-        .map_err(|e| SourceError::Query(self.conn.uid.clone(), crate::chain(&e)))?;
-        let status = response.status().as_u16();
-        let text = response.into_body().read_to_string().map_err(|e| SourceError::Query(self.conn.uid.clone(), e.to_string()))?;
-        Ok((status, text))
+        let bearer = format!("Bearer {token}");
+        let headers = [
+            ("Authorization", bearer.as_str()),
+            ("X-Snowflake-Authorization-Token-Type", kind),
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+            ("User-Agent", USER_AGENT),
+        ];
+        http::call(&self.conn, &self.agent, method, url, &headers, body.as_deref().map(str::as_bytes))
     }
 
     /// A refusal, as the server put it: the `message` of its JSON when

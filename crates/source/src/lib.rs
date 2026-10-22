@@ -18,12 +18,16 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod athena;
+pub mod bigquery;
 pub mod catalogue;
 pub mod clickhouse;
+pub mod databricks;
 mod http;
 pub mod jwt;
 pub mod mysql;
 pub mod postgres;
+pub mod sigv4;
 pub mod snowflake;
 pub mod sqlite;
 pub mod sqlserver;
@@ -186,6 +190,26 @@ pub struct Connection {
     /// secret, so it may live in `datasources.yml`; the key itself may
     /// instead be in `.zsql` as `private_key`.
     pub private_key_file: Option<PathBuf>,
+    /// Databricks' Unity catalog, Athena's data catalog.
+    pub catalog: Option<String>,
+    /// An OAuth client id: Databricks' service principal application id.
+    /// Not a secret, unlike the client secret beside it in `.zsql`.
+    pub client_id: Option<String>,
+    /// BigQuery's project.
+    pub project: Option<String>,
+    /// BigQuery's location, for a job and for a region-wide catalogue read.
+    pub location: Option<String>,
+    /// BigQuery's service-account key file, or an application-default
+    /// credentials file.
+    pub key_file: Option<PathBuf>,
+    /// An AWS region, for Athena.
+    pub region: Option<String>,
+    /// An Athena workgroup.
+    pub workgroup: Option<String>,
+    /// Athena's result location on S3, unless the workgroup sets one.
+    pub output_location: Option<String>,
+    /// A named profile in the AWS shared credentials file.
+    pub profile: Option<String>,
 }
 
 impl Connection {
@@ -206,7 +230,7 @@ impl Connection {
                 host: s("host"),
                 port: i("port").and_then(|p| u16::try_from(p).ok()),
                 database: s("database"),
-                schema: s("schema"),
+                schema: s("schema").or_else(|| s("dataset")),
                 username: s("username"),
                 url: s("url").map(|u| u.trim_end_matches('/').to_string()),
                 file: s("file").map(PathBuf::from),
@@ -220,6 +244,15 @@ impl Connection {
                 warehouse: s("warehouse"),
                 role: s("role"),
                 private_key_file: s("private_key_file").or_else(|| s("private_key_path")).map(PathBuf::from),
+                catalog: s("catalog"),
+                client_id: s("client_id").or_else(|| s("oauth_client_id")),
+                project: s("project").or_else(|| s("project_id")),
+                location: s("location"),
+                key_file: s("key_file").or_else(|| s("credentials_file")).map(PathBuf::from),
+                region: s("region"),
+                workgroup: s("workgroup"),
+                output_location: s("output_location").or_else(|| s("s3_output_location")),
+                profile: s("profile"),
             });
         }
         Ok(out)
@@ -325,15 +358,33 @@ pub fn secret(project_dir: Option<&Path>, uid: &str, field: &str) -> Option<Secr
 pub struct Secrets {
     /// What every password-taking adapter reads.
     pub password: Option<Secret>,
-    /// Snowflake's personal access token; Databricks' token later.
+    /// Snowflake's and Databricks' personal access token.
     pub personal_access_token: Option<Secret>,
     /// The PEM of a key pair's private key, or a path to it.
     pub private_key: Option<Secret>,
+    /// An OAuth client id, when it is kept beside its secret rather than
+    /// in `datasources.yml`.
+    pub oauth_client_id: Option<Secret>,
+    /// Databricks' service-principal secret.
+    pub oauth_client_secret: Option<Secret>,
+    /// AWS credentials, for Athena.
+    pub access_key_id: Option<Secret>,
+    pub secret_access_key: Option<Secret>,
+    pub session_token: Option<Secret>,
 }
 
 /// The field names [`secrets`] resolves, as `.zsql` and the environment
 /// spell them.
-pub const SECRET_FIELDS: [&str; 3] = ["password", "personal_access_token", "private_key"];
+pub const SECRET_FIELDS: [&str; 8] = [
+    "password",
+    "personal_access_token",
+    "private_key",
+    "oauth_client_id",
+    "oauth_client_secret",
+    "access_key_id",
+    "secret_access_key",
+    "session_token",
+];
 
 impl Secrets {
     /// Just a password, which is what most adapters are given.
@@ -345,10 +396,16 @@ impl Secrets {
 /// Every field of [`SECRET_FIELDS`] for one datasource, each resolved as
 /// [`secret`] resolves it.
 pub fn secrets(project_dir: Option<&Path>, uid: &str) -> Secrets {
+    let get = |field: &str| secret(project_dir, uid, field);
     Secrets {
-        password: secret(project_dir, uid, "password"),
-        personal_access_token: secret(project_dir, uid, "personal_access_token"),
-        private_key: secret(project_dir, uid, "private_key"),
+        password: get("password"),
+        personal_access_token: get("personal_access_token"),
+        private_key: get("private_key"),
+        oauth_client_id: get("oauth_client_id"),
+        oauth_client_secret: get("oauth_client_secret"),
+        access_key_id: get("access_key_id"),
+        secret_access_key: get("secret_access_key"),
+        session_token: get("session_token"),
     }
 }
 
@@ -389,6 +446,12 @@ pub trait Source {
     /// error: that `prefer` ended plaintext, for one.
     fn warnings(&self) -> &[String] {
         &[]
+    }
+
+    /// The connection this was opened from, for a catalogue read that
+    /// needs more than the adapter's name: BigQuery's project and location.
+    fn connection(&self) -> Option<&Connection> {
+        None
     }
 }
 
@@ -475,9 +538,12 @@ pub fn open(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> {
         "postgres" | "redshift" => Ok(Box::new(postgres::Postgres::open(conn, secret)?)),
         "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
         "mysql" => Ok(Box::new(mysql::MySql::open(conn, secret)?)),
-        "trino" | "athena" => Ok(Box::new(trino::Trino::open(conn, secret)?)),
+        "trino" => Ok(Box::new(trino::Trino::open(conn, secret)?)),
+        "athena" => Ok(Box::new(athena::Athena::open(conn, secrets)?)),
         "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret)?)),
         "snowflake" => Ok(Box::new(snowflake::Snowflake::open(conn, secrets)?)),
+        "databricks" => Ok(Box::new(databricks::Databricks::open(conn, secrets)?)),
+        "bigquery" => Ok(Box::new(bigquery::BigQuery::open(conn, secrets)?)),
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),
     }

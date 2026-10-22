@@ -78,6 +78,38 @@ pub const DATASOURCES_YML: &str = "\
 #   username: zsql                # the user the key is registered to\n\
 #   private_key_file: ./rsa_key.p8   # PKCS#8 PEM, unencrypted; or the PEM itself in .zsql as private_key\n\
 \n\
+# lake:\n\
+#   name: Databricks\n\
+#   adapter: databricks\n\
+#   tier: warm\n\
+#   host: adb-1234567890123456.7.azuredatabricks.net   # the workspace\n\
+#   warehouse: abc123def456      # the SQL warehouse id\n\
+#   catalog: main                 # Unity Catalog; introspect reads its information_schema\n\
+#   schema: default               # optional\n\
+#   # a personal access token goes in .zsql as personal_access_token; or a service principal:\n\
+#   client_id: 00000000-0000-0000-0000-000000000000   # with oauth_client_secret in .zsql\n\
+\n\
+# bq:\n\
+#   name: BigQuery\n\
+#   adapter: bigquery\n\
+#   tier: warm\n\
+#   project: my-project\n\
+#   dataset: analytics            # optional; introspect reads the whole region without it\n\
+#   location: US                  # the region, for a whole-region read\n\
+#   key_file: ./service-account.json   # or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`\n\
+\n\
+# lakehouse:\n\
+#   name: Athena\n\
+#   adapter: athena\n\
+#   tier: cold\n\
+#   region: us-east-1             # or AWS_REGION, or the profile's config\n\
+#   database: default             # the Glue database; introspect reads it\n\
+#   catalog: awsdatacatalog       # optional\n\
+#   workgroup: primary            # optional\n\
+#   output_location: s3://my-athena-results/zsql/   # unless the workgroup sets one\n\
+#   # keys: access_key_id and secret_access_key in .zsql (session_token too), or AWS_ACCESS_KEY_ID and\n\
+#   # AWS_SECRET_ACCESS_KEY, or a profile in ~/.aws/credentials (profile: name, or AWS_PROFILE)\n\
+\n\
 # local:\n\
 #   name: Local DuckDB\n\
 #   adapter: duckdb\n\

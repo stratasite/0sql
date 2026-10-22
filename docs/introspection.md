@@ -577,8 +577,9 @@ what makes the remaining adapters cheap instead of frightening.
       `text` raises when a column is turned on by hand. Remaining: the
       governance rules written into the command's output and the sample
       file's documentation.
-- [ ] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
-      Athena. The shape below comes from reading how strata and its `dwh`
+- [x] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
+      Athena, built and proven on fakes; what remains is an account on
+      each to run them against. The shape below comes from reading how strata and its `dwh`
       gem connect to four of them (see "What strata and dwh do"); the
       plan's earlier line, "the HTTP transport plus SigV4 for the two AWS
       ones", was half right. Redshift is Postgres on the wire and gets the
@@ -612,6 +613,25 @@ what makes the remaining adapters cheap instead of frightening.
       account will tell: whether `SHOW … IN DATABASE` needs the name
       spelled, how a statement with no warehouse answers, and the
       `numRows` of a `SHOW`.
+
+      The other four followed the same day, each proven the same way, on
+      a fake of its endpoint. Redshift is the Postgres transport with the
+      session SET up after connecting and a catalogue of its own:
+      `svv_table_info` for rows, `pg_attribute` for columns, and key
+      arrays expanded here, two of the three statements proven on the
+      Postgres fixture. Databricks: the Statement Execution API with
+      `row_limit` one past the cap, a token as given or a service
+      principal's minted at the workspace's own token endpoint, Unity
+      Catalog's `information_schema` with the standard four key views.
+      BigQuery: `jobs.query` and `getQueryResults`, a service account's
+      key file signing a grant with the read-only scope or the
+      application-default file's refresh token, the catalogue of one
+      dataset with `__TABLES__` for rows or a whole region without them.
+      Athena: SigV4 written on `ring` and checked against the signing
+      documentation's worked example, the three-link credential chain,
+      and `information_schema` with column comments and nothing else.
+      All five transports share one `http::call` and one credentials
+      error that names everything missing at once.
 
       Decisions the shape rests on, each of which is the user's; all five
       were agreed on 2026-10-21:

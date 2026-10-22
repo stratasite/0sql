@@ -123,8 +123,11 @@ impl Catalogue {
             "clickhouse" => clickhouse(src, scope)?,
             "mysql" => mysql(src, scope)?,
             "sqlserver" => sqlserver(src, scope)?,
-            "trino" | "athena" => trino(src, scope)?,
+            "trino" => trino(src, scope)?,
+            "athena" => athena(src, scope)?,
             "snowflake" => snowflake(src, scope)?,
+            "databricks" => databricks(src, scope)?,
+            "bigquery" => bigquery(src, scope)?,
             "sqlite" => sqlite(src)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
         };
@@ -613,6 +616,131 @@ fn snowflake(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
+/// Athena's `information_schema`, which is Trino's without the comment
+/// view: the column comments are there, a table's are not, and nothing
+/// counts rows or declares a key. The scope is the Athena database.
+fn athena(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT table_schema, table_name, CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS table_kind, \
+         CAST(NULL AS VARCHAR) AS row_estimate, CAST(NULL AS VARCHAR) AS table_comment \
+         FROM information_schema.tables WHERE {} ORDER BY 1, 2",
+        scope_clause("table_schema", scope)
+    );
+    let columns = format!(
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable, \
+         CAST(NULL AS VARCHAR) AS max_length, CAST(ordinal_position AS VARCHAR) AS position, comment AS column_comment \
+         FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
+        scope_clause("table_schema", scope)
+    );
+    assemble(src, &tables, &columns)
+}
+
+/// Unity Catalog's `information_schema`, which the session's catalog
+/// resolves: comments on tables and columns, widths, and the keys through
+/// the standard four views, a foreign key's referenced columns paired by
+/// `position_in_unique_constraint`.
+fn databricks(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT table_schema, table_name, \
+         CASE WHEN table_type IN ('VIEW', 'MATERIALIZED_VIEW') THEN 'view' ELSE 'table' END AS table_kind, \
+         CAST(NULL AS STRING) AS row_estimate, comment AS table_comment \
+         FROM information_schema.tables WHERE {} ORDER BY 1, 2",
+        scope_clause("table_schema", scope)
+    );
+    let columns = format!(
+        "SELECT table_schema, table_name, column_name, full_data_type AS data_type, is_nullable, \
+         CAST(character_maximum_length AS STRING) AS max_length, CAST(ordinal_position AS STRING) AS position, \
+         comment AS column_comment \
+         FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
+        scope_clause("table_schema", scope)
+    );
+    let mut tables = assemble(src, &tables, &columns)?;
+    let keys_sql = format!("{} AND {}", standard_keys_sql("information_schema", false), scope_clause("k.table_schema", scope));
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
+}
+
+/// The key read over the SQL standard's four views, for a warehouse that
+/// has them with `position_in_unique_constraint`: Databricks and BigQuery.
+/// `prefix` qualifies the views, spelled upper-case when `upper` says so,
+/// as BigQuery's are; the caller's `AND` follows the `WHERE`.
+fn standard_keys_sql(prefix: &str, upper: bool) -> String {
+    let sql = format!(
+        "SELECT k.table_schema, k.table_name, \
+         CASE t.constraint_type WHEN 'PRIMARY KEY' THEN 'primary' ELSE 'foreign' END AS key_kind, \
+         k.constraint_name AS key_name, k.column_name, CAST(k.ordinal_position AS STRING) AS position, \
+         u.table_schema AS ref_schema, u.table_name AS ref_table, rk.column_name AS ref_column \
+         FROM {prefix}.key_column_usage k \
+         JOIN {prefix}.table_constraints t \
+           ON t.constraint_schema = k.constraint_schema AND t.constraint_name = k.constraint_name \
+         LEFT JOIN (SELECT DISTINCT constraint_schema, constraint_name, table_schema, table_name FROM {prefix}.constraint_column_usage) u \
+           ON t.constraint_type = 'FOREIGN KEY' AND u.constraint_schema = k.constraint_schema AND u.constraint_name = k.constraint_name \
+         LEFT JOIN {prefix}.table_constraints rt \
+           ON rt.table_schema = u.table_schema AND rt.table_name = u.table_name AND rt.constraint_type = 'PRIMARY KEY' \
+         LEFT JOIN {prefix}.key_column_usage rk \
+           ON rk.constraint_schema = rt.constraint_schema AND rk.constraint_name = rt.constraint_name \
+          AND rk.ordinal_position = k.position_in_unique_constraint \
+         WHERE t.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')"
+    );
+    if upper {
+        ["key_column_usage", "table_constraints", "constraint_column_usage"]
+            .iter()
+            .fold(sql, |s, v| s.replace(&format!(".{v}"), &format!(".{}", v.to_uppercase())))
+    } else {
+        sql
+    }
+}
+
+/// BigQuery's `INFORMATION_SCHEMA`, read for one dataset when the scope
+/// names one and region-wide otherwise. A dataset read joins `__TABLES__`
+/// for the row count, which the region has no view for. Descriptions
+/// live in `TABLE_OPTIONS` as quoted literals and in `COLUMN_FIELD_PATHS`
+/// for a column; a parameterised `STRING(n)` carries its width in the
+/// type's spelling.
+fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let conn = src.connection().ok_or_else(|| SourceError::Missing("bigquery".into(), "project"))?;
+    let project = conn.project.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "project"))?;
+    let (qualifier, rows_join, rows_expr) = match scope {
+        Some(dataset) => (
+            format!("`{project}.{dataset}`"),
+            format!("LEFT JOIN `{project}.{dataset}.__TABLES__` s ON s.table_id = t.table_name"),
+            "CAST(s.row_count AS STRING)",
+        ),
+        None => {
+            let location = conn
+                .location
+                .clone()
+                .ok_or_else(|| SourceError::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalogue"))?;
+            (format!("`{project}.region-{location}`"), String::new(), "CAST(NULL AS STRING)")
+        }
+    };
+    let tables = format!(
+        "SELECT t.table_schema, t.table_name, CASE WHEN t.table_type LIKE '%VIEW' THEN 'view' ELSE 'table' END AS table_kind, \
+         {rows_expr} AS row_estimate, TRIM(o.option_value, '\"') AS table_comment \
+         FROM {qualifier}.INFORMATION_SCHEMA.TABLES t \
+         LEFT JOIN {qualifier}.INFORMATION_SCHEMA.TABLE_OPTIONS o \
+           ON o.table_schema = t.table_schema AND o.table_name = t.table_name AND o.option_name = 'description' \
+         {rows_join} \
+         WHERE {} ORDER BY 1, 2",
+        scope_clause("t.table_schema", scope)
+    );
+    let columns = format!(
+        "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, \
+         REGEXP_EXTRACT(c.data_type, r'^STRING\\((\\d+)\\)$') AS max_length, CAST(c.ordinal_position AS STRING) AS position, \
+         f.description AS column_comment \
+         FROM {qualifier}.INFORMATION_SCHEMA.COLUMNS c \
+         LEFT JOIN {qualifier}.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS f \
+           ON f.table_schema = c.table_schema AND f.table_name = c.table_name AND f.field_path = c.column_name \
+         WHERE {} ORDER BY 1, 2, c.ordinal_position",
+        scope_clause("c.table_schema", scope)
+    );
+    let mut tables = assemble(src, &tables, &columns)?;
+    let keys_sql =
+        format!("{} AND {}", standard_keys_sql(&format!("{qualifier}.INFORMATION_SCHEMA"), true), scope_clause("k.table_schema", scope));
+    keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
+}
+
 /// `sqlite_master` for the tables and `PRAGMA table_info` per table for
 /// the columns. No schema, no comments, no row estimate: SQLite keeps none.
 fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
@@ -680,20 +808,9 @@ fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
 
 /// Now, RFC 3339 to the second, with no date crate: civil-from-days.
 pub fn now() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (y, m, d, hh, mm, ss) = crate::sigv4::civil_time(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 // --------------------------------------------------------------------- drift

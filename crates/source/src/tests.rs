@@ -56,9 +56,9 @@ fn a_connection_is_the_keys_the_model_reads_past() {
 
 #[test]
 fn an_unknown_adapter_is_named_rather_than_guessed() {
-    let conn = Connection { uid: "wh".into(), adapter: "bigquery".into(), ..Default::default() };
+    let conn = Connection { uid: "wh".into(), adapter: "duckdb".into(), ..Default::default() };
     let err = open(&conn, Secrets::default()).err().unwrap().to_string();
-    assert!(err.contains("bigquery is not an adapter this build can reach"), "{err}");
+    assert!(err.contains("duckdb is not an adapter this build can reach"), "{err}");
 }
 
 #[test]
@@ -1056,7 +1056,7 @@ fn a_connection_reads_snowflakes_keys() {
     assert_eq!(c.warehouse.as_deref(), Some("COMPUTE_WH"));
     assert_eq!(c.role.as_deref(), Some("analyst"));
     assert_eq!(c.private_key_file.as_deref(), Some(Path::new("./rsa_key.p8")));
-    assert_eq!(SECRET_FIELDS, ["password", "personal_access_token", "private_key"]);
+    assert!(SECRET_FIELDS.contains(&"private_key") && SECRET_FIELDS.contains(&"secret_access_key"));
     let s = secrets(Some(&dir), "snow");
     assert_eq!(s, Secrets::default());
 }
@@ -1166,4 +1166,742 @@ fn redshifts_column_and_key_statements_hold_on_postgres() {
     assert_eq!(k.get(fk, "table_name"), Some("orders"));
     assert_eq!(k.get(fk, "ref_table"), Some("customers"));
     assert!(k.get(fk, "key_attnums").unwrap().starts_with('{'), "arrays arrive as their text");
+}
+
+// --------------------------------------------------------------- databricks
+
+/// A finished Databricks statement, as the API shapes it.
+fn dbx_result(
+    id: &str,
+    state: &str,
+    columns: &[&str],
+    data: serde_json::Value,
+    total: usize,
+    next: Option<i64>,
+    truncated: bool,
+) -> String {
+    serde_json::json!({
+        "statement_id": id,
+        "status": { "state": state },
+        "manifest": {
+            "format": "JSON_ARRAY",
+            "schema": { "column_count": columns.len(), "columns": columns.iter().enumerate().map(|(i, c)| serde_json::json!({"name": c, "position": i})).collect::<Vec<_>>() },
+            "total_row_count": total,
+            "truncated": truncated,
+        },
+        "result": { "chunk_index": 0, "row_offset": 0, "data_array": data, "next_chunk_index": next },
+    })
+    .to_string()
+}
+
+#[test]
+fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polled = polls.clone();
+    let server = fake(move |method, path, body| {
+        match (method, path) {
+        ("POST", "/oidc/v1/token") => (200, r#"{"access_token":"minted","expires_in":3600,"token_type":"Bearer"}"#.into()),
+        ("POST", "/api/2.0/sql/statements") if body.contains("slow") => {
+            (200, serde_json::json!({"statement_id": "s1", "status": {"state": "PENDING"}}).to_string())
+        }
+        ("POST", "/api/2.0/sql/statements") if body.contains("broken") => {
+            (200, serde_json::json!({"statement_id": "s2", "status": {"state": "FAILED", "error": {"error_code": "BAD_REQUEST", "message": "TABLE_OR_VIEW_NOT_FOUND: nope"}}}).to_string())
+        }
+        ("POST", "/api/2.0/sql/statements") if body.contains("wide") => {
+            (200, dbx_result("s3", "SUCCEEDED", &["x"], serde_json::json!([["1"], ["2"], ["3"]]), 3, None, true))
+        }
+        ("POST", "/api/2.0/sql/statements") => {
+            (200, dbx_result("s0", "SUCCEEDED", &["status", "n"], serde_json::json!([["paid", "3"], [null, "1"]]), 3, Some(1), false))
+        }
+        ("GET", "/api/2.0/sql/statements/s0/result/chunks/1") => {
+            (200, serde_json::json!({"chunk_index": 1, "row_offset": 2, "data_array": [["open", "1"]]}).to_string())
+        }
+        ("GET", "/api/2.0/sql/statements/s1") => {
+            if polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (200, serde_json::json!({"statement_id": "s1", "status": {"state": "RUNNING"}}).to_string())
+            } else {
+                (200, dbx_result("s1", "SUCCEEDED", &["one"], serde_json::json!([["1"]]), 1, None, false))
+            }
+        }
+        ("POST", "/api/2.0/sql/statements/s9") => (403, r#"{"error_code":"PERMISSION_DENIED","message":"no"}"#.into()),
+        _ => (404, format!("{{\"message\":\"no route {method} {path}\"}}")),
+    }
+    });
+    let conn = Connection {
+        uid: "dbx".into(),
+        adapter: "databricks".into(),
+        url: Some(server.url.clone()),
+        warehouse: Some("abc123".into()),
+        catalog: Some("main".into()),
+        schema: Some("shop".into()),
+        client_id: Some("app-id".into()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(5),
+        ..Default::default()
+    };
+    let secrets = Secrets { oauth_client_secret: Some(Secret("app-secret".into())), ..Default::default() };
+    let mut src = open(&conn, secrets).expect("opens");
+    assert_eq!(src.adapter(), "databricks");
+
+    let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    assert_eq!(rows.columns, ["status", "n"]);
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.get(&rows.rows[1], "status"), None);
+    assert_eq!(rows.get(&rows.rows[2], "status"), Some("open"));
+    {
+        let seen = server.seen.lock().unwrap();
+        // The token first, with the client credentials as basic auth and the form body.
+        let (method, path, head, body) = &seen[0];
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/oidc/v1/token"));
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode("app-id:app-secret");
+        assert!(head.contains(&format!("Basic {basic}")), "{head}");
+        assert_eq!(body, "grant_type=client_credentials&scope=all-apis");
+        // Then the statement, with the minted token and the cap one past.
+        let (_, path, head, body) = &seen[1];
+        assert_eq!(path, "/api/2.0/sql/statements");
+        assert!(head.contains("Bearer minted"), "{head}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["warehouse_id"], "abc123");
+        assert_eq!(body["catalog"], "main");
+        assert_eq!(body["schema"], "shop");
+        assert_eq!(body["row_limit"], 11);
+        assert_eq!(body["wait_timeout"], "30s");
+        assert_eq!(body["format"], "JSON_ARRAY");
+        assert_eq!(seen[2].1, "/api/2.0/sql/statements/s0/result/chunks/1");
+    }
+    // One token for the whole session.
+    src.query("SELECT 1 AS one FROM slow", 10).expect("polls");
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(server.seen.lock().unwrap().iter().filter(|(_, p, _, _)| p == "/oidc/v1/token").count(), 1);
+
+    let err = src.query("SELECT x FROM wide", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
+    assert!(err.contains("failed") && err.contains("TABLE_OR_VIEW_NOT_FOUND"), "{err}");
+    assert!(src.query("DELETE FROM orders", 1).is_err());
+
+    // A token works too, sent as it is.
+    let secrets = Secrets { personal_access_token: Some(Secret("dapi123".into())), ..Default::default() };
+    let mut src = open(&Connection { client_id: None, ..conn.clone() }, secrets).unwrap();
+    src.query("SELECT 1", 10).unwrap();
+    assert!(server.seen.lock().unwrap().last().unwrap().2.contains("Bearer dapi123"));
+
+    // Everything missing, named at once.
+    let bare = Connection { uid: "dbx".into(), adapter: "databricks".into(), ..Default::default() };
+    let err = open(&bare, Secrets::default()).err().unwrap().to_string();
+    for want in ["host", "warehouse", "personal_access_token", "client_id", "ZSQL_DS_DBX_OAUTH_CLIENT_SECRET"] {
+        assert!(err.contains(want), "{want} named: {err}");
+    }
+    let err = open(&Connection { client_id: Some("x".into()), ..bare.clone() }, Secrets::default()).err().unwrap().to_string();
+    assert!(err.contains("oauth_client_secret"), "{err}");
+}
+
+#[test]
+fn a_databricks_catalogue_reads_unity_information_schema() {
+    let server = fake(|_, path, body| {
+        if path == "/oidc/v1/token" {
+            return (200, r#"{"access_token":"t","expires_in":3600}"#.into());
+        }
+        let sql = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|b| b["statement"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        if sql.contains("information_schema.tables") {
+            (
+                200,
+                dbx_result(
+                    "t",
+                    "SUCCEEDED",
+                    &["table_schema", "table_name", "table_kind", "row_estimate", "table_comment"],
+                    serde_json::json!([["shop", "customers", "table", null, "Who buys"], ["shop", "orders", "table", null, null]]),
+                    2,
+                    None,
+                    false,
+                ),
+            )
+        } else if sql.contains("information_schema.columns") {
+            (
+                200,
+                dbx_result(
+                    "c",
+                    "SUCCEEDED",
+                    &["table_schema", "table_name", "column_name", "data_type", "is_nullable", "max_length", "position", "column_comment"],
+                    serde_json::json!([
+                        ["shop", "customers", "id", "bigint", "NO", null, "1", null],
+                        ["shop", "customers", "name", "string", "YES", null, "2", "Full name"],
+                        ["shop", "orders", "id", "bigint", "NO", null, "1", null],
+                        ["shop", "orders", "customer_id", "bigint", "YES", null, "2", null]
+                    ]),
+                    4,
+                    None,
+                    false,
+                ),
+            )
+        } else if sql.contains("key_column_usage") {
+            assert!(sql.contains("position_in_unique_constraint") && sql.contains("k.table_schema = 'shop'"), "{sql}");
+            (
+                200,
+                dbx_result(
+                    "k",
+                    "SUCCEEDED",
+                    &[
+                        "table_schema",
+                        "table_name",
+                        "key_kind",
+                        "key_name",
+                        "column_name",
+                        "position",
+                        "ref_schema",
+                        "ref_table",
+                        "ref_column",
+                    ],
+                    serde_json::json!([
+                        ["shop", "customers", "primary", "customers_pk", "id", "1", null, null, null],
+                        ["shop", "orders", "foreign", "orders_customers_fk", "customer_id", "1", "shop", "customers", "id"]
+                    ]),
+                    2,
+                    None,
+                    false,
+                ),
+            )
+        } else {
+            (400, format!("{{\"message\":\"unexpected: {sql}\"}}"))
+        }
+    });
+    let conn = Connection {
+        uid: "dbx".into(),
+        adapter: "databricks".into(),
+        url: Some(server.url.clone()),
+        warehouse: Some("w".into()),
+        catalog: Some("main".into()),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let mut src = open(&conn, Secrets { personal_access_token: Some(Secret("t".into())), ..Default::default() }).unwrap();
+    let cat = Catalogue::read(&mut *src, "dbx", Some("shop")).expect("reads");
+    let orders = cat.table(Some("shop"), "orders").unwrap();
+    assert!(orders.primary_key.is_empty());
+    assert_eq!(orders.foreign_keys[0].references_table, "customers");
+    let customers = cat.table(Some("shop"), "customers").unwrap();
+    assert_eq!(customers.primary_key, ["id"]);
+    assert_eq!(customers.columns[1].comment.as_deref(), Some("Full name"));
+}
+
+// ----------------------------------------------------------------- bigquery
+
+fn bq_result(job: &str, complete: bool, columns: &[&str], rows: serde_json::Value, total: usize, page: Option<&str>) -> String {
+    let mut v = serde_json::json!({
+        "kind": "bigquery#queryResponse",
+        "jobReference": { "projectId": "p", "jobId": job, "location": "US" },
+        "jobComplete": complete,
+    });
+    if complete {
+        v["schema"] =
+            serde_json::json!({ "fields": columns.iter().map(|c| serde_json::json!({"name": c, "type": "STRING"})).collect::<Vec<_>>() });
+        v["totalRows"] = serde_json::Value::String(total.to_string());
+        v["rows"] = serde_json::Value::Array(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::json!({"f": r.as_array().unwrap().iter().map(|c| serde_json::json!({"v": c})).collect::<Vec<_>>()}))
+                .collect(),
+        );
+        if let Some(p) = page {
+            v["pageToken"] = serde_json::Value::String(p.into());
+        }
+    }
+    v.to_string()
+}
+
+#[test]
+fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polled = polls.clone();
+    let server = fake(move |method, path, body| match (method, path) {
+        ("POST", "/token") => (200, r#"{"access_token":"granted","expires_in":3599,"token_type":"Bearer"}"#.into()),
+        ("POST", "/bigquery/v2/projects/p/queries") if body.contains("slow") => {
+            (200, bq_result("j1", false, &[], serde_json::json!([]), 0, None))
+        }
+        ("POST", "/bigquery/v2/projects/p/queries") if body.contains("broken") => {
+            (400, r#"{"error":{"code":400,"message":"Not found: Table p:d.nope","status":"NOT_FOUND"}}"#.into())
+        }
+        ("POST", "/bigquery/v2/projects/p/queries") if body.contains("wide") => {
+            (200, bq_result("j3", true, &["x"], serde_json::json!([["1"]]), 500, Some("more")))
+        }
+        ("POST", "/bigquery/v2/projects/p/queries") => {
+            (200, bq_result("j0", true, &["status", "n"], serde_json::json!([["paid", "3"], [null, "1"]]), 3, Some("pg2")))
+        }
+        ("GET", p) if p.starts_with("/bigquery/v2/projects/p/queries/j0?") && p.contains("pageToken=pg2") => {
+            (200, bq_result("j0", true, &["status", "n"], serde_json::json!([["open", {"f": [{"v": "nested"}]}]]), 3, None))
+        }
+        ("GET", p) if p.starts_with("/bigquery/v2/projects/p/queries/j1?") => {
+            if polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (200, bq_result("j1", false, &[], serde_json::json!([]), 0, None))
+            } else {
+                (200, bq_result("j1", true, &["one"], serde_json::json!([["1"]]), 1, None))
+            }
+        }
+        _ => (404, format!("{{\"error\":{{\"message\":\"no route {method} {path}\"}}}}")),
+    });
+    // A service-account key file whose token endpoint is the fake.
+    let dir = temp("bigquery-key");
+    let key = dir.join("sa.json");
+    let pem = std::fs::read_to_string(sf_key()).unwrap();
+    std::fs::write(
+        &key,
+        serde_json::json!({"type": "service_account", "client_email": "zsql@p.iam.gserviceaccount.com", "private_key": pem, "token_uri": format!("{}/token", server.url)}).to_string(),
+    )
+    .unwrap();
+    let conn = Connection {
+        uid: "bq".into(),
+        adapter: "bigquery".into(),
+        url: Some(server.url.clone()),
+        project: Some("p".into()),
+        schema: Some("d".into()),
+        location: Some("US".into()),
+        key_file: Some(key.clone()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(5),
+        ..Default::default()
+    };
+    let mut src = open(&conn, Secrets::default()).expect("opens");
+    assert_eq!(src.adapter(), "bigquery");
+
+    let rows = src.query("SELECT status, count(*) AS n FROM d.orders GROUP BY 1", 10).expect("reads");
+    assert_eq!(rows.columns, ["status", "n"]);
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.get(&rows.rows[1], "status"), None);
+    assert_eq!(rows.get(&rows.rows[2], "n"), Some(r#"{"f":[{"v":"nested"}]}"#), "a record stays JSON");
+    {
+        let seen = server.seen.lock().unwrap();
+        let (_, path, _, body) = &seen[0];
+        assert_eq!(path, "/token");
+        let assertion = body.strip_prefix("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=").expect(body);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let parts: Vec<&str> = assertion.split('.').collect();
+        let claims: serde_json::Value = serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "zsql@p.iam.gserviceaccount.com");
+        assert_eq!(claims["scope"], "https://www.googleapis.com/auth/bigquery.readonly");
+        assert_eq!(claims["aud"], format!("{}/token", server.url));
+        let signer = jwt::Signer::from_pem("bq", pem.as_bytes()).unwrap();
+        let public = ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signer.public_key_pkcs1());
+        public.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &b64.decode(parts[2]).unwrap()).expect("signed by the key");
+        let (_, path, head, body) = &seen[1];
+        assert_eq!(path, "/bigquery/v2/projects/p/queries");
+        assert!(head.contains("Bearer granted"), "{head}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["useLegacySql"], false);
+        assert_eq!(body["defaultDataset"]["datasetId"], "d");
+        assert_eq!(body["location"], "US");
+        assert_eq!(body["timeoutMs"], 5000);
+        assert!(seen[2].1.contains("pageToken=pg2") && seen[2].1.contains("location=US"), "{}", seen[2].1);
+    }
+    src.query("SELECT 1 AS one FROM slow", 10).expect("polls until complete");
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let before = server.seen.lock().unwrap().len();
+    let err = src.query("SELECT x FROM wide", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    assert_eq!(server.seen.lock().unwrap().len(), before + 1, "refused from totalRows, no page fetched");
+    let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
+    assert!(err.contains("400") && err.contains("Not found: Table"), "{err}");
+
+    // Application-default credentials: a refresh token traded at the same endpoint.
+    let adc = dir.join("adc.json");
+    std::fs::write(&adc, serde_json::json!({"type": "authorized_user", "client_id": "cid", "client_secret": "csec", "refresh_token": "rt", "token_uri": format!("{}/token", server.url)}).to_string()).unwrap();
+    let env = |k: &str| (k == "GOOGLE_APPLICATION_CREDENTIALS").then(|| adc.display().to_string());
+    let mut src =
+        bigquery::BigQuery::open_with(&Connection { key_file: None, ..conn.clone() }, Secrets::default(), &env, None).expect("adc");
+    src.query("SELECT 1", 10).unwrap();
+    let seen = server.seen.lock().unwrap();
+    let token = seen.iter().rev().find(|(_, p, _, _)| p == "/token").unwrap();
+    assert_eq!(token.3, "grant_type=refresh_token&client_id=cid&client_secret=csec&refresh_token=rt");
+    drop(seen);
+
+    // Nothing to go on is named; a wrong file is named with its path.
+    let err = bigquery::BigQuery::open_with(
+        &Connection { key_file: None, ..conn.clone() },
+        Secrets::default(),
+        &|_| None,
+        Some(dir.join("absent.json")),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("key_file") && err.contains("GOOGLE_APPLICATION_CREDENTIALS"), "{err}");
+    std::fs::write(dir.join("odd.json"), r#"{"type": "external_account"}"#).unwrap();
+    let err = open(&Connection { key_file: Some(dir.join("odd.json")), ..conn.clone() }, Secrets::default()).err().unwrap().to_string();
+    assert!(err.contains("odd.json") && err.contains("external_account"), "{err}");
+}
+
+#[test]
+fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
+    let server = fake(|_, path, body| {
+        if path == "/token" {
+            return (200, r#"{"access_token":"t","expires_in":3600}"#.into());
+        }
+        let sql =
+            serde_json::from_str::<serde_json::Value>(body).ok().and_then(|b| b["query"].as_str().map(str::to_string)).unwrap_or_default();
+        if sql.contains("INFORMATION_SCHEMA.TABLES") {
+            (
+                200,
+                bq_result(
+                    "t",
+                    true,
+                    &["table_schema", "table_name", "table_kind", "row_estimate", "table_comment"],
+                    serde_json::json!([["d", "orders", "table", "100", "Sales"]]),
+                    1,
+                    None,
+                ),
+            )
+        } else if sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+            (
+                200,
+                bq_result(
+                    "c",
+                    true,
+                    &["table_schema", "table_name", "column_name", "data_type", "is_nullable", "max_length", "position", "column_comment"],
+                    serde_json::json!([
+                        ["d", "orders", "id", "INT64", "NO", null, "1", null],
+                        ["d", "orders", "status", "STRING(20)", "YES", "20", "2", "Paid or open"]
+                    ]),
+                    2,
+                    None,
+                ),
+            )
+        } else if sql.contains("KEY_COLUMN_USAGE") {
+            (
+                200,
+                bq_result(
+                    "k",
+                    true,
+                    &[
+                        "table_schema",
+                        "table_name",
+                        "key_kind",
+                        "key_name",
+                        "column_name",
+                        "position",
+                        "ref_schema",
+                        "ref_table",
+                        "ref_column",
+                    ],
+                    serde_json::json!([["d", "orders", "primary", "pk$", "id", "1", null, null, null]]),
+                    1,
+                    None,
+                ),
+            )
+        } else {
+            (400, format!("{{\"error\":{{\"message\":\"unexpected: {sql}\"}}}}"))
+        }
+    });
+    let dir = temp("bigquery-cat");
+    let key = dir.join("adc.json");
+    std::fs::write(&key, serde_json::json!({"type": "authorized_user", "client_id": "c", "client_secret": "s", "refresh_token": "r", "token_uri": format!("{}/token", server.url)}).to_string()).unwrap();
+    let conn = Connection {
+        uid: "bq".into(),
+        adapter: "bigquery".into(),
+        url: Some(server.url.clone()),
+        project: Some("p".into()),
+        key_file: Some(key),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let cat = Catalogue::read(&mut *src, "bq", Some("d")).expect("a dataset");
+    let orders = cat.table(Some("d"), "orders").unwrap();
+    assert_eq!(orders.rows, Some(100));
+    assert_eq!(orders.comment.as_deref(), Some("Sales"));
+    assert_eq!(orders.columns[1].max_length, Some(20), "from STRING(20)");
+    assert_eq!(orders.primary_key, ["id"]);
+    let statements: Vec<String> = server
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p, _, _)| p != "/token")
+        .map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).unwrap()["query"].as_str().unwrap().to_string())
+        .collect();
+    assert!(statements[0].contains("`p.d`.INFORMATION_SCHEMA.TABLES") && statements[0].contains("`p.d.__TABLES__`"), "{}", statements[0]);
+    assert!(statements[1].contains("COLUMN_FIELD_PATHS") && statements[1].contains("REGEXP_EXTRACT"), "{}", statements[1]);
+
+    // Without a dataset the region is read, and that needs a location.
+    let err = Catalogue::read(&mut *src, "bq", None).err().unwrap().to_string();
+    assert!(err.contains("location"), "{err}");
+    let mut src = open(&Connection { location: Some("eu".into()), ..conn.clone() }, Secrets::default()).unwrap();
+    let _ = Catalogue::read(&mut *src, "bq", None).expect("a region");
+    let last = server.seen.lock().unwrap();
+    let regional: Vec<String> = last
+        .iter()
+        .rev()
+        .take(3)
+        .filter(|(_, p, _, _)| p != "/token")
+        .map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).unwrap()["query"].as_str().unwrap().to_string())
+        .collect();
+    assert!(regional.iter().all(|s| s.contains("`p.region-eu`.INFORMATION_SCHEMA")), "{regional:?}");
+    assert!(regional.iter().all(|s| !s.contains("__TABLES__")), "no row count region-wide: {regional:?}");
+}
+
+// ------------------------------------------------------------------- athena
+
+/// The worked example in the Signature Version 4 documentation: an IAM
+/// ListUsers call on 2015-08-30 with the example key, whose signature the
+/// documentation prints.
+#[test]
+fn sigv4_reproduces_the_documented_example() {
+    let creds = sigv4::Credentials {
+        access_key_id: "AKIDEXAMPLE".into(),
+        secret_access_key: Secret("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into()),
+        session_token: None,
+    };
+    let headers = vec![
+        ("Content-Type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string()),
+        ("Host".to_string(), "iam.amazonaws.com".to_string()),
+    ];
+    let req = sigv4::Request { method: "GET", path: "/", query: "Action=ListUsers&Version=2010-05-08", headers: &headers, body: b"" };
+    let signed = sigv4::sign(&creds, "us-east-1", "iam", &req, "20150830T123600Z");
+    let auth = &signed.iter().find(|(k, _)| k == "authorization").unwrap().1;
+    assert_eq!(
+        auth,
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+    );
+    assert!(signed.iter().all(|(k, _)| k != "x-amz-security-token"));
+    let with_token = sigv4::sign(
+        &sigv4::Credentials { session_token: Some(Secret("tok".into())), ..creds },
+        "us-east-1",
+        "iam",
+        &req,
+        "20150830T123600Z",
+    );
+    assert!(with_token.iter().any(|(k, v)| k == "x-amz-security-token" && v == "tok"));
+    assert!(with_token
+        .iter()
+        .any(|(k, v)| k == "authorization" && v.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token")));
+    assert_eq!(sigv4::stamp(1_440_938_160), "20150830T123600Z");
+}
+
+#[test]
+fn athena_starts_polls_pages_drops_the_header_row_and_walks_the_credential_chain() {
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polled = polls.clone();
+    let server = fake(move |_, _, body| {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        // The fake dispatches on the body: the target rides in a header the
+        // reply closure does not see, but each action's body is distinct.
+        if let Some(sql) = v.get("QueryString").and_then(|q| q.as_str()) {
+            let id = if sql.contains("slow") {
+                "q-slow"
+            } else if sql.contains("broken") {
+                "q-broken"
+            } else if sql.contains("wide") {
+                "q-wide"
+            } else {
+                "q0"
+            };
+            return (200, serde_json::json!({"QueryExecutionId": id}).to_string());
+        }
+        let id = v.get("QueryExecutionId").and_then(|i| i.as_str()).unwrap_or_default();
+        if v.get("MaxResults").is_none() {
+            // GetQueryExecution (or StopQueryExecution, which has no MaxResults either).
+            let state = match id {
+                "q-slow" => {
+                    if polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        "RUNNING"
+                    } else {
+                        "SUCCEEDED"
+                    }
+                }
+                "q-broken" => "FAILED",
+                _ => "SUCCEEDED",
+            };
+            return (
+                200,
+                serde_json::json!({"QueryExecution": {"Status": {"State": state, "StateChangeReason": "SYNTAX_ERROR: line 1:8: nope"}}})
+                    .to_string(),
+            );
+        }
+        let page = |cols: &[&str], rows: &[&[Option<&str>]], next: Option<&str>| {
+            let mut r = serde_json::json!({"ResultSet": {
+                "Rows": rows.iter().map(|row| serde_json::json!({"Data": row.iter().map(|c| match c { Some(s) => serde_json::json!({"VarCharValue": s}), None => serde_json::json!({}) }).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "ResultSetMetadata": {"ColumnInfo": cols.iter().map(|c| serde_json::json!({"Name": c, "Type": "varchar"})).collect::<Vec<_>>()}
+            }});
+            if let Some(n) = next {
+                r["NextToken"] = serde_json::Value::String(n.into());
+            }
+            r.to_string()
+        };
+        match (id, v.get("NextToken").and_then(|t| t.as_str())) {
+            ("q0", None) => {
+                (200, page(&["status", "n"], &[&[Some("status"), Some("n")], &[Some("paid"), Some("3")], &[None, Some("1")]], Some("t2")))
+            }
+            ("q0", Some("t2")) => (200, page(&["status", "n"], &[&[Some("open"), Some("1")]], None)),
+            ("q-wide", None) => (200, page(&["x"], &[&[Some("x")], &[Some("1")], &[Some("2")], &[Some("3")]], None)),
+            _ => (200, page(&["one"], &[&[Some("one")], &[Some("1")]], None)),
+        }
+    });
+    let conn = Connection {
+        uid: "ath".into(),
+        adapter: "athena".into(),
+        url: Some(server.url.clone()),
+        region: Some("us-east-1".into()),
+        database: Some("shop".into()),
+        output_location: Some("s3://results/zsql/".into()),
+        workgroup: Some("primary".into()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(5),
+        ..Default::default()
+    };
+    let secrets = Secrets {
+        access_key_id: Some(Secret("AKIAEXAMPLE".into())),
+        secret_access_key: Some(Secret("s3cr3t".into())),
+        ..Default::default()
+    };
+    let mut src = open(&conn, secrets).expect("opens");
+    assert_eq!(src.adapter(), "athena");
+
+    let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    assert_eq!(rows.columns, ["status", "n"]);
+    assert_eq!(rows.rows.len(), 3, "the header row is dropped: {:?}", rows.rows);
+    assert_eq!(rows.get(&rows.rows[0], "status"), Some("paid"));
+    assert_eq!(rows.get(&rows.rows[1], "status"), None);
+    assert_eq!(rows.get(&rows.rows[2], "status"), Some("open"));
+    {
+        let seen = server.seen.lock().unwrap();
+        let (_, _, head, body) = &seen[0];
+        let head = head.to_lowercase();
+        assert!(head.contains("x-amz-target: amazonathena.startqueryexecution"), "{head}");
+        assert!(
+            head.contains("authorization: aws4-hmac-sha256 credential=akiaexample/")
+                && head.contains("/us-east-1/athena/aws4_request, signedheaders=content-type;host;x-amz-date;x-amz-target, signature="),
+            "{head}"
+        );
+        assert!(head.contains("x-amz-date: 20"), "{head}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["QueryExecutionContext"]["Database"], "shop");
+        assert_eq!(body["QueryExecutionContext"]["Catalog"], "awsdatacatalog");
+        assert_eq!(body["ResultConfiguration"]["OutputLocation"], "s3://results/zsql/");
+        assert_eq!(body["WorkGroup"], "primary");
+        assert!(seen[1].2.to_lowercase().contains("x-amz-target: amazonathena.getqueryexecution"));
+        assert!(seen[2].2.to_lowercase().contains("x-amz-target: amazonathena.getqueryresults"));
+        assert!(seen[2].3.contains("MaxResults"));
+        assert!(seen[3].3.contains("\"NextToken\":\"t2\""), "{}", seen[3].3);
+    }
+    src.query("SELECT 1 AS one FROM slow", 10).expect("polls");
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let err = src.query("SELECT x FROM wide", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
+    assert!(err.contains("failed") && err.contains("SYNTAX_ERROR"), "{err}");
+    assert!(src.query("INSERT INTO orders VALUES (1)", 1).is_err());
+
+    // The chain: explicit keys, then the environment, then the profile file.
+    let dir = temp("athena-chain");
+    std::fs::create_dir_all(dir.join(".aws")).unwrap();
+    std::fs::write(dir.join(".aws/credentials"), "[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = d\n\n[analytics]\n# a comment\naws_access_key_id = AKIAPROFILE\naws_secret_access_key = p\naws_session_token = sess\n").unwrap();
+    std::fs::write(dir.join(".aws/config"), "[profile analytics]\nregion = eu-west-1\n").unwrap();
+    let home = dir.clone();
+    let from_env = |k: &str| match k {
+        "AWS_ACCESS_KEY_ID" => Some("AKIAENV".to_string()),
+        "AWS_SECRET_ACCESS_KEY" => Some("e".to_string()),
+        "AWS_SHARED_CREDENTIALS_FILE" => Some(home.join(".aws/credentials").display().to_string()),
+        "AWS_CONFIG_FILE" => Some(home.join(".aws/config").display().to_string()),
+        _ => None,
+    };
+    let bare = Connection {
+        uid: "ath".into(),
+        adapter: "athena".into(),
+        url: Some(server.url.clone()),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let mut s =
+        athena::Athena::open_with(&Connection { profile: Some("analytics".into()), ..bare.clone() }, Secrets::default(), &from_env, None)
+            .expect("env keys, profile region");
+    s.query("SELECT 1", 10).unwrap();
+    let head = server.seen.lock().unwrap().last().unwrap().2.to_lowercase();
+    assert!(head.contains("credential=akiaenv/") && head.contains("/eu-west-1/athena/"), "{head}");
+    let no_env = |k: &str| match k {
+        "AWS_SHARED_CREDENTIALS_FILE" | "AWS_CONFIG_FILE" => from_env(k),
+        _ => None,
+    };
+    let mut s =
+        athena::Athena::open_with(&Connection { profile: Some("analytics".into()), ..bare.clone() }, Secrets::default(), &no_env, None)
+            .expect("profile keys");
+    s.query("SELECT 1", 10).unwrap();
+    let head = server.seen.lock().unwrap().last().unwrap().2.to_lowercase();
+    assert!(head.contains("credential=akiaprofile/") && head.contains("x-amz-security-token: sess"), "{head}");
+    // The default profile from the home directory, with no variables at all; the region then must be said.
+    let err = athena::Athena::open_with(&bare, Secrets::default(), &|_| None, Some(dir.clone())).err().unwrap().to_string();
+    assert!(err.contains("region") && !err.contains("credentials:"), "{err}");
+    let s = athena::Athena::open_with(
+        &Connection { region: Some("us-west-2".into()), ..bare.clone() },
+        Secrets::default(),
+        &|_| None,
+        Some(dir.clone()),
+    );
+    assert!(s.is_ok(), "{:?}", s.err().map(|e| e.to_string()));
+    let err = athena::Athena::open_with(&bare, Secrets::default(), &|_| None, None).err().unwrap().to_string();
+    for want in ["region", "access_key_id", "AWS_ACCESS_KEY_ID", "ZSQL_DS_ATH_SECRET_ACCESS_KEY", "'default'"] {
+        assert!(err.contains(want), "{want} named: {err}");
+    }
+}
+
+#[test]
+fn an_athena_catalogue_reads_information_schema_without_comments_on_tables() {
+    let server = fake(|_, _, body| {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        if let Some(sql) = v.get("QueryString").and_then(|q| q.as_str()) {
+            let id = if sql.contains("information_schema.tables") { "t" } else { "c" };
+            assert!(sql.contains("table_schema = 'shop'"), "{sql}");
+            return (200, serde_json::json!({"QueryExecutionId": id}).to_string());
+        }
+        if v.get("MaxResults").is_none() {
+            return (200, serde_json::json!({"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}).to_string());
+        }
+        let rows = |rows: Vec<Vec<&str>>| {
+            serde_json::json!({"ResultSet": {"Rows": rows.iter().map(|r| serde_json::json!({"Data": r.iter().map(|c| serde_json::json!({"VarCharValue": c})).collect::<Vec<_>>()})).collect::<Vec<_>>(), "ResultSetMetadata": {"ColumnInfo": rows[0].iter().map(|c| serde_json::json!({"Name": c})).collect::<Vec<_>>()}}}).to_string()
+        };
+        match v["QueryExecutionId"].as_str() {
+            Some("t") => (
+                200,
+                rows(vec![
+                    vec!["table_schema", "table_name", "table_kind", "row_estimate", "table_comment"],
+                    vec!["shop", "orders", "table", "", ""],
+                ]),
+            ),
+            _ => (
+                200,
+                rows(vec![
+                    vec![
+                        "table_schema",
+                        "table_name",
+                        "column_name",
+                        "data_type",
+                        "is_nullable",
+                        "max_length",
+                        "position",
+                        "column_comment",
+                    ],
+                    vec!["shop", "orders", "status", "varchar", "YES", "", "1", "Paid or open"],
+                ]),
+            ),
+        }
+    });
+    let conn = Connection {
+        uid: "ath".into(),
+        adapter: "athena".into(),
+        url: Some(server.url.clone()),
+        region: Some("us-east-1".into()),
+        database: Some("shop".into()),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let secrets = Secrets { access_key_id: Some(Secret("a".into())), secret_access_key: Some(Secret("s".into())), ..Default::default() };
+    let mut src = open(&conn, secrets).unwrap();
+    let cat = Catalogue::read(&mut *src, "ath", Some("shop")).expect("reads");
+    let orders = cat.table(Some("shop"), "orders").unwrap();
+    assert_eq!(orders.rows, None);
+    assert_eq!(orders.columns[0].comment.as_deref(), Some("Paid or open"));
+    assert!(orders.primary_key.is_empty());
 }
