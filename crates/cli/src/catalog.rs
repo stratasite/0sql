@@ -318,56 +318,146 @@ pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> 
 
 /// `zsql catalog search <pattern>`: the file, or the warehouse with
 /// `--live`, which asks every non-system schema for names holding the
-/// pattern and reads those tables whole.
+/// pattern and reads those tables whole. Without `-d`, every
+/// datasource's file is searched, since reading files is free.
 pub fn search(project_dir: Option<&Path>, datasource: Option<&str>, pattern: &str, live: bool, json: bool) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
-    let conn = choose(&project.dir, datasource)?;
     let want = pattern.trim().to_lowercase();
-    let held = load(&project.dir, &conn.uid)?;
-    let (tables, where_) = if live {
+    // (datasource, table, in the file already)
+    let mut hits: Vec<(String, zsql_source::Table, bool)> = Vec::new();
+    let where_ = if live {
+        let conn = choose(&project.dir, datasource)?;
+        let held = load(&project.dir, &conn.uid)?;
         let mut src = open(&project.dir, &conn)?;
         let fresh = Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::like(None, &want))?;
-        (fresh.tables, "the warehouse")
+        for t in fresh.tables {
+            let in_file = held.as_ref().is_some_and(|h| {
+                h.tables.iter().any(|x| {
+                    x.name.eq_ignore_ascii_case(&t.name)
+                        && x.schema.as_deref().map(str::to_lowercase) == t.schema.as_deref().map(str::to_lowercase)
+                })
+            });
+            hits.push((conn.uid.clone(), t, in_file));
+        }
+        "the warehouse"
     } else {
-        let Some(cat) = &held else {
-            bail!("{}: no catalog yet; `zsql catalog read --schema <name>` reads one, or `--live` searches the warehouse", conn.uid);
-        };
-        let hits = cat.tables.iter().filter(|t| t.physical_name().to_lowercase().contains(&want)).cloned().collect();
-        (hits, "the catalog")
-    };
-    let in_file = |t: &zsql_source::Table| {
-        held.as_ref().is_some_and(|h| {
-            h.tables.iter().any(|x| {
-                x.name.eq_ignore_ascii_case(&t.name)
-                    && x.schema.as_deref().map(str::to_lowercase) == t.schema.as_deref().map(str::to_lowercase)
-            })
-        })
+        let mut any_file = false;
+        for conn in files_of(&project.dir, datasource)? {
+            let Some(cat) = load(&project.dir, &conn.uid)? else { continue };
+            any_file = true;
+            for t in cat.tables.iter().filter(|t| t.physical_name().to_lowercase().contains(&want)) {
+                hits.push((conn.uid.clone(), t.clone(), true));
+            }
+        }
+        if !any_file {
+            bail!("no catalog yet; `zsql catalog read --schema <name>` reads one, or `--live` searches the warehouse");
+        }
+        "the catalog"
     };
     if json {
-        let v: Vec<serde_json::Value> = tables
+        let v: Vec<serde_json::Value> = hits
             .iter()
-            .map(|t| {
+            .map(|(ds, t, in_file)| {
                 serde_json::json!({
-                    "schema": t.schema, "name": t.name, "physical_name": t.physical_name(), "kind": t.kind,
-                    "columns": t.columns.len(), "rows": t.rows, "in_catalog": in_file(t),
+                    "datasource": ds, "schema": t.schema, "name": t.name, "physical_name": t.physical_name(), "kind": t.kind,
+                    "columns": t.columns.len(), "rows": t.rows, "in_catalog": in_file,
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "datasource": conn.uid, "live": live, "tables": v }))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "live": live, "tables": v }))?);
         return Ok(());
     }
-    if tables.is_empty() {
+    if hits.is_empty() {
         println!("nothing in {where_} matches {pattern}{}", if live { "" } else { "; --live searches the warehouse" });
         return Ok(());
     }
-    for t in &tables {
+    for (ds, t, in_file) in &hits {
         println!(
-            "{:<40} {:<5} {:>4} columns{}{}",
+            "{:<40} {:<5} {:>4} columns{}   {ds}{}",
             t.physical_name(),
             t.kind,
             t.columns.len(),
             t.rows.map(|r| format!(", ~{r} rows")).unwrap_or_default(),
-            if live && !in_file(t) { "   (not in the catalog; `zsql catalog read <name>` adds it)" } else { "" }
+            if live && !in_file { "   (not in the catalog; `zsql catalog read <name>` adds it)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+/// The datasources whose files a read-only command looks in: the one
+/// named, else every one.
+fn files_of(project_dir: &Path, datasource: Option<&str>) -> Result<Vec<Connection>> {
+    let all = Connection::read_all(project_dir).context("reading datasources.yml")?;
+    match datasource {
+        Some(d) => Ok(vec![choose(project_dir, Some(d))?]),
+        None if all.is_empty() => bail!("no datasource yet; `zsql datasource add`, or edit datasources.yml"),
+        None => Ok(all),
+    }
+}
+
+/// `zsql catalog show <table>`: one table's columns, keys and comment,
+/// from the file. Without `-d`, every datasource's file is searched; one
+/// match is shown and says where it came from, several are listed.
+pub fn show(project_dir: Option<&Path>, datasource: Option<&str>, table: &str, json: bool) -> Result<()> {
+    let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
+    let (schema, name) = split(table.trim());
+    let mut found: Vec<(String, zsql_source::Table)> = Vec::new();
+    let mut any_file = false;
+    for conn in files_of(&project.dir, datasource)? {
+        let Some(cat) = load(&project.dir, &conn.uid)? else { continue };
+        any_file = true;
+        for t in &cat.tables {
+            let same_name = t.name.eq_ignore_ascii_case(name);
+            let same_schema = match (schema, &t.schema) {
+                (Some(s), Some(ts)) => ts.eq_ignore_ascii_case(s),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if same_name && same_schema {
+                found.push((conn.uid.clone(), t.clone()));
+            }
+        }
+    }
+    if !any_file {
+        bail!("no catalog yet; `zsql catalog read --schema <name>` reads one");
+    }
+    match found.len() {
+        0 => bail!("no table named {table} in the catalog; `zsql catalog search {name}` finds names, `--live` asks the warehouse"),
+        1 => {}
+        n => {
+            let list: Vec<String> = found.iter().map(|(d, t)| format!("{d}: {}", t.physical_name())).collect();
+            bail!("{n} tables are named {table}; say which with -d:\n  {}", list.join("\n  "));
+        }
+    }
+    let (ds, t) = &found[0];
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "datasource": ds, "table": t }))?);
+        return Ok(());
+    }
+    println!(
+        "{} ({ds}) {}{}{}",
+        t.physical_name(),
+        t.kind,
+        t.rows.map(|r| format!(", ~{r} rows")).unwrap_or_default(),
+        t.comment.as_deref().map(|c| format!("\n  {c}")).unwrap_or_default()
+    );
+    for c in &t.columns {
+        println!(
+            "  {:<32} {:<24}{}{}{}",
+            c.name,
+            c.data_type,
+            if c.nullable { "" } else { " not null" },
+            if t.primary_key.iter().any(|k| k.eq_ignore_ascii_case(&c.name)) { " key" } else { "" },
+            c.comment.as_deref().map(|x| format!("   {x}")).unwrap_or_default()
+        );
+    }
+    for fk in &t.foreign_keys {
+        println!(
+            "  -> {} ({}) references {} ({})",
+            fk.columns.join(", "),
+            fk.name.as_deref().unwrap_or("foreign key"),
+            fk.references_table,
+            fk.references_columns.join(", ")
         );
     }
     Ok(())

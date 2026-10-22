@@ -8,9 +8,23 @@ use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static NO_INPUT: AtomicBool = AtomicBool::new(false);
+static AGENT: AtomicBool = AtomicBool::new(false);
 
 pub fn set_no_input(no: bool) {
     NO_INPUT.store(no, Ordering::Relaxed);
+}
+
+/// `--agent`: JSON wherever a command has a JSON shape, and never a
+/// prompt. One flag, one promise, for a program driving the tool.
+pub fn set_agent(on: bool) {
+    AGENT.store(on, Ordering::Relaxed);
+    if on {
+        NO_INPUT.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn agent() -> bool {
+    AGENT.load(Ordering::Relaxed)
 }
 
 /// Whether a prompt may be shown.

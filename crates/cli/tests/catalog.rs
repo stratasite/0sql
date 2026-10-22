@@ -177,4 +177,54 @@ fn datasources_are_listed_added_and_tested() {
     assert!(ok && out.contains("created models/local/tbl.orders.yml") && out.contains("next: zsql check"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["sql", "total"]));
     assert!(ok && out.contains("-- datasource: local (sqlite)"), "the key, not the display name: {out}");
+
+    // One table's columns from the file; without -d, every file is searched.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "show", "orders"]));
+    assert!(ok && out.contains("orders (local) table") && out.contains("id") && out.contains("key") && out.contains("total"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "show", "nowhere"]));
+    assert!(!ok && out.contains("no table named nowhere") && out.contains("--live"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "show", "orders", "--json"]));
+    assert!(ok && serde_json::from_str::<serde_json::Value>(&out).unwrap()["table"]["name"] == "orders", "{out}");
+    // A second datasource with the same table: the match is ambiguous without -d.
+    let db2 = rusqlite::Connection::open(project.join("other.db")).unwrap();
+    db2.execute_batch("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount NUMERIC);").unwrap();
+    assert!(run(zsql(&home, &project).args(["datasource", "add", "other", "--adapter", "sqlite", "--file", "./other.db"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "other", "--all"])).0);
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "show", "orders"]));
+    assert!(!ok && out.contains("2 tables are named orders") && out.contains("local: orders") && out.contains("other: orders"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "show", "orders", "-d", "other"]));
+    assert!(ok && out.contains("orders (other)") && out.contains("amount"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "search", "ord"]));
+    assert!(ok && out.matches("orders").count() == 2 && out.contains("local") && out.contains("other"), "every file: {out}");
+
+    // --agent: JSON where there is a shape, and never a prompt.
+    let (ok, out) = run(zsql(&home, &project).args(["--agent", "catalog", "search", "ord"]));
+    assert!(ok && out.trim_start().starts_with('{'), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["--agent", "fields"]));
+    assert!(ok && out.trim_start().starts_with('{'), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["--agent", "run", "total"]));
+    assert!(ok && serde_json::from_str::<serde_json::Value>(&out).unwrap()["manifest"]["rows"] == 1, "{out}");
+
+    // A secret set after the fact, from stdin.
+    let mut cmd = zsql(&home, &project);
+    cmd.args(["datasource", "auth", "-d", "local", "--field", "password", "--secret-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(b"hunter2\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read_to_string(project.join(".zsql")).unwrap().contains("local_password: hunter2"));
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "local"]));
+    assert!(!ok && out.contains("takes no secret"), "sqlite opens a file: {out}");
+
+    // An empty model from the template, and a test from the model's own fields.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "returns", "--empty", "table", "-d", "local"]));
+    assert!(ok && out.contains("create models/core/tbl.returns.yml"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["test", "--new", "smoke"]));
+    assert!(ok && out.contains("create tests/smoke.yml"), "{out}");
+    let test = std::fs::read_to_string(project.join("tests/smoke.yml")).unwrap();
+    assert!(test.contains("  - Total") || test.contains("  - Id"), "from the model's own fields:\n{test}");
 }

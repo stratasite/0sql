@@ -264,20 +264,24 @@ what to change.
 The flow, in order. Nothing prompts when stdin is not a terminal, so every
 step below is its non-interactive form; the flag forms are what you use.
 
+    zsql --agent <command>                     # JSON wherever a command has a shape, and never a prompt
     zsql datasource list                       # what datasources.yml holds, and whether each has its secret
+    zsql datasource auth -d wh --secret-stdin  # set or replace its secret in .zsql
     zsql datasource test -d wh                 # open the connection; list the schemas it can see
     zsql catalog read -d wh --schema public    # read a schema into catalog/wh.json (never --all on a big warehouse)
     zsql catalog read -d wh sales.orders       # or one table by name
     zsql catalog search orders [--live] --json # find tables, in the file or in the warehouse
+    zsql catalog show orders --json            # one table's columns, keys and comment, from the file
     zsql catalog sync -d wh                    # re-read what the file records; drift is printed
     zsql generate orders customers             # draft models for named tables; --schema S or --all for more
     zsql generate orders --new-columns         # add the columns a model lacks
+    zsql generate returns --empty table        # an empty model from the template, no catalog behind it
     zsql check                                 # load the model, check it against the catalog, run the tests
     zsql sample --yes [Status Region]          # collect sampled values; asks first on a terminal
     zsql sql 'revenue by region, order date >= 28d'
     zsql run 'revenue by region' --format jsonl
     zsql fields cost                           # find a field
-    zsql test                                  # run tests/*.yml
+    zsql test                                  # run tests/*.yml; --new NAME writes one from the model's own fields
 
 Run `zsql check` after every edit. A model that does not load cannot be
 deployed. `zsql generate` with no table and no terminal refuses and says

@@ -3,40 +3,8 @@
 
 use crate::{config, templates};
 use anyhow::{bail, Result};
-use clap::Subcommand;
 use config::Project;
 use std::path::{Path, PathBuf};
-
-#[derive(Subcommand)]
-pub enum NewCommand {
-    /// `models/<domain>/tbl.<name>.yml`
-    Table {
-        name: String,
-        #[arg(long)]
-        datasource: String,
-        #[arg(long)]
-        physical_name: Option<String>,
-        #[arg(long, default_value = "core")]
-        domain: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-    /// `models/<domain>/rel.<domain>.yml`
-    Relation {
-        #[arg(long)]
-        datasource: String,
-        #[arg(long, default_value = "core")]
-        domain: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-    /// `tests/<name>.yml`
-    Test {
-        name: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-}
 
 pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>, no_git: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
@@ -91,35 +59,8 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>, no_
     Ok(())
 }
 
-pub fn new_file(what: NewCommand) -> Result<()> {
-    let (project_dir, rel, text) = match what {
-        NewCommand::Table { name, datasource, physical_name, domain, project } => {
-            let p = project_of(project)?;
-            let file = zsql_project::parameterize(&name).replace('-', "_");
-            (
-                p.dir,
-                format!("models/{domain}/tbl.{file}.yml"),
-                templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource),
-            )
-        }
-        NewCommand::Relation { datasource, domain, project } => {
-            let p = project_of(project)?;
-            (p.dir, format!("models/{domain}/rel.{domain}.yml"), templates::relation_yml(&datasource))
-        }
-        NewCommand::Test { name, project } => {
-            let p = project_of(project)?;
-            let file = zsql_project::parameterize(&name).replace('-', "_");
-            // The model's own first dimension and measure, when it loads, so
-            // the test runs as written; placeholders otherwise.
-            let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
-                let s = m.universe().snapshot();
-                let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
-                (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))
-            });
-            (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name, fields))
-        }
-    };
-    let path = project_dir.join(&rel);
+fn write_new(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
+    let path = project_dir.join(rel);
     if path.exists() {
         bail!("{} exists", path.display());
     }
@@ -128,6 +69,47 @@ pub fn new_file(what: NewCommand) -> Result<()> {
     }
     std::fs::write(&path, text)?;
     println!("create {rel}");
+    Ok(())
+}
+
+/// `zsql generate NAME --empty table`: a table model from the template,
+/// with no catalog behind it.
+pub fn empty_table(
+    project_dir: Option<&Path>,
+    name: &str,
+    datasource: &str,
+    physical_name: Option<&str>,
+    domain: Option<&str>,
+) -> Result<()> {
+    let p = project_of(project_dir.map(Path::to_path_buf))?;
+    let domain = domain.unwrap_or("core");
+    let file = zsql_project::parameterize(name).replace('-', "_");
+    let physical = physical_name.unwrap_or(name);
+    write_new(&p.dir, &format!("models/{domain}/tbl.{file}.yml"), &templates::table_yml(name, physical, datasource))?;
+    eprintln!("next: name its fields, then zsql check");
+    Ok(())
+}
+
+/// `zsql generate --empty relation`: a rel file from the template.
+pub fn empty_relation(project_dir: Option<&Path>, datasource: &str, domain: Option<&str>) -> Result<()> {
+    let p = project_of(project_dir.map(Path::to_path_buf))?;
+    let domain = domain.unwrap_or("core");
+    write_new(&p.dir, &format!("models/{domain}/rel.{domain}.yml"), &templates::relation_yml(datasource))
+}
+
+/// `zsql test --new NAME`: a test from the template, projecting the
+/// model's own first dimension and measure when it loads, so the test
+/// runs as written; placeholders otherwise.
+pub fn new_test(project_dir: Option<&Path>, name: &str) -> Result<()> {
+    let p = project_of(project_dir.map(Path::to_path_buf))?;
+    let file = zsql_project::parameterize(name).replace('-', "_");
+    let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
+        let s = m.universe().snapshot();
+        let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
+        (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))
+    });
+    write_new(&p.dir, &format!("tests/{file}.yml"), &templates::test_yml(name, fields))?;
+    eprintln!("next: zsql test");
     Ok(())
 }
 

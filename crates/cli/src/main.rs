@@ -60,6 +60,9 @@ struct Cli {
     /// Never prompt: fail with the flag form instead. Implied when stdin is not a terminal or CI is set.
     #[arg(long, global = true)]
     no_input: bool,
+    /// For a program driving zsql: JSON wherever a command has a JSON shape, and never a prompt.
+    #[arg(long, global = true)]
+    agent: bool,
 }
 
 /// The flags that name a server's copy of the model, on the commands that
@@ -211,7 +214,7 @@ enum Command {
         #[command(subcommand)]
         what: datasource::DatasourceWhat,
     },
-    /// What the warehouse holds, in catalog/<datasource>.json: read it, sync it, search it. Local only.
+    /// What the warehouse holds, in catalog/<datasource>.json: read it, sync it, search it, show a table. Local only.
     #[command(display_order = 3, alias = "introspect")]
     Catalog {
         #[command(subcommand)]
@@ -246,11 +249,20 @@ enum Command {
         /// A named table the catalog lacks is read from the warehouse first and added to the catalog.
         #[arg(long)]
         live: bool,
+        /// An empty model file for the table named, from the template and no catalog; `--empty relation` for a rel file.
+        #[arg(long, value_name = "table|relation")]
+        empty: Option<String>,
+        /// With --empty: the physical name; the table's name when unsaid.
+        #[arg(long, requires = "empty")]
+        physical_name: Option<String>,
+        /// With --empty: the models/<domain> directory; core when unsaid.
+        #[arg(long, requires = "empty")]
+        domain: Option<String>,
         /// Say what would be written and write nothing.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Load the model, check it against the catalog, and run its tests; with -r, on the server.
+    /// Load the model, check it against the catalog, and run its tests. Connects to nothing (`datasource test` does); with -r, on the server.
     #[command(display_order = 5)]
     Check {
         #[command(flatten)]
@@ -400,16 +412,13 @@ enum Command {
         #[arg(num_args = 1.., value_name = "LINE", required = true)]
         line: Vec<String>,
     },
-    /// A model file from a template: a table, a relation file, a test.
-    #[command(display_order = 19)]
-    New {
-        #[command(subcommand)]
-        what: scaffold::NewCommand,
-    },
     // --------------------------------------------------------- shipping it
-    /// Run tests/*.yml here; with -r, the deployed branch's tests on the server.
+    /// Run tests/*.yml here; with -r, the deployed branch's tests on the server. `--new NAME` writes one from the template.
     #[command(display_order = 30)]
     Test {
+        /// Write tests/<name>.yml from the template, projecting the model's first fields, and run nothing.
+        #[arg(long, value_name = "NAME")]
+        new: Option<String>,
         #[command(flatten)]
         remote: Remote,
     },
@@ -432,6 +441,9 @@ enum Command {
         /// Redeploy whenever a project file changes.
         #[arg(long)]
         watch: bool,
+        /// Send without loading and testing the model here first.
+        #[arg(long)]
+        skip_check: bool,
         #[command(flatten)]
         remote: Remote,
     },
@@ -518,6 +530,17 @@ enum CatalogWhat {
         #[arg(short = 'd', long)]
         datasource: Option<String>,
     },
+    /// One table's columns, keys and comment, from the file: every datasource's when -d is unsaid.
+    Show {
+        /// The table, as schema.table or table.
+        table: String,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Which datasource; every one's catalog is searched when unsaid.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+    },
     /// Read these tables by name and add them to the file. The same as `read TABLE...`.
     #[command(hide = true)]
     Add {
@@ -579,6 +602,9 @@ impl Command {
     /// Whether the command answers in JSON, which is where a refusal
     /// goes too.
     fn wants_json(&self) -> bool {
+        if tty::agent() {
+            return true;
+        }
         match self {
             Command::Sql { json, .. }
             | Command::Explain { json, .. }
@@ -610,8 +636,9 @@ impl Command {
 }
 
 fn main() {
-    let Cli { command, project, no_input } = Cli::parse();
+    let Cli { command, project, no_input, agent } = Cli::parse();
     tty::set_no_input(no_input);
+    tty::set_agent(agent);
     let command = match command {
         Some(c) => c,
         // Bare `zsql` on a terminal inside a project is the repl; anywhere
@@ -659,7 +686,6 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             Ok(())
         }
         Command::Init { dir, name, uid, no_git } => scaffold::init(dir, name, uid, no_git),
-        Command::New { what } => scaffold::new_file(what),
         Command::Datasource { what } => datasource::run(dir, what),
         Command::Auth { api_key, server } => {
             let project = here.project_dir()?;
@@ -670,8 +696,9 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             println!("saved to {}", project.dir.join(config::LOCAL_FILE).display());
             Ok(())
         }
-        Command::Deploy { dry_run, watch, remote } => deploy::deploy(Where::with(project, remote), dry_run, watch),
+        Command::Deploy { dry_run, watch, skip_check, remote } => deploy::deploy(Where::with(project, remote), dry_run, watch, skip_check),
         Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
+            let format = format.or_else(|| tty::agent().then(|| "json".to_string()));
             let (mode, q, context) = query.resolve(here)?;
             let Mode::Local(local) = mode else { unreachable!("no remote flags on run") };
             let model = local.model()?;
@@ -686,8 +713,8 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         Command::Results { what } => {
             let project = here.project_dir()?;
             let cmd = match &what {
-                None => run::ResultsCommand::List { json: false },
-                Some(ResultsWhat::List { json }) => run::ResultsCommand::List { json: *json },
+                None => run::ResultsCommand::List { json: tty::agent() },
+                Some(ResultsWhat::List { json }) => run::ResultsCommand::List { json: *json || tty::agent() },
                 Some(ResultsWhat::Show { id, format, head, offset }) => {
                     run::ResultsCommand::Show { id, format: format.as_deref(), head: *head, offset: *offset }
                 }
@@ -704,13 +731,30 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             Some(CatalogWhat::Add { tables, datasource }) => catalog::read(dir, datasource.as_deref(), &[], &tables, false),
             Some(CatalogWhat::Sync { datasource }) => catalog::sync(dir, datasource.as_deref()),
             Some(CatalogWhat::Search { pattern, live, json, datasource }) => {
-                catalog::search(dir, datasource.as_deref(), &pattern, live, json)
+                catalog::search(dir, datasource.as_deref(), &pattern, live, json || tty::agent())
             }
+            Some(CatalogWhat::Show { table, json, datasource }) => catalog::show(dir, datasource.as_deref(), &table, json || tty::agent()),
         },
         Command::Sample { names, datasource, dry_run, budget, yes } => {
             sample::run(dir, sample::Options { datasource: datasource.as_deref(), names: &names, dry_run, budget, yes })
         }
-        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run } => generate::run(
+        Command::Generate {
+            tables, datasource, schema, all, columns, new_columns, live, empty: Some(kind), physical_name, domain, ..
+        } => {
+            let conn = catalog::choose(&here.project_dir()?.dir, datasource.as_deref())?;
+            let _ = (schema, all, columns, new_columns, live);
+            match kind.as_str() {
+                "table" => {
+                    let Some(name) = tables.first() else {
+                        bail!("--empty table needs the table's name: zsql generate orders --empty table")
+                    };
+                    scaffold::empty_table(dir, name, &conn.uid, physical_name.as_deref(), domain.as_deref())
+                }
+                "relation" => scaffold::empty_relation(dir, &conn.uid, domain.as_deref()),
+                other => bail!("--empty takes table or relation, not {other}"),
+            }
+        }
+        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run, .. } => generate::run(
             dir,
             generate::Options {
                 datasource: datasource.as_deref(),
@@ -738,19 +782,20 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             }
             Ok(())
         }
-        Command::Test { remote } => {
+        Command::Test { new: Some(name), .. } => scaffold::new_test(dir, &name),
+        Command::Test { remote, .. } => {
             if !show::print_tests(&Where::with(project, remote).mode()?.side()?.test()?) {
                 bail!("tests failed");
             }
             Ok(())
         }
-        Command::Sql { query, explain, json, remote } => query.run(Where::with(project, remote), explain, json),
-        Command::Explain { query, json, remote } => query.run(Where::with(project, remote), true, json),
+        Command::Sql { query, explain, json, remote } => query.run(Where::with(project, remote), explain, json || tty::agent()),
+        Command::Explain { query, json, remote } => query.run(Where::with(project, remote), true, json || tty::agent()),
         Command::Explore { query, q, json, remote } => {
             let (mode, query, context) = query.resolve(Where::with(project, remote))?;
             let mut side = mode.side()?;
             let v = side.explore(&query, context.as_ref(), q.as_deref())?;
-            if json {
+            if json || tty::agent() {
                 show::print_json(&v)?;
             } else {
                 show::print_explore(&v, &|s| s.to_string(), side.origin());
@@ -766,7 +811,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Fields { term, hidden, json, remote } => {
             let v = Where::with(project, remote).mode()?.side()?.fields(&term.unwrap_or_default(), hidden)?;
-            if json {
+            if json || tty::agent() {
                 show::print_json(&v)
             } else {
                 show::print_fields(&v);
@@ -775,7 +820,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Tables { json, remote } => {
             let v = Where::with(project, remote).mode()?.side()?.tables()?;
-            if json {
+            if json || tty::agent() {
                 show::print_json(&v)
             } else {
                 show::print_tables(&v);
@@ -784,7 +829,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Values { dim, json, remote } => {
             let v = Where::with(project, remote).mode()?.side()?.values(&dim)?;
-            if json {
+            if json || tty::agent() {
                 show::print_json(&v)
             } else {
                 show::print_values(&v);

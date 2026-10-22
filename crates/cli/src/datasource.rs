@@ -66,6 +66,18 @@ pub enum DatasourceWhat {
         #[arg(long)]
         secret_stdin: bool,
     },
+    /// Set or replace a datasource's secret in .zsql: the password, token or key its adapter takes.
+    Auth {
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+        /// Which secret: password, personal_access_token, private_key, oauth_client_secret, access_key_id, secret_access_key, session_token. The adapter's usual one when unsaid.
+        #[arg(long)]
+        field: Option<String>,
+        /// Read the secret from stdin, for scripts.
+        #[arg(long)]
+        secret_stdin: bool,
+    },
     /// Open the connection, run a one-row probe, and list the schemas it can see.
     Test {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
@@ -112,6 +124,9 @@ pub fn run(project_dir: Option<&Path>, what: DatasourceWhat) -> Result<()> {
     match what {
         DatasourceWhat::List => list(&project.dir),
         DatasourceWhat::Test { datasource } => test(&project.dir, datasource.as_deref()),
+        DatasourceWhat::Auth { datasource, field, secret_stdin } => {
+            auth(&project.dir, datasource.as_deref(), field.as_deref(), secret_stdin)
+        }
         DatasourceWhat::Add {
             key,
             adapter,
@@ -201,6 +216,42 @@ fn tier_of(dir: &Path, uid: &str) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("datasources.yml")).ok()?;
     let v: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
     v.get(uid)?.get("tier")?.as_str().map(str::to_string)
+}
+
+fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin: bool) -> Result<()> {
+    let conn = crate::catalog::choose(dir, datasource)?;
+    let usual = shape(&conn.adapter).1.or(if conn.adapter == "athena" { Some("secret_access_key") } else { None });
+    let field = match (field, usual) {
+        (Some(f), _) => f.to_string(),
+        (None, Some(f)) => f.to_string(),
+        (None, None) => bail!(
+            "{}: {} takes no secret in .zsql ({})",
+            conn.uid,
+            conn.adapter,
+            if conn.adapter == "bigquery" { "its key file is named by key_file in datasources.yml" } else { "it opens a file" }
+        ),
+    };
+    if !zsql_source::SECRET_FIELDS.contains(&field.as_str()) {
+        bail!("{field} is not a secret field; one of {}", zsql_source::SECRET_FIELDS.join(", "));
+    }
+    let value = if secret_stdin {
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        s.trim_end_matches(['\n', '\r']).to_string()
+    } else {
+        tty::ask_secret(&format!("{field} for {}", conn.uid), "--secret-stdin reads it from stdin")?
+    };
+    if value.is_empty() {
+        bail!("nothing entered; nothing saved");
+    }
+    config::write_secret(dir, &format!("{}_{field}", conn.uid), &value)?;
+    println!("saved   {field} for {} in .zsql", conn.uid);
+    if field == "access_key_id" {
+        eprintln!("next: zsql datasource auth -d {} --field secret_access_key", conn.uid);
+    } else {
+        eprintln!("next: zsql datasource test -d {}", conn.uid);
+    }
+    Ok(())
 }
 
 fn test(dir: &Path, datasource: Option<&str>) -> Result<()> {
