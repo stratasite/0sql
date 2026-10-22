@@ -214,7 +214,7 @@ enum Command {
         #[command(subcommand)]
         what: datasource::DatasourceWhat,
     },
-    /// What the warehouse holds, in catalog/<datasource>.json: read it, sync it, search it, show a table. Local only.
+    /// What the warehouse holds, in catalog/{datasource}.json: read it, sync it, search it, show a table. Local only.
     #[command(display_order = 3, alias = "introspect")]
     Catalog {
         #[command(subcommand)]
@@ -255,7 +255,7 @@ enum Command {
         /// With --empty: the physical name; the table's name when unsaid.
         #[arg(long, requires = "empty")]
         physical_name: Option<String>,
-        /// With --empty: the models/<domain> directory; core when unsaid.
+        /// With --empty: the models/{domain} directory; core when unsaid.
         #[arg(long, requires = "empty")]
         domain: Option<String>,
         /// Say what would be written and write nothing.
@@ -416,7 +416,7 @@ enum Command {
     /// Run tests/*.yml here; with -r, the deployed branch's tests on the server. `--new NAME` writes one from the template.
     #[command(display_order = 30)]
     Test {
-        /// Write tests/<name>.yml from the template, projecting the model's first fields, and run nothing.
+        /// Write tests/{name}.yml from the template, projecting the model's first fields, and run nothing.
         #[arg(long, value_name = "NAME")]
         new: Option<String>,
         #[command(flatten)]
