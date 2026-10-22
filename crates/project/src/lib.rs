@@ -742,7 +742,12 @@ impl<'d> Builder<'d> {
                 .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list (one of: string, integer, decimal, date, date_time, boolean, bigint, binary)")))?,
             None => return Err(invalid(file, format!("Field {name} errors: Data type can't be blank"))),
         };
-        let sample_size = int_of(fm, "sample_size").unwrap_or_else(zsql_semantic::default_sample_size);
+        let sample_size = match get(fm, "sample_size") {
+            None => zsql_semantic::default_sample_size(),
+            Some(_) => {
+                int_of(fm, "sample_size").ok_or_else(|| invalid(file, format!("Field {name} errors: sample_size is not a whole number")))?
+            }
+        };
         if !(1..=zsql_semantic::MAX_SAMPLE_SIZE).contains(&sample_size) {
             let most = zsql_semantic::MAX_SAMPLE_SIZE;
             return Err(invalid(file, format!("Field {name} errors: sample_size {sample_size} is not between 1 and {most}")));

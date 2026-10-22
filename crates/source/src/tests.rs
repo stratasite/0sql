@@ -630,10 +630,8 @@ fn ca_file_is_read_and_an_empty_or_missing_one_is_named() {
 #[test]
 #[ignore]
 fn a_real_postgres_with_tls_proves_every_rung() {
-    if std::env::var("ZSQL_TEST_PG_TLS").is_err() {
-        eprintln!("ZSQL_TEST_PG_TLS unset; skipping");
-        return;
-    }
+    // Never a pass by default: an ignored test that is run is meant to run.
+    std::env::var("ZSQL_TEST_PG_TLS").expect("ZSQL_TEST_PG_TLS");
     let base = Connection {
         uid: "pg".into(),
         adapter: "postgres".into(),

@@ -41,9 +41,10 @@ in `.zsql` under the same datasource key, or in
 `crates/cli/src/project.rs` strips twelve secret-shaped key names at
 any depth from `datasources.yml` before a deploy sends it, so a nested
 `oauth: {client_secret: …}` goes too. The deployed model keeps only
-name, adapter and tier. `ZSQL_DS_<KEY>_PASSWORD` is documented and read
-by nothing yet: making it real, and adding the same shape for tokens
-and key files, is this plan's credential design in full.
+name, adapter and tier. `ZSQL_DS_<KEY>_PASSWORD` was documented and read
+by nothing when this was written; it is read now, with the same shape
+for tokens and keys (`ZSQL_DS_<KEY>_<FIELD>`), which is this plan's
+credential design in full.
 
 **The sample file already exists, with all its consumers.**
 `crates/project/src/values.rs` defines `samples/values.jsonl.gz`, read
@@ -223,8 +224,9 @@ things follow from that separation, and they are the reason for it:
   written names, descriptions and synonyms into the generated files.
   With the catalogue separate, generation is a diff-and-patch: new
   columns added, dropped and retyped columns flagged, nothing a human
-  wrote overwritten. `--dry-run` prints the patch and is the default
-  for a project that already has models.
+  wrote overwritten. `--dry-run` prints what would be written and
+  writes nothing; a project that already has models gets a listing of
+  what is new and adds it only when asked, by `--columns` or `--new`.
 - **`zsql check` gains the check it cannot do today.** The commonest
   defect in a hand-authored model is a typo in a `physical_name`, and
   nothing catches it: the loader does not know the warehouse and the
@@ -277,18 +279,20 @@ what came back looks like long text.
 
 Whether the file is committed is **the author's choice**, not the
 tool's: it is deployed either way, and it is customer data, so the
-scaffold keeps it in `.gitignore` and says in a comment that removing
-the line is a decision about where those values are allowed to go.
+scaffold keeps it in `.gitignore`, and the command says on every write
+that committing the file is a decision about where those values may go.
 
 **Cost is a first-class argument here**, because this is the one place
 in this feature that spends real money. A model with 353 fields,
 sampled naively, is several hundred warehouse queries from a command
-that sounds like metadata. So: the distinct counts batched one query
-per table; a budget in queries; a printed plan and estimate before
-anything runs; `--dry-run`; a concurrency cap; and a statement timeout
-on every query, defaulting to the `query_timeout` already on
-`Datasource`. `--only <table-or-field>` so re-sampling one dimension
-does not re-sample the model.
+that sounds like metadata. What landed: a budget in queries; a printed
+plan and count before anything runs; `--dry-run`; the statement
+timeout the transport puts on every query, from the `query_timeout`
+already on `Datasource`; and `--only <table-or-field>` so re-sampling
+one dimension does not re-sample the model. Each planned dimension is
+two queries, the values and their distinct total, since the planner
+answers one dimension at a time; batching the totals per table and a
+concurrency cap were proposed here and are not built.
 
 ## Governance: two different questions about the same file
 
@@ -307,13 +311,15 @@ that those names enter a corpus.
 So: collection and corpus are separate decisions, separately consented.
 `zsql sample` writes the customer's file and nothing else. Anything
 that pools files into a training corpus is a different command, a
-different opt-in, and its own document. The string-only default helps
-less than it looks — names, emails and addresses are all strings — so
-the deny rules still matter: by column name (email, phone, ssn, dob,
-address, name, account) and by the `secure` flag and policy tags
-already in the model, defaulting those to not sampled and saying so in
-the output. A field wrongly excluded costs a flag; a field wrongly
-included cannot be un-collected.
+different opt-in, and its own document. Sampling is off unless a
+field says `enable_sampling: true`, and AGENTS.md tells an agent to
+turn it on only for short strings; that helps less than it looks —
+names, emails and addresses are all short strings — so the model's own
+rules still apply: a hidden field and a field a security policy names
+are never sampled, and the command says so. The `secure` flag this
+paragraph once leaned on left the field set with this change. A field
+wrongly excluded costs a flag; a field wrongly included cannot be
+un-collected.
 
 The sharp edge is free text. A low-cardinality status column is safe; a
 `notes` or `comment` column holds whatever a human typed, including the

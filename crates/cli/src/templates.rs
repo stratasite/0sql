@@ -21,10 +21,13 @@ pub const DATASOURCES_YML: &str = "\
 # The warehouses this project's tables live in. One entry per datasource,\n\
 # keyed by a short id that table files refer to.\n\
 #\n\
-# 0sql never connects to your warehouse. The server has no database driver in\n\
-# it at all: it takes a query spec and gives back SQL text. Running that\n\
-# SQL against your data stays inside your network, with your credentials,\n\
-# and nothing about the rows ever reaches the service.\n\
+# The server never connects to your warehouse. It has no database driver\n\
+# in it at all: it takes a query spec and gives back SQL text, and nothing\n\
+# about your rows ever reaches it. The zsql command on this machine does\n\
+# connect, read-only, when you ask it to: `zsql introspect` reads the\n\
+# catalogue a model is drafted from, and `zsql sample` reads the values of\n\
+# the dimensions you turn sampling on for. Give it a credential with no\n\
+# write grant.\n\
 #\n\
 # So the settings below are two different things.\n\
 #\n\
@@ -33,11 +36,11 @@ pub const DATASOURCES_YML: &str = "\
 # ranks datasources when more than one could answer a query. They are\n\
 # compiled into the deployed model.\n\
 #\n\
-# Anything else here (host, port, database, username, schema, file) is\n\
-# for the tools that run the SQL on your side; 0sql never reads it. A\n\
-# deploy does upload this file, with the secrets taken out, but every\n\
-# one of those keys is ignored and none of them is kept: the deployed\n\
-# model holds the adapter, the tier and the name.\n\
+# Everything else here (host, port, database, username, schema, file and\n\
+# the keys each warehouse adds) is for the zsql command and for your own\n\
+# tools. A deploy does upload this file, with the secrets taken out, but\n\
+# every one of those keys is ignored and none of them is kept: the\n\
+# deployed model holds the adapter, the tier and the name.\n\
 #\n\
 # Secrets never leave this machine. Passwords, tokens and keys go in\n\
 # .zsql under the same datasource key, or in ZSQL_DS_<KEY>_<FIELD>:\n\
@@ -251,7 +254,7 @@ what to change.
     zsql check            # load the model and report problems
     zsql test             # run tests/*.yml
     zsql sql 'revenue by category last month'
-    zsql fields -q cost   # find a field
+    zsql fields cost      # find a field
     zsql repl             # explore interactively
 
 Run `zsql check` after every edit. A model that does not load cannot be

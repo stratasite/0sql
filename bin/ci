@@ -81,6 +81,12 @@ if [ $failed -ne 0 ]; then
 fi
 if [ $signoff -eq 1 ]; then
   printf '\n\033[1m== Signoff\033[0m\n'
+  # What ran was the working tree; the sign-off goes on HEAD. They must be
+  # the same thing, or a commit is vouched for by a run of something else.
+  if [ -n "$(git status --porcelain)" ]; then
+    printf '\033[31mThe tree has uncommitted changes, so HEAD is not what just ran. Nothing signed off.\033[0m\n'
+    exit 1
+  fi
   gh signoff && printf '\033[32mAll systems go. Ready for merge and deploy.\033[0m\n'
 else
   printf '\n\033[32mAll steps passed.\033[0m Nothing signed off: --no-signoff.\n'

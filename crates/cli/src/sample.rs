@@ -230,8 +230,11 @@ fn sample_one(
     // The planner lays dimensions before calculations, so the count cannot
     // lead the order and the warehouse picks which of the tied values a
     // limit cuts; the file is still sorted, by count then value.
+    // The dimension is projected quoted, so a name that holds a keyword or
+    // a comma reads as the one field it is.
+    let dim = format!("\"{}\"", j.field.name.replace('"', "\"\""));
     let hints = if j.lookups.is_empty() { String::new() } else { format!(", hints ({})", j.lookups.join(", ")) };
-    let line = format!("{}, calc(count(*), integer) as n desc, limit {size}{hints}", j.field.name);
+    let line = format!("{dim}, calc(count(*), integer) as n desc, limit {size}{hints}");
     let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
     let planned = model.plan_request(req, false, &zsql_service::unlimited).map_err(|e| anyhow::anyhow!("{e}"))?;
     let dialect = model.dialects.get(&planned.plan.adapter)?;
@@ -246,7 +249,7 @@ fn sample_one(
     // The distinct total: the same question without the order or the
     // limit, counted as a derived table. Any common table expressions stay
     // in front, which is what the plan's root offset is for.
-    let line = format!("{}, calc(count(*), integer) as n{hints}", j.field.name);
+    let line = format!("{dim}, calc(count(*), integer) as n{hints}");
     let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
     let distinct = match model.plan_request(req, false, &zsql_service::unlimited) {
         Ok(p) => {

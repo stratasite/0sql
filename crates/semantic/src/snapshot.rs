@@ -452,6 +452,8 @@ pub enum LoadError {
     Json(#[from] serde_json::Error),
     #[error("this snapshot is in format {found}, and this build reads up to {FORMAT}; deploy it again from its project")]
     Newer { found: u32 },
+    #[error("this snapshot is in format {found}, and this build reads format {FORMAT}; deploy it again from its project")]
+    Older { found: u32 },
 }
 
 impl Snapshot {
@@ -480,6 +482,9 @@ impl Snapshot {
             // real reason when it is the reason.
             Err(e) => match Self::format_of(text) {
                 Some(found) if found > FORMAT => Err(LoadError::Newer { found }),
+                // An older one fails the same way, on a field that left;
+                // there is no migration, and the sentence says what to do.
+                Some(found) if found < FORMAT => Err(LoadError::Older { found }),
                 _ => Err(e.into()),
             },
         }

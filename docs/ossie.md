@@ -1,6 +1,6 @@
 # 0sql and Apache Ossie: what each can say, and a plan to meet
 
-An analysis and a plan, 2026-10-18. The question asked: is 0sql's
+An analysis and a proposed plan, 2026-10-18, not yet the plan of record (that is `docs/introspection.md`). The question asked: is 0sql's
 semantic model a superset of what Apache Ossie (incubating, formerly
 Open Semantic Interchange) can express, a subset, or something else;
 what gaps should 0sql fill first; and how should it integrate with
@@ -113,9 +113,10 @@ and the snapshot (`crates/semantic/src/snapshot.rs`):
   imports, fields. A `metadata` key is accepted and ignored.
 - **field**: type (dimension or measure), name, description,
   data_type (string, integer, decimal, date, date_time, boolean,
-  bigint, binary), display_type, hidden, tags, grains, format,
-  synonyms, secure, disable_listing, value_list_size, values
-  (sampling), snapshot (ending or beginning), exclusion_type and
+  bigint, binary), hidden, tags, grains, format, synonyms,
+  enable_sampling, sample_size, sample_sql (sampling; `display_type`,
+  `secure` and the listing keys left on 2026-10-21), snapshot (ending or
+  beginning), exclusion_type and
   exclusions (level-of-detail exclude rules with filter modes),
   inclusions (level-of-detail include rules with an outer
   aggregation), extended_blend_group, expression {sql, array, lookup,
@@ -189,7 +190,7 @@ are simply not present, and the planner falls back to its defaults.
 | Extended blend groups (role-playing dates aligned across facts) | none |
 | Row-level security and masking policies | none; ThoughtSpot's converter marks RLS as unrepresentable and security-bearing; proposals #87, #58, #59 |
 | Segments, named filters, default filters | open and contested: semantic filters (#5); maintainer favours a minimal spec |
-| Format, display type, secure, hidden, value sampling | none; extended metadata PR #287 proposes `display_format` and `default_aggregation` |
+| Format, hidden, value sampling | none; extended metadata PR #287 proposes `display_format` and `default_aggregation` |
 | Grains on a time dimension | none; dbt's converter assigns every time dimension DAY |
 | Period-over-period, windows, contribution | query-time decorators in 0sql; Ossie permits `OVER()` in strings but has no grain or window declaration, and dbt's converter reports `CUMULATIVE_SEMANTICS_LOSS` |
 | Stable uids, branches, deploy history | open: stable ids (#31), ownership (#13, #53) |
