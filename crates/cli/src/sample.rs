@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use zsql_project::values::{DimensionValues, ValueCatalog, ValueCount};
-use zsql_semantic::{Expression, Field, FieldKind, Snapshot, Table};
+use zsql_semantic::{Field, FieldKind, Snapshot, Table};
 use zsql_service::{Model, Trust};
 use zsql_source::{Catalogue, Connection};
 
@@ -30,13 +30,13 @@ const LONG_TEXT: usize = 100;
 /// before any row is read; it is the number in AGENTS.md.
 const WIDE: i64 = 255;
 
-/// One dimension the model wants sampled, and how.
+/// One dimension the model wants sampled, and how: through the planner,
+/// or through the author's own query.
 struct Job<'a> {
     field: &'a Field,
-    table: &'a Table,
-    /// The rendered expression for the generated query, or none when the
-    /// author's own `sample_sql` is used.
-    expr: Option<String>,
+    /// Tables whose expression for this field is marked `lookup`, passed
+    /// to the planner as hints.
+    lookups: Vec<String>,
 }
 
 pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
@@ -48,201 +48,126 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     let out_path = project.dir.join("samples").join(zsql_project::values::FILE_NAME);
     let mut catalog = ValueCatalog::read(&out_path).with_context(|| out_path.display().to_string())?.unwrap_or_default();
 
-    let mut total_queries = 0;
-    let mut sampled = 0;
-    for ds in &s.datasources {
-        if opts.datasource.is_some_and(|d| !d.eq_ignore_ascii_case(&ds.uid)) {
-            continue;
-        }
-        let dialect = model.dialects.get(&ds.adapter)?;
-        // What the model asks for on this datasource, with the reasons for
-        // what it does not get.
-        let mut jobs: Vec<Job> = Vec::new();
-        for f in s.fields.iter().filter(|f| f.kind == FieldKind::Dimension) {
-            let Some((e, table)) = expression_on(s, f, ds.id) else { continue };
-            if let Some(o) = &only {
-                let hit = f.uid.to_lowercase() == *o
-                    || f.name.to_lowercase() == *o
-                    || table.name.to_lowercase() == *o
-                    || table.physical_name.to_lowercase() == *o;
-                if !hit {
-                    continue;
-                }
-            }
-            if !f.enable_sampling {
+    // What the model asks for, with the reasons for what it does not get.
+    // Which table answers is the planner's decision, not this command's,
+    // so a dimension is a job whatever its expression looks like.
+    let mut jobs: Vec<Job> = Vec::new();
+    for f in s.fields.iter().filter(|f| f.kind == FieldKind::Dimension && f.enable_sampling) {
+        let tables: Vec<&Table> =
+            s.expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id)).collect();
+        if let Some(o) = &only {
+            let hit = f.uid.to_lowercase() == *o
+                || f.name.to_lowercase() == *o
+                || tables.iter().any(|t| t.name.to_lowercase() == *o || t.physical_name.to_lowercase() == *o);
+            if !hit {
                 continue;
             }
-            match why_not(s, f, e, table) {
-                Some(why) => println!("skip    {} ({}): {why}", f.name, table.name),
-                None => {
-                    let expr = match &f.sample_sql {
-                        Some(_) => None,
-                        None => Some(render(e, &dialect)?),
-                    };
-                    jobs.push(Job { field: f, table, expr });
-                }
+        }
+        if let Some(d) = opts.datasource {
+            if !tables.iter().any(|t| s.datasources.iter().any(|ds| ds.id == t.datasource_id && ds.uid.eq_ignore_ascii_case(d))) {
+                continue;
             }
         }
-        if jobs.is_empty() {
-            continue;
-        }
-        // One distinct-count query per table for the generated ones, plus
-        // one query per dimension.
-        let tables: BTreeMap<zsql_semantic::Id, Vec<&Job>> = jobs.iter().filter(|j| j.expr.is_some()).fold(BTreeMap::new(), |mut m, j| {
-            m.entry(j.table.id).or_default().push(j);
-            m
-        });
-        let planned = tables.len() + jobs.len();
-        total_queries += planned;
-        println!(
-            "{}: {} dimension{} on {} table{}: {planned} quer{}",
-            ds.uid,
-            jobs.len(),
-            if jobs.len() == 1 { "" } else { "s" },
-            tables.len(),
-            if tables.len() == 1 { "" } else { "s" },
-            if planned == 1 { "y" } else { "ies" }
-        );
-        if let Some(b) = opts.budget {
-            if planned > b {
-                bail!("{planned} queries is more than the budget of {b}; narrow with --only, or raise --budget");
+        match why_not(s, f) {
+            Some(why) => println!("skip    {}: {why}", f.name),
+            None => {
+                let lookups = s
+                    .expressions
+                    .iter()
+                    .filter(|e| e.field_id == f.id && e.lookup)
+                    .filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id).map(|t| t.uid.clone()))
+                    .collect();
+                jobs.push(Job { field: f, lookups });
             }
         }
-        if opts.dry_run {
-            for j in &jobs {
-                println!(
-                    "  would sample {} from {} ({})",
-                    j.field.name,
-                    j.table.physical_name,
-                    if j.expr.is_some() { "generated" } else { "sample_sql" }
-                );
-            }
-            continue;
-        }
-
-        let conn = Connection::read(&project.dir, &ds.uid).context("reading datasources.yml")?;
-        let secret = zsql_source::secret(Some(&project.dir), &conn.uid, "password");
-        let mut src = zsql_source::open(&conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
-        for w in src.warnings() {
-            eprintln!("warning: {w}");
-        }
-        let catalogue = std::fs::read_to_string(crate::introspect::path(&project.dir, &ds.uid))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Catalogue>(&t).ok());
-
-        // Distinct counts, one scan per table.
-        let mut distinct: BTreeMap<String, i64> = BTreeMap::new();
-        for group in tables.values() {
-            let cols: Vec<String> =
-                group.iter().enumerate().map(|(i, j)| format!("COUNT(DISTINCT {}) AS d{i}", j.expr.as_ref().unwrap())).collect();
-            let sql = format!("SELECT {} FROM {}", cols.join(", "), group[0].table.physical_name);
-            match src.query(&sql, 1) {
-                Ok(rows) => {
-                    for (i, j) in group.iter().enumerate() {
-                        if let Some(n) = rows.rows.first().and_then(|r| rows.get(r, &format!("d{i}"))).and_then(|n| n.parse::<f64>().ok()) {
-                            distinct.insert(j.field.uid.clone(), n as i64);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("warning: distinct counts for {}: {e}", group[0].table.name),
-            }
-        }
-
-        // The values, most frequent first.
-        for j in &jobs {
-            let size = j.field.sample_size;
-            let rows = match (&j.field.sample_sql, &j.expr) {
-                (Some(own), _) => src.query(own, zsql_semantic::MAX_SAMPLE_SIZE as usize),
-                (None, Some(expr)) => {
-                    // Most frequent first, ties by value, so two runs of the
-                    // same warehouse write the same file.
-                    let sql =
-                        format!("SELECT {expr} AS v, COUNT(*) AS n FROM {} GROUP BY {expr} ORDER BY n DESC, v", j.table.physical_name);
-                    let sql = dialect.apply_limit(&sql, 0, &size.to_string())?;
-                    src.query(&sql, size as usize)
-                }
-                (None, None) => unreachable!(),
-            };
-            let rows = match rows {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("warning: {} ({}): {e}", j.field.name, j.table.name);
-                    continue;
-                }
-            };
-            let values: Vec<ValueCount> = rows
-                .rows
-                .iter()
-                .filter_map(|r| {
-                    let v = r.first()?.clone()?;
-                    let n = r.get(1).and_then(|c| c.as_deref()).and_then(|c| c.parse::<f64>().ok()).map(|n| n as i64).unwrap_or(1);
-                    Some(ValueCount { v, n })
-                })
-                .collect();
-            let d = distinct.get(&j.field.uid).copied();
-
-            // Long text: what came back, and what the catalogue declared.
-            if !values.is_empty() {
-                let avg = values.iter().map(|v| v.v.chars().count()).sum::<usize>() / values.len();
-                if avg > LONG_TEXT {
-                    eprintln!("warning: {} ({}): the values average {avg} characters, which is text, not a value; sampling it will blur resolution — turn enable_sampling off, or give it a sample_sql that trims", j.field.name, j.table.name);
-                }
-            }
-            if let (Some(cat), Some(e)) = (&catalogue, j.expr.as_deref()) {
-                if let Some(col) = declared(cat, &j.table.physical_name, e) {
-                    match col.max_length {
-                        Some(w) if w > WIDE => eprintln!(
-                            "warning: {} ({}): declared {} wide, past the {WIDE} AGENTS.md advises; check it is a value and not text",
-                            j.field.name, j.table.name, w
-                        ),
-                        None if col.data_type.to_lowercase().contains("text") || col.data_type.to_lowercase().contains("clob") => {
-                            eprintln!(
-                                "warning: {} ({}): declared {}, unbounded text; check it is a value and not prose",
-                                j.field.name, j.table.name, col.data_type
-                            )
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            let complete = match d {
-                Some(n) => n <= size,
-                None => (values.len() as i64) < size,
-            };
-            println!(
-                "sampled {} ({}): {} value{}{}{}",
-                j.field.name,
-                j.table.name,
-                values.len(),
-                if values.len() == 1 { "" } else { "s" },
-                match d {
-                    Some(n) => format!(" of {n}"),
-                    None => String::new(),
-                },
-                if complete { "" } else { ", cut at the limit" }
-            );
-            let record = DimensionValues {
-                uid: j.field.uid.clone(),
-                name: j.field.name.clone(),
-                table: j.table.name.clone(),
-                sampled_at: zsql_source::catalogue::now(),
-                sample_size: Some(size),
-                distinct: d,
-                values,
-                range: None,
-            };
-            catalog.dimensions.retain(|x| x.uid != record.uid);
-            catalog.dimensions.push(record);
-            sampled += 1;
+    }
+    if jobs.is_empty() {
+        println!("nothing to sample: no dimension has enable_sampling: true, or none matched");
+        return Ok(());
+    }
+    // The planner answers twice per dimension — the values and their
+    // distinct total — and an author's query once.
+    let planned: usize = jobs.iter().map(|j| if j.field.sample_sql.is_some() { 1 } else { 2 }).sum();
+    println!(
+        "{} dimension{}: {planned} quer{}",
+        jobs.len(),
+        if jobs.len() == 1 { "" } else { "s" },
+        if planned == 1 { "y" } else { "ies" }
+    );
+    if let Some(b) = opts.budget {
+        if planned > b {
+            bail!("{planned} queries is more than the budget of {b}; narrow with --only, or raise --budget");
         }
     }
     if opts.dry_run {
-        println!("{total_queries} quer{} in all; nothing run, nothing written", if total_queries == 1 { "y" } else { "ies" });
+        for j in &jobs {
+            println!("  would sample {} ({})", j.field.name, if j.field.sample_sql.is_some() { "sample_sql" } else { "planned" });
+        }
+        println!("nothing run, nothing written");
         return Ok(());
     }
+
+    // A policy needs a context to plan under; none of these projections
+    // names a policy's trigger, so an empty one fires nothing.
+    let context = (!s.security_policies.is_empty()).then(zsql_spec::SecurityContext::default);
+    let catalogues: BTreeMap<String, Catalogue> = s
+        .datasources
+        .iter()
+        .filter_map(|ds| {
+            let text = std::fs::read_to_string(crate::introspect::path(&project.dir, &ds.uid)).ok()?;
+            Some((ds.uid.clone(), serde_json::from_str(&text).ok()?))
+        })
+        .collect();
+    // Connections by the datasource the planner chose, opened on first use.
+    let mut sources: BTreeMap<String, Box<dyn zsql_source::Source>> = BTreeMap::new();
+    let mut sampled = 0;
+    for j in &jobs {
+        let size = j.field.sample_size;
+        let result = sample_one(&model, &project.dir, s, j, context.as_ref(), &mut sources, &catalogues);
+        let (values, distinct, via) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("warning: {}: {e}", j.field.name);
+                continue;
+            }
+        };
+        if !values.is_empty() {
+            let avg = values.iter().map(|v| v.v.chars().count()).sum::<usize>() / values.len();
+            if avg > LONG_TEXT {
+                eprintln!("warning: {}: the values average {avg} characters, which is text, not a value; sampling it will blur resolution — turn enable_sampling off, or give it a sample_sql that trims", j.field.name);
+            }
+        }
+        let complete = match distinct {
+            Some(n) => n <= size,
+            None => (values.len() as i64) < size,
+        };
+        println!(
+            "sampled {} ({via}): {} value{}{}{}",
+            j.field.name,
+            values.len(),
+            if values.len() == 1 { "" } else { "s" },
+            match distinct {
+                Some(n) => format!(" of {n}"),
+                None => String::new(),
+            },
+            if complete { "" } else { ", cut at the limit" }
+        );
+        let record = DimensionValues {
+            uid: j.field.uid.clone(),
+            name: j.field.name.clone(),
+            table: via.clone(),
+            sampled_at: zsql_source::catalogue::now(),
+            sample_size: Some(size),
+            distinct,
+            values,
+            range: None,
+        };
+        catalog.dimensions.retain(|x| x.uid != record.uid);
+        catalog.dimensions.push(record);
+        sampled += 1;
+    }
     if sampled == 0 {
-        println!("nothing sampled: no dimension has enable_sampling: true, or none matched --only");
+        println!("nothing sampled");
         return Ok(());
     }
     catalog.dimensions.sort_by(|a, b| a.uid.cmp(&b.uid));
@@ -255,19 +180,131 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         if sampled == 1 { "" } else { "s" },
         out_path.strip_prefix(&project.dir).unwrap_or(&out_path).display()
     );
+    println!("that file is customer data: it ships with the model on deploy and is gitignored by default; committing it is a decision about where those values may go");
     Ok(())
 }
 
-/// The field's expression on a table of this datasource, and that table.
-fn expression_on<'a>(s: &'a Snapshot, f: &Field, ds: zsql_semantic::Id) -> Option<(&'a Expression, &'a Table)> {
-    s.expressions.iter().filter(|e| e.field_id == f.id).find_map(|e| {
-        let t = s.tables.iter().find(|t| t.id == e.table_id && t.datasource_id == ds)?;
-        Some((e, t))
-    })
+/// The values, their distinct total, and where they came from.
+#[allow(clippy::too_many_arguments)]
+fn sample_one(
+    model: &Model,
+    project_dir: &Path,
+    s: &Snapshot,
+    j: &Job<'_>,
+    context: Option<&zsql_spec::SecurityContext>,
+    sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>,
+    catalogues: &BTreeMap<String, Catalogue>,
+) -> Result<(Vec<ValueCount>, Option<i64>, String)> {
+    let size = j.field.sample_size;
+    let open = |uid: &str, sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>| -> Result<()> {
+        if !sources.contains_key(uid) {
+            let conn = Connection::read(project_dir, uid).context("reading datasources.yml")?;
+            let secret = zsql_source::secret(Some(project_dir), &conn.uid, "password");
+            let src = zsql_source::open(&conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
+            for w in src.warnings() {
+                eprintln!("warning: {w}");
+            }
+            sources.insert(uid.to_string(), src);
+        }
+        Ok(())
+    };
+
+    // The author's own query runs on the datasource the field's tables are
+    // on, as written, with the value first and an optional count second.
+    if let Some(own) = &j.field.sample_sql {
+        let ds = s
+            .expressions
+            .iter()
+            .filter(|e| e.field_id == j.field.id)
+            .filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id))
+            .filter_map(|t| s.datasources.iter().find(|d| d.id == t.datasource_id))
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no datasource"))?;
+        open(&ds.uid, sources)?;
+        let rows = sources.get_mut(&ds.uid).unwrap().query(own, zsql_semantic::MAX_SAMPLE_SIZE as usize)?;
+        return Ok((values_of(&rows, 0, 1), None, ds.uid.clone()));
+    }
+
+    // Through the planner, like any other query: the dimension, a count as
+    // a calculation, descending, the limit, and the lookup tables as hints.
+    // The planner lays dimensions before calculations, so the count cannot
+    // lead the order and the warehouse picks which of the tied values a
+    // limit cuts; the file is still sorted, by count then value.
+    let hints = if j.lookups.is_empty() { String::new() } else { format!(", hints ({})", j.lookups.join(", ")) };
+    let line = format!("{}, calc(count(*), integer) as n desc, limit {size}{hints}", j.field.name);
+    let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
+    let planned = model.plan_request(req, false, &zsql_service::unlimited).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let dialect = model.dialects.get(&planned.plan.adapter)?;
+    let sql = planned.plan.sql_with_limit(planned.limit, &dialect).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let via = planned.plan.datasource_uid.clone();
+    open(&via, sources)?;
+    let rows = sources.get_mut(&via).unwrap().query(&sql, size as usize)?;
+    let count = rows.columns.iter().position(|c| c.eq_ignore_ascii_case("n")).unwrap_or(1);
+    let mut values = values_of(&rows, usize::from(count == 0), count);
+    values.sort_by(|a, b| b.n.cmp(&a.n).then_with(|| a.v.cmp(&b.v)));
+
+    // The distinct total: the same question without the order or the
+    // limit, counted as a derived table. Any common table expressions stay
+    // in front, which is what the plan's root offset is for.
+    let line = format!("{}, calc(count(*), integer) as n{hints}", j.field.name);
+    let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
+    let distinct = match model.plan_request(req, false, &zsql_service::unlimited) {
+        Ok(p) => {
+            let (prefix, root) = p.plan.sql.split_at(p.plan.root_at);
+            let count = format!("{prefix}SELECT COUNT(*) AS d FROM (\n{root}\n) AS zsql_distinct");
+            match sources.get_mut(&via).unwrap().query(&count, 1) {
+                Ok(r) => r.rows.first().and_then(|row| r.get(row, "d")).and_then(|n| n.parse::<f64>().ok()).map(|n| n as i64),
+                Err(e) => {
+                    eprintln!("warning: {}: distinct total: {e}", j.field.name);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: {}: distinct total: {e}", j.field.name);
+            None
+        }
+    };
+
+    // What the catalogue declares for the column behind a bare-column
+    // expression, on any table the field has one on.
+    for e in s.expressions.iter().filter(|e| e.field_id == j.field.id) {
+        let Some(t) = s.tables.iter().find(|t| t.id == e.table_id) else { continue };
+        let Some(ds) = s.datasources.iter().find(|d| d.id == t.datasource_id) else { continue };
+        let (Some(cat), Some(expr)) = (catalogues.get(&ds.uid), e.sql.as_deref()) else { continue };
+        if let Some(col) = declared(cat, &t.physical_name, expr) {
+            match col.max_length {
+                Some(w) if w > WIDE => eprintln!(
+                    "warning: {} ({}): declared {} wide, past the {WIDE} AGENTS.md advises; check it is a value and not text",
+                    j.field.name, t.name, w
+                ),
+                None if col.data_type.to_lowercase().contains("text") || col.data_type.to_lowercase().contains("clob") => eprintln!(
+                    "warning: {} ({}): declared {}, unbounded text; check it is a value and not prose",
+                    j.field.name, t.name, col.data_type
+                ),
+                _ => {}
+            }
+        }
+    }
+    Ok((values, distinct, via))
 }
 
-/// Why a dimension that asks to be sampled is not, in one line.
-fn why_not(s: &Snapshot, f: &Field, e: &Expression, table: &Table) -> Option<String> {
+/// Rows as values with their counts, given which column holds the value
+/// and which the count. A missing count is one; a null value is no value.
+fn values_of(rows: &zsql_source::Rows, value: usize, count: usize) -> Vec<ValueCount> {
+    rows.rows
+        .iter()
+        .filter_map(|r| {
+            let v = r.get(value)?.clone()?;
+            let n = r.get(count).and_then(|c| c.as_deref()).and_then(|c| c.parse::<f64>().ok()).map(|n| n as i64).unwrap_or(1);
+            Some(ValueCount { v, n })
+        })
+        .collect()
+}
+
+/// Why a dimension that asks to be sampled is not, in one line. Only the
+/// model's own rules: what table answers, and how, is the planner's.
+fn why_not(s: &Snapshot, f: &Field) -> Option<String> {
     if f.hidden {
         return Some("hidden".into());
     }
@@ -279,29 +316,7 @@ fn why_not(s: &Snapshot, f: &Field, e: &Expression, table: &Table) -> Option<Str
             return Some(format!("named by the security policy \"{}\"; its values are what the policy protects", p.name));
         }
     }
-    if f.sample_sql.is_some() {
-        return None;
-    }
-    if e.lookup || e.array {
-        return Some("a lookup or array expression; give it a sample_sql".into());
-    }
-    if !e.dimension_ref_ids.is_empty() || !e.measure_ref_ids.is_empty() {
-        return Some("a calculated dimension; give it a sample_sql".into());
-    }
-    if e.sql.as_deref().map(str::trim).is_none_or(str::is_empty) {
-        return Some("no sql expression".into());
-    }
-    if s.partitions.iter().any(|p| p.table_id == table.id) {
-        return Some("a partitioned table; without a window the query scans all history — give it a sample_sql with one".into());
-    }
     None
-}
-
-/// A bare column quoted by the dialect; anything else as the author wrote it.
-fn render(e: &Expression, dialect: &zsql_dialect::Dialect) -> Result<String> {
-    let sql = e.sql.as_deref().unwrap_or("").trim();
-    let bare = !sql.is_empty() && sql.chars().all(|c| c.is_alphanumeric() || c == '_') && !sql.chars().next().unwrap().is_ascii_digit();
-    Ok(if bare { dialect.quote(sql)? } else { sql.to_string() })
 }
 
 /// The catalogue's column behind a bare-column expression, if the

@@ -123,19 +123,19 @@ again rather than failing on a serde error.
 
 ### The generated sampling query
 
-When a dimension has no `sample_sql`, 0sql writes the statement for it:
+When a dimension has no `sample_sql`, it goes through the planner like any
+other query. The command writes one expression line per dimension:
 
-```sql
-SELECT <rendered expression> AS v, COUNT(*) AS n
-FROM <physical table>
-[WHERE <an explicit window, on a partitioned table>]
-GROUP BY <rendered expression>
-ORDER BY n DESC
-LIMIT <sample_size>
+```
+<dimension>, calc(count(*), integer) as n desc, limit <sample_size>, hints (<lookup tables>)
 ```
 
-Most frequent first, which is what the record format stores. Four things
-about it are harder than they look.
+and runs the statement the planner returns on the datasource the planner
+chose, through the same transport `introspect` uses. The distinct total is
+the same line without the order or the limit, wrapped as a derived table
+and counted; the plan's `root_at` keeps any common table expressions in
+front of the wrapper. Most frequent first, which is what the record format
+stores. Four things about it are worth knowing.
 
 **The row limit is now the dialect's**, and that landed first.
 `Plan::sql_with_limit`, `dag.rs` and `sql/builder.rs` each appended
@@ -150,36 +150,27 @@ expression in front of it. `Plan` carries that offset as `root_at`, which
 `final_query` reports because it is the one place that knows. The third
 site was dead and is gone.
 
-**There is no reusable expression renderer.**
-`crates/planner/src/sql/expr.rs` is `qualify`, `column_gsub` and
-`entity_gsub` — string rewrites over SQL that is already known. The real
-renderer is `expression_sql` in `crates/planner/src/visitors/sql.rs`, it is
-private, and its `Ctx` holds a `&Graph`, a `&Universe` and an `&RQuery`: a
-planned query graph, which a sampling command does not have. What sampling
-can reuse is `expr::qualify` plus `Dialect::quote`, which covers a
-dimension that is a column or a plain `expression: {sql: …}` over its own
-table. That is the honest scope.
+**Which table answers is the planner's decision, not the command's.** A
+partitioned table in this model is a more recent cache of the same rows,
+and the table a dimension is declared on is not necessarily the one it
+should be read from. The planner already ranks candidates — partitions,
+lookups, row estimates — so the command does not re-decide any of that.
+Tables whose expression for the dimension is marked `lookup` are passed
+as `hints`, from which the planner may choose; in the end the planner
+decides, or the author does with `sample_sql`. The same goes for the
+expression itself: a calculated dimension, an array, a plain `sql`, are
+all the planner's to render, so none of them is skipped. What the command
+skips is only what the model's own rules forbid — a hidden dimension, one
+a security policy names — and a planner refusal is reported as a warning
+on that dimension, not a reason to stop.
 
-**So calculated, lookup and array dimensions are out of scope.** A
-calculated dimension resolves through `ref_to_sql_on_node`, which needs
-sibling nodes a one-table query does not have. An `array` expression needs
-`dialect.array_unnest_join` via a private `unnest_array`, and `GROUP BY`
-over an array or variant column is invalid on BigQuery and Snowflake
-anyway. These are skipped with a reason, and `sample_sql` is how an author
-samples one — a better justification for that key than "a custom query".
-
-**Partition filters cannot be taken from the model.** The planner never
-emits a partition predicate: `partition_score` in `pruner.rs` only *ranks*
-candidate tables by whether the caller's filters fall inside a partition.
-And `Partition.filter_value` is an authoring default rather than the
-current partition — in the golden universes they are all `between`, with
-values like `1980-01-01` to `1995-01-01`, and the table template documents
-relative tokens such as `2y` that need `sql/dates.rs` to become dates.
-Rendering those verbatim would sample a stale historical window and
-silently bias every sampled dimension on a partitioned table, which is
-worse than not sampling it. So a partitioned table is sampled only with an
-explicit window, or the author's own `sample_sql`, and is otherwise skipped
-with a reason.
+**Ties are the warehouse's.** The planner lays dimensions before
+calculations and orders by the projections in that order, so the count
+cannot lead an `ORDER BY` that then breaks ties by value. The order is the
+count alone; which of several equally frequent values a limit cuts is
+whatever the warehouse returns. The written file is still sorted, by
+count then value, so two runs over the same values produce the same
+record.
 
 **`COUNT(*)` counts the rows of the table the dimension lives on.** On a
 dimension table that is dimension rows, so a near-unique column returns
@@ -557,15 +548,16 @@ what makes the remaining adapters cheap instead of frightening.
       Remaining: `zsql check` against a catalogue with dialect-correct
       folding, and a drift report between two catalogues.
 - [ ] **D — sampling.** `zsql sample` landed: every dimension with
-      `enable_sampling`, through the generated query — the column or plain
-      expression through the dialect, `COUNT(*)` ordered descending, the
-      dialect's own row limit at `sample_size` — or the author's
+      `enable_sampling`, through the planner like any other query — the
+      dimension, `calc(count(*), integer)` descending, the dialect's own
+      row limit at `sample_size`, lookup tables as hints — or the author's
       `sample_sql` as written, value in the first column and an optional
-      count in the second. Distinct counts come one scan per table, so a
-      record says whether its list is complete; `sample_size` rides on
-      every record. Hidden dimensions, policy-named ones, lookups, arrays
-      and calculated dimensions are skipped with their reasons, and the
-      command says its plan — dimensions, tables, queries — before running,
+      count in the second. The distinct total is the same plan counted as
+      a derived table, so a record says whether its list is complete;
+      `sample_size` rides on every record. Hidden dimensions and
+      policy-named ones are skipped with their reasons; everything else is
+      the planner's to answer or refuse, and a refusal is a warning. The
+      command says its plan — dimensions, queries — before running,
       with `--dry-run` to stop there, `--budget` to refuse past a count,
       and `--only` for one dimension or table, keeping the rest of the
       file. The long-text warning fires on what came back and on what the
@@ -575,10 +567,8 @@ what makes the remaining adapters cheap instead of frightening.
       and the transport test asserts an integer, a boolean, a numeric and
       a date arrive as text.
 
-      Two numbers are placeholders until ruled on: a partitioned table is
-      skipped with a reason rather than scanned, and the long-text warning
-      fires past an average of 100 characters or a declared width past
-      255. Both are one constant each.
+      The long-text warning fires past an average of 100 characters or a
+      declared width past 255, one constant each; ruled fine as is.
 
       Proven on CI: the SQLite flow in the ordinary suite, and the
       Postgres fixture through a model `generate` drafted from it — the
