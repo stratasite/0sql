@@ -45,9 +45,9 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     .unwrap();
 
     // Introspect, then generate: two drafts and a join.
-    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"]));
     assert!(ok && out.contains("2 tables"), "{out}");
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok, "{out}");
     assert!(out.contains("created models/local/tbl.customers.yml") && out.contains("created models/local/tbl.orders.yml"), "{out}");
     assert!(out.contains("created models/local/rel.local.yml"), "{out}");
@@ -75,42 +75,42 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
 
     // A second run rewrites nothing and has nothing to say but the untyped column.
     let before = orders.clone();
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok && out.contains("nothing to do"), "{out}");
     assert!(out.contains("no 0sql type, so not a field: tags"), "{out}");
     assert_eq!(std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap(), before, "never rewritten");
 
     // The warehouse grows two columns: listed with the command to add them.
     db.execute_batch("ALTER TABLE orders ADD COLUMN status VARCHAR(20); ALTER TABLE orders ADD COLUMN discount NUMERIC(6,2);").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"]));
     assert!(ok, "{out}");
     assert!(
         out.contains("column added:   orders.status") && out.contains("column added:   orders.discount"),
         "drift is reported before the catalog is replaced:\n{out}"
     );
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok && out.contains("2 new columns: status, discount"), "{out}");
-    assert!(out.contains("--table orders --columns status,discount"), "the exact command is printed: {out}");
+    assert!(out.contains("zsql generate orders --columns status,discount"), "the exact command is printed: {out}");
     assert_eq!(std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap(), before, "listing changes nothing");
 
     // One by name, then the rest; the file keeps everything it had.
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--table", "orders", "--columns", "discount"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders", "--columns", "discount"]));
     assert!(ok && out.contains("added   1 field"), "{out}");
     let after = std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap();
     assert!(after.starts_with(&before), "appended, not rewritten");
     assert!(after.contains("sql: sum(discount)") && !after.contains("sql: status"), "{after}");
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--new"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all", "--new-columns"]));
     assert!(ok && out.contains("added   1 field"), "{out}");
     let after = std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap();
     assert!(after.contains("sql: status"), "{after}");
     let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(ok && out.contains("2 tables"), "still loads: {out}");
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok && out.contains("nothing to do"), "{out}");
 
     // The warehouse changes under the model: check names what is gone.
     db.execute_batch("ALTER TABLE orders DROP COLUMN status; ALTER TABLE customers RENAME TO clients;").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"]));
     assert!(ok, "{out}");
     assert!(
         out.contains("column dropped: orders.status")
@@ -124,14 +124,14 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     assert!(out.contains("orders has no column status"), "{out}");
     assert!(out.contains("checked against catalog"), "{out}");
     db.execute_batch("ALTER TABLE clients RENAME TO customers; ALTER TABLE orders ADD COLUMN status VARCHAR(20);").unwrap();
-    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"])).0);
     let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(ok, "put back, the check passes again:\n{out}");
 
     // --dry-run writes nothing, for a new table too.
     db.execute_batch("CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT);").unwrap();
-    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--dry-run"]));
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"])).0);
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all", "--dry-run"]));
     assert!(ok && out.contains("would create models/local/tbl.products.yml"), "{out}");
     assert!(!project.join("models/local/tbl.products.yml").exists());
     let _ = std::fs::remove_dir_all(home.parent().unwrap());
@@ -165,13 +165,13 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
     .unwrap();
 
     // The connection's schema is its search path, not the catalog's scope: the scope is said.
-    let (ok, out) = run(zsql(&home, &project).args(["catalog", "wh", "--schema", "shop"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "-d", "wh", "--schema", "shop"]));
     assert!(ok && out.contains("(shop)"), "{out}");
     if !out.contains("2 tables, 1 views") {
         // Say what this connection can see at all, so a miss explains itself.
         let ds = std::fs::read_to_string(project.join("datasources.yml")).unwrap().replace("  schema: shop\n", "");
         std::fs::write(project.join("datasources.yml"), ds).unwrap();
-        let (_, every) = run(zsql(&home, &project).args(["catalog", "wh"]));
+        let (_, every) = run(zsql(&home, &project).args(["catalog", "read", "-d", "wh", "--all"]));
         let cat = std::fs::read_to_string(project.join("catalog/wh.json")).unwrap_or_default();
         let names: Vec<String> = serde_json::from_str::<serde_json::Value>(&cat)
             .ok()
@@ -183,7 +183,7 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
             .unwrap_or_default();
         panic!("shop was empty for the CLI. Without a scope it saw: {every}\n{}", names.join(", "));
     }
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "wh"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "-d", "wh", "--all"]));
     assert!(ok && out.contains("created models/shop/tbl.customers.yml"), "{out}");
 
     let customers = std::fs::read_to_string(project.join("models/shop/tbl.customers.yml")).unwrap();
@@ -224,7 +224,7 @@ fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
            ship_to_id INTEGER REFERENCES customers(id), total NUMERIC(12,2) NOT NULL);",
     )
     .unwrap();
-    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "local", "--all"])).0);
 
     // An existing model, written by hand: the list at the margin, the name qualified.
     std::fs::create_dir_all(project.join("models/core")).unwrap();
@@ -234,11 +234,11 @@ fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
          - type: dimension\n  name: Id\n  data_type: integer\n  expression:\n    sql: id\n    primary_key: true\n",
     )
     .unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok, "{out}");
     assert!(!out.contains("created models/local/tbl.orders.yml"), "the qualified name matched the catalog's bare one: {out}");
     assert!(out.contains("3 new columns") || out.contains("new columns"), "{out}");
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--new"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all", "--new-columns"]));
     assert!(ok && out.contains("added"), "{out}");
     let orders = std::fs::read_to_string(project.join("models/core/tbl.orders.yml")).unwrap();
     assert!(orders.contains("\n- type: measure") && orders.contains("\n  name: Total\n"), "appended at the list's own indent:\n{orders}");

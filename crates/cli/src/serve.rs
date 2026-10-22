@@ -201,8 +201,15 @@ pub enum ServerCommand {
     },
     /// The last lines of the background server's log.
     Logs {
+        /// How many lines from the end.
         #[arg(long, default_value_t = 100)]
         lines: usize,
+    },
+    /// Whether a server answers: this machine's, or the one --server names.
+    Health {
+        /// The server to ask; the configured one when unsaid.
+        #[arg(long)]
+        server: Option<String>,
     },
 }
 
@@ -434,6 +441,14 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
     match command {
         ServerCommand::Start { args } => start(args, at),
         ServerCommand::Stop => stop(),
+        ServerCommand::Health { server } => {
+            let project = at.project_dir().ok();
+            let client =
+                crate::remote::Client::new(&config::server(server.as_deref(), project.as_ref()), config::api_key(project.as_ref()));
+            let v = client.get("/healthz")?;
+            println!("{} {}", client.server, v.as_str().unwrap_or("ok"));
+            Ok(())
+        }
         ServerCommand::Status { data_dir } => status(data_dir),
         ServerCommand::Logs { lines } => {
             let text = std::fs::read_to_string(log_file()?).unwrap_or_default();

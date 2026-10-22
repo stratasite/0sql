@@ -1,16 +1,16 @@
-//! zsql: author a semantic model, plan SQL from it, deploy it, serve it.
-//!
-//! One rule decides where a command runs. Anything that needs only the
-//! model runs here, from the project directory at hand: sql, explain,
-//! explore, fields, tables, values, check, test, the repl. Anything
-//! about a server's copy needs `-r`: deploy, status, list, remove, and
-//! the same reads against what the server holds. `--server` and
-//! `--uid` imply `-r`; `ZSQL_SERVER` in the environment does not.
+//! `zsql`: the command line. One rule decides where a command runs:
+//! anything about the model runs here, on the files, unless a flag names
+//! a server. `-r` says the server, `--server` and `--uid` imply it, and
+//! `--branch` alone is a mistake, not a hint. Commands that connect to a
+//! warehouse (`catalog`, `generate --live`, `sample`, `run`, `datasource
+//! test`) never take those flags: the credentials are on this machine
+//! and the server holds none.
 
 mod assist;
 mod catalog;
 mod catalog_check;
 mod config;
+mod datasource;
 mod deploy;
 mod failure;
 mod generate;
@@ -26,6 +26,7 @@ mod serve;
 mod show;
 mod side;
 mod templates;
+mod tty;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -37,34 +38,66 @@ use side::{Query, Session, Side};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+const GETTING_STARTED: &str = "\
+A new project, start to finish:
+  zsql init my-model && cd my-model     start here
+  zsql datasource add                   point it at a warehouse (or edit datasources.yml)
+  zsql catalog read --schema public     read what the warehouse holds into catalog/
+  zsql generate                         pick tables, get a draft model
+  zsql check                            make sure it loads
+  zsql sample                           collect values so a question can name one
+  zsql run 'revenue by region'          ask it something
+Inside a project, `zsql` alone opens the repl. Every prompt has a flag form, so scripts never wait.";
+
 #[derive(Parser)]
-#[command(name = "zsql", about = "zsql: semantic layer to SQL (0sql.io)", version)]
+#[command(name = "zsql", about = "zsql: a semantic model, and the SQL it plans (0sql.io)", version, after_help = GETTING_STARTED)]
 struct Cli {
-    /// Without a command, `zsql` inside a project opens the repl.
     #[command(subcommand)]
     command: Option<Command>,
-    #[command(flatten)]
-    at: Where,
-}
-
-/// Which project a command works on, and whether here or on a server.
-#[derive(Args, Clone, Default)]
-struct Where {
     /// Project directory; defaults to the one holding project.yml here or above.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
-    /// Use the server's copy of the model rather than the files here.
-    #[arg(short = 'r', long, global = true)]
+    /// Never prompt: fail with the flag form instead. Implied when stdin is not a terminal or CI is set.
+    #[arg(long, global = true)]
+    no_input: bool,
+}
+
+/// The flags that name a server's copy of the model, on the commands that
+/// can ask either side.
+#[derive(Args, Clone, Default)]
+struct Remote {
+    /// Ask the server's copy of the model rather than the files here.
+    #[arg(short = 'r', long)]
     remote: bool,
     /// Branch on the server; defaults to the checked-out git branch. Implies nothing here: the files are what they are.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch: Option<String>,
     /// The server (implies -r); defaults to ZSQL_SERVER, .zsql, project.yml, then the local server.
-    #[arg(long, global = true)]
+    #[arg(long)]
     server: Option<String>,
     /// Project uid on the server (implies -r), when there is no project directory at hand.
-    #[arg(long, global = true)]
+    #[arg(long)]
     uid: Option<String>,
+}
+
+/// Which project a command works on, and whether here or on a server.
+#[derive(Clone, Default)]
+struct Where {
+    project: Option<PathBuf>,
+    remote: bool,
+    branch: Option<String>,
+    server: Option<String>,
+    uid: Option<String>,
+}
+
+impl Where {
+    fn here(project: Option<PathBuf>) -> Where {
+        Where { project, ..Default::default() }
+    }
+
+    fn with(project: Option<PathBuf>, r: Remote) -> Where {
+        Where { project, remote: r.remote, branch: r.branch, server: r.server, uid: r.uid }
+    }
 }
 
 /// A server's copy of a project's branch.
@@ -99,7 +132,7 @@ impl Where {
     /// The project directory at hand, unless the flags ask for a server.
     fn mode(&self) -> Result<Mode> {
         if self.wants_remote() {
-            return Ok(Mode::Remote(self.target()?));
+            return Ok(Mode::Remote(self.target(false)?));
         }
         if let Some(b) = &self.branch {
             bail!("--branch {b} names a branch on the server; add -r to plan against it, or check it out to plan it here");
@@ -122,8 +155,10 @@ impl Where {
     }
 
     /// The server target, for commands that are about a server's copy.
-    /// This is the one place the git branch is read.
-    fn target(&self) -> Result<Target> {
+    /// This is the one place the git branch is read. A read that cannot
+    /// learn the branch is told to name one; only a deploy is told to
+    /// commit, since only a deploy sends the checked-out branch.
+    fn target(&self, deploying: bool) -> Result<Target> {
         let project = match &self.project {
             Some(dir) => Some(config::read_project(dir)?),
             None => match (&self.uid, config::find_project(Path::new("."))) {
@@ -139,7 +174,11 @@ impl Where {
         };
         let branch = match (&self.branch, &project) {
             (Some(b), _) => b.clone(),
-            (None, Some(p)) => config::git_branch(&p.dir)?,
+            (None, Some(p)) => match config::git_branch(&p.dir) {
+                Ok(b) => b,
+                Err(e) if deploying => return Err(e),
+                Err(_) => bail!("no branch to ask for: {} has no committed branch; add --branch NAME, or commit first", p.dir.display()),
+            },
             (None, None) => "main".into(),
         };
         let server = config::server(self.server.as_deref(), project.as_ref());
@@ -150,72 +189,93 @@ impl Where {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a project here (or in DIR): project.yml, datasources.yml, models/, tests/, security.yml.
+    // ----------------------------------------------------- getting started
+    /// Start a project here (or in DIR): project.yml, datasources.yml, models/, tests/, AGENTS.md.
+    #[command(display_order = 1)]
     Init {
+        /// Where to start it; here when unsaid.
         dir: Option<PathBuf>,
+        /// The project's name; the directory's when unsaid.
         #[arg(long)]
         name: Option<String>,
+        /// The uid the server knows the project as; made from the name when unsaid.
         #[arg(long)]
         uid: Option<String>,
+        /// Do not run `git init` in a directory that is not a repository.
+        #[arg(long)]
+        no_git: bool,
     },
-    /// Generate a model file from a template.
-    New {
+    /// The warehouses in datasources.yml: list them, add one, test a connection.
+    #[command(display_order = 2)]
+    Datasource {
         #[command(subcommand)]
-        what: scaffold::NewCommand,
+        what: datasource::DatasourceWhat,
     },
-    /// Store the API key (and optionally a server) in .zsql for this project.
-    Auth {
-        #[arg(long)]
-        api_key: String,
-        #[arg(long)]
-        server: Option<String>,
-    },
-    /// Deploy the checked-out branch: the model files, tests and sampled values (never secrets).
-    Deploy {
-        /// Validate only; the server keeps nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Redeploy whenever a project file changes.
-        #[arg(long)]
-        watch: bool,
-    },
-    /// Load and validate the project here, and run its tests; with -r, validate on the server.
-    Check,
-    /// Model files from catalog/{datasource}.json: a draft per table, joins from its foreign keys. Never rewrites a file.
-    Generate {
+    /// What the warehouse holds, in catalog/<datasource>.json: read it, sync it, search it. Local only.
+    #[command(display_order = 3, alias = "introspect")]
+    Catalog {
+        #[command(subcommand)]
+        what: Option<CatalogWhat>,
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
         datasource: Option<String>,
-        /// Only this schema (ClickHouse, MySQL: database).
+    },
+    /// Draft model files from the catalog for the tables you pick. Never rewrites a file.
+    #[command(
+        display_order = 4,
+        after_help = "With no table and a terminal, pick from a list; without a terminal, name the tables, a --schema, or --all."
+    )]
+    Generate {
+        /// Tables to draft, as schema.table or table; with none, a picker on a terminal.
+        tables: Vec<String>,
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+        /// Every table of this schema (ClickHouse, MySQL: database).
         #[arg(long)]
         schema: Option<String>,
-        /// Only this table, by physical name or name.
-        #[arg(long)]
-        table: Option<String>,
-        /// For a table that has a model: add fields for these columns, comma-separated.
-        #[arg(long, value_delimiter = ',')]
+        /// Every table in the catalog. Never the default.
+        #[arg(long, conflicts_with = "schema")]
+        all: bool,
+        /// For a named table that has a model: add fields for these columns, comma-separated.
+        #[arg(long, value_delimiter = ',', requires = "tables")]
         columns: Vec<String>,
         /// For a table that has a model: add fields for every column it lacks.
+        #[arg(long, alias = "new")]
+        new_columns: bool,
+        /// A named table the catalog lacks is read from the warehouse first and added to the catalog.
         #[arg(long)]
-        new: bool,
+        live: bool,
         /// Say what would be written and write nothing.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sample the values of every dimension with enable_sampling into samples/values.jsonl.gz. Local only.
+    /// Load the model, check it against the catalog, and run its tests; with -r, on the server.
+    #[command(display_order = 5)]
+    Check {
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// Collect the values of the dimensions marked enable_sampling into samples/values.jsonl.gz. Local only; spends warehouse time.
+    #[command(display_order = 6)]
     Sample {
+        /// Only these dimensions or tables, by name or uid; every sampled dimension when none.
+        names: Vec<String>,
         /// Which datasource; every one when unsaid.
+        #[arg(short = 'd', long)]
         datasource: Option<String>,
-        /// Only this dimension or table, by name or uid.
-        #[arg(long)]
-        only: Option<String>,
         /// Say what would be run and run nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Refuse before running when more queries than this are needed.
+        /// Refuse before running when more queries than this are needed; 100 when unsaid.
         #[arg(long)]
         budget: Option<usize>,
+        /// Run without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Run a query on the datasource the planner chooses and keep its rows under ~/.zsql/results. Local only.
+    #[command(display_order = 7)]
     Run {
         #[command(flatten)]
         query: QueryArgs,
@@ -234,7 +294,7 @@ enum Command {
         /// table (default), json, jsonl or csv; never changes with where stdout goes.
         #[arg(long)]
         format: Option<String>,
-        /// Write the rows to this file, in the format its extension says.
+        /// Write the rows to this file, in the format its extension says (json, jsonl, csv).
         #[arg(long)]
         out: Option<PathBuf>,
         /// Print at most this many rows; a table on a terminal shows 50 unless said.
@@ -244,25 +304,9 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
-    /// What `zsql run` kept: list them, show one, export, the SQL, remove, purge.
-    Results {
-        #[command(subcommand)]
-        what: Option<ResultsWhat>,
-    },
-    /// Read a datasource's tables and columns into catalog/{datasource}.json, or re-read what it holds. Local only.
-    #[command(alias = "introspect", args_conflicts_with_subcommands = true)]
-    Catalog {
-        #[command(subcommand)]
-        what: Option<CatalogWhat>,
-        /// Which datasource, by its key in datasources.yml; the only one when there is one.
-        datasource: Option<String>,
-        /// Read this schema (ClickHouse: this database); repeatable. Without it: what the file records, else every non-system schema.
-        #[arg(long)]
-        schema: Vec<String>,
-    },
-    /// Run tests/*.yml here; with -r, the deployed branch's tests on the server.
-    Test,
-    /// Generate one query's SQL.
+    // ---------------------------------------------------- asking the model
+    /// The SQL for a line or a spec; with -r, planned by the server.
+    #[command(display_order = 10)]
     Sql {
         #[command(flatten)]
         query: QueryArgs,
@@ -272,16 +316,22 @@ enum Command {
         /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
-    /// Explain how a query is planned: SQL, node graph and timings.
+    /// How a query is planned: SQL, node graph and timings.
+    #[command(display_order = 11)]
     Explain {
         #[command(flatten)]
         query: QueryArgs,
         /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
     /// What a query can take on: the dimensions to drill into and the measures to add.
+    #[command(display_order = 12)]
     Explore {
         #[command(flatten)]
         query: QueryArgs,
@@ -291,48 +341,237 @@ enum Command {
         /// Print the answer as JSON.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
-    /// Print the query spec an expression line makes, and how each item was read.
-    #[command(long_about = zsql_shorthand::ABOUT, after_long_help = zsql_shorthand::FORMS)]
-    Spec {
-        /// The line: projections, filters, calculations, segments and settings, comma-separated. Several arguments are joined with spaces, so quoting the line is optional.
-        #[arg(trailing_var_arg = true, required = true)]
-        line: Vec<String>,
-    },
-    /// Plan interactively: the model here, reloaded as its files change; with -r, the server's copy.
-    Repl {
-        #[arg(long)]
-        context: Option<PathBuf>,
-    },
-    /// Fields of the model, filtered by text.
+    /// The fields of the model, filtered by text.
+    #[command(display_order = 13)]
     Fields {
-        q: Option<String>,
+        /// Keep fields whose name, uid or synonyms contain this.
+        term: Option<String>,
+        /// Include hidden fields.
         #[arg(long)]
         hidden: bool,
-    },
-    /// Tables of the model.
-    Tables,
-    /// Sampled values of a dimension, from samples/values.jsonl.gz.
-    Values { dim: String },
-    /// Summary of the deployed branch.
-    Status,
-    /// Every deployment on the server.
-    List,
-    /// Remove a deployed branch from the server.
-    Remove {
+        /// Print the answer as JSON.
         #[arg(long)]
-        yes: bool,
+        json: bool,
+        #[command(flatten)]
+        remote: Remote,
     },
-    /// Liveness of the server.
-    Health,
-    /// Run the server here. Inside a project, serve that project and redeploy it as its files change.
+    /// The tables of the model.
+    #[command(display_order = 14)]
+    Tables {
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// A dimension's sampled values, from samples/values.jsonl.gz.
+    #[command(display_order = 15)]
+    Values {
+        /// The dimension, by name or uid.
+        dim: String,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// What `zsql run` kept: list, show, export, the SQL, remove, purge.
+    #[command(display_order = 16)]
+    Results {
+        #[command(subcommand)]
+        what: Option<ResultsWhat>,
+    },
+    /// All of the above, interactively: the model here, reloaded as its files change; with -r, the server's copy.
+    #[command(display_order = 17)]
+    Repl {
+        /// A JSON file holding the security context to plan under.
+        #[arg(long)]
+        context: Option<PathBuf>,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// The query spec an expression line makes, and how each item was read.
+    #[command(display_order = 18, long_about = zsql_shorthand::ABOUT, after_long_help = zsql_shorthand::FORMS)]
+    Spec {
+        /// The line: projections, filters, calculations, segments and settings, comma-separated. Several arguments are joined with spaces, so quoting the line is optional.
+        #[arg(num_args = 1.., value_name = "LINE", required = true)]
+        line: Vec<String>,
+    },
+    /// A model file from a template: a table, a relation file, a test.
+    #[command(display_order = 19)]
+    New {
+        #[command(subcommand)]
+        what: scaffold::NewCommand,
+    },
+    // --------------------------------------------------------- shipping it
+    /// Run tests/*.yml here; with -r, the deployed branch's tests on the server.
+    #[command(display_order = 30)]
+    Test {
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// Save the API key, and optionally the server, in .zsql for this project.
+    #[command(display_order = 31)]
+    Auth {
+        /// The key the server gave you.
+        #[arg(long)]
+        api_key: String,
+        /// The server the key is for; the default server when unsaid.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Deploy the checked-out branch: the model files, tests and sampled values (never secrets).
+    #[command(display_order = 32)]
+    Deploy {
+        /// Validate only; the server keeps nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Redeploy whenever a project file changes.
+        #[arg(long)]
+        watch: bool,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// The deployed branch's summary.
+    #[command(display_order = 33)]
+    Status {
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// Every deployment the key can see on the server.
+    #[command(display_order = 34, alias = "list")]
+    Deployments {
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// Remove a deployed branch from the server.
+    #[command(display_order = 35, alias = "remove")]
+    Undeploy {
+        /// Confirm: this removes the branch from the server.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    // ---------------------------------------------------- running a server
+    /// Run the server here, in the foreground. Inside a project, serve that project and redeploy it as its files change.
     #[cfg(feature = "server")]
+    #[command(display_order = 40)]
     Serve(serve::ServeArgs),
-    /// The server in the background: start, stop, status, logs.
+    /// The server in the background: start, stop, status, logs, health.
     #[cfg(feature = "server")]
+    #[command(display_order = 41)]
     Server {
         #[command(subcommand)]
         what: serve::ServerCommand,
+    },
+    /// Liveness of a server, by its URL.
+    #[command(hide = true)]
+    Health {
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// Shell completion for bash, zsh or fish; `source <(zsql completions bash)`.
+    #[command(display_order = 42)]
+    Completions {
+        /// bash, zsh, fish, elvish or powershell.
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogWhat {
+    /// The first read, or more of it: named schemas and tables are read and merged into the file. With nothing named: a schema picker on a terminal.
+    Read {
+        /// Tables to read by name, as schema.table or table.
+        tables: Vec<String>,
+        /// Read this schema whole (ClickHouse, MySQL: this database); repeatable.
+        #[arg(long)]
+        schema: Vec<String>,
+        /// Every non-system schema. Never the default.
+        #[arg(long)]
+        all: bool,
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+    },
+    /// Re-read every schema and table the file records, report drift, drop what the warehouse says is gone.
+    Sync {
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+    },
+    /// Tables whose name holds the pattern: in the file, or in the warehouse with --live.
+    Search {
+        /// Part of a table name, matched without regard to case.
+        pattern: String,
+        /// Ask the warehouse, every non-system schema, rather than the file.
+        #[arg(long)]
+        live: bool,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Which datasource, by its key in datasources.yml; the only one when there is one.
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+    },
+    /// Read these tables by name and add them to the file. The same as `read TABLE...`.
+    #[command(hide = true)]
+    Add {
+        tables: Vec<String>,
+        #[arg(short = 'd', long)]
+        datasource: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResultsWhat {
+    /// Every stored result, newest first.
+    List {
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One result's rows.
+    Show {
+        /// The result's id, or enough of it to be one.
+        id: String,
+        /// table (default), json, jsonl or csv.
+        #[arg(long)]
+        format: Option<String>,
+        /// Print at most this many rows.
+        #[arg(long)]
+        head: Option<usize>,
+        /// Skip this many rows first.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// One result's rows to a file, in the format its extension says.
+    Export {
+        /// The result's id, or enough of it to be one.
+        id: String,
+        /// The file to write; .json, .jsonl or .csv.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The statement a result ran.
+    Sql {
+        /// The result's id, or enough of it to be one.
+        id: String,
+    },
+    /// Remove results by id.
+    Rm {
+        /// Ids, or enough of each to be one.
+        ids: Vec<String>,
+    },
+    /// Remove every result of this project.
+    Purge {
+        /// Remove without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -340,7 +579,21 @@ impl Command {
     /// Whether the command answers in JSON, which is where a refusal
     /// goes too.
     fn wants_json(&self) -> bool {
-        matches!(self, Command::Sql { json: true, .. } | Command::Explain { json: true, .. } | Command::Explore { json: true, .. })
+        match self {
+            Command::Sql { json, .. }
+            | Command::Explain { json, .. }
+            | Command::Explore { json, .. }
+            | Command::Fields { json, .. }
+            | Command::Tables { json, .. }
+            | Command::Values { json, .. } => *json,
+            Command::Run { format, .. } => format.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("json")),
+            Command::Results { what: Some(ResultsWhat::Show { format, .. }) } => {
+                format.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("json"))
+            }
+            Command::Results { what: Some(ResultsWhat::List { json }) } => *json,
+            Command::Catalog { what: Some(CatalogWhat::Search { json, .. }), .. } => *json,
+            _ => false,
+        }
     }
 
     /// Whether the command runs the server in this process.
@@ -357,14 +610,18 @@ impl Command {
 }
 
 fn main() {
-    let Cli { command, at } = Cli::parse();
+    let Cli { command, project, no_input } = Cli::parse();
+    tty::set_no_input(no_input);
     let command = match command {
         Some(c) => c,
-        None if at.project.is_some() || at.uid.is_some() || config::find_project(Path::new(".")).is_ok() => Command::Repl { context: None },
+        // Bare `zsql` on a terminal inside a project is the repl; anywhere
+        // else, or with no terminal to talk to, the help.
+        None if tty::interactive() && (project.is_some() || config::find_project(Path::new(".")).is_ok()) => {
+            Command::Repl { context: None, remote: Remote::default() }
+        }
         None => {
             use clap::CommandFactory;
             let _ = Cli::command().print_help();
-            println!("\nInside a project, `zsql` alone opens the repl.");
             return;
         }
     };
@@ -378,13 +635,19 @@ fn main() {
         }
     }
     let json = command.wants_json();
-    if let Err(e) = run(command, at) {
+    if let Err(e) = run(command, project) {
+        if e.downcast_ref::<tty::Cancelled>().is_some() {
+            eprintln!("{e}");
+            std::process::exit(130);
+        }
         failure::report(&e, json);
         std::process::exit(1);
     }
 }
 
-fn run(command: Command, at: Where) -> Result<()> {
+fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
+    let here = Where::here(project.clone());
+    let dir = project.as_deref();
     match command {
         Command::Spec { line } => {
             let (spec, _, items) =
@@ -395,10 +658,11 @@ fn run(command: Command, at: Where) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&spec)?);
             Ok(())
         }
-        Command::Init { dir, name, uid } => scaffold::init(dir, name, uid),
+        Command::Init { dir, name, uid, no_git } => scaffold::init(dir, name, uid, no_git),
         Command::New { what } => scaffold::new_file(what),
+        Command::Datasource { what } => datasource::run(dir, what),
         Command::Auth { api_key, server } => {
-            let project = at.project_dir()?;
+            let project = here.project_dir()?;
             config::write_secret(&project.dir, "api_key", &api_key)?;
             if let Some(s) = server {
                 config::write_secret(&project.dir, "server", &s)?;
@@ -406,13 +670,10 @@ fn run(command: Command, at: Where) -> Result<()> {
             println!("saved to {}", project.dir.join(config::LOCAL_FILE).display());
             Ok(())
         }
-        Command::Deploy { dry_run, watch } => deploy::deploy(at, dry_run, watch),
+        Command::Deploy { dry_run, watch, remote } => deploy::deploy(Where::with(project, remote), dry_run, watch),
         Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
-            if at.wants_remote() {
-                bail!("zsql run runs here, with the credentials on this machine; it does not take -r");
-            }
-            let (mode, q, context) = query.resolve(at)?;
-            let Mode::Local(local) = mode else { bail!("zsql run runs here, with the credentials on this machine; it does not take -r") };
+            let (mode, q, context) = query.resolve(here)?;
+            let Mode::Local(local) = mode else { unreachable!("no remote flags on run") };
             let model = local.model()?;
             run::run(
                 &local.project,
@@ -423,64 +684,70 @@ fn run(command: Command, at: Where) -> Result<()> {
             )
         }
         Command::Results { what } => {
-            let project = at.project_dir()?;
+            let project = here.project_dir()?;
             let cmd = match &what {
-                None | Some(ResultsWhat::List) => run::ResultsCommand::List,
+                None => run::ResultsCommand::List { json: false },
+                Some(ResultsWhat::List { json }) => run::ResultsCommand::List { json: *json },
                 Some(ResultsWhat::Show { id, format, head, offset }) => {
                     run::ResultsCommand::Show { id, format: format.as_deref(), head: *head, offset: *offset }
                 }
                 Some(ResultsWhat::Export { id, out }) => run::ResultsCommand::Export { id, out },
                 Some(ResultsWhat::Sql { id }) => run::ResultsCommand::Sql { id },
-                Some(ResultsWhat::Rm { id }) => run::ResultsCommand::Remove { id },
-                Some(ResultsWhat::Purge) => run::ResultsCommand::Purge,
+                Some(ResultsWhat::Rm { ids }) => run::ResultsCommand::Remove { ids },
+                Some(ResultsWhat::Purge { yes }) => run::ResultsCommand::Purge { yes: *yes },
             };
             run::results(&project, cmd)
         }
-        Command::Catalog { what, datasource, schema } => match what {
-            None => catalog::run(at.project.as_deref(), datasource.as_deref(), &schema),
-            Some(CatalogWhat::Search { pattern, live, datasource }) => {
-                catalog::search(at.project.as_deref(), datasource.as_deref(), &pattern, live)
+        Command::Catalog { what, datasource } => match what {
+            None => catalog::status(dir, datasource.as_deref()),
+            Some(CatalogWhat::Read { tables, schema, all, datasource }) => catalog::read(dir, datasource.as_deref(), &schema, &tables, all),
+            Some(CatalogWhat::Add { tables, datasource }) => catalog::read(dir, datasource.as_deref(), &[], &tables, false),
+            Some(CatalogWhat::Sync { datasource }) => catalog::sync(dir, datasource.as_deref()),
+            Some(CatalogWhat::Search { pattern, live, json, datasource }) => {
+                catalog::search(dir, datasource.as_deref(), &pattern, live, json)
             }
-            Some(CatalogWhat::Add { tables, datasource }) => catalog::add(at.project.as_deref(), datasource.as_deref(), &tables),
         },
-        Command::Sample { datasource, only, dry_run, budget } => sample::run(
-            at.project.as_deref(),
-            sample::Options { datasource: datasource.as_deref(), only: only.as_deref(), dry_run, budget },
-        ),
-        Command::Generate { datasource, schema, table, columns, new, dry_run } => generate::run(
-            at.project.as_deref(),
+        Command::Sample { names, datasource, dry_run, budget, yes } => {
+            sample::run(dir, sample::Options { datasource: datasource.as_deref(), names: &names, dry_run, budget, yes })
+        }
+        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run } => generate::run(
+            dir,
             generate::Options {
                 datasource: datasource.as_deref(),
+                tables: &tables,
                 schema: schema.as_deref(),
-                table: table.as_deref(),
+                all,
                 columns: &columns,
-                new,
+                new_columns,
+                live,
                 dry_run,
             },
         ),
-        Command::Check => {
+        Command::Check { remote } => {
+            let at = Where::with(project, remote);
             let t0 = Instant::now();
             let mut side = at.mode()?.side()?;
             let v = side.check()?;
             let ok = show::print_deploy(&v);
             if side.origin() == "local" {
                 eprintln!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+                show::next_after_check(&v, &at.project_dir()?);
             }
             if !ok {
                 bail!("tests failed");
             }
             Ok(())
         }
-        Command::Test => {
-            if !show::print_tests(&at.mode()?.side()?.test()?) {
+        Command::Test { remote } => {
+            if !show::print_tests(&Where::with(project, remote).mode()?.side()?.test()?) {
                 bail!("tests failed");
             }
             Ok(())
         }
-        Command::Sql { query, explain, json } => query.run(at, explain, json),
-        Command::Explain { query, json } => query.run(at, true, json),
-        Command::Explore { query, q, json } => {
-            let (mode, query, context) = query.resolve(at)?;
+        Command::Sql { query, explain, json, remote } => query.run(Where::with(project, remote), explain, json),
+        Command::Explain { query, json, remote } => query.run(Where::with(project, remote), true, json),
+        Command::Explore { query, q, json, remote } => {
+            let (mode, query, context) = query.resolve(Where::with(project, remote))?;
             let mut side = mode.side()?;
             let v = side.explore(&query, context.as_ref(), q.as_deref())?;
             if json {
@@ -490,31 +757,46 @@ fn run(command: Command, at: Where) -> Result<()> {
             }
             Ok(())
         }
-        Command::Repl { context } => {
+        Command::Repl { context, remote } => {
             let context = read_json(context)?;
-            match at.mode()? {
+            match Where::with(project, remote).mode()? {
                 Mode::Local(l) => repl::run(Session::open(l)?, context),
                 Mode::Remote(t) => repl::run(t, context),
             }
         }
-        Command::Fields { q, hidden } => {
-            show::print_fields(&at.mode()?.side()?.fields(&q.unwrap_or_default(), hidden)?);
-            Ok(())
+        Command::Fields { term, hidden, json, remote } => {
+            let v = Where::with(project, remote).mode()?.side()?.fields(&term.unwrap_or_default(), hidden)?;
+            if json {
+                show::print_json(&v)
+            } else {
+                show::print_fields(&v);
+                Ok(())
+            }
         }
-        Command::Tables => {
-            show::print_tables(&at.mode()?.side()?.tables()?);
-            Ok(())
+        Command::Tables { json, remote } => {
+            let v = Where::with(project, remote).mode()?.side()?.tables()?;
+            if json {
+                show::print_json(&v)
+            } else {
+                show::print_tables(&v);
+                Ok(())
+            }
         }
-        Command::Values { dim } => {
-            show::print_values(&at.mode()?.side()?.values(&dim)?);
-            Ok(())
+        Command::Values { dim, json, remote } => {
+            let v = Where::with(project, remote).mode()?.side()?.values(&dim)?;
+            if json {
+                show::print_json(&v)
+            } else {
+                show::print_values(&v);
+                Ok(())
+            }
         }
-        Command::Status => {
-            let t = at.target()?;
+        Command::Status { remote } => {
+            let t = Where::with(project, remote).target(false)?;
             show::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::List => {
-            let v = at.client().get("/projects")?;
+        Command::Deployments { remote } => {
+            let v = Where::with(project, remote).client().get("/projects")?;
             for d in v["deployments"].as_array().into_iter().flatten() {
                 println!(
                     "{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests",
@@ -529,37 +811,47 @@ fn run(command: Command, at: Where) -> Result<()> {
             }
             Ok(())
         }
-        Command::Remove { yes } => {
-            let t = at.target()?;
-            if !yes {
-                bail!("this removes {}/{} from {}; add --yes to confirm", t.uid, t.branch, t.client.server);
+        Command::Undeploy { yes, remote } => {
+            let t = Where::with(project, remote).target(false)?;
+            let sure = yes || tty::confirm(&format!("remove {}/{} from {}?", t.uid, t.branch, t.client.server), "--yes")?;
+            if !sure {
+                bail!("nothing removed");
             }
             show::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
         }
-        Command::Health => {
-            let client = at.client();
+        Command::Health { remote } => {
+            let client = Where::with(project, remote).client();
             let v = client.get("/healthz")?;
             println!("{} {}", client.server, v.as_str().unwrap_or("ok"));
             Ok(())
         }
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "zsql", &mut std::io::stdout());
+            Ok(())
+        }
         #[cfg(feature = "server")]
-        Command::Serve(args) => serve::serve(args, at),
+        Command::Serve(args) => serve::serve(args, here),
         #[cfg(feature = "server")]
-        Command::Server { what } => serve::server(what, at),
+        Command::Server { what } => serve::server(what, here),
     }
 }
 
-/// What `zsql sql`, `zsql explain` and `zsql explore` take: the query, as
-/// a spec file or an expression line, and the security context.
+/// What `zsql sql`, `zsql explain`, `zsql explore` and `zsql run` take:
+/// the query as an expression line (the positional words, joined) or a
+/// spec file, and the security context.
 #[derive(clap::Args)]
 struct QueryArgs {
-    /// A JSON file holding a query spec.
-    #[arg(long, conflicts_with = "expr", required_unless_present = "expr")]
+    /// The line: projections, filters, calculations, segments and settings, comma-separated. Several arguments are joined with spaces, so quoting is optional. `zsql spec --help` has the forms.
+    #[arg(num_args = 1.., value_name = "LINE", conflicts_with = "spec")]
+    line: Vec<String>,
+    /// A JSON file holding a query spec, instead of a line.
+    #[arg(long)]
     spec: Option<PathBuf>,
-    /// An expression line: projections, filters, calculations, segments and settings, comma-separated. `zsql spec --help` has the forms.
-    #[arg(long, required_unless_present = "spec")]
+    /// The line as one flag; the same as giving it bare.
+    #[arg(long, hide = true, conflicts_with_all = ["spec", "line"])]
     expr: Option<String>,
-    /// A JSON file holding the security context.
+    /// A JSON file holding the security context to plan under.
     #[arg(long)]
     context: Option<PathBuf>,
 }
@@ -570,14 +862,23 @@ impl QueryArgs {
     /// one place.
     fn resolve(self, at: Where) -> Result<(Mode, Query, Option<Value>)> {
         let mode = at.mode()?;
-        let query = match (self.spec, self.expr) {
+        let line = self.expr.or_else(|| (!self.line.is_empty()).then(|| self.line.join(" ")));
+        let query = match (self.spec, line) {
             (Some(path), _) => {
                 let value = read_json(Some(path))?.expect("a path was given");
                 Query::Spec(value.get("spec").cloned().unwrap_or(value))
             }
             (None, Some(line)) => Query::Expr(line),
-            // clap requires one of the two.
-            (None, None) => bail!("give the query as --spec FILE or --expr LINE"),
+            (None, None) => {
+                // A usage error, as clap would report one: exit 2.
+                use clap::CommandFactory;
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "give the query: a line such as 'revenue by region', or --spec FILE",
+                    )
+                    .exit()
+            }
         };
         let context = read_json(self.context)?;
         Ok((mode, query, context))
@@ -607,53 +908,6 @@ impl QueryArgs {
         }
         Ok(())
     }
-}
-
-#[derive(Subcommand)]
-enum CatalogWhat {
-    /// Tables whose name holds the pattern: in the file, or in the warehouse with --live.
-    Search {
-        pattern: String,
-        /// Ask the warehouse, every non-system schema, rather than the file.
-        #[arg(long)]
-        live: bool,
-        #[arg(long)]
-        datasource: Option<String>,
-    },
-    /// Read these tables by name (schema.table or table) and add them to the file.
-    Add {
-        tables: Vec<String>,
-        #[arg(long)]
-        datasource: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum ResultsWhat {
-    /// Every stored result, newest first.
-    List,
-    /// One result's rows.
-    Show {
-        id: String,
-        #[arg(long)]
-        format: Option<String>,
-        #[arg(long)]
-        head: Option<usize>,
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-    },
-    /// One result's rows to a file, in the format its extension says.
-    Export {
-        id: String,
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// The statement a result ran.
-    Sql { id: String },
-    /// Remove one result.
-    Rm { id: String },
-    /// Remove every result of this project.
-    Purge,
 }
 
 /// A JSON file, named in any error: the read and the parse alike.
@@ -702,15 +956,36 @@ mod tests {
             Ok(_) => panic!("--branch without -r was accepted"),
         };
         assert!(err.contains("add -r"), "{err}");
-        // A project directory that is not a git repository still plans here.
+        // A project directory that is not a git repository still plans here,
+        // and a read against the server is told to name a branch, not to commit.
         assert!(matches!(here.mode().unwrap(), Mode::Local(_)));
+        let err = Where { remote: true, ..here.clone() }.mode().err().unwrap().to_string();
+        assert!(err.contains("add --branch NAME") && !err.contains("deploy"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn json_commands() {
-        assert!(Command::Sql { query: QueryArgs { spec: None, expr: Some("a".into()), context: None }, explain: false, json: true }
-            .wants_json());
-        assert!(!Command::Tables.wants_json());
+        let q = || QueryArgs { line: vec!["a".into()], spec: None, expr: None, context: None };
+        assert!(Command::Sql { query: q(), explain: false, json: true, remote: Remote::default() }.wants_json());
+        assert!(Command::Run {
+            query: q(),
+            limit: None,
+            all: false,
+            fresh: false,
+            timeout: None,
+            format: Some("json".into()),
+            out: None,
+            head: None,
+            quiet: false
+        }
+        .wants_json());
+        assert!(!Command::Tables { json: false, remote: Remote::default() }.wants_json());
+    }
+
+    #[test]
+    fn the_command_line_parses_its_own_help() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }

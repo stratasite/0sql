@@ -58,16 +58,22 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
     // Say the plan first.
     let (ok, out) = run(zsql(&home, &project).args(["sample", "--dry-run"]));
     assert!(ok, "{out}");
-    assert!(out.contains("would sample Status (planned)") && out.contains("would sample Region (sample_sql)"), "{out}");
+    assert!(
+        out.contains("Status") && out.contains("planned, up to 2 values") && out.contains("Region") && out.contains("sample_sql"),
+        "{out}"
+    );
     assert!(out.contains("skip    Secret: hidden"), "{out}");
-    assert!(out.contains("would sample Shouting (planned)"), "a calculated dimension is the planner's to answer: {out}");
+    assert!(
+        out.contains("Shouting") && out.contains("nothing run, nothing written"),
+        "a calculated dimension is the planner's to answer: {out}"
+    );
     assert!(!out.contains("Quiet"), "a dimension that did not ask is not mentioned: {out}");
     assert!(!project.join("samples/values.jsonl.gz").exists(), "dry run writes nothing");
-    let (ok, out) = run(zsql(&home, &project).args(["sample", "--budget", "1"]));
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "--budget", "1", "--yes"]));
     assert!(!ok && out.contains("more than the budget of 1"), "{out}");
 
     // Then do it.
-    let (ok, out) = run(zsql(&home, &project).arg("sample"));
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "--yes"]));
     assert!(ok, "{out}");
     assert!(out.contains("sampled Status (local): 2 values of 3, cut at the limit"), "{out}");
     assert!(out.contains("sampled Region (local): 3 values"), "{out}");
@@ -107,7 +113,7 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
 
     // --only touches one dimension and keeps the rest.
     db.execute_batch("UPDATE orders SET status = 'open' WHERE status = 'refunded'").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["sample", "--only", "status"]));
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "status", "--yes"]));
     assert!(ok && out.contains("sampled Status") && !out.contains("sampled Region"), "{out}");
     let cat = zsql_project::values::ValueCatalog::read(&project.join("samples/values.jsonl.gz")).unwrap().unwrap();
     assert_eq!(cat.dimensions.len(), 5, "the others are kept");
@@ -150,11 +156,11 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
         format!("wh:\n  password: {}\n", std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")),
     )
     .unwrap();
-    assert!(run(zsql(&home, &project).args(["catalog", "wh", "--schema", "shop"])).0);
-    assert!(run(zsql(&home, &project).args(["generate", "wh"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "wh", "--schema", "shop"])).0);
+    assert!(run(zsql(&home, &project).args(["generate", "-d", "wh", "--all"])).0);
 
     // The draft turned sampling on for name (varchar(80)) and not for notes (text).
-    let (ok, out) = run(zsql(&home, &project).args(["sample", "wh"]));
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "-d", "wh", "--yes"]));
     assert!(ok, "{out}");
     assert!(out.contains("sampled Name (wh): 2 values of 2"), "{out}");
     assert!(!out.contains("Notes"), "text was not turned on by the draft: {out}");
@@ -171,7 +177,7 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
     let on = yml.replacen("    name: Notes\n", "    name: Notes\n    enable_sampling: true\n", 1);
     assert_ne!(on, yml, "Notes is in the draft");
     std::fs::write(&path, on).unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["sample", "wh", "--only", "notes"]));
+    let (ok, out) = run(zsql(&home, &project).args(["sample", "-d", "wh", "notes", "--yes"]));
     assert!(ok, "{out}");
     assert!(out.contains("warning: Notes (Customers): declared text, unbounded text"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["values", "Name"]));

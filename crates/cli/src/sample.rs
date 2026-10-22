@@ -5,7 +5,7 @@
 //! `docs/introspection.md`, phase D, and the project's AGENTS.md for the
 //! judgment the flag asks of a modeller.
 
-use crate::{config, local};
+use crate::{config, local, tty};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,12 +16,18 @@ use zsql_source::{Catalog, Connection};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,
-    /// Only this dimension or table, by name or uid.
-    pub only: Option<&'a str>,
+    /// Only these dimensions or tables, by name or uid.
+    pub names: &'a [String],
     pub dry_run: bool,
-    /// Refuse before running when the plan needs more queries than this.
+    /// Refuse before running when the plan needs more queries than this;
+    /// a hundred when unsaid.
     pub budget: Option<usize>,
+    /// Run without asking.
+    pub yes: bool,
 }
+
+/// Queries a run may need before it is refused without a budget said.
+const DEFAULT_BUDGET: usize = 100;
 
 /// A value longer than this, on average, is prose and not a value: the
 /// catalog fills with text that matches every request a little.
@@ -43,7 +49,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let model = Model::from_dir(&project.dir, Trust::Owned, local::dialects()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let s = model.universe().snapshot();
-    let only = opts.only.map(|o| o.trim().to_lowercase());
+    let only: Vec<String> = opts.names.iter().map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty()).collect();
 
     let out_path = project.dir.join("samples").join(zsql_project::values::FILE_NAME);
     let mut catalog = ValueCatalog::read(&out_path).with_context(|| out_path.display().to_string())?.unwrap_or_default();
@@ -55,10 +61,14 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     for f in s.fields.iter().filter(|f| f.kind == FieldKind::Dimension && f.enable_sampling) {
         let tables: Vec<&Table> =
             s.expressions.iter().filter(|e| e.field_id == f.id).filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id)).collect();
-        if let Some(o) = &only {
-            let hit = f.uid.to_lowercase() == *o
-                || f.name.to_lowercase() == *o
-                || tables.iter().any(|t| t.name.to_lowercase() == *o || t.uid.to_lowercase() == *o || t.physical_name.to_lowercase() == *o);
+        if !only.is_empty() {
+            let hit = only.iter().any(|o| {
+                f.uid.to_lowercase() == *o
+                    || f.name.to_lowercase() == *o
+                    || tables
+                        .iter()
+                        .any(|t| t.name.to_lowercase() == *o || t.uid.to_lowercase() == *o || t.physical_name.to_lowercase() == *o)
+            });
             if !hit {
                 continue;
             }
@@ -94,17 +104,47 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         if jobs.len() == 1 { "" } else { "s" },
         if planned == 1 { "y" } else { "ies" }
     );
-    if let Some(b) = opts.budget {
-        if planned > b {
-            bail!("{planned} queries is more than the budget of {b}; narrow with --only, or raise --budget");
-        }
+    let budget = opts.budget.unwrap_or(DEFAULT_BUDGET);
+    if planned > budget {
+        bail!("{planned} queries is more than the budget of {budget}; narrow by naming dimensions or tables, or raise --budget");
+    }
+    // The plan: each dimension, where it is declared, and its width.
+    let datasources: Vec<String> = {
+        let mut d: Vec<String> = jobs
+            .iter()
+            .flat_map(|j| s.expressions.iter().filter(|e| e.field_id == j.field.id))
+            .filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id))
+            .filter_map(|t| s.datasources.iter().find(|d| d.id == t.datasource_id))
+            .map(|d| d.uid.clone())
+            .collect();
+        d.sort();
+        d.dedup();
+        d
+    };
+    for j in &jobs {
+        let on: Vec<String> = s
+            .expressions
+            .iter()
+            .filter(|e| e.field_id == j.field.id)
+            .filter_map(|e| s.tables.iter().find(|t| t.id == e.table_id))
+            .map(|t| t.name.clone())
+            .collect();
+        println!(
+            "  {:<32} on {:<24} {}",
+            j.field.name,
+            on.join(", "),
+            if j.field.sample_sql.is_some() { "sample_sql".to_string() } else { format!("planned, up to {} values", j.field.sample_size) }
+        );
     }
     if opts.dry_run {
-        for j in &jobs {
-            println!("  would sample {} ({})", j.field.name, if j.field.sample_sql.is_some() { "sample_sql" } else { "planned" });
-        }
         println!("nothing run, nothing written");
         return Ok(());
+    }
+    if !opts.yes {
+        let question = format!("run {planned} quer{} on {}?", if planned == 1 { "y" } else { "ies" }, datasources.join(", "));
+        if !tty::confirm(&question, "--yes")? {
+            bail!("nothing run");
+        }
     }
 
     // A policy needs a context to plan under; none of these projections

@@ -227,10 +227,8 @@ pub fn print(v: &Value) -> bool {
     for u in v["unchecked"].as_array().into_iter().flatten() {
         let u = s(u);
         if u.contains("outside the catalog's scope") {
-            println!(
-                "catalog: {u}; `zsql catalog {} --schema <name>` or `zsql catalog add <table>` would read them",
-                u.split(' ').next().unwrap_or("")
-            );
+            let ds = u.split(' ').next().unwrap_or("");
+            println!("catalog: {u}; `zsql catalog read -d {ds} --schema <name>` or `zsql catalog read -d {ds} <table>` would read them");
         } else if u.contains("catalog read") {
             println!("catalog: {u}; `zsql catalog {}` re-reads it", u.split(' ').next().unwrap_or(""));
         } else {

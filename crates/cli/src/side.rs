@@ -276,7 +276,7 @@ impl Side for Session {
     }
 
     fn results(&mut self) -> Result<()> {
-        crate::run::results(&self.local.project, crate::run::ResultsCommand::List)
+        crate::run::results(&self.local.project, crate::run::ResultsCommand::List { json: false })
     }
 
     fn check(&mut self) -> Result<Value> {

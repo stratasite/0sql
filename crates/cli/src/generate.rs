@@ -3,7 +3,7 @@
 //! guess is marked on its line, and what could not be mapped is listed
 //! rather than silently left out. See `docs/introspection.md`, phase C.
 
-use crate::{catalog, config};
+use crate::{catalog, config, tty};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,11 +11,51 @@ use zsql_source::{Catalog, Column, Connection, Table};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,
+    /// Tables to draft, as schema.table or table; none means the picker.
+    pub tables: &'a [String],
     pub schema: Option<&'a str>,
-    pub table: Option<&'a str>,
+    /// Every table in the catalog: never the default.
+    pub all: bool,
     pub columns: &'a [String],
-    pub new: bool,
+    pub new_columns: bool,
+    /// A named table the catalog lacks is read from the warehouse first.
+    pub live: bool,
     pub dry_run: bool,
+}
+
+/// Column names that are a person, a contact or a credential by their
+/// name alone: short strings, but not categories, and not for a sample
+/// file that travels with the model. The width rule still holds; the
+/// line is written commented out with the reason, for the author to
+/// turn on when the column is in fact a category.
+const IDENTITY_NAMES: [&str; 22] = [
+    "name",
+    "first_name",
+    "last_name",
+    "full_name",
+    "email",
+    "mail",
+    "phone",
+    "mobile",
+    "address",
+    "street",
+    "zip",
+    "postcode",
+    "postal_code",
+    "ssn",
+    "dob",
+    "birth",
+    "ip",
+    "user",
+    "login",
+    "password",
+    "token",
+    "secret",
+];
+
+fn looks_like_identity(column: &str) -> bool {
+    let c = column.to_lowercase();
+    IDENTITY_NAMES.iter().any(|n| c == *n || c.ends_with(&format!("_{n}")) || c.starts_with(&format!("{n}_")))
 }
 
 /// What a warehouse type becomes.
@@ -189,7 +229,21 @@ fn field(column: &Column, table: &Table) -> std::result::Result<String, String> 
     out.push_str(&format!("{:<32}# {}\n", format!("    data_type: {data_type}"), note));
     if data_type == "string" && !measure {
         if let Some(n) = column.max_length.filter(|n| (1..=255).contains(n)) {
-            out.push_str(&format!("{:<32}# inferred: a short string, {n} wide\n", "    enable_sampling: true"));
+            let key = table.primary_key.iter().any(|k| k.eq_ignore_ascii_case(&column.name))
+                || table.foreign_keys.iter().any(|f| f.columns.iter().any(|k| k.eq_ignore_ascii_case(&column.name)));
+            if key {
+                out.push_str(&format!(
+                    "{:<32}# a key, {n} wide: values nobody names; turn on only if these are categories\n",
+                    "    # enable_sampling: true"
+                ));
+            } else if looks_like_identity(&column.name) {
+                out.push_str(&format!(
+                    "{:<32}# inferred: {n} wide, but looks like a person or a credential; turn on only if these are categories\n",
+                    "    # enable_sampling: true"
+                ));
+            } else {
+                out.push_str(&format!("{:<32}# inferred: a short string, {n} wide\n", "    enable_sampling: true"));
+            }
         }
     }
     out.push_str("    expression:\n");
@@ -424,33 +478,120 @@ fn append_fields(path: &Path, entries: &str) -> Result<bool> {
 pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let all = Connection::read_all(&project.dir).context("reading datasources.yml")?;
-    let uid = match opts.datasource {
-        Some(u) => u.trim().to_lowercase(),
-        None if all.len() == 1 => all[0].uid.clone(),
+    let conn = catalog::choose(&project.dir, opts.datasource)?;
+    let uid = conn.uid.clone();
+    let _ = all;
+    let mut cat = match catalog::load(&project.dir, &uid)? {
+        Some(c) => c,
         None => {
-            let have: Vec<&str> = all.iter().map(|c| c.uid.as_str()).collect();
-            bail!("datasources.yml names several datasources ({}); say which", have.join(", "));
+            if tty::interactive()
+                && tty::confirm(&format!("{uid}: no catalog yet. Read it now?"), "zsql catalog read -d {uid} --schema NAME")?
+            {
+                crate::catalog::read(Some(&project.dir), Some(&uid), &[], &[], false)?;
+                catalog::load(&project.dir, &uid)?.ok_or_else(|| anyhow::anyhow!("{uid}: still no catalog"))?
+            } else {
+                bail!("{uid}: no catalog yet; `zsql catalog read -d {uid} --schema NAME` reads one");
+            }
         }
     };
-    let cat_path = catalog::path(&project.dir, &uid);
-    let text = std::fs::read_to_string(&cat_path).with_context(|| {
-        format!("{}: run `zsql catalog {uid}` first", cat_path.strip_prefix(&project.dir).unwrap_or(&cat_path).display())
-    })?;
-    let cat: Catalog = serde_json::from_str(&text).with_context(|| cat_path.display().to_string())?;
-    let today = cat.read_at.get(..10).unwrap_or(&cat.read_at).to_string();
-
-    let want_table = opts.table.map(|t| t.trim().to_lowercase());
-    let tables: Vec<&Table> = cat
-        .tables
-        .iter()
-        .filter(|t| t.kind == "table" || t.kind == "view")
-        .filter(|t| opts.schema.is_none_or(|s| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s))))
-        .filter(|t| want_table.as_deref().is_none_or(|w| t.physical_name().eq_ignore_ascii_case(w) || t.name.eq_ignore_ascii_case(w)))
-        .collect();
-    if tables.is_empty() {
-        bail!("the catalog has no table matching that; `zsql catalog {uid}` reads it again");
-    }
     let have = existing(&project.dir)?;
+
+    // Which tables: named, a schema, everything, or the picker. A named
+    // table the catalog lacks is read live when asked, else named.
+    let names: Vec<String> = opts.tables.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect();
+    if !names.is_empty() {
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|w| !cat.tables.iter().any(|t| t.physical_name().eq_ignore_ascii_case(w) || t.name.eq_ignore_ascii_case(w)))
+            .collect();
+        if !missing.is_empty() {
+            if !opts.live {
+                let list: Vec<String> = missing.iter().map(|m| m.to_string()).collect();
+                bail!(
+                    "the catalog has no table named {}; `zsql catalog search <pattern>` finds names, --live reads one from the warehouse",
+                    list.join(", ")
+                );
+            }
+            let read: Vec<String> = missing.iter().map(|m| m.to_string()).collect();
+            crate::catalog::read(Some(&project.dir), Some(&uid), &[], &read, false)?;
+            cat = catalog::load(&project.dir, &uid)?.ok_or_else(|| anyhow::anyhow!("{uid}: no catalog"))?;
+        }
+    }
+    let today = cat.read_at.get(..10).unwrap_or(&cat.read_at).to_string();
+    if let Some(s) = opts.schema {
+        if !cat.tables.iter().any(|t| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s))) {
+            let mut have_schemas: Vec<String> = cat.tables.iter().filter_map(|t| t.schema.clone()).collect();
+            have_schemas.sort();
+            have_schemas.dedup();
+            bail!(
+                "the catalog has no schema {s} (it has: {})",
+                if have_schemas.is_empty() { "none".to_string() } else { have_schemas.join(", ") }
+            );
+        }
+    }
+    let candidates: Vec<&Table> = cat.tables.iter().filter(|t| t.kind == "table" || t.kind == "view").collect();
+    let tables: Vec<&Table> = if !names.is_empty() {
+        candidates
+            .iter()
+            .copied()
+            .filter(|t| names.iter().any(|w| t.physical_name().eq_ignore_ascii_case(w) || t.name.eq_ignore_ascii_case(w)))
+            .collect()
+    } else if let Some(s) = opts.schema {
+        candidates.iter().copied().filter(|t| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s))).collect()
+    } else if opts.all {
+        candidates.clone()
+    } else {
+        // The picker: every table, its state against the models that exist.
+        let flag_form = "say which tables: `zsql generate orders customers`, `--schema NAME`, or `--all`; `zsql catalog search PATTERN --json` lists what the catalog holds";
+        if candidates.is_empty() {
+            bail!("{uid}: the catalog holds no tables; `zsql catalog read -d {uid} --schema NAME` reads some");
+        }
+        let find_existing = |t: &Table| {
+            have.iter().find(|e| {
+                e.table == t.name.to_lowercase()
+                    && match (&e.schema, &t.schema) {
+                        (Some(es), Some(ts)) => es == &ts.to_lowercase(),
+                        _ => true,
+                    }
+                    && e.datasource.as_deref().is_none_or(|d| d == uid.to_lowercase())
+            })
+        };
+        let options: Vec<String> = candidates
+            .iter()
+            .map(|t| {
+                let state = match find_existing(t) {
+                    Some(e) => {
+                        let new = t
+                            .columns
+                            .iter()
+                            .filter(|c| !e.columns.contains(&c.name.to_lowercase()) && map_type(&c.data_type) != Mapped::Skip)
+                            .count();
+                        if new == 0 {
+                            "model exists, up to date".to_string()
+                        } else {
+                            format!("model exists: {new} new column{}", if new == 1 { "" } else { "s" })
+                        }
+                    }
+                    None => String::new(),
+                };
+                format!(
+                    "{:<40} {:<5} {:>3} columns{:<14} {state}",
+                    t.physical_name(),
+                    t.kind,
+                    t.columns.len(),
+                    t.rows.map(|r| format!(" ~{r} rows")).unwrap_or_default()
+                )
+            })
+            .collect();
+        let chosen = tty::pick_many("tables to generate", options, vec![], flag_form)?;
+        if chosen.is_empty() {
+            return Err(tty::Cancelled("nothing selected; nothing written").into());
+        }
+        chosen.into_iter().map(|i| candidates[i]).collect()
+    };
+    if tables.is_empty() {
+        bail!("the catalog has no table matching that; `zsql catalog search <pattern>` finds names");
+    }
     // A model matches a catalog table by its last two name parts, and
     // by datasource when the model says one: the same `public.orders` on
     // two warehouses is two models.
@@ -482,14 +623,14 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     let absent: Vec<&Column> = t.columns.iter().filter(|c| !e.columns.contains(&c.name.to_lowercase())).collect();
                     let (new, untyped): (Vec<&Column>, Vec<&Column>) =
                         absent.into_iter().partition(|c| map_type(&c.data_type) != Mapped::Skip);
-                    if !untyped.is_empty() && !opts.new && opts.columns.is_empty() {
+                    if !untyped.is_empty() && !opts.new_columns && opts.columns.is_empty() {
                         let names: Vec<String> = untyped.iter().map(|c| format!("{} ({})", c.name, c.data_type)).collect();
                         println!("        {}: no 0sql type, so not a field: {}", rel(&e.path), names.join(", "));
                     }
                     if new.is_empty() {
                         continue;
                     }
-                    let chosen: Vec<&Column> = if opts.new {
+                    let chosen: Vec<&Column> = if opts.new_columns {
                         new.clone()
                     } else {
                         new.iter().copied().filter(|c| opts.columns.iter().any(|w| w.eq_ignore_ascii_case(&c.name))).collect()
@@ -498,7 +639,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                         listed += 1;
                         let names: Vec<&str> = new.iter().map(|c| c.name.as_str()).collect();
                         println!(
-                            "exists  {}: {} new column{}: {}\n        zsql generate {uid} --table {} --columns {}   (or --new)",
+                            "exists  {}: {} new column{}: {}\n        zsql generate {} --columns {}   (or --new-columns)",
                             rel(&e.path),
                             new.len(),
                             if new.len() == 1 { "" } else { "s" },
@@ -608,8 +749,11 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             }
         }
     }
+    if created > 0 || added > 0 {
+        eprintln!("next: zsql check, then zsql sample");
+    }
     if created == 0 && listed == 0 && added == 0 && !opts.dry_run {
-        println!("nothing to do: every table in the catalog has a model, with no new columns");
+        println!("nothing to do: every table named has a model, with no new columns");
     }
     Ok(())
 }

@@ -189,6 +189,9 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
                         Err(e) => println!("error: {e}"),
                     }
                 }
+                "catalog" | "generate" | "sample" | "check" | "test" | "deploy" => {
+                    println!("`zsql {cmd}` is a command-line step; the repl plans and runs queries. .help lists what it does.")
+                }
                 other => println!("unknown command .{other}; .help lists them"),
             }
             Ok(())

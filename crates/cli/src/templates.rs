@@ -209,13 +209,19 @@ datasource: {datasource}\n\
     )
 }
 
-pub fn test_yml(name: &str) -> String {
+pub fn test_yml(name: &str, fields: Option<(Option<String>, Option<String>)>) -> String {
+    let (dim, msr) = fields.unwrap_or((None, None));
+    let projections = match (dim, msr) {
+        (Some(d), Some(m)) => format!("  - {d}\n  - {m}\n"),
+        (Some(d), None) => format!("  - {d}\n"),
+        (None, Some(m)) => format!("  - {m}\n"),
+        (None, None) => "  # - A Dimension   # name fields of this model; `zsql fields` lists them\n  # - A Measure\n".to_string(),
+    };
     format!(
         "# A planner test: project these fields and compare the SQL. Runs on every deploy.\n\
 name: {name}\n\
 projections:\n\
-  - Category\n\
-  - Revenue\n\
+{projections}\
 # assert_sql: |\n\
 #   SELECT ...\n\
 assert_regex: SELECT\n"
@@ -239,9 +245,13 @@ what to change.
 
 - `project.yml` — the project's name, uid and production branch.
 - `datasources.yml` — one entry per warehouse: `adapter` picks the SQL
-  dialect, `tier` ranks datasources when more than one could answer.
+  dialect, `tier` ranks datasources when more than one could answer; the
+  other keys are how the `zsql` command on this machine connects.
   **Never put a password, token or key in this file.** Secrets belong in
   `.zsql`, which is gitignored and never deployed.
+- `catalog/<datasource>.json` — what the warehouse holds, as `zsql catalog`
+  read it. Committed: it is schema, not data, and `zsql check` validates
+  the model against it.
 - `models/<domain>/tbl.<name>.yml` — a table with its dimensions and
   measures. `models/<domain>/rel.<domain>.yml` — the joins between them.
 - `security.yml` — row-level policies.
@@ -251,14 +261,28 @@ what to change.
 
 ## Commands
 
-    zsql check            # load the model and report problems
-    zsql test             # run tests/*.yml
-    zsql sql 'revenue by category last month'
-    zsql fields cost      # find a field
-    zsql repl             # explore interactively
+The flow, in order. Nothing prompts when stdin is not a terminal, so every
+step below is its non-interactive form; the flag forms are what you use.
+
+    zsql datasource list                       # what datasources.yml holds, and whether each has its secret
+    zsql datasource test -d wh                 # open the connection; list the schemas it can see
+    zsql catalog read -d wh --schema public    # read a schema into catalog/wh.json (never --all on a big warehouse)
+    zsql catalog read -d wh sales.orders       # or one table by name
+    zsql catalog search orders [--live] --json # find tables, in the file or in the warehouse
+    zsql catalog sync -d wh                    # re-read what the file records; drift is printed
+    zsql generate orders customers             # draft models for named tables; --schema S or --all for more
+    zsql generate orders --new-columns         # add the columns a model lacks
+    zsql check                                 # load the model, check it against the catalog, run the tests
+    zsql sample --yes [Status Region]          # collect sampled values; asks first on a terminal
+    zsql sql 'revenue by region, order date >= 28d'
+    zsql run 'revenue by region' --format jsonl
+    zsql fields cost                           # find a field
+    zsql test                                  # run tests/*.yml
 
 Run `zsql check` after every edit. A model that does not load cannot be
-deployed.
+deployed. `zsql generate` with no table and no terminal refuses and says
+the three ways to name tables; it never drafts every table unless told
+`--all`.
 
 ## Authoring fields
 
@@ -303,8 +327,7 @@ most frequent first, so a smaller number keeps the ones that matter.
 "#;
 
 pub const GITIGNORE: &str = "\
-# zsql: local secrets, sampled data, and query results exported here\n\
+# zsql: local secrets and sampled data. catalog/ is meant to be committed.\n\
 .zsql\n\
 .strata\n\
-samples/values.jsonl.gz\n\
-results/\n";
+samples/values.jsonl.gz\n";

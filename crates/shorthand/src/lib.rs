@@ -99,7 +99,7 @@ Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explo
 
 /// The repl's `.help`: the forms, then its dot commands.
 pub fn help() -> String {
-    format!("Type comma-separated items; a newline separates items too. Each item is read from its shape.\n{FORMS}\n{REPL_COMMANDS}")
+    format!("{REPL_COMMANDS}\n\n{FORMS}")
 }
 
 #[cfg(test)]

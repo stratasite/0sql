@@ -118,7 +118,9 @@ pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Val
 
     let format = match (opts.format, opts.out) {
         (Some(f), _) => Format::parse(f)?,
-        (None, Some(p)) => Format::of_path(p).unwrap_or(Format::Jsonl),
+        (None, Some(p)) => {
+            Format::of_path(p).ok_or_else(|| anyhow::anyhow!("{}: say --format for this extension (json, jsonl, csv)", p.display()))?
+        }
         (None, None) => Format::Table,
     };
     let tty = unsafe { libc::isatty(1) } == 1;
@@ -298,12 +300,12 @@ fn table(w: &mut dyn Write, names: &[&str], columns: &[zsql_exec::Column], rows:
 // ------------------------------------------------------------------ results
 
 pub enum ResultsCommand<'a> {
-    List,
+    List { json: bool },
     Show { id: &'a str, format: Option<&'a str>, head: Option<usize>, offset: usize },
     Export { id: &'a str, out: &'a Path },
     Sql { id: &'a str },
-    Remove { id: &'a str },
-    Purge,
+    Remove { ids: &'a [String] },
+    Purge { yes: bool },
 }
 
 pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
@@ -312,8 +314,13 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
     };
     let store = Store::open(&root)?;
     match cmd {
-        ResultsCommand::List => {
+        ResultsCommand::List { json } => {
             let all = store.list()?;
+            if json {
+                let v: Vec<&Manifest> = all.iter().map(|s| &s.manifest).collect();
+                println!("{}", serde_json::to_string_pretty(&json!({ "root": root, "results": v }))?);
+                return Ok(());
+            }
             if all.is_empty() {
                 println!("no results under {}", root.display());
                 return Ok(());
@@ -349,7 +356,8 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
         ResultsCommand::Export { id, out } => {
             let s = store.get(id)?;
             let rows: Vec<Vec<Option<String>>> = s.rows()?.collect::<zsql_exec::Result<_>>()?;
-            let format = Format::of_path(out).unwrap_or(Format::Jsonl);
+            let format = Format::of_path(out)
+                .ok_or_else(|| anyhow::anyhow!("{}: say the format by the extension (json, jsonl, csv)", out.display()))?;
             let mut file = std::fs::File::create(out).with_context(|| out.display().to_string())?;
             emit(&mut file, format, &s.manifest, &rows, None, &CacheStatus::Hit { age: s.age() })?;
             eprintln!("{} rows -> {}", rows.len(), out.display());
@@ -359,12 +367,21 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
             println!("-- {} on {} ({})", s.manifest.id, s.manifest.datasource_uid, s.manifest.adapter);
             println!("{}", s.manifest.sql);
         }
-        ResultsCommand::Remove { id } => {
-            let s = store.get(id)?;
-            store.remove(&s.manifest.key)?;
-            eprintln!("removed {}", s.manifest.id);
+        ResultsCommand::Remove { ids } => {
+            if ids.is_empty() {
+                bail!("name the results to remove, by id");
+            }
+            for id in ids {
+                let s = store.get(id)?;
+                store.remove(&s.manifest.key)?;
+                eprintln!("removed {}", s.manifest.id);
+            }
         }
-        ResultsCommand::Purge => {
+        ResultsCommand::Purge { yes } => {
+            let n = store.list()?.len();
+            if n > 0 && !yes && !crate::tty::confirm(&format!("remove all {n} results under {}?", root.display()), "--yes")? {
+                bail!("nothing removed");
+            }
             let n = store.purge()?;
             eprintln!("purged {n} result{} under {}", if n == 1 { "" } else { "s" }, root.display());
         }

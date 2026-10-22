@@ -682,10 +682,14 @@ read, and a sync re-reads exactly that.
   tables read one by one, each with when. A table inside a scope read
   whole needs no entry of its own, and a read of every schema subsumes
   everything narrower.
-- **Sync.** `zsql catalog <ds>` with nothing else re-reads every
-  recorded scope and every added table and replaces what each read
-  covers; `--schema a --schema b` reads those and adds them to the
-  union; the file is never replaced wholesale. The connection's
+- **Read and sync.** `zsql catalog read --schema a --schema b` reads
+  those schemas and adds them to the union, `zsql catalog read
+  sales.orders` one table by name, `--all` every non-system schema and
+  never by default; with nothing named, a schema picker on a terminal.
+  `zsql catalog sync` re-reads every recorded scope and every added
+  table and replaces what each read covers; the file is never replaced
+  wholesale. Bare `zsql catalog` says what the file holds and connects
+  to nothing. The connection's
   `schema:` is its search path for unqualified names, not a limit on
   the catalog, so the old default that narrowed the read to it is gone.
 - **Drift and dropping.** Drift is computed over what a read covers, so
@@ -695,12 +699,11 @@ read, and a sync re-reads exactly that.
   and removed: the warehouse was asked and answered. A read that fails
   keeps what the file held for it, says so, and the command exits
   non-zero. Nothing is removed on a failure, only on an answer.
-- **Search and add.** `zsql catalog search <pattern>` looks in the
-  file; `--live` asks the warehouse, every non-system schema, for names
-  holding the pattern and says which are not yet in the file. `zsql
-  catalog add schema.table …` reads those tables by name and folds them
-  in. `-r` keeps its one meaning, the 0sql server, which is why the
-  warehouse flag is `--live`.
+- **Search.** `zsql catalog search <pattern>` looks in the file;
+  `--live` asks the warehouse, every non-system schema, for names
+  holding the pattern and says which are not yet in the file; `--json`
+  for a script. `-r` keeps its one meaning, the 0sql server, which is
+  why the warehouse flag is `--live`.
 - **`check`.** A table outside every scope and not added by name is
   unchecked, with the command that would read it; a catalog older than
   a week is said to be, with the sync that refreshes it. Syncing is the
@@ -715,6 +718,45 @@ read, and a sync re-reads exactly that.
 
 Proven on the SQLite fixture end to end; the schema scopes on the
 Postgres fixture.
+
+## The command line, reviewed
+
+On 2026-10-22 an independent review of the command line, from 112 real
+runs, found a first-time user refused at every turn: a fresh `init`
+would not load, `generate` wrote every table, sampling was turned on
+for names and e-mails, `-r` was ignored by the commands that could not
+take it, and the help listed commands in declaration order. All
+fourteen of its steps were taken the same day. What stands now:
+
+- `zsql --help` lists the commands in the order of the flow and ends
+  with a new project start to finish. Every argument has a sentence.
+- `generate` drafts only what is named: tables, `--schema`, or `--all`;
+  with nothing named and a terminal, a searchable picker that shows each
+  table's state against the models that exist and offers the warehouse
+  when the catalog has no match; without a terminal, a refusal naming
+  the three forms. A short string that looks like a person or a
+  credential, or that is a key, gets its sampling line commented out
+  with the reason.
+- `sample` prints its plan, dimension by dimension, and asks before
+  running; `--yes` for scripts; a budget of a hundred queries unless
+  said.
+- `-r`, `--branch`, `--server` and `--uid` exist only on the commands
+  that can ask a server; everything that connects to a warehouse
+  rejects them as unknown. A read against the server that cannot learn
+  the branch is told to name one, not to commit.
+- `-d` names the datasource everywhere; the line is positional on
+  `sql`, `explain`, `explore` and `run`, as it is in the repl and in
+  AGENTS.md.
+- `datasource list`, `add` and `test`; `catalog` bare, `read`, `sync`
+  and `search`; `deployments` and `undeploy` for what were `list` and
+  `remove`; `server health`; `completions`.
+- One rule for prompts: stdin and stderr are terminals, no `--no-input`,
+  no `CI`. Every prompt has a flag form, named in the refusal. A left
+  picker exits 130 and writes nothing.
+- A fresh project loads with no datasource; `--out` with an unknown
+  extension is refused; errors are JSON under `--format json`; a
+  `next:` line follows `init`, `datasource test`, `catalog read`,
+  `generate` and `check`.
 
 ## What strata and dwh do
 

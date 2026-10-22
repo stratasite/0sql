@@ -516,6 +516,11 @@ impl<'d> Builder<'d> {
             return Err(invalid(&file, "datasources.yml is required"));
         }
         let v = self.read(&file)?;
+        // A file of comments alone is YAML null: a project with no
+        // datasource yet, not a broken one.
+        if v.is_null() {
+            return Ok(());
+        }
         let m = as_map(&v).ok_or_else(|| invalid(&file, "datasources.yml must map each datasource key to its settings"))?;
         for (key, def) in m {
             let Some(uid) = key.as_str() else {

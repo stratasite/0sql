@@ -127,7 +127,7 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     assert!(ok && err.contains("removed"), "{err}");
     let (ok, _, err) = run(zsql(&home, &project).args(["results", "show", &id]));
     assert!(!ok && err.contains("no result"), "{err}");
-    let (ok, _, err) = run(zsql(&home, &project).args(["results", "purge"]));
+    let (ok, _, err) = run(zsql(&home, &project).args(["results", "purge", "--yes"]));
     assert!(ok && err.contains("purged"), "{err}");
     let (ok, out, _) = run(zsql(&home, &project).arg("results"));
     assert!(ok && out.contains("no results"), "{out}");
@@ -144,6 +144,7 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     // The repl runs the same way, with .run and .results, and .run! runs fresh.
     std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n").unwrap();
     let mut repl = zsql(&home, &project);
+    repl.arg("repl");
     repl.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = repl.spawn().unwrap();
     use std::io::Write as _;
@@ -160,5 +161,10 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
 
     // Remote is refused: the credentials are here.
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "-r", "--expr", "status, total"]));
-    assert!(!ok && err.contains("does not take -r"), "{err}");
+    assert!(!ok && err.contains("unexpected argument '-r'"), "no such flag on run: {err}");
+    // The line is positional; --expr is the same thing.
+    let (ok, out, _) = run(zsql(&home, &project).args(["run", "status,", "total", "--format", "csv"]));
+    assert!(ok && out.starts_with("Status,Total\n"), "{out}");
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--out", "x.parquet"]));
+    assert!(!ok && err.contains("say --format for this extension"), "{err}");
 }

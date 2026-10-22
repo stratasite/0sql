@@ -38,7 +38,7 @@ pub enum NewCommand {
     },
 }
 
-pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Result<()> {
+pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>, no_git: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
     if dir.join("project.yml").exists() {
@@ -76,7 +76,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
         )?;
         println!("update .gitignore");
     }
-    if !dir.join(".git").exists() {
+    if !no_git && !dir.join(".git").exists() {
         // Deploying reads the checked-out branch, so an uncommitted
         // project cannot be deployed. Say so here, where it is a step on
         // a list, rather than at the deploy that fails; and say when git
@@ -87,7 +87,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
             Err(_) => println!("git is not installed; a deploy needs the project in a git repository"),
         }
     }
-    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `zsql sql --expr ...`; then `git commit`, `zsql auth --api-key ...`, `zsql deploy`");
+    eprintln!("\nnext: zsql datasource add, or edit datasources.yml; then zsql catalog read --schema <name>, zsql generate, zsql check");
     Ok(())
 }
 
@@ -109,7 +109,14 @@ pub fn new_file(what: NewCommand) -> Result<()> {
         NewCommand::Test { name, project } => {
             let p = project_of(project)?;
             let file = zsql_project::parameterize(&name).replace('-', "_");
-            (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name))
+            // The model's own first dimension and measure, when it loads, so
+            // the test runs as written; placeholders otherwise.
+            let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
+                let s = m.universe().snapshot();
+                let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
+                (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))
+            });
+            (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name, fields))
         }
     };
     let path = project_dir.join(&rel);

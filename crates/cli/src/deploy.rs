@@ -5,7 +5,7 @@ use crate::{project, remote, show, Target, Where};
 use anyhow::{bail, Result};
 
 pub fn deploy(at: Where, dry_run: bool, watch: bool) -> Result<()> {
-    let t = at.target()?;
+    let t = at.target(true)?;
     let Some(p) = &t.project else { bail!("deploy needs a project directory") };
     let action = if dry_run { "validate" } else { "deploy" };
     let once = |t: &Target| -> Result<bool> {

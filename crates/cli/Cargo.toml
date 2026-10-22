@@ -40,6 +40,8 @@ tar = "0.4"
 ureq = { version = "3", features = ["json"] }
 rustyline = "15"
 libc = "0.2"
+inquire = "0.7"
+clap_complete = "4"
 
 [lints]
 workspace = true
