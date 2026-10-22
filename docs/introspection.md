@@ -598,7 +598,23 @@ what makes the remaining adapters cheap instead of frightening.
       | Redshift | Postgres transport, port 5439, `sslmode` as today | `password`; later IAM temporary credentials | `svv_table_info` for rows, `pg_description` for comments, `svv_columns` for widths |
       | Athena | SigV4 to `athena.<region>.amazonaws.com`: `StartQueryExecution`, `GetQueryExecution` poll, `GetQueryResults` pages (first row is the header; every cell is `VarCharValue`) | `access_key_id` + `secret_access_key` (+ `session_token`); the `AWS_*` variables; a profile in `~/.aws/credentials` | `information_schema` over Glue, `s3_output_location` and `workgroup` required |
 
-      Decisions the shape rests on, each of which is the user's:
+      Snowflake landed first, on the shape above and without an account:
+      the transport is proven against a fake of the statements endpoint
+      on a loopback socket — submit, 202 and poll, partitions, the cap
+      from the total before any partition is fetched, the server's own
+      message on a refusal — and the key-pair signer against the
+      fingerprint openssl prints for the same key, the token's claims and
+      signature checked with the public key. The catalogue reads
+      `INFORMATION_SCHEMA` with every alias quoted and the keys from two
+      `SHOW`s mapped into the shared shape. `Secrets` replaced the single
+      password: every field `.zsql` may hold, resolved once, and the
+      adapter names everything it is missing in one error. What a real
+      account will tell: whether `SHOW … IN DATABASE` needs the name
+      spelled, how a statement with no warehouse answers, and the
+      `numRows` of a `SHOW`.
+
+      Decisions the shape rests on, each of which is the user's; all five
+      were agreed on 2026-10-21:
       1. Redshift over the Postgres wire, not the Data API. It is what
          dwh does, it reuses a transport that is proven, and it leaves
          SigV4 to Athena alone.

@@ -199,8 +199,8 @@ fn sample_one(
     let open = |uid: &str, sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>| -> Result<()> {
         if !sources.contains_key(uid) {
             let conn = Connection::read(project_dir, uid).context("reading datasources.yml")?;
-            let secret = zsql_source::secret(Some(project_dir), &conn.uid, "password");
-            let src = zsql_source::open(&conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
+            let secrets = zsql_source::secrets(Some(project_dir), &conn.uid);
+            let src = zsql_source::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
             for w in src.warnings() {
                 eprintln!("warning: {w}");
             }

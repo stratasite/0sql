@@ -40,9 +40,10 @@ pub const DATASOURCES_YML: &str = "\
 # model holds the adapter, the tier and the name.\n\
 #\n\
 # Secrets never leave this machine. Passwords, tokens and keys go in\n\
-# .zsql under the same datasource key, or in ZSQL_DS_<KEY>_PASSWORD;\n\
-# `zsql deploy` strips them from what it sends, and .zsql is gitignored\n\
-# and never deployed.\n\
+# .zsql under the same datasource key, or in ZSQL_DS_<KEY>_<FIELD>:\n\
+# ZSQL_DS_WAREHOUSE_PASSWORD, ZSQL_DS_SNOW_PERSONAL_ACCESS_TOKEN,\n\
+# ZSQL_DS_SNOW_PRIVATE_KEY. `zsql deploy` strips them from what it sends,\n\
+# and .zsql is gitignored and never deployed.\n\
 #\n\
 # warehouse:\n\
 #   name: Warehouse\n\
@@ -56,6 +57,19 @@ pub const DATASOURCES_YML: &str = "\
 #   sslmode: verify-full          # disable | prefer | require | verify-ca | verify-full, libpq's meanings; verify-full unless said\n\
 #   ca_file: ./ca.pem             # a PEM of certificates to trust besides the platform's, for a private CA\n\
 #\n\
+# snow:\n\
+#   name: Snowflake\n\
+#   adapter: snowflake\n\
+#   tier: warm\n\
+#   account: myorg-myaccount      # the account identifier: <account>.snowflakecomputing.com\n\
+#   database: ANALYTICS           # as you would type it unquoted; \"Mixed Case\" in quotes to send it as written\n\
+#   warehouse: COMPUTE_WH         # optional; your user's default otherwise\n\
+#   schema: PUBLIC                # optional; introspect reads every schema without it\n\
+#   role: ANALYST                 # optional\n\
+#   # a personal access token goes in .zsql as personal_access_token; or a key pair:\n\
+#   username: zsql                # the user the key is registered to\n\
+#   private_key_file: ./rsa_key.p8   # PKCS#8 PEM, unencrypted; or the PEM itself in .zsql as private_key\n\
+\n\
 # local:\n\
 #   name: Local DuckDB\n\
 #   adapter: duckdb\n\

@@ -3231,7 +3231,9 @@ dependencies = [
 name = "zsql-source"
 version = "0.6.1"
 dependencies = [
+ "base64 0.22.1",
  "mysql_async",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-native-certs",

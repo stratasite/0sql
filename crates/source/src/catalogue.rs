@@ -98,7 +98,7 @@ impl Catalogue {
 
 // ---------------------------------------------------------------------- read
 
-use crate::{Result, Source, SourceError};
+use crate::{Result, Rows, Source, SourceError};
 
 /// Caps on a catalogue read. A warehouse with more tables or columns than
 /// this is refused rather than half-read, so a generated model is never
@@ -123,6 +123,7 @@ impl Catalogue {
             "mysql" => mysql(src, scope)?,
             "sqlserver" => sqlserver(src, scope)?,
             "trino" | "athena" => trino(src, scope)?,
+            "snowflake" => snowflake(src, scope)?,
             "sqlite" => sqlite(src)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
         };
@@ -182,6 +183,13 @@ fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result
 /// constraint name, each group's columns put in `position` order.
 fn keys(src: &mut dyn Source, tables: &mut [Table], keys_sql: &str) -> Result<()> {
     let k = src.query(keys_sql, MAX_COLUMNS)?;
+    apply_keys(tables, &k);
+    Ok(())
+}
+
+/// The key rows applied to the tables, for an adapter whose keys arrive
+/// in that shape from somewhere other than one statement.
+fn apply_keys(tables: &mut [Table], k: &Rows) {
     // (schema, table, kind, name) -> rows, keeping first-seen order.
     let mut groups: Vec<((Option<String>, String, String, Option<String>), Vec<&Vec<Option<String>>>)> = Vec::new();
     for r in &k.rows {
@@ -213,7 +221,6 @@ fn keys(src: &mut dyn Source, tables: &mut [Table], keys_sql: &str) -> Result<()
             table.primary_key = columns;
         }
     }
-    Ok(())
 }
 
 /// A schema predicate for a `WHERE`, over a column holding the schema
@@ -424,6 +431,77 @@ fn trino(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
         scope_clause("table_schema", scope)
     );
     assemble(src, &tables, &columns)
+}
+
+/// `INFORMATION_SCHEMA` of the session's database for the tables and
+/// columns, comments included; `SHOW PRIMARY KEYS` and `SHOW IMPORTED
+/// KEYS` for the constraints, since Snowflake's `INFORMATION_SCHEMA` has
+/// no `KEY_COLUMN_USAGE`. Every column is aliased in quotes because an
+/// unquoted alias comes back upper-cased, and the scope is folded the
+/// way Snowflake folds an unquoted name.
+fn snowflake(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let scope = scope.map(crate::snowflake::ident);
+    let tables = format!(
+        "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", \
+         CASE WHEN table_type LIKE '%VIEW' THEN 'view' ELSE 'table' END AS \"table_kind\", \
+         CAST(row_count AS VARCHAR) AS \"row_estimate\", comment AS \"table_comment\" \
+         FROM INFORMATION_SCHEMA.TABLES \
+         WHERE {} AND table_type IN ('BASE TABLE', 'VIEW', 'MATERIALIZED VIEW', 'EXTERNAL TABLE') ORDER BY 1, 2",
+        scope_clause("table_schema", scope.as_deref())
+    );
+    let columns = format!(
+        "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", column_name AS \"column_name\", \
+         data_type AS \"data_type\", is_nullable AS \"is_nullable\", \
+         CAST(character_maximum_length AS VARCHAR) AS \"max_length\", CAST(ordinal_position AS VARCHAR) AS \"position\", \
+         comment AS \"column_comment\" \
+         FROM INFORMATION_SCHEMA.COLUMNS WHERE {} ORDER BY 1, 2, ordinal_position",
+        scope_clause("table_schema", scope.as_deref())
+    );
+    let mut tables = assemble(src, &tables, &columns)?;
+    let within = match &scope {
+        Some(s) => format!("IN SCHEMA \"{}\"", s.replace('"', "\"\"")),
+        None => "IN DATABASE".to_string(),
+    };
+    let pk = src.query(&format!("SHOW PRIMARY KEYS {within}"), MAX_COLUMNS)?;
+    let fk = src.query(&format!("SHOW IMPORTED KEYS {within}"), MAX_COLUMNS)?;
+    let own = |s: &str| Some(s.to_string());
+    let mut k = Rows {
+        columns: ["table_schema", "table_name", "key_kind", "key_name", "column_name", "position", "ref_schema", "ref_table", "ref_column"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: vec![],
+    };
+    for r in &pk.rows {
+        let g = |c: &str| pk.get(r, c).map(str::to_string);
+        k.rows.push(vec![
+            g("schema_name"),
+            g("table_name"),
+            own("primary"),
+            g("constraint_name"),
+            g("column_name"),
+            g("key_sequence"),
+            None,
+            None,
+            None,
+        ]);
+    }
+    for r in &fk.rows {
+        let g = |c: &str| fk.get(r, c).map(str::to_string);
+        k.rows.push(vec![
+            g("fk_schema_name"),
+            g("fk_table_name"),
+            own("foreign"),
+            g("fk_name"),
+            g("fk_column_name"),
+            g("key_sequence"),
+            g("pk_schema_name"),
+            g("pk_table_name"),
+            g("pk_column_name"),
+        ]);
+    }
+    apply_keys(&mut tables, &k);
+    Ok(tables)
 }
 
 /// `sqlite_master` for the tables and `PRAGMA table_info` per table for

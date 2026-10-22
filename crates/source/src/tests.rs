@@ -56,9 +56,9 @@ fn a_connection_is_the_keys_the_model_reads_past() {
 
 #[test]
 fn an_unknown_adapter_is_named_rather_than_guessed() {
-    let conn = Connection { uid: "wh".into(), adapter: "snowflake".into(), ..Default::default() };
-    let err = open(&conn, None).err().unwrap().to_string();
-    assert!(err.contains("snowflake is not an adapter this build can reach"), "{err}");
+    let conn = Connection { uid: "wh".into(), adapter: "bigquery".into(), ..Default::default() };
+    let err = open(&conn, Secrets::default()).err().unwrap().to_string();
+    assert!(err.contains("bigquery is not an adapter this build can reach"), "{err}");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn sqlite_reads_its_file_and_cannot_write_it() {
             .unwrap();
     }
     let conn = Connection { uid: "local".into(), adapter: "sqlite".into(), file: Some(file.clone()), ..Default::default() };
-    let mut src = open(&conn, None).expect("opens");
+    let mut src = open(&conn, Secrets::default()).expect("opens");
     assert_eq!(src.adapter(), "sqlite");
 
     let rows = src.query("SELECT id, name, note FROM t ORDER BY id", 10).unwrap();
@@ -238,7 +238,7 @@ fn sqlite_reads_its_file_and_cannot_write_it() {
     // Refused by the guard, and if it ever were not, by the file.
     assert!(src.query("DELETE FROM t", 1).is_err());
     let missing = Connection { uid: "none".into(), adapter: "sqlite".into(), ..Default::default() };
-    let err = open(&missing, None).err().unwrap().to_string();
+    let err = open(&missing, Secrets::default()).err().unwrap().to_string();
     assert!(err.contains("has no file"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -260,7 +260,7 @@ fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
         ..Default::default()
     };
     let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
-    let mut src = open(&conn, secret).expect("opens");
+    let mut src = open(&conn, Secrets::password(secret)).expect("opens");
 
     let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three, 1.5 AS four", 10).expect("reads");
     assert_eq!(rows.columns, ["one", "two", "three", "four"]);
@@ -290,7 +290,7 @@ fn a_sqlite_catalogue_has_its_tables_views_and_columns_in_order() {
         .unwrap();
     }
     let conn = Connection { uid: "local".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
-    let mut src = open(&conn, None).unwrap();
+    let mut src = open(&conn, Secrets::default()).unwrap();
     let cat = Catalogue::read(src.as_mut(), "local", None).unwrap();
 
     assert_eq!(cat.datasource, "local");
@@ -329,7 +329,7 @@ fn a_real_postgres_catalogue_reads_pg_catalog() {
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
-    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
     let cat = Catalogue::read(src.as_mut(), "test", Some("pg_catalog")).expect("reads");
 
     let class = cat.table(Some("pg_catalog"), "pg_class").expect("pg_class is in every server");
@@ -359,7 +359,7 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
         ..Default::default()
     };
     let secret = std::env::var("ZSQL_TEST_CLICKHOUSE_PASSWORD").ok().map(Secret);
-    let mut src = open(&conn, secret).expect("opens");
+    let mut src = open(&conn, Secrets::password(secret)).expect("opens");
     // The playground has `blogs`; a container has `default`, empty but
     // real. Either way the read works and the scope holds.
     let scope = std::env::var("ZSQL_TEST_CLICKHOUSE_DB").unwrap_or_else(|_| "blogs".into());
@@ -399,7 +399,7 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_MYSQL_PASSWORD").expect("ZSQL_TEST_MYSQL_PASSWORD");
-    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
     let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three, 1.5 AS four", 10).expect("reads");
     assert_eq!(rows.columns, ["one", "two", "three", "four"]);
     assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
@@ -412,9 +412,9 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
     // exactly what `require` accepts and `verify-full` refuses.
     let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
     let pw = || Some(Secret(std::env::var("ZSQL_TEST_MYSQL_PASSWORD").unwrap()));
-    assert!(open(&tls(SslMode::Require), pw()).is_ok(), "require accepts a certificate signed by nobody");
-    assert!(open(&tls(SslMode::VerifyFull), pw()).is_err(), "verify-full refuses a self-signed certificate");
-    let p = open(&tls(SslMode::Prefer), pw()).expect("prefer connects");
+    assert!(open(&tls(SslMode::Require), Secrets::password(pw())).is_ok(), "require accepts a certificate signed by nobody");
+    assert!(open(&tls(SslMode::VerifyFull), Secrets::password(pw())).is_err(), "verify-full refuses a self-signed certificate");
+    let p = open(&tls(SslMode::Prefer), Secrets::password(pw())).expect("prefer connects");
     assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
     // The catalogue of mysql's own schema: always there, never written to.
     let cat = Catalogue::read(src.as_mut(), "my", Some("mysql")).expect("reads");
@@ -458,7 +458,7 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_MSSQL_PASSWORD").expect("ZSQL_TEST_MSSQL_PASSWORD");
-    let mut src = open(&conn, Some(Secret(password))).expect("connects");
+    let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
     let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three", 10).expect("reads");
     assert_eq!(rows.columns, ["one", "two", "three"]);
     assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
@@ -471,9 +471,9 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
     // SQL Server also makes itself a self-signed certificate.
     let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
     let pw = || Some(Secret(std::env::var("ZSQL_TEST_MSSQL_PASSWORD").unwrap()));
-    assert!(open(&tls(SslMode::Require), pw()).is_ok(), "require accepts a certificate signed by nobody");
-    assert!(open(&tls(SslMode::VerifyFull), pw()).is_err(), "verify-full refuses a self-signed certificate");
-    let p = open(&tls(SslMode::Prefer), pw()).expect("prefer connects");
+    assert!(open(&tls(SslMode::Require), Secrets::password(pw())).is_ok(), "require accepts a certificate signed by nobody");
+    assert!(open(&tls(SslMode::VerifyFull), Secrets::password(pw())).is_err(), "verify-full refuses a self-signed certificate");
+    let p = open(&tls(SslMode::Prefer), Secrets::password(pw())).expect("prefer connects");
     assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
     // sys.objects lists user objects, so the catalogue views themselves
     // are not in it, which is right for a model. master.dbo always holds
@@ -501,7 +501,7 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
         sslmode: SslMode::Disable,
         ..Default::default()
     };
-    let mut src = open(&conn, None).expect("opens");
+    let mut src = open(&conn, Secrets::default()).expect("opens");
     let rows = src.query("SELECT 1 AS one, 'two' AS two, NULL AS three", 10).expect("reads");
     assert_eq!(rows.columns, ["one", "two", "three"]);
     assert_eq!(rows.get(&rows.rows[0], "one"), Some("1"));
@@ -589,14 +589,14 @@ fn a_plain_url_is_refused_when_the_mode_insists_and_noted_when_it_prefers() {
         ..Default::default()
     };
     // verify-full, the default, refuses http outright.
-    let err = open(&conn(SslMode::VerifyFull, "http://ch.internal:8123"), None).err().unwrap().to_string();
+    let err = open(&conn(SslMode::VerifyFull, "http://ch.internal:8123"), Secrets::default()).err().unwrap().to_string();
     assert!(err.contains("requires TLS") && err.contains("plain http"), "{err}");
-    let err = open(&conn(SslMode::Require, "HTTP://ch.internal:8123"), None).err().unwrap().to_string();
+    let err = open(&conn(SslMode::Require, "HTTP://ch.internal:8123"), Secrets::default()).err().unwrap().to_string();
     assert!(err.contains("sslmode: disable"), "it says the way out: {err}");
     // disable allows it and says nothing; prefer allows it and says so.
     // (Neither reaches a server: ClickHouse's open probes, so they fail
     // on connect, which is past the rule being tested.)
-    let e = open(&conn(SslMode::Disable, "http://127.0.0.1:1"), None).err().unwrap().to_string();
+    let e = open(&conn(SslMode::Disable, "http://127.0.0.1:1"), Secrets::default()).err().unwrap().to_string();
     assert!(!e.contains("requires TLS"), "{e}");
     // A host with no url builds https under an insisting mode and http otherwise.
     let built = |mode: SslMode| {
@@ -662,17 +662,401 @@ fn a_real_postgres_with_tls_proves_every_rung() {
         r.rows[0][0].clone()
     };
 
-    let mut s = open(&with(SslMode::Disable, None), secret()).expect("disable connects");
+    let mut s = open(&with(SslMode::Disable, None), Secrets::password(secret())).expect("disable connects");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("f"));
-    let mut s = open(&with(SslMode::Prefer, None), secret()).expect("prefer connects");
+    let mut s = open(&with(SslMode::Prefer, None), Secrets::password(secret())).expect("prefer connects");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"), "the server offers TLS, so prefer takes it");
     assert!(s.warnings().is_empty(), "nothing to warn about: {:?}", s.warnings());
-    let mut s = open(&with(SslMode::Require, None), secret()).expect("require accepts a certificate signed by nobody");
+    let mut s = open(&with(SslMode::Require, None), Secrets::password(secret())).expect("require accepts a certificate signed by nobody");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
-    let err = open(&with(SslMode::VerifyFull, None), secret()).err().expect("verify-full refuses a self-signed certificate").to_string();
+    let err = open(&with(SslMode::VerifyFull, None), Secrets::password(secret()))
+        .err()
+        .expect("verify-full refuses a self-signed certificate")
+        .to_string();
     assert!(err.contains("certificate") || err.contains("Certificate") || err.contains("tls") || err.contains("TLS"), "{err}");
-    let mut s = open(&with(SslMode::VerifyFull, Some(ca.clone())), secret()).expect("verify-full with the private CA trusted");
+    let mut s =
+        open(&with(SslMode::VerifyFull, Some(ca.clone())), Secrets::password(secret())).expect("verify-full with the private CA trusted");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
-    let mut s = open(&with(SslMode::VerifyCa, Some(ca)), secret()).expect("verify-ca with the private CA trusted");
+    let mut s = open(&with(SslMode::VerifyCa, Some(ca)), Secrets::password(secret())).expect("verify-ca with the private CA trusted");
     assert_eq!(ssl_of(&mut s).as_deref(), Some("t"));
+}
+
+// ---------------------------------------------------------------- snowflake
+
+/// A warehouse of one thread on a loopback port: every request is
+/// answered by `reply` from its method, path and body, and recorded with
+/// its headers for the test to read back. Responses close the socket so
+/// the agent reconnects each time and nothing is left half-read.
+struct Fake {
+    url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>,
+}
+
+fn fake(reply: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> Fake {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let split = loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if buf.len() >= i + 4 + len {
+                        break Some(i);
+                    }
+                }
+            };
+            let Some(i) = split else { continue };
+            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+            let body = String::from_utf8_lossy(&buf[i + 4..]).to_string();
+            let mut first = head.lines().next().unwrap_or_default().split(' ');
+            let method = first.next().unwrap_or_default().to_string();
+            let path = first.next().unwrap_or_default().to_string();
+            let (status, out) = reply(&method, &path, &body);
+            record.lock().unwrap().push((method, path, head, body));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                out.len()
+            );
+        }
+    });
+    Fake { url, seen }
+}
+
+/// A finished statement as the SQL API shapes it.
+fn sf_result(handle: &str, columns: &[&str], data: serde_json::Value, num_rows: usize, partitions: usize) -> String {
+    serde_json::json!({
+        "resultSetMetaData": {
+            "numRows": num_rows,
+            "format": "jsonv2",
+            "rowType": columns.iter().map(|c| serde_json::json!({"name": c, "type": "text"})).collect::<Vec<_>>(),
+            "partitionInfo": (0..partitions).map(|_| serde_json::json!({"rowCount": 1})).collect::<Vec<_>>(),
+        },
+        "data": data,
+        "code": "090001",
+        "statementHandle": handle,
+        "message": "Statement executed successfully.",
+    })
+    .to_string()
+}
+
+fn sf_key() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness/sources/snowflake/rsa_key.p8")
+}
+
+#[test]
+fn snowflake_submits_polls_pages_and_caps_with_a_token() {
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polled = polls.clone();
+    let server = fake(move |method, path, body| match (method, path) {
+        ("POST", "/api/v2/statements") if body.contains("slow") => {
+            (202, r#"{"code":"333334","statementHandle":"h1","message":"Asynchronous execution in progress."}"#.into())
+        }
+        ("POST", "/api/v2/statements") if body.contains("broken") => {
+            (422, r#"{"code":"002003","message":"SQL compilation error: Object 'NOPE' does not exist","sqlState":"42S02"}"#.into())
+        }
+        ("POST", "/api/v2/statements") => (200, sf_result("h0", &["STATUS", "N"], serde_json::json!([["paid", "3"], [null, "1"]]), 3, 2)),
+        ("GET", "/api/v2/statements/h0?partition=1") => (200, serde_json::json!({"data": [["open", "1"]]}).to_string()),
+        ("GET", "/api/v2/statements/h1") => {
+            if polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (202, r#"{"code":"333334","statementHandle":"h1","message":"still running"}"#.into())
+            } else {
+                (200, sf_result("h1", &["ONE"], serde_json::json!([["1"]]), 1, 1))
+            }
+        }
+        _ => (404, format!("{{\"message\":\"no route {method} {path}\"}}")),
+    });
+    let conn = Connection {
+        uid: "snow".into(),
+        adapter: "snowflake".into(),
+        url: Some(server.url.clone()),
+        database: Some("analytics".into()),
+        schema: Some("\"Public\"".into()),
+        warehouse: Some("compute_wh".into()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(5),
+        ..Default::default()
+    };
+    let secrets = Secrets { personal_access_token: Some(Secret("tok".into())), ..Default::default() };
+    let mut src = open(&conn, secrets).expect("opens");
+    assert_eq!(src.adapter(), "snowflake");
+
+    // The guard refuses before any request.
+    assert!(src.query("DROP TABLE orders", 10).is_err());
+    assert!(server.seen.lock().unwrap().is_empty());
+
+    // Rows across two partitions, every cell text or null.
+    let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    assert_eq!(rows.columns, ["STATUS", "N"]);
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.get(&rows.rows[0], "STATUS"), Some("paid"));
+    assert_eq!(rows.get(&rows.rows[1], "STATUS"), None);
+    assert_eq!(rows.get(&rows.rows[2], "STATUS"), Some("open"));
+    {
+        let seen = server.seen.lock().unwrap();
+        let (method, path, head, body) = &seen[0];
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/api/v2/statements"));
+        assert!(head.contains("Authorization: Bearer tok") || head.contains("authorization: Bearer tok"), "{head}");
+        assert!(head.to_lowercase().contains("x-snowflake-authorization-token-type: programmatic_access_token"), "{head}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["statement"], "SELECT status, count(*) AS n FROM orders GROUP BY 1");
+        assert_eq!(body["database"], "ANALYTICS", "folded as Snowflake folds an unquoted name");
+        assert_eq!(body["schema"], "Public", "a quoted name is sent as written");
+        assert_eq!(body["warehouse"], "COMPUTE_WH");
+        assert!(body.get("role").is_none(), "an absent context key is not sent as null");
+        assert_eq!(body["timeout"], 5);
+        assert_eq!(body["parameters"]["DATE_OUTPUT_FORMAT"], "YYYY-MM-DD");
+        assert_eq!(seen[1].1, "/api/v2/statements/h0?partition=1");
+    }
+
+    // Over the cap: refused from the total, before the second partition.
+    let before = server.seen.lock().unwrap().len();
+    let err = src.query("SELECT status FROM orders", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    assert_eq!(server.seen.lock().unwrap().len(), before + 1, "one request, no partition fetched");
+
+    // A statement still running is polled until it is done.
+    let rows = src.query("SELECT 1 AS one FROM slow", 10).expect("polls");
+    assert_eq!(rows.get(&rows.rows[0], "ONE"), Some("1"));
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // A refusal carries the server's message.
+    let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
+    assert!(err.contains("422") && err.contains("Object 'NOPE' does not exist"), "{err}");
+}
+
+#[test]
+fn snowflake_key_pair_signs_a_token_the_account_can_check() {
+    // The fingerprint is what openssl prints for the same key; see the README beside it.
+    let pem = std::fs::read(sf_key()).unwrap();
+    let signer = jwt::Signer::from_pem("snow", &pem).expect("pkcs8");
+    assert_eq!(signer.public_key_fingerprint(), "W/K39Ak+DVbIXnQSGsa+qi9HMOPiwrK3vLEAYTyLuF0=");
+    let pkcs1 = std::fs::read(sf_key().with_file_name("rsa_key.pkcs1.pem")).unwrap();
+    assert_eq!(jwt::Signer::from_pem("snow", &pkcs1).expect("pkcs1").public_key_fingerprint(), signer.public_key_fingerprint());
+    let encrypted = std::fs::read(sf_key().with_file_name("rsa_key.encrypted.p8")).unwrap();
+    let err = jwt::Signer::from_pem("snow", &encrypted).err().unwrap().to_string();
+    assert!(err.contains("encrypted") && err.contains("-nocrypt"), "{err}");
+
+    let server = fake(|_, _, _| (200, sf_result("h", &["ONE"], serde_json::json!([["1"]]), 1, 1)));
+    let conn = Connection {
+        uid: "snow".into(),
+        adapter: "snowflake".into(),
+        url: Some(server.url.clone()),
+        account: Some("xy12345.us-east-2.aws".into()),
+        database: Some("ANALYTICS".into()),
+        username: Some("analyst".into()),
+        private_key_file: Some(sf_key()),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let mut src = open(&conn, Secrets::default()).expect("a key file in datasources.yml is enough");
+    src.query("SELECT 1 AS one", 1).expect("signed");
+    let seen = server.seen.lock().unwrap();
+    let head = &seen[0].2;
+    assert!(head.to_lowercase().contains("x-snowflake-authorization-token-type: keypair_jwt"), "{head}");
+    let token =
+        head.lines().find_map(|l| l.strip_prefix("Authorization: Bearer ").or_else(|| l.strip_prefix("authorization: Bearer "))).unwrap();
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3);
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header: serde_json::Value = serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+    assert_eq!(header["alg"], "RS256");
+    let claims: serde_json::Value = serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+    assert_eq!(
+        claims["iss"], "XY12345.ANALYST.SHA256:W/K39Ak+DVbIXnQSGsa+qi9HMOPiwrK3vLEAYTyLuF0=",
+        "region and cloud stripped, upper-cased"
+    );
+    assert_eq!(claims["sub"], "XY12345.ANALYST");
+    assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 3600);
+    let public = ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signer.public_key_pkcs1());
+    public
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &b64.decode(parts[2]).unwrap())
+        .expect("the signature checks against the public key");
+    drop(seen);
+
+    // The PEM itself in .zsql works too, and so does a path there.
+    let text = String::from_utf8(pem).unwrap();
+    let secrets = Secrets { private_key: Some(Secret(text)), ..Default::default() };
+    assert!(open(&Connection { private_key_file: None, ..conn.clone() }, secrets).is_ok());
+    let secrets = Secrets { private_key: Some(Secret(sf_key().display().to_string())), ..Default::default() };
+    assert!(open(&Connection { private_key_file: None, ..conn.clone() }, secrets).is_ok());
+
+    // Everything missing is named at once.
+    let bare = Connection { uid: "snow".into(), adapter: "snowflake".into(), ..Default::default() };
+    let err = open(&bare, Secrets::default()).err().unwrap().to_string();
+    for want in [
+        "account",
+        "database",
+        "personal_access_token",
+        "ZSQL_DS_SNOW_PERSONAL_ACCESS_TOKEN",
+        "private_key_file",
+        "ZSQL_DS_SNOW_PRIVATE_KEY",
+    ] {
+        assert!(err.contains(want), "{want} named: {err}");
+    }
+    let err = open(&Connection { username: None, ..conn.clone() }, Secrets::default()).err().unwrap().to_string();
+    assert!(err.contains("username"), "{err}");
+}
+
+#[test]
+fn a_snowflake_catalogue_reads_information_schema_and_show_keys() {
+    let server = fake(|_, _, body| {
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        let sql = body["statement"].as_str().unwrap_or_default();
+        if sql.contains("INFORMATION_SCHEMA.TABLES") {
+            assert!(
+                sql.contains("table_schema = 'PUBLIC'") || (sql.contains("table_schema NOT IN (") && sql.contains("'INFORMATION_SCHEMA'")),
+                "{sql}"
+            );
+            (
+                200,
+                sf_result(
+                    "t",
+                    &["table_schema", "table_name", "table_kind", "row_estimate", "table_comment"],
+                    serde_json::json!([
+                        ["PUBLIC", "CUSTOMERS", "table", "20", "Who buys"],
+                        ["PUBLIC", "ORDERS", "table", "100", null],
+                        ["PUBLIC", "V_ORDERS", "view", null, null]
+                    ]),
+                    3,
+                    1,
+                ),
+            )
+        } else if sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+            (
+                200,
+                sf_result(
+                    "c",
+                    &["table_schema", "table_name", "column_name", "data_type", "is_nullable", "max_length", "position", "column_comment"],
+                    serde_json::json!([
+                        ["PUBLIC", "CUSTOMERS", "ID", "NUMBER", "NO", null, "1", null],
+                        ["PUBLIC", "CUSTOMERS", "NAME", "TEXT", "YES", "255", "2", "Full name"],
+                        ["PUBLIC", "ORDERS", "ID", "NUMBER", "NO", null, "1", null],
+                        ["PUBLIC", "ORDERS", "CUSTOMER_ID", "NUMBER", "YES", null, "2", null],
+                        ["PUBLIC", "V_ORDERS", "ID", "NUMBER", "YES", null, "1", null]
+                    ]),
+                    5,
+                    1,
+                ),
+            )
+        } else if sql == "SHOW PRIMARY KEYS IN DATABASE" || sql == "SHOW PRIMARY KEYS IN SCHEMA \"PUBLIC\"" {
+            (
+                200,
+                sf_result(
+                    "p",
+                    &["created_on", "database_name", "schema_name", "table_name", "column_name", "key_sequence", "constraint_name"],
+                    serde_json::json!([
+                        ["x", "ANALYTICS", "PUBLIC", "ORDERS", "ID", "1", "ORDERS_PK"],
+                        ["x", "ANALYTICS", "PUBLIC", "CUSTOMERS", "ID", "1", "CUSTOMERS_PK"]
+                    ]),
+                    2,
+                    1,
+                ),
+            )
+        } else if sql == "SHOW IMPORTED KEYS IN DATABASE" || sql == "SHOW IMPORTED KEYS IN SCHEMA \"PUBLIC\"" {
+            (
+                200,
+                sf_result(
+                    "f",
+                    &[
+                        "pk_schema_name",
+                        "pk_table_name",
+                        "pk_column_name",
+                        "fk_schema_name",
+                        "fk_table_name",
+                        "fk_column_name",
+                        "key_sequence",
+                        "fk_name",
+                    ],
+                    serde_json::json!([["PUBLIC", "CUSTOMERS", "ID", "PUBLIC", "ORDERS", "CUSTOMER_ID", "1", "ORDERS_CUSTOMER_FK"]]),
+                    1,
+                    1,
+                ),
+            )
+        } else {
+            (422, format!("{{\"message\":\"unexpected statement: {sql}\"}}"))
+        }
+    });
+    let conn = Connection {
+        uid: "snow".into(),
+        adapter: "snowflake".into(),
+        url: Some(server.url.clone()),
+        database: Some("analytics".into()),
+        sslmode: SslMode::Disable,
+        ..Default::default()
+    };
+    let secrets = Secrets { personal_access_token: Some(Secret("tok".into())), ..Default::default() };
+    let mut src = open(&conn, secrets).unwrap();
+    let cat = Catalogue::read(&mut *src, "snow", None).expect("reads");
+    assert_eq!(cat.adapter, "snowflake");
+    let names: Vec<(String, String)> = cat.tables.iter().map(|t| (t.name.clone(), t.kind.clone())).collect();
+    assert_eq!(
+        names,
+        [("CUSTOMERS".to_string(), "table".to_string()), ("ORDERS".into(), "table".into()), ("V_ORDERS".into(), "view".into())]
+    );
+    let customers = cat.table(Some("PUBLIC"), "CUSTOMERS").unwrap();
+    assert_eq!(customers.rows, Some(20));
+    assert_eq!(customers.comment.as_deref(), Some("Who buys"));
+    assert_eq!(customers.columns[1].max_length, Some(255));
+    assert_eq!(customers.columns[1].comment.as_deref(), Some("Full name"));
+    assert_eq!(customers.primary_key, ["ID"]);
+    let orders = cat.table(Some("PUBLIC"), "ORDERS").unwrap();
+    assert_eq!(orders.primary_key, ["ID"]);
+    assert_eq!(
+        orders.foreign_keys,
+        [ForeignKey {
+            name: Some("ORDERS_CUSTOMER_FK".into()),
+            columns: vec!["CUSTOMER_ID".into()],
+            references_schema: Some("PUBLIC".into()),
+            references_table: "CUSTOMERS".into(),
+            references_columns: vec!["ID".into()],
+        }]
+    );
+
+    // Scoped to a schema, the SHOWs name it and the scope is folded.
+    let seen_before = server.seen.lock().unwrap().len();
+    let scoped = Catalogue::read(&mut *src, "snow", Some("public")).expect("reads one schema");
+    assert_eq!(scoped.tables.len(), 3);
+    let seen = server.seen.lock().unwrap();
+    let statements: Vec<String> = seen[seen_before..]
+        .iter()
+        .map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).unwrap()["statement"].as_str().unwrap().to_string())
+        .collect();
+    assert!(statements[0].contains("table_schema = 'PUBLIC'"), "{}", statements[0]);
+    assert_eq!(statements[2], "SHOW PRIMARY KEYS IN SCHEMA \"PUBLIC\"");
+    assert_eq!(statements[3], "SHOW IMPORTED KEYS IN SCHEMA \"PUBLIC\"");
+}
+
+#[test]
+fn a_connection_reads_snowflakes_keys() {
+    let dir = temp("snowflake-keys");
+    std::fs::write(
+        dir.join("datasources.yml"),
+        "snow:\n  adapter: snowflake\n  account_identifier: myorg-myaccount\n  warehouse: COMPUTE_WH\n  role: analyst\n  private_key_path: ./rsa_key.p8\n  database: ANALYTICS\n",
+    )
+    .unwrap();
+    let c = Connection::read(&dir, "snow").unwrap();
+    assert_eq!(c.account.as_deref(), Some("myorg-myaccount"));
+    assert_eq!(c.warehouse.as_deref(), Some("COMPUTE_WH"));
+    assert_eq!(c.role.as_deref(), Some("analyst"));
+    assert_eq!(c.private_key_file.as_deref(), Some(Path::new("./rsa_key.p8")));
+    assert_eq!(SECRET_FIELDS, ["password", "personal_access_token", "private_key"]);
+    let s = secrets(Some(&dir), "snow");
+    assert_eq!(s, Secrets::default());
 }

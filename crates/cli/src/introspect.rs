@@ -38,8 +38,8 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
 
     for conn in chosen {
         let t0 = Instant::now();
-        let secret = zsql_source::secret(Some(&project.dir), &conn.uid, "password");
-        let mut src = zsql_source::open(conn, secret).with_context(|| format!("opening datasource {}", conn.uid))?;
+        let secrets = zsql_source::secrets(Some(&project.dir), &conn.uid);
+        let mut src = zsql_source::open(conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
         for w in src.warnings() {
             eprintln!("warning: {w}");
         }

@@ -21,8 +21,10 @@ use std::path::{Path, PathBuf};
 pub mod catalogue;
 pub mod clickhouse;
 mod http;
+pub mod jwt;
 pub mod mysql;
 pub mod postgres;
+pub mod snowflake;
 pub mod sqlite;
 pub mod sqlserver;
 pub mod tls;
@@ -58,6 +60,10 @@ pub enum SourceError {
     PlainUrl(String, &'static str),
     #[error("reading ca_file {0}: {1}")]
     CaFile(String, String),
+    #[error("datasource {0} is missing: {1}")]
+    NoCredentials(String, String),
+    #[error("{0}: private key: {1}")]
+    PrivateKey(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, SourceError>;
@@ -169,6 +175,17 @@ pub struct Connection {
     /// A PEM file of certificates to trust in addition to the platform's:
     /// libpq's `sslrootcert`, MySQL's `--ssl-ca`. For a private CA.
     pub ca_file: Option<PathBuf>,
+    /// Snowflake's account identifier: the host is
+    /// `<account>.snowflakecomputing.com`, and a key pair signs for it.
+    pub account: Option<String>,
+    /// Snowflake's compute to run on; optional, the user's default otherwise.
+    pub warehouse: Option<String>,
+    /// Snowflake's role to assume; optional.
+    pub role: Option<String>,
+    /// A PEM file holding the private key of a key pair. A path is not a
+    /// secret, so it may live in `datasources.yml`; the key itself may
+    /// instead be in `.zsql` as `private_key`.
+    pub private_key_file: Option<PathBuf>,
 }
 
 impl Connection {
@@ -199,6 +216,10 @@ impl Connection {
                     None => SslMode::default(),
                 },
                 ca_file: s("ca_file").or_else(|| s("sslrootcert")).or_else(|| s("ssl_ca")).map(PathBuf::from),
+                account: s("account").or_else(|| s("account_identifier")),
+                warehouse: s("warehouse"),
+                role: s("role"),
+                private_key_file: s("private_key_file").or_else(|| s("private_key_path")).map(PathBuf::from),
             });
         }
         Ok(out)
@@ -295,6 +316,40 @@ pub fn secret(project_dir: Option<&Path>, uid: &str, field: &str) -> Option<Secr
         }
     }
     None
+}
+
+/// Every secret a transport might ask for, resolved once. An adapter takes
+/// the ones it understands and names the rest in one error when none of
+/// them is there.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Secrets {
+    /// What every password-taking adapter reads.
+    pub password: Option<Secret>,
+    /// Snowflake's personal access token; Databricks' token later.
+    pub personal_access_token: Option<Secret>,
+    /// The PEM of a key pair's private key, or a path to it.
+    pub private_key: Option<Secret>,
+}
+
+/// The field names [`secrets`] resolves, as `.zsql` and the environment
+/// spell them.
+pub const SECRET_FIELDS: [&str; 3] = ["password", "personal_access_token", "private_key"];
+
+impl Secrets {
+    /// Just a password, which is what most adapters are given.
+    pub fn password(password: Option<Secret>) -> Secrets {
+        Secrets { password, ..Default::default() }
+    }
+}
+
+/// Every field of [`SECRET_FIELDS`] for one datasource, each resolved as
+/// [`secret`] resolves it.
+pub fn secrets(project_dir: Option<&Path>, uid: &str) -> Secrets {
+    Secrets {
+        password: secret(project_dir, uid, "password"),
+        personal_access_token: secret(project_dir, uid, "personal_access_token"),
+        private_key: secret(project_dir, uid, "private_key"),
+    }
 }
 
 // ---------------------------------------------------------------------- rows
@@ -412,14 +467,17 @@ fn skeleton(sql: &str) -> String {
     out
 }
 
-/// Opens the adapter this connection names.
-pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Box<dyn Source>> {
+/// Opens the adapter this connection names, with whichever of the
+/// secrets it takes.
+pub fn open(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> {
+    let secret = secrets.password.clone();
     match conn.adapter.as_str() {
         "postgres" | "redshift" => Ok(Box::new(postgres::Postgres::open(conn, secret)?)),
         "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
         "mysql" => Ok(Box::new(mysql::MySql::open(conn, secret)?)),
         "trino" | "athena" => Ok(Box::new(trino::Trino::open(conn, secret)?)),
         "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret)?)),
+        "snowflake" => Ok(Box::new(snowflake::Snowflake::open(conn, secrets)?)),
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),
     }
