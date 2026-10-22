@@ -512,7 +512,8 @@ the fakes in `crates/source/src/tests.rs`.
    twenty-four-hour TTL with `cache_ttl` per datasource, `--fresh`, the
    cap pushed one past into the statement, the four formats, `--out`,
    and `zsql results` list, show, export, sql, rm and purge, proven on
-   the SQLite fixture end to end. Lineage records the line's items, the
+   the SQLite fixture end to end. The repl has the same as `.run <line>`
+   (`.run!` bypasses the cache) and `.results`, on the local side only. Lineage records the line's items, the
    fields the columns resolved to and the tables the statement names.*
    The crate with `Store`, `Manifest`,
    JSONL rows, `Engine::run` over `Source::query` under the default cap,

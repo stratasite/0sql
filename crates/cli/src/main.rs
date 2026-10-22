@@ -410,8 +410,10 @@ fn run(command: Command, at: Where) -> Result<()> {
             }
             let (mode, q, context) = query.resolve(at)?;
             let Mode::Local(local) = mode else { bail!("zsql run runs here, with the credentials on this machine; it does not take -r") };
+            let model = local.model()?;
             run::run(
-                &local,
+                &local.project,
+                &model,
                 &q,
                 context.as_ref(),
                 run::Options { limit, all, fresh, timeout, format: format.as_deref(), out: out.as_deref(), head, quiet },

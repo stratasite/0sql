@@ -108,6 +108,32 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
                     side.borrow_mut().reload()?;
                     field_names = reread(&mut editor, &side)?;
                 }
+                "run" | "run!" => {
+                    // The line as a query, run and kept; `.run!` runs it fresh.
+                    if rest.is_empty() {
+                        println!("usage: .run <line or {{...spec...}}>   (.run! to bypass the cache)");
+                        return Ok(());
+                    }
+                    let query = if rest.starts_with('{') {
+                        match serde_json::from_str(rest) {
+                            Ok(v) => Query::Spec(v),
+                            Err(e) => {
+                                println!("error: {e}");
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        Query::Expr(rest.to_string())
+                    };
+                    if let Err(e) = side.borrow_mut().run(&query, context.as_ref(), cmd == "run!") {
+                        println!("error: {e}");
+                    }
+                }
+                "results" => {
+                    if let Err(e) = side.borrow_mut().results() {
+                        println!("error: {e}");
+                    }
+                }
                 "spec" => match zsql_service::spec_of(None, Some(rest), &zsql_service::unlimited).map_err(Refusal::from) {
                     Ok((spec, _, items)) => {
                         for d in items {

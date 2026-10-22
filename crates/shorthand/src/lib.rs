@@ -94,7 +94,8 @@ Fields are names or uids, matched without regard to case; add @d or @m when a na
 pub const REPL_COMMANDS: &str = "\
 Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explore <line> [? term] (what the query can add),
 .fields [text], .tables, .values <dim>,
-.json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
+.json {...spec...}, .spec <line> (the spec a line makes), .run <line> (run it here and keep the rows; .run! runs fresh),
+.results (what .run kept), .branch [name], .help, .quit";
 
 /// The repl's `.help`: the forms, then its dot commands.
 pub fn help() -> String {

@@ -4,7 +4,7 @@
 //! `docs/run.md`.
 
 use crate::config::{self, Project};
-use crate::local::{self, Local};
+use crate::local;
 use crate::side::Query;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zsql_exec::{CacheStatus, Connector, Engine, Limit, Manifest, RunRequest, Store};
-use zsql_service::SqlRequest;
+use zsql_service::{Model, SqlRequest};
 use zsql_source::{Connection, Source};
 
 /// Where a project's results live: `ZSQL_RESULTS_DIR`, else
@@ -89,6 +89,13 @@ impl Format {
     }
 }
 
+impl Default for Options<'_> {
+    /// What the repl runs with: the cap, the cache, a table, fifty rows.
+    fn default() -> Self {
+        Options { limit: None, all: false, fresh: false, timeout: None, format: None, out: None, head: Some(50), quiet: false }
+    }
+}
+
 pub struct Options<'a> {
     pub limit: Option<u64>,
     pub all: bool,
@@ -100,16 +107,14 @@ pub struct Options<'a> {
     pub quiet: bool,
 }
 
-pub fn run(local: &Local, query: &Query, context: Option<&Value>, opts: Options<'_>) -> Result<()> {
-    let model = local.model()?;
-    let project = &local.project;
+pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Value>, opts: Options<'_>) -> Result<()> {
     let req = SqlRequest { spec: query.spec().cloned(), expr: query.expr().map(str::to_string), context: local::context_of(context)? };
     let cap = std::env::var("ZSQL_RUN_CAP").ok().and_then(|c| c.parse().ok()).unwrap_or(zsql_exec::DEFAULT_CAP);
     let limit = if opts.all { Limit::All } else { Limit::Rows(opts.limit.unwrap_or(cap)) };
     let root = results_root(project);
     let engine = Engine::open(root.as_deref())?;
     let connector = Local_ { dir: project.dir.clone(), timeout: opts.timeout };
-    let outcome = engine.run(&model, &connector, RunRequest { query: req, limit, fresh: opts.fresh, store: root.is_some() })?;
+    let outcome = engine.run(model, &connector, RunRequest { query: req, limit, fresh: opts.fresh, store: root.is_some() })?;
 
     let format = match (opts.format, opts.out) {
         (Some(f), _) => Format::parse(f)?,

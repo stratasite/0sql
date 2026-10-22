@@ -141,6 +141,23 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total"]));
     assert!(ok && !err.contains("cached"), "a zero TTL is never a hit: {err}");
 
+    // The repl runs the same way, with .run and .results, and .run! runs fresh.
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n").unwrap();
+    let mut repl = zsql(&home, &project);
+    repl.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = repl.spawn().unwrap();
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(b".run status, total\n.run status, total\n.run! status, total\n.results\n.run\n.quit\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    eprintln!("{text}");
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("21.75"), "rows in the repl: {text}");
+    assert!(text.matches("rows (complete)").count() >= 3, "{text}");
+    assert!(text.contains("cached") && text.contains("ran fresh"), "a hit, then fresh: {text}");
+    assert!(text.contains("status, total") && text.contains("results under"), ".results lists: {text}");
+    assert!(text.contains("usage: .run"), "{text}");
+
     // Remote is refused: the credentials are here.
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "-r", "--expr", "status, total"]));
     assert!(!ok && err.contains("does not take -r"), "{err}");
