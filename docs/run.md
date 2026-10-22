@@ -122,8 +122,8 @@ fn query_into(&mut self, sql: &str, sink: &mut dyn RowSink) -> Result<()>  // de
 
 The HTTP adapters already page, so their `query_into` feeds each page
 to the sink; Postgres uses the raw simple-query stream; MySQL and SQL
-Server their row streams. The sink is the gzip writer, so memory is one
-page, and the byte budget is enforced in the sink.
+Server their row streams. The sink is the Parquet writer, so memory is
+one row group, and the byte budget is enforced in the sink.
 
 **Typed cells versus text.** Cells stay text on the wire: every API
 already delivers text, text is lossless, and a typed cell would make
@@ -132,11 +132,11 @@ waiting in each. What presentation needs is a type per column. Strata
 does exactly this: its CSV holds text and `convert_field` applies the
 projection's `output_data_type` at read time. Sources, in order of
 trust: the model, through a `projections` list added to `Planned`
-(alias, field uid, `data_type`); the warehouse's column metadata where
-it is free (Snowflake `rowType`, BigQuery schema, Databricks manifest,
-Postgres `RowDescription`); inference over the first two hundred rows
-as a last resort, marked as such. The manifest records each column's
-type and where it came from.
+(alias, field uid, `data_type`); the warehouse's column metadata, which
+every transport already sees (Snowflake `rowType`, BigQuery schema,
+Databricks manifest, Postgres `RowDescription`) and `Rows` will carry;
+and string for what neither names. No inference: the second pass says
+why. The manifest records each column's type and where it came from.
 
 **Concurrency.** One query per invocation; several shells at once are
 normal. Each result is its own directory with an id that cannot
