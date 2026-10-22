@@ -719,6 +719,54 @@ already knows the fold; the retry wrapper on `execute` re-runs a query
 that may have cost money; `ssl: true` on Redshift is a boolean where the
 rest of 0sql spells `sslmode`.
 
+## What the review of 2026-10-21 found
+
+Three independent reads of the branch, one per slice — the transports,
+the catalogue and commands, the planner and semantic changes with CI —
+after the cloud five landed. Everything confirmed was folded in the
+same day, in three commits named for the slice. The ones worth knowing
+about, because they change what the code promises:
+
+- **An older snapshot is told to deploy again.** The format bump had
+  only the newer case worded; a format-1 snapshot failed on the field
+  that left. There is still no migration, by the ruling that nothing
+  is in production use, but the sentence now says what to do, and the
+  server skips the branch rather than refusing to start.
+- **The read guard refuses a write that rides inside a read.** A
+  data-modifying CTE, `SELECT … INTO`, an `INSERT` behind a `WITH`:
+  any write word as a bare word refuses, with quoted names and literals
+  blanked first. A credential with no write grant remains the defence;
+  this is the second pair of eyes doing its job.
+- **The HTTP call's limit sits past the statement timeout.** Each API
+  holds a request open while a statement runs; with the two equal, the
+  client gave up first and the statement ran on unseen. The poll loops
+  own the budget, and the timeout path is proven on all four.
+- **A catalogue records its scope.** `check` counts a table outside it
+  as unchecked, drift compares only what both reads saw, and a
+  qualified name resolves by its last two parts, so a database or a
+  project in front is not read as the schema.
+- **`generate` on an existing file.** It appends at the indent the
+  file's own list uses, since a list at the margin was being made
+  unloadable; it matches a model by name parts and datasource; and a
+  second key to one table is written down as the role it needs, since
+  the model holds one join per pair of tables.
+- **The sampler reads by layout, not by alias.** A dimension named `N`
+  was read as its own count. The value is the first column and the
+  count the last, as the planner lays them.
+
+What the reviews raised that waits on a real account or a decision,
+added to the list below: Snowflake's `SHOW … IN DATABASE` without a
+name, a statement with no warehouse, and a `SHOW`'s `numRows`; Redshift
+with no startup options and the text form of `conkey`; BigQuery's
+`errors` on a completed job (read as a warning when a result came back)
+and its path quoting; a Databricks or BigQuery foreign key that
+references a unique constraint rather than a primary key; MariaDB,
+which has no `max_execution_time`; SQL Server's `verify-full` on a host
+with no OS trust store; sampling a dimension on a policed table under
+an empty security context; case folding in `check` on the dialects
+that keep case; and the distinct totals batched per table with a
+concurrency cap, proposed and not built.
+
 ## To verify before building
 
 - Which of the thirteen expose column and table comments through
