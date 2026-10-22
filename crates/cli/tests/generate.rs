@@ -190,11 +190,13 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
     assert!(customers.contains("physical_name: shop.customers"), "{customers}");
     assert!(customers.contains("description: Who buys"), "the table comment:\n{customers}");
     assert!(customers.contains("description: As they sign"), "the column comment:\n{customers}");
+    // name is varchar(80), a short string, and looks like a person: the
+    // width rule writes the line, the identity rule comments it out.
     assert!(
-        customers.contains("enable_sampling: true") && customers.contains("a short string, 80 wide"),
-        "varchar(80) is sampled:\n{customers}"
+        customers.contains("# enable_sampling: true") && customers.contains("80 wide, but looks like a person"),
+        "varchar(80) named name is left to the author:\n{customers}"
     );
-    assert_eq!(customers.matches("enable_sampling: true").count(), 1, "text is not:\n{customers}");
+    assert_eq!(customers.matches("\n    enable_sampling: true").count(), 0, "text is not sampled either:\n{customers}");
     assert!(customers.contains("# character varying"), "the warehouse's spelling rides along:\n{customers}");
     let orders = std::fs::read_to_string(project.join("models/shop/tbl.orders.yml")).unwrap();
     assert!(orders.contains("sql: sum(total)") && orders.contains("# numeric"), "{orders}");

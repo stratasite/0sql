@@ -159,7 +159,13 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
     assert!(run(zsql(&home, &project).args(["catalog", "read", "-d", "wh", "--schema", "shop"])).0);
     assert!(run(zsql(&home, &project).args(["generate", "-d", "wh", "--all"])).0);
 
-    // The draft turned sampling on for name (varchar(80)) and not for notes (text).
+    // The draft left name (varchar(80), but a person's) commented out and
+    // notes (text) off; turning name on by hand is the author's call.
+    let path = project.join("models/shop/tbl.customers.yml");
+    let yml = std::fs::read_to_string(&path).unwrap();
+    let on = yml.replacen("    # enable_sampling: true", "    enable_sampling: true", 1);
+    assert_ne!(on, yml, "the commented line is in the draft");
+    std::fs::write(&path, on).unwrap();
     let (ok, out) = run(zsql(&home, &project).args(["sample", "-d", "wh", "--yes"]));
     assert!(ok, "{out}");
     assert!(out.contains("sampled Name (wh): 2 values of 2"), "{out}");

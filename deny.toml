@@ -15,6 +15,9 @@ ignore = [
   # a parser swap across the loader, the dialects and the CLI; tracked,
   # not done here.
   { id = "RUSTSEC-2024-0449", reason = "serde_yaml's archived backend; a parser swap is tracked separately" },
+  # fxhash is unmaintained, not vulnerable: a hash function behind the
+  # picker's filtering in inquire. It goes when inquire moves off it.
+  { id = "RUSTSEC-2025-0057", reason = "fxhash under inquire, a hash for the picker's filter; unmaintained, not a vulnerability" },
 ]
 
 [licenses]
