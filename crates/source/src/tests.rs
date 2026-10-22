@@ -193,7 +193,7 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
         uid: "test".into(),
         adapter: "postgres".into(),
         host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
-        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()).or(Some(5466)),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
         sslmode: SslMode::Disable,
@@ -335,7 +335,7 @@ fn a_real_postgres_catalogue_reads_pg_catalog() {
         uid: "test".into(),
         adapter: "postgres".into(),
         host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
-        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()).or(Some(5466)),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
         sslmode: SslMode::Disable,
@@ -649,7 +649,7 @@ fn a_real_postgres_with_tls_proves_every_rung() {
         uid: "pg".into(),
         adapter: "postgres".into(),
         host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
-        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()).or(Some(5466)),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
         ..Default::default()
@@ -1153,7 +1153,7 @@ fn redshifts_column_and_key_statements_hold_on_postgres() {
         uid: "test".into(),
         adapter: "postgres".into(),
         host: std::env::var("ZSQL_TEST_PG_HOST").ok().or(Some("localhost".into())),
-        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()),
+        port: std::env::var("ZSQL_TEST_PG_PORT").ok().and_then(|p| p.parse().ok()).or(Some(5466)),
         database: std::env::var("ZSQL_TEST_PG_DB").ok().or(Some("postgres".into())),
         username: std::env::var("ZSQL_TEST_PG_USER").ok().or(Some("postgres".into())),
         sslmode: SslMode::Disable,
@@ -1638,7 +1638,11 @@ fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
         .filter(|(_, p, _, _)| p != "/token")
         .map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).unwrap()["query"].as_str().unwrap().to_string())
         .collect();
-    assert!(statements[0].contains("`p.d`.INFORMATION_SCHEMA.TABLES") && statements[0].contains("`p.d.__TABLES__`"), "{}", statements[0]);
+    assert!(
+        statements[0].contains("`p`.`d`.INFORMATION_SCHEMA.TABLES") && statements[0].contains("`p`.`d`.__TABLES__"),
+        "{}",
+        statements[0]
+    );
     assert!(statements[1].contains("COLUMN_FIELD_PATHS") && statements[1].contains("REGEXP_EXTRACT"), "{}", statements[1]);
 
     // Without a dataset the region is read, and that needs a location.
@@ -1654,7 +1658,7 @@ fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
         .filter(|(_, p, _, _)| p != "/token")
         .map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).unwrap()["query"].as_str().unwrap().to_string())
         .collect();
-    assert!(regional.iter().all(|s| s.contains("`p.region-eu`.INFORMATION_SCHEMA")), "{regional:?}");
+    assert!(regional.iter().all(|s| s.contains("`p`.`region-eu`.INFORMATION_SCHEMA")), "{regional:?}");
     assert!(regional.iter().all(|s| !s.contains("__TABLES__")), "no row count region-wide: {regional:?}");
 }
 

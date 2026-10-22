@@ -58,7 +58,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         if let Some(o) = &only {
             let hit = f.uid.to_lowercase() == *o
                 || f.name.to_lowercase() == *o
-                || tables.iter().any(|t| t.name.to_lowercase() == *o || t.physical_name.to_lowercase() == *o);
+                || tables.iter().any(|t| t.name.to_lowercase() == *o || t.uid.to_lowercase() == *o || t.physical_name.to_lowercase() == *o);
             if !hit {
                 continue;
             }
@@ -137,9 +137,10 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                 eprintln!("warning: {}: the values average {avg} characters, which is text, not a value; sampling it will blur resolution — turn enable_sampling off, or give it a sample_sql that trims", j.field.name);
             }
         }
+        let own = j.field.sample_sql.is_some();
         let complete = match distinct {
             Some(n) => n <= size,
-            None => (values.len() as i64) < size,
+            None => own || (values.len() as i64) < size,
         };
         println!(
             "sampled {} ({via}): {} value{}{}{}",
@@ -157,7 +158,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             name: j.field.name.clone(),
             table: via.clone(),
             sampled_at: zsql_source::catalogue::now(),
-            sample_size: Some(size),
+            sample_size: (!own).then_some(size),
             distinct,
             values,
             range: None,
@@ -223,6 +224,8 @@ fn sample_one(
         open(&ds.uid, sources)?;
         let rows = sources.get_mut(&ds.uid).unwrap().query(own, zsql_semantic::MAX_SAMPLE_SIZE as usize)?;
         return Ok((values_of(&rows, 0, 1), None, ds.uid.clone()));
+        // (The record's sample_size is left unset for this path: the
+        // author's query is what it is, and nothing was cut by a limit.)
     }
 
     // Through the planner, like any other query: the dimension, a count as
@@ -242,9 +245,16 @@ fn sample_one(
     let via = planned.plan.datasource_uid.clone();
     open(&via, sources)?;
     let rows = sources.get_mut(&via).unwrap().query(&sql, size as usize)?;
-    let count = rows.columns.iter().position(|c| c.eq_ignore_ascii_case("n")).unwrap_or(1);
-    let mut values = values_of(&rows, usize::from(count == 0), count);
+    // The planner lays the dimension first and the calculation last, so
+    // the value is the first column and the count the last whatever the
+    // dimension is called — a dimension named N would otherwise be read
+    // as its own count.
+    let count = rows.columns.len().saturating_sub(1).max(1);
+    let mut values = values_of(&rows, 0, count);
     values.sort_by(|a, b| b.n.cmp(&a.n).then_with(|| a.v.cmp(&b.v)));
+    // A null group is a row the file does not keep; the distinct total
+    // below counts it, so it is taken back when it was seen.
+    let null_group = rows.rows.iter().any(|r| r.first().is_some_and(|c| c.is_none()));
 
     // The distinct total: the same question without the order or the
     // limit, counted as a derived table. Any common table expressions stay
@@ -256,7 +266,12 @@ fn sample_one(
             let (prefix, root) = p.plan.sql.split_at(p.plan.root_at);
             let count = format!("{prefix}SELECT COUNT(*) AS d FROM (\n{root}\n) AS zsql_distinct");
             match sources.get_mut(&via).unwrap().query(&count, 1) {
-                Ok(r) => r.rows.first().and_then(|row| r.get(row, "d")).and_then(|n| n.parse::<f64>().ok()).map(|n| n as i64),
+                Ok(r) => r
+                    .rows
+                    .first()
+                    .and_then(|row| r.get(row, "d"))
+                    .and_then(|n| n.parse::<f64>().ok())
+                    .map(|n| (n as i64 - i64::from(null_group)).max(0)),
                 Err(e) => {
                     eprintln!("warning: {}: distinct total: {e}", j.field.name);
                     None

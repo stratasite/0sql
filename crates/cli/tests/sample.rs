@@ -48,6 +48,7 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
          - type: dimension\n  name: Notes\n  data_type: string\n  enable_sampling: true\n  expression:\n    sql: notes\n\
          - type: dimension\n  name: Secret\n  data_type: string\n  hidden: true\n  enable_sampling: true\n  expression:\n    sql: status\n\
          - type: dimension\n  name: Shouting\n  data_type: string\n  enable_sampling: true\n  expression:\n    sql: \"status || [Quiet]\"\n\
+         - type: dimension\n  name: Tied\n  data_type: string\n  enable_sampling: true\n  sample_size: 3\n  expression:\n    sql: status\n\
          - type: dimension\n  name: Quiet\n  data_type: string\n  expression:\n    sql: region\n\
          - type: measure\n  name: Total\n  data_type: decimal\n  expression:\n    sql: sum(total)\n",
     )
@@ -95,6 +96,10 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
     let region = by("Region");
     assert_eq!(region.values[0].v, "EAST", "the author's query as written");
     assert_eq!(region.values[0].n, 3);
+    assert_eq!(region.sample_size, None, "an author's query has no limit to be cut at");
+    assert!(out.contains("sampled Region (local): 3 values\n"), "not cut: {out}");
+    let tied: Vec<(&str, i64)> = by("Tied").values.iter().map(|v| (v.v.as_str(), v.n)).collect();
+    assert_eq!(tied, [("paid", 3), ("open", 1), ("refunded", 1)], "sorted by count, then by value");
     assert!(by("Notes").values.len() == 5);
     assert!(cat.dimensions.iter().all(|d| d.name != "Secret" && d.name != "Quiet"));
     let shouting = by("Shouting");
@@ -105,7 +110,7 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
     let (ok, out) = run(zsql(&home, &project).args(["sample", "--only", "status"]));
     assert!(ok && out.contains("sampled Status") && !out.contains("sampled Region"), "{out}");
     let cat = zsql_project::values::ValueCatalog::read(&project.join("samples/values.jsonl.gz")).unwrap().unwrap();
-    assert_eq!(cat.dimensions.len(), 4, "the others are kept");
+    assert_eq!(cat.dimensions.len(), 5, "the others are kept");
     assert_eq!(cat.dimensions.iter().find(|d| d.name == "Status").unwrap().distinct, Some(2));
 
     // And the planner serves them.
@@ -134,7 +139,7 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
         format!(
             "wh:\n  adapter: postgres\n  tier: hot\n  host: {}\n  port: {}\n  database: {}\n  username: {}\n  schema: shop\n  sslmode: disable\n",
             var("ZSQL_TEST_PG_HOST", "localhost"),
-            var("ZSQL_TEST_PG_PORT", "5432"),
+            var("ZSQL_TEST_PG_PORT", "5466"),
             var("ZSQL_TEST_PG_DB", "postgres"),
             var("ZSQL_TEST_PG_USER", "postgres")
         ),

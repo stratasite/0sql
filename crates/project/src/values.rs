@@ -29,7 +29,8 @@ pub struct ValueCatalog {
 pub struct DimensionValues {
     pub uid: String,
     pub name: String,
-    /// The table the values were read from.
+    /// Where the values came from: the datasource the planner chose for
+    /// them, or the one an author's `sample_sql` ran on.
     pub table: String,
     /// RFC 3339.
     pub sampled_at: String,
@@ -92,15 +93,19 @@ impl ValueCatalog {
         Ok(Some(ValueCatalog { dimensions }))
     }
 
+    /// Written beside the target and renamed over it, so a run that dies
+    /// mid-write leaves the old file whole rather than a truncated gzip
+    /// that nothing can read.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
+        let tmp = path.with_extension("gz.tmp");
+        let file = std::fs::File::create(&tmp)?;
         let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         for d in &self.dimensions {
             enc.write_all(serde_json::to_string(d)?.as_bytes())?;
             enc.write_all(b"\n")?;
         }
-        enc.finish()?;
-        Ok(())
+        enc.finish()?.sync_all()?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn get(&self, uid: &str) -> Option<&DimensionValues> {

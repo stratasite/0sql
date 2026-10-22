@@ -264,6 +264,23 @@ fn relation_yml(cat: &Catalogue, tables: &[&Table], today: &str) -> Option<Strin
             };
             let on: Vec<String> = fk.columns.iter().zip(&fk.references_columns).map(|(l, r)| format!("left.{l} = right.{r}")).collect();
             let key = format!("{}_{}", t.name, right.name).to_lowercase();
+            // The model holds one join per pair of tables. A second key to
+            // the same table (bill_to and ship_to, say) wants a second
+            // model of that table, a role, which is the author's to name;
+            // it is written down here, commented out, so it is not lost.
+            if joins.contains(&format!("\n{key}:")) || joins.starts_with(&format!("{key}:")) {
+                joins.push_str(&format!(
+                    "# {} also references {} through {}: one join per pair of tables, so this one needs\n\
+                     # a second model of {} (a role, with its own physical_name) before it can be a join.\n\
+                     #   sql: {}\n",
+                    t.name,
+                    right.name,
+                    fk.columns.join(", "),
+                    right.name,
+                    on.join(" AND ")
+                ));
+                continue;
+            }
             joins.push_str(&format!(
                 "{key}:\n  left: {}\n  right: {}\n  sql: {}\n{:<32}# inferred: a foreign key\n  join: inner\n",
                 yaml(&title(&t.name)),
@@ -288,7 +305,10 @@ fn relation_yml(cat: &Catalogue, tables: &[&Table], today: &str) -> Option<Strin
 /// the column names its field expressions use.
 struct Existing {
     path: PathBuf,
-    physical: String,
+    /// The physical name's last two parts, unquoted and lower-cased.
+    schema: Option<String>,
+    table: String,
+    datasource: Option<String>,
     columns: BTreeSet<String>,
 }
 
@@ -313,6 +333,12 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
             let text = std::fs::read_to_string(&path)?;
             let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) else { continue };
             let Some(physical) = v.get("physical_name").and_then(|p| p.as_str()) else { continue };
+            let datasource = v.get("datasource").and_then(|d| d.as_str()).map(|d| d.trim().to_lowercase());
+            // Any quoting the dialect allows is stripped: what remains is
+            // compared without case, as the catalogue's own names are.
+            let bare = |s: &str| s.trim().trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).to_lowercase();
+            let (schema, table) = crate::catalogue_check::parts(physical, &("\"".into(), "\"".into()));
+            let (schema, table) = (schema.map(bare), bare(table));
             let mut columns = BTreeSet::new();
             if let Some(fields) = v.get("fields").and_then(|f| f.as_sequence()) {
                 for f in fields {
@@ -326,7 +352,7 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
                     }
                 }
             }
-            out.push(Existing { path, physical: physical.to_lowercase(), columns });
+            out.push(Existing { path, schema, table, datasource, columns });
         }
     }
     Ok(out)
@@ -362,20 +388,35 @@ fn identifiers(sql: &str) -> Vec<String> {
 /// them to paste.
 fn append_fields(path: &Path, entries: &str) -> Result<bool> {
     let text = std::fs::read_to_string(path)?;
-    let last_key = text.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with([' ', '\t', '#', '-']));
-    if last_key.map(|l| l.trim_end()) != Some("fields:") && !text.lines().any(|l| l == "fields:") {
-        return Ok(false);
-    }
     // The last top-level key must be fields:, so entries land in its list.
     let top: Vec<&str> = text.lines().filter(|l| !l.starts_with([' ', '\t', '#']) && l.contains(':') && !l.starts_with('-')).collect();
     if top.last().map(|l| l.trim_end()) != Some("fields:") {
         return Ok(false);
     }
+    // The list's own indent: a file may put its items at the margin
+    // (`fields:\n- type:`) or two in, and an entry must match or the
+    // file stops loading. The generated entries are written two in.
+    let indent = text
+        .lines()
+        .skip_while(|l| l.trim_end() != "fields:")
+        .skip(1)
+        .find(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.len() - l.trim_start().len())
+        .unwrap_or(2);
     let mut out = text.clone();
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(entries);
+    for line in entries.lines() {
+        if line.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let bare = line.strip_prefix("  ").unwrap_or(line);
+        out.push_str(&" ".repeat(indent));
+        out.push_str(bare);
+        out.push('\n');
+    }
     std::fs::write(path, out)?;
     Ok(true)
 }
@@ -410,9 +451,18 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         bail!("the catalogue has no table matching that; `zsql introspect {uid}` reads it again");
     }
     let have = existing(&project.dir)?;
+    // A model matches a catalogue table by its last two name parts, and
+    // by datasource when the model says one: the same `public.orders` on
+    // two warehouses is two models.
     let find = |t: &Table| {
-        let full = t.physical_name().to_lowercase();
-        have.iter().find(|e| e.physical == full || (!e.physical.contains('.') && e.physical == t.name.to_lowercase()))
+        have.iter().find(|e| {
+            e.table == t.name.to_lowercase()
+                && match (&e.schema, &t.schema) {
+                    (Some(es), Some(ts)) => es == &ts.to_lowercase(),
+                    _ => true,
+                }
+                && e.datasource.as_deref().is_none_or(|d| d == uid.to_lowercase())
+        })
     };
 
     let mut by_domain: BTreeMap<String, Vec<&Table>> = BTreeMap::new();

@@ -18,6 +18,10 @@ pub struct Catalogue {
     pub read_at: String,
     /// The version of `zsql` that read it: a catalogue outlives a build.
     pub read_by: String,
+    /// The one schema this read was narrowed to, when it was: a table
+    /// outside it is unread, not absent, and `check` and drift say so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub tables: Vec<Table>,
 }
 
@@ -136,6 +140,7 @@ impl Catalogue {
             adapter,
             read_at: now(),
             read_by: env!("CARGO_PKG_VERSION").to_string(),
+            scope: scope.map(str::to_string),
             tables,
         })
     }
@@ -177,8 +182,26 @@ fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result
     }
     for t in &mut tables {
         t.columns.sort_by_key(|c| c.position);
+        for c in &mut t.columns {
+            if c.max_length.is_none() {
+                c.max_length = width_in_type(&c.data_type);
+            }
+        }
     }
     Ok(tables)
+}
+
+/// The width a character type's own spelling carries — `varchar(80)`,
+/// `STRING(255)`, `character varying(40)` — for a warehouse that reports
+/// no `character_maximum_length`: SQLite, Trino, Athena, BigQuery.
+pub(crate) fn width_in_type(data_type: &str) -> Option<i64> {
+    let t = data_type.trim().to_lowercase();
+    let (head, rest) = t.split_once('(')?;
+    let head = head.trim();
+    if !matches!(head, "char" | "character" | "varchar" | "character varying" | "nchar" | "nvarchar" | "string" | "text" | "bpchar") {
+        return None;
+    }
+    rest.split([')', ',']).next()?.trim().parse().ok().filter(|n| *n > 0)
 }
 
 /// The third shared read: one row per key column. `key_kind` is
@@ -213,13 +236,19 @@ pub(crate) fn apply_keys(tables: &mut [Table], k: &Rows) {
         let Some(table) = tables.iter_mut().find(|t| t.name == name && t.schema.as_deref() == schema.as_deref()) else { continue };
         let columns: Vec<String> = rows.iter().filter_map(|r| k.get(r, "column_name")).map(str::to_string).collect();
         if kind == "foreign" {
+            // Each column with the column it references, row by row; a
+            // reference that could not be named makes the whole key
+            // unusable, so it is left out rather than misaligned.
+            let pairs: Option<Vec<(String, String)>> =
+                rows.iter().map(|r| Some((k.get(r, "column_name")?.to_string(), k.get(r, "ref_column")?.to_string()))).collect();
+            let Some(pairs) = pairs.filter(|p| !p.is_empty()) else { continue };
             let first = rows[0];
             table.foreign_keys.push(ForeignKey {
                 name: key_name,
-                columns,
+                columns: pairs.iter().map(|(c, _)| c.clone()).collect(),
                 references_schema: k.get(first, "ref_schema").map(str::to_string),
                 references_table: k.get(first, "ref_table").unwrap_or_default().to_string(),
-                references_columns: rows.iter().filter_map(|r| k.get(r, "ref_column")).map(str::to_string).collect(),
+                references_columns: pairs.into_iter().map(|(_, r)| r).collect(),
             });
         } else if table.primary_key.is_empty() {
             table.primary_key = columns;
@@ -251,16 +280,9 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {} ORDER BY 1, 2",
         scope_clause("n.nspname", scope)
     );
-    let columns = format!(
-        "SELECT col.table_schema, col.table_name, col.column_name, col.data_type, col.is_nullable, \
-         col.character_maximum_length::text AS max_length, col.ordinal_position::text AS position, \
-         col_description(c.oid, col.ordinal_position::int) AS column_comment \
-         FROM information_schema.columns col \
-         JOIN pg_catalog.pg_namespace n ON n.nspname = col.table_schema \
-         JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = col.table_name \
-         WHERE {} ORDER BY 1, 2, col.ordinal_position",
-        scope_clause("col.table_schema", scope)
-    );
+    // Columns from pg_attribute rather than information_schema.columns,
+    // which does not list a materialized view's.
+    let columns = pg_columns_sql(scope, "('r', 'p', 'v', 'm', 'f')");
     let mut tables = assemble(src, &tables, &columns)?;
     // pg_constraint holds the key columns as attribute numbers; unnest
     // them with their ordinality so each row is one column in order, and
@@ -285,14 +307,34 @@ fn postgres(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
+/// The columns of every relation of the given kinds, from `pg_attribute`,
+/// the type without its modifier and the width from the modifier. Shared
+/// by Postgres and Redshift; the fixture proves it.
+fn pg_columns_sql(scope: Option<&str>, relkinds: &str) -> String {
+    format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, \
+         format_type(a.atttypid, NULL) AS data_type, \
+         CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, \
+         CAST(CASE WHEN a.atttypid IN (1042, 1043) AND a.atttypmod > 4 THEN a.atttypmod - 4 END AS VARCHAR) AS max_length, \
+         CAST(a.attnum AS VARCHAR) AS position, d.description AS column_comment \
+         FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum \
+         WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN {relkinds} AND {} ORDER BY 1, 2, a.attnum",
+        scope_clause("n.nspname", scope)
+    )
+}
+
 /// The three statements of a Redshift read. Redshift is Postgres 8 with
 /// its own bookkeeping: `reltuples` is not maintained there, so the row
-/// count is `svv_table_info`'s; `information_schema.columns` does not see
-/// a late-binding view, so the columns come from `pg_attribute`; and
-/// there is no `unnest … WITH ORDINALITY`, so a constraint's attribute
-/// numbers arrive as the array's text and are expanded here against the
-/// columns already read. Every statement but the first is also valid
-/// Postgres, which is how two of the three are proven on the fixture.
+/// count is `svv_table_info`'s; the columns come from `pg_attribute` as
+/// Postgres's do (a late-binding view's are in neither, and wait on
+/// `pg_get_late_binding_view_cols`); and there is no `unnest … WITH
+/// ORDINALITY`, so a constraint's attribute numbers arrive as the array's
+/// text and are expanded here against the columns already read. Every
+/// statement but the first is also valid Postgres, which is how two of
+/// the three are proven on the fixture.
 pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
     let tables = format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, \
@@ -304,19 +346,7 @@ pub(crate) fn redshift_sql(scope: Option<&str>) -> (String, String, String) {
          WHERE c.relkind IN ('r', 'v') AND {} ORDER BY 1, 2",
         scope_clause("n.nspname", scope)
     );
-    let columns = format!(
-        "SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, \
-         format_type(a.atttypid, a.atttypmod) AS data_type, \
-         CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, \
-         CAST(CASE WHEN a.atttypid IN (1042, 1043) AND a.atttypmod > 4 THEN a.atttypmod - 4 END AS VARCHAR) AS max_length, \
-         CAST(a.attnum AS VARCHAR) AS position, d.description AS column_comment \
-         FROM pg_catalog.pg_attribute a \
-         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum \
-         WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'v') AND {} ORDER BY 1, 2, a.attnum",
-        scope_clause("n.nspname", scope)
-    );
+    let columns = pg_columns_sql(scope, "('r', 'v')");
     let keys = format!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, \
          CASE con.contype WHEN 'p' THEN 'primary' ELSE 'foreign' END AS key_kind, con.conname AS key_name, \
@@ -436,7 +466,7 @@ fn mysql(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     let tables = format!(
         "SELECT table_schema AS table_schema, table_name AS table_name, \
          IF(table_type = 'VIEW', 'view', 'table') AS table_kind, \
-         CAST(table_rows AS CHAR) AS row_estimate, table_comment AS table_comment \
+         CAST(table_rows AS CHAR) AS row_estimate, NULLIF(table_comment, 'VIEW') AS table_comment \
          FROM information_schema.tables WHERE {} ORDER BY 1, 2",
         scope_clause("table_schema", scope)
     );
@@ -702,8 +732,8 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     let project = conn.project.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "project"))?;
     let (qualifier, rows_join, rows_expr) = match scope {
         Some(dataset) => (
-            format!("`{project}.{dataset}`"),
-            format!("LEFT JOIN `{project}.{dataset}.__TABLES__` s ON s.table_id = t.table_name"),
+            format!("`{project}`.`{dataset}`"),
+            format!("LEFT JOIN `{project}`.`{dataset}`.__TABLES__ s ON s.table_id = t.table_name"),
             "CAST(s.row_count AS STRING)",
         ),
         None => {
@@ -711,7 +741,7 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
                 .location
                 .clone()
                 .ok_or_else(|| SourceError::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalogue"))?;
-            (format!("`{project}.region-{location}`"), String::new(), "CAST(NULL AS STRING)")
+            (format!("`{project}`.`region-{location}`"), String::new(), "CAST(NULL AS STRING)")
         }
     };
     let tables = format!(
@@ -759,7 +789,7 @@ fn sqlite(src: &mut dyn Source) -> Result<Vec<Table>> {
                 name: c.get(r, "name").unwrap_or_default().to_string(),
                 data_type: c.get(r, "type").unwrap_or_default().to_string(),
                 nullable: c.get(r, "notnull") != Some("1"),
-                max_length: None,
+                max_length: width_in_type(c.get(r, "type").unwrap_or_default()),
                 position: c.get(r, "cid").and_then(|n| n.parse::<i64>().ok()).map(|n| n + 1).unwrap_or(0),
                 comment: None,
             })
@@ -819,6 +849,9 @@ pub fn now() -> String {
 /// drift, which is what a committed catalogue is for.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Drift {
+    /// (was, now): the two reads were narrowed differently, so what is
+    /// compared is only what both saw.
+    pub scope_changed: Option<(Option<String>, Option<String>)>,
     pub tables_added: Vec<String>,
     pub tables_dropped: Vec<String>,
     /// (table, column)
@@ -830,7 +863,8 @@ pub struct Drift {
 
 impl Drift {
     pub fn is_empty(&self) -> bool {
-        self.tables_added.is_empty()
+        self.scope_changed.is_none()
+            && self.tables_added.is_empty()
             && self.tables_dropped.is_empty()
             && self.columns_added.is_empty()
             && self.columns_dropped.is_empty()
@@ -841,7 +875,15 @@ impl Drift {
     pub fn between(before: &Catalogue, after: &Catalogue) -> Drift {
         let key = |t: &Table| t.physical_name().to_lowercase();
         let mut d = Drift::default();
-        for t in &after.tables {
+        // A table outside the other read's scope was not read, not dropped.
+        let within = |t: &Table, scope: &Option<String>| match scope {
+            Some(s) => t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s)),
+            None => true,
+        };
+        if before.scope != after.scope {
+            d.scope_changed = Some((before.scope.clone(), after.scope.clone()));
+        }
+        for t in after.tables.iter().filter(|t| within(t, &before.scope)) {
             match before.tables.iter().find(|b| key(b) == key(t)) {
                 None => d.tables_added.push(t.physical_name()),
                 Some(b) => {
@@ -862,7 +904,7 @@ impl Drift {
                 }
             }
         }
-        for b in &before.tables {
+        for b in before.tables.iter().filter(|b| within(b, &after.scope)) {
             if !after.tables.iter().any(|t| key(t) == key(b)) {
                 d.tables_dropped.push(b.physical_name());
             }
@@ -873,6 +915,10 @@ impl Drift {
     /// One line per change, in the order a reader wants them.
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some((was, now)) = &self.scope_changed {
+            let say = |s: &Option<String>| s.clone().unwrap_or_else(|| "every schema".into());
+            out.push(format!("scope changed:  {} -> {}; only what both reads saw is compared", say(was), say(now)));
+        }
         for t in &self.tables_added {
             out.push(format!("table added:    {t}"));
         }

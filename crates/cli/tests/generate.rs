@@ -152,7 +152,7 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
         format!(
             "wh:\n  adapter: postgres\n  tier: hot\n  host: {}\n  port: {}\n  database: {}\n  username: {}\n  schema: shop\n  sslmode: disable\n",
             var("ZSQL_TEST_PG_HOST", "localhost"),
-            var("ZSQL_TEST_PG_PORT", "5432"),
+            var("ZSQL_TEST_PG_PORT", "5466"),
             var("ZSQL_TEST_PG_DB", "postgres"),
             var("ZSQL_TEST_PG_USER", "postgres")
         ),
@@ -206,4 +206,53 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
     let (ok, out) = run(zsql(&home, &project).args(["sql", "--expr", "name, total"]));
     assert!(ok && out.contains("shop.orders"), "{out}");
     let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
+/// The shapes the second run has to live with: a model whose list sits
+/// at the margin, a table with two keys to one other, and an existing
+/// model spelled with its schema.
+#[test]
+fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
+    let (home, project) = scratch("sqlite-shapes");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop"])).0);
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n").unwrap();
+    let db = rusqlite::Connection::open(project.join("shop.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL);\
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, bill_to_id INTEGER REFERENCES customers(id), \
+           ship_to_id INTEGER REFERENCES customers(id), total NUMERIC(12,2) NOT NULL);",
+    )
+    .unwrap();
+    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+
+    // An existing model, written by hand: the list at the margin, the name qualified.
+    std::fs::create_dir_all(project.join("models/core")).unwrap();
+    std::fs::write(
+        project.join("models/core/tbl.orders.yml"),
+        "name: Orders\nphysical_name: main.orders\ndatasource: local\ncost: 1\nfields:\n\
+         - type: dimension\n  name: Id\n  data_type: integer\n  expression:\n    sql: id\n    primary_key: true\n",
+    )
+    .unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
+    assert!(ok, "{out}");
+    assert!(!out.contains("created models/local/tbl.orders.yml"), "the qualified name matched the catalogue's bare one: {out}");
+    assert!(out.contains("3 new columns") || out.contains("new columns"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--new"]));
+    assert!(ok && out.contains("added"), "{out}");
+    let orders = std::fs::read_to_string(project.join("models/core/tbl.orders.yml")).unwrap();
+    assert!(orders.contains("\n- type: measure") && orders.contains("\n  name: Total\n"), "appended at the list's own indent:\n{orders}");
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok, "still loads:\n{out}");
+
+    // Two keys to one table: one join, and the other written down as the
+    // role it needs, since the model holds one join per pair of tables.
+    let rel = std::fs::read_to_string(project.join("models/local/rel.local.yml")).unwrap();
+    assert_eq!(rel.matches("orders_customers:").count(), 1, "{rel}");
+    assert!(rel.contains("# orders also references customers through") && rel.contains("#   sql: left."), "{rel}");
+    assert!(rel.contains("left.bill_to_id = right.id") && rel.contains("left.ship_to_id = right.id"), "neither key is lost: {rel}");
+    assert!(ok && out.contains("1 joins"), "{out}");
+
+    // The declared width turns sampling on for a short string, even on SQLite.
+    let customers = std::fs::read_to_string(project.join("models/local/tbl.customers.yml")).unwrap();
+    assert!(customers.contains("enable_sampling: true"), "VARCHAR(80) is a short string:\n{customers}");
 }

@@ -66,9 +66,10 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(&cat)?;
-        std::fs::write(&out, json.as_bytes() /* a trailing newline keeps diffs clean */)?;
-        std::fs::OpenOptions::new().append(true).open(&out)?.write_all(b"\n")?;
+        // A trailing newline keeps diffs clean.
+        let mut json = serde_json::to_string_pretty(&cat)?;
+        json.push('\n');
+        std::fs::write(&out, json.as_bytes())?;
 
         let columns: usize = cat.tables.iter().map(|t| t.columns.len()).sum();
         let views = cat.tables.iter().filter(|t| t.kind == "view").count();
@@ -91,5 +92,3 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
     }
     Ok(())
 }
-
-use std::io::Write;
