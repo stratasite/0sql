@@ -32,6 +32,9 @@ allow = [
   "BSL-1.0",
   # The Mozilla CA bundle webpki-roots ships for TLS.
   "CDLA-Permissive-2.0",
+  # A public-domain dedication: tiny-keccak, under const-random, in
+  # DuckDB's tree. Nothing is owed under it.
+  "CC0-1.0",
 ]
 confidence-threshold = 0.8
 

@@ -54,3 +54,10 @@ zsql-exec = { path = "crates/exec" }
 zsql-service = { path = "crates/service" }
 zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }
+
+# What a release ships: symbols stripped and thin link-time optimisation,
+# which took the binary from 97 MB to 76 MB with DuckDB in it. Fat LTO
+# and one codegen unit buy little more and cost minutes of build.
+[profile.release]
+strip = true
+lto = "thin"
