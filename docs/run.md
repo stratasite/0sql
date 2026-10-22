@@ -14,7 +14,7 @@ its CLI. Where the two agree the matter is settled; where strata has
 lived with a choice for longer, its experience wins; where strata's
 shape is a web application's, it is left.
 
-Three decisions belong to the product owner and are marked **[OWNER]**.
+Four decisions belong to the product owner and are marked **[OWNER]**.
 
 ## What exists, and what this adds
 
@@ -165,16 +165,47 @@ is the equivalent place. **[OWNER A]** the user-level location
 public repository. `--out` writes an export copy wherever the user
 names.
 
-**Format.** `rows.jsonl.gz`, one JSON array per row, cells text or
-null, which is `Rows` exactly, with `manifest.json` beside it. It costs
-nothing: `flate2` and `serde_json` are in the workspace, it streams on
-write and read, and `gunzip | jq` works. Strata's file is CSV, which
-cannot tell null from the empty string and has nowhere for a manifest;
-CSV is an export here. Parquet and Arrow bring typed columns this
-design does not have and about fifty seconds of clean build; DuckDB
-brings the musl toolchain problem the repository has already weighed.
-SQLite is already linked and earns a place only as an in-memory
-re-query engine, later.
+**Format.** Parquet, written with the pure-Rust `parquet` and
+`arrow-array` crates, zstd-compressed, one file per result. The first
+draft of this plan said gzipped JSON lines; the second pass below says
+why that changes, and what it costs. The options, measured on this
+machine (twelve cores, clean release build of a scratch crate holding
+only the format's dependencies; zsql's own clean build is about
+seventy seconds and its stripped binary about fourteen megabytes):
+
+| format | build | binary | typed | columnar | streams | read by other tools |
+|---|---|---|---|---|---|---|
+| JSON lines, gzip | 0 s, in the tree | 0 | no | no | yes | `jq`, anything |
+| CSV | 0 s | 0 | no | no | yes | everything; null and empty are one |
+| Parquet (arrow-rs, zstd) | 48 s | 8.5 MB in the scratch crate, less in zsql where tokio, serde and the hashers are already compiled | yes, string where unknown | yes, with per-column min and max | per row group | DuckDB, pandas, polars, Spark, every warehouse's loader |
+| Arrow IPC | 40 s, the same crates less the Parquet encoder | about the same | yes | yes | yes | pandas, polars, DuckDB; not a warehouse loader's first choice |
+| SQLite, a file per result | 0 s, `rusqlite` is linked | 0 | affinity only | no | yes | sqlite3; nothing in a data stack |
+| DuckDB | 317 s | 41 MB | yes | yes | yes | best in class | musl C++ toolchain, already declined |
+
+A cache file that only `zsql` can read is a cache; a Parquet file is a
+dataset. Every reuse the second pass lists — a server serving slices, a
+local engine, a team cache on a bucket, a corpus — reads Parquet
+without conversion, and none of them reads JSON lines without one.
+JSON lines costs nothing today and a migration tomorrow; Parquet costs
+a minute of build today and no migration. The decision is marked
+**[OWNER D]** below with the number.
+
+The schema: each column typed by the model's `data_type` when the
+model names it and every value parses as it, by the warehouse's column
+type when the model is silent and the mapping is known, and `Utf8`
+otherwise, with the intended type and its source kept in the file's
+key-value metadata beside the manifest. A value that fails to parse as
+its declared type demotes the column to `Utf8` for that result and
+says so in a warning; text is never lost to a type. Rows are sorted by
+the projected dimensions before writing, row groups hold about
+sixty-four thousand rows, and the per-column minimum and maximum the
+writer records are what let a later reader skip what it does not need.
+Parquet's modular encryption is in the crate behind a feature; it is
+the answer if results at rest must be encrypted, and it is not turned
+on in the first phases.
+
+CSV and JSON lines remain exports: `--format csv`, `--format jsonl`,
+`--out file.csv`.
 
 **Manifest.** `zsql_exec::Manifest`, with a `format: 1` field:
 
@@ -186,6 +217,9 @@ sql (as sent, limit included), user_limit, cap, rows, complete, cancelled,
 columns: [{name, data_type, source: model | warehouse | inferred, field_uid}],
 timings: {plan_us, connect_ms, run_ms, fetch_ms}, bytes_inflated,
 warehouse: {bytes_scanned, query_id} where the API reports them,
+table_versions: {"<schema.table>": "<what the warehouse said>"},
+lineage (lineage_format: 1): {fields: [...uids], tables: [...], partition, measures: [{uid, aggregation, additive}],
+  filters: [{field, op, value, rendered, anchor}], grain: [...]},
 warnings: [...]
 ```
 
@@ -300,6 +334,118 @@ command, keyed by principal so it is never cross-served, and said so in
 `AGENTS.md` and the `results` help. `ZSQL_RESULTS=off` makes `run`
 print without storing.
 
+## A second pass: the cache as an asset
+
+The first draft treated the store as a cache for one command. Read as
+a data engineer and as someone who has run shared caches across
+machines, that is the wrong frame: a cache of query results over a
+semantic model is a dataset with lineage, and the cheap decisions made
+now decide whether it can ever be anything else. What follows changes
+the design in six places and adds the reasons.
+
+**What the cache might be asked to be.** A server endpoint serving
+slices of a stored result to many clients without re-running it; a
+dashboard reading a dozen results at once; a materialised or
+scheduled result refreshed on a timer, which is strata's subscription;
+a team cache on a bucket, so one analyst's run serves the next; a
+local engine that re-aggregates a superset result for a narrower
+question, which is the cube the earlier survey set aside; a diff of
+the same question across two runs, "what changed since yesterday"; and
+a corpus of questions, SQL and result shapes to train the expression
+model on. Each wants three things of a stored result: a format other
+tools read, a record of what question it answers and over what data,
+and an identity that holds across machines. The first draft had the
+first wrong and the second missing.
+
+**Identity and lineage are two different records.** The cache key is
+the exact question: SQL, datasource, connection identity, context. It
+must stay narrow, because a hit is a promise that the rows are the same
+rows. Lineage is what the question was made of, and it is the manifest's
+to carry whether or not anything reads it yet: the resolved spec with
+field uids; the tables the plan read and the partition it chose; each
+measure with its aggregation and whether it is additive; each filter
+in canonical form, with a relative date kept as both the token
+(`28d`) and the literal it rendered to and the anchor it rendered
+from; the grain. None of this costs a query. All of it is impossible to
+backfill. With it, a later engine can find a superset result for a
+narrower question and know whether re-aggregation is even valid; a
+table-level invalidation can find every result that read a table; a
+corpus has its training pairs; a diff knows two results are the same
+question. The schema for the lineage block is versioned on its own
+(`lineage_format`) so it can grow without touching the key.
+
+**Freshness needs a probe, not only a clock.** A TTL is a guess about
+the warehouse. Most of the ten can answer "when did this table last
+change" cheaply: BigQuery's `last_modified_time` and Snowflake's
+`LAST_ALTERED` from `INFORMATION_SCHEMA.TABLES`, Databricks' `DESCRIBE
+DETAIL`, Postgres's `pg_stat_user_tables.n_tup_ins` and friends as a
+counter rather than a time, ClickHouse's `system.parts`; Athena and
+SQL Server less so. The manifest records the table versions the run
+saw, as `{table: version}`, in whatever form the warehouse gives. A hit
+within the TTL is served as it is; `--validate` (and a datasource-level
+`cache_validate: true`) re-reads the versions, one metadata query per
+table, and treats a change as a miss. That is cheaper than any run and
+more honest than any TTL, and it is the hook `data_updated_at` was
+standing in for. The TTL stays as the bound for warehouses that cannot
+answer.
+
+**The store is a layout, not a directory.** Everything is written so a
+directory can be copied to a bucket and still be a store: results are
+immutable; a result is a prefix `results/<key[..2]>/<key>/` holding
+`rows.parquet`, `manifest.json` and nothing else; the manifest is
+written last and is the commit marker, so a reader that finds a prefix
+without one skips it; the human id is an alias recorded in the index,
+not the directory's name; nothing is ever updated in place, and
+`last_used_at` lives in the index rather than the manifest, because a
+touch on every hit is write amplification locally and a round trip on
+a bucket. `Store` is a trait with a local filesystem implementation
+now and room for the `object_store` crate (pure Rust; S3, GCS, Azure,
+local) later; the layout does not change between them. Single flight
+is a lease, not a pid: `results/<…>/<key>/lease.json` with a start
+time, a holder name and an expiry a running writer renews; a second
+runner waits on a live lease and takes over a stale one. A pid means
+nothing on another machine; a lease with a clock does.
+
+**An index, rebuildable from the files.** Listing three hundred
+manifests is fine; listing thirty thousand, or asking "every result
+that read `store_sales` in the last week", is not. A SQLite index per
+store root (`index.sqlite`, through the `rusqlite` already linked)
+holds the manifest fields, the lineage tables and the usage counters,
+and answers `results`, `prune`, `stats` and the lineage questions. The
+files remain the truth: `zsql results reindex` rebuilds it from the
+manifests, and a store copied from elsewhere is indexed on first use.
+This is the opposite of strata's shape, where the database row is the
+truth and the file hangs off it, and it is the right way round for
+something that must survive being copied.
+
+**Types before the first row, which streaming needs.** A Parquet
+writer needs the schema before the first row group, and the first
+draft's inference "over the first two hundred rows" fought that. The
+order is now: the model's type for every projected field (through
+`Planned.projections`), the warehouse's column type for the rest
+(`Rows` gains a typed column list; every transport already sees the
+type and throws it away), `Utf8` for what neither names. Inference is
+gone. A row group is buffered before it is written in any case, so a
+declared type that a value fails is caught before the first group is
+flushed and demotes the column, with the demotion in the warning list.
+
+**What this costs and what it defers.** Parquet is a minute of clean
+build and a few megabytes; the index is a schema to keep; lineage is a
+block to fill from the plan, which the planner already has. Deferred,
+with the measurement that defers it: the local engine. DataFusion with
+Flight SQL measured 376 seconds and a hundred megabytes in the earlier
+survey, DuckDB 317 seconds and forty-one with the toolchain problem.
+Neither goes in now. The point of the Parquet choice is that when one
+does, every result already stored is its input.
+
+**The phases, revised.** Parquet and the lineage block go in phase 1,
+because a format or a manifest field changed later is a migration of
+customer data. The index and the lease go in phase 2 with `results`.
+Version probing and `--validate` go in phase 3 with cancel and
+timeouts, since both are per-adapter work. Streaming in phase 4 and
+types in phase 5 are unchanged, except that phase 5 is smaller: the
+types are decided in phase 1 and phase 5 is presentation.
+
 ## Where the work goes
 
 A new crate `crates/exec` (`zsql-exec`), depending on `zsql-service`
@@ -386,3 +532,9 @@ the fakes in `crates/source/src/tests.rs`.
 
 The cloud five remain verified by fakes until accounts exist, as the
 introspection plan left them; nothing in these phases needs one.
+
+**[OWNER D]** Parquet from the first phase, recommended, at a measured
+48 seconds of clean release build and about eight megabytes in a
+scratch binary (less inside zsql, which already compiles most of the
+shared dependencies); or JSON lines now, at no cost, and a conversion
+of every stored result the day the cache is asked to be anything else.
