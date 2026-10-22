@@ -23,6 +23,7 @@ pub mod bigquery;
 pub mod catalogue;
 pub mod clickhouse;
 pub mod databricks;
+pub mod duckdb;
 mod http;
 pub mod jwt;
 pub mod mysql;
@@ -563,6 +564,7 @@ pub fn open(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> {
         "databricks" => Ok(Box::new(databricks::Databricks::open(conn, secrets)?)),
         "bigquery" => Ok(Box::new(bigquery::BigQuery::open(conn, secrets)?)),
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
+        "duckdb" => Ok(Box::new(duckdb::DuckDb::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),
     }
 }

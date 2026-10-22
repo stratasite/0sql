@@ -585,7 +585,20 @@ what makes the remaining adapters cheap instead of frightening.
       file's documentation.
 - [x] **E — the cloud five.** Snowflake, BigQuery, Databricks, Redshift and
       Athena, built and proven on fakes; what remains is an account on
-      each to run them against. The shape below comes from reading how strata and its `dwh`
+      each to run them against. DuckDB followed on 2026-10-22, linked and
+      bundled, by decision: the engine's C++ compiles in with the crate
+      (about four and a half minutes on a clean build here), the file is
+      opened in the engine's own read-only mode, cells are rendered by
+      Arrow's formatter so a decimal keeps its scale and a list prints as
+      DuckDB prints it, a statement past the timeout is interrupted through
+      the engine's handle, and the catalogue reads `duckdb_tables()`,
+      `duckdb_views()`, `duckdb_columns()` and `duckdb_constraints()`,
+      comments and estimates included. DuckDB keeps no width on a
+      `VARCHAR(n)`, so sampling is not turned on from one. Both Linux
+      release targets now build in cross's container, which carries the
+      musl C++ toolchain the runner's `musl-tools` lacks; that is unproven
+      until a release runs. If the cost is not liked, the commit is one to
+      drop. The shape below comes from reading how strata and its `dwh`
       gem connect to four of them (see "What strata and dwh do"); the
       plan's earlier line, "the HTTP transport plus SigV4 for the two AWS
       ones", was half right. Redshift is Postgres on the wire and gets the

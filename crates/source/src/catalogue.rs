@@ -133,6 +133,7 @@ impl Catalogue {
             "databricks" => databricks(src, scope)?,
             "bigquery" => bigquery(src, scope)?,
             "sqlite" => sqlite(src)?,
+            "duckdb" => duckdb(src, scope)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
         };
         Ok(Catalogue {
@@ -768,6 +769,70 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     let keys_sql =
         format!("{} AND {}", standard_keys_sql(&format!("{qualifier}.INFORMATION_SCHEMA"), true), scope_clause("k.table_schema", scope));
     keys(src, &mut tables, &keys_sql)?;
+    Ok(tables)
+}
+
+/// DuckDB's own catalogue functions, which carry comments, a row estimate
+/// and the constraints with their column lists: `duckdb_tables()`,
+/// `duckdb_views()`, `duckdb_columns()` and `duckdb_constraints()`. A
+/// key's columns arrive as one string joined on a unit separator and are
+/// paired here by index.
+fn duckdb(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT schema_name AS table_schema, table_name, 'table' AS table_kind, \
+         CAST(estimated_size AS VARCHAR) AS row_estimate, comment AS table_comment \
+         FROM duckdb_tables() WHERE NOT internal AND {} \
+         UNION ALL \
+         SELECT schema_name, view_name, 'view', NULL, comment \
+         FROM duckdb_views() WHERE NOT internal AND {} ORDER BY 1, 2",
+        scope_clause("schema_name", scope),
+        scope_clause("schema_name", scope)
+    );
+    let columns = format!(
+        "SELECT schema_name AS table_schema, table_name, column_name, data_type, \
+         CASE WHEN is_nullable THEN 'YES' ELSE 'NO' END AS is_nullable, \
+         CAST(character_maximum_length AS VARCHAR) AS max_length, CAST(column_index AS VARCHAR) AS position, \
+         comment AS column_comment \
+         FROM duckdb_columns() WHERE NOT internal AND {} ORDER BY 1, 2, column_index",
+        scope_clause("schema_name", scope)
+    );
+    let mut tables = assemble(src, &tables, &columns)?;
+    let keys_sql = format!(
+        "SELECT schema_name AS table_schema, table_name, \
+         CASE constraint_type WHEN 'PRIMARY KEY' THEN 'primary' ELSE 'foreign' END AS key_kind, \
+         CAST(constraint_index AS VARCHAR) AS key_name, \
+         array_to_string(constraint_column_names, chr(31)) AS key_columns, \
+         referenced_table AS ref_table, array_to_string(referenced_column_names, chr(31)) AS ref_columns \
+         FROM duckdb_constraints() WHERE constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY') AND {} ORDER BY 1, 2, constraint_index",
+        scope_clause("schema_name", scope)
+    );
+    let k = src.query(&keys_sql, MAX_COLUMNS)?;
+    let mut out = Rows {
+        columns: ["table_schema", "table_name", "key_kind", "key_name", "column_name", "position", "ref_schema", "ref_table", "ref_column"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: vec![],
+    };
+    for r in &k.rows {
+        let g = |c: &str| k.get(r, c).map(str::to_string);
+        let cols: Vec<&str> = k.get(r, "key_columns").map(|s| s.split('\x1f').collect()).unwrap_or_default();
+        let refs: Vec<&str> = k.get(r, "ref_columns").map(|s| s.split('\x1f').collect()).unwrap_or_default();
+        for (i, c) in cols.iter().enumerate() {
+            out.rows.push(vec![
+                g("table_schema"),
+                g("table_name"),
+                g("key_kind"),
+                g("key_name"),
+                Some(c.to_string()),
+                Some((i + 1).to_string()),
+                g("table_schema"),
+                g("ref_table"),
+                refs.get(i).map(|s| s.to_string()),
+            ]);
+        }
+    }
+    apply_keys(&mut tables, &out);
     Ok(tables)
 }
 

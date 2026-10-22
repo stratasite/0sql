@@ -56,9 +56,9 @@ fn a_connection_is_the_keys_the_model_reads_past() {
 
 #[test]
 fn an_unknown_adapter_is_named_rather_than_guessed() {
-    let conn = Connection { uid: "wh".into(), adapter: "duckdb".into(), ..Default::default() };
+    let conn = Connection { uid: "wh".into(), adapter: "druid".into(), ..Default::default() };
     let err = open(&conn, Secrets::default()).err().unwrap().to_string();
-    assert!(err.contains("duckdb is not an adapter this build can reach"), "{err}");
+    assert!(err.contains("druid is not an adapter this build can reach"), "{err}");
 }
 
 #[test]
@@ -2009,4 +2009,104 @@ fn a_statement_that_never_settles_is_cancelled_at_the_timeout() {
         }
         assert!(seen.len() > before + 1, "{}: polled before giving up", conn.uid);
     }
+}
+
+// ------------------------------------------------------------------- duckdb
+
+fn duckdb_file(name: &str) -> PathBuf {
+    let dir = temp(name);
+    let path = dir.join("shop.duckdb");
+    let db = ::duckdb::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL, notes TEXT);\
+         COMMENT ON TABLE customers IS 'Who buys';\
+         COMMENT ON COLUMN customers.name IS 'As they sign';\
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers (id), \
+           placed DATE NOT NULL, total DECIMAL(12, 2) NOT NULL, paid BOOLEAN, tags VARCHAR[], seen TIMESTAMP);\
+         CREATE VIEW recent AS SELECT id, customer_id FROM orders WHERE placed > DATE '2026-01-01';\
+         INSERT INTO customers VALUES (1, 'Ann', NULL), (2, 'Bo', 'vip');\
+         INSERT INTO orders VALUES (1, 1, DATE '2026-03-01', 10.50, true, ['a', 'b'], TIMESTAMP '2026-03-01 09:30:00'), \
+           (2, 2, DATE '2026-03-02', 4.25, false, NULL, NULL), (3, 1, DATE '2026-03-03', 7, NULL, [], NULL);",
+    )
+    .unwrap();
+    drop(db);
+    path
+}
+
+#[test]
+fn duckdb_reads_its_file_renders_every_type_as_text_and_cannot_write_it() {
+    let path = duckdb_file("duckdb-reads");
+    let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path.clone()), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).expect("opens read-only");
+    assert_eq!(src.adapter(), "duckdb");
+    let rows = src.query("SELECT id, placed, total, paid, tags, seen FROM orders ORDER BY id", 10).expect("reads");
+    assert_eq!(rows.columns, ["id", "placed", "total", "paid", "tags", "seen"]);
+    assert_eq!(rows.rows.len(), 3);
+    let first = &rows.rows[0];
+    assert_eq!(rows.get(first, "id"), Some("1"));
+    assert_eq!(rows.get(first, "placed"), Some("2026-03-01"));
+    assert_eq!(rows.get(first, "total"), Some("10.50"), "a decimal keeps its scale");
+    assert_eq!(rows.get(first, "paid"), Some("true"));
+    assert_eq!(rows.get(first, "tags"), Some("[a, b]"), "a list prints as DuckDB prints it");
+    assert_eq!(rows.get(first, "seen"), Some("2026-03-01T09:30:00"));
+    assert_eq!(rows.get(&rows.rows[1], "tags"), None);
+    assert_eq!(rows.get(&rows.rows[2], "paid"), None);
+    // Past the cap: refused, never trimmed.
+    let err = src.query("SELECT id FROM orders", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    // The guard refuses a write first; the engine would second it.
+    assert!(src.query("DELETE FROM orders", 1).is_err());
+    let conn2 =
+        ::duckdb::Connection::open_with_flags(&path, ::duckdb::Config::default().access_mode(::duckdb::AccessMode::ReadOnly).unwrap())
+            .unwrap();
+    assert!(conn2.execute_batch("DELETE FROM orders").is_err(), "the file is opened read-only by the engine");
+    // A missing file is named.
+    let err = open(&Connection { file: Some(path.with_file_name("absent.duckdb")), ..conn.clone() }, Secrets::default())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("absent.duckdb") && err.contains("does not exist"), "{err}");
+}
+
+#[test]
+fn duckdb_interrupts_a_statement_past_the_timeout() {
+    let path = duckdb_file("duckdb-interrupt");
+    let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path), query_timeout: Some(1), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let started = std::time::Instant::now();
+    let err = src.query("SELECT count(*) FROM range(200000) a, range(200000) b WHERE a.range + b.range = -1", 1).err().unwrap().to_string();
+    assert!(err.contains("no answer within 1s"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "interrupted, not waited out");
+}
+
+#[test]
+fn a_duckdb_catalogue_reads_tables_views_columns_comments_and_keys() {
+    let path = duckdb_file("duckdb-catalogue");
+    let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let cat = Catalogue::read(&mut *src, "local", None).expect("reads");
+    assert_eq!(cat.adapter, "duckdb");
+    let names: Vec<(String, String)> = cat.tables.iter().map(|t| (t.name.clone(), t.kind.clone())).collect();
+    assert_eq!(
+        names,
+        [("customers".to_string(), "table".to_string()), ("orders".into(), "table".into()), ("recent".into(), "view".into())]
+    );
+    let customers = cat.table(Some("main"), "customers").unwrap();
+    assert_eq!(customers.comment.as_deref(), Some("Who buys"));
+    assert_eq!(customers.rows, Some(2), "duckdb_tables() estimates");
+    let name = customers.columns.iter().find(|c| c.name == "name").unwrap();
+    assert_eq!(name.comment.as_deref(), Some("As they sign"));
+    assert_eq!(name.max_length, None, "DuckDB keeps no width on VARCHAR(80): it is VARCHAR");
+    assert!(!name.nullable);
+    assert_eq!(customers.primary_key, ["id"]);
+    let orders = cat.table(Some("main"), "orders").unwrap();
+    assert_eq!(orders.primary_key, ["id"]);
+    assert_eq!(orders.foreign_keys.len(), 1, "{:?}", orders.foreign_keys);
+    assert_eq!(orders.foreign_keys[0].columns, ["customer_id"]);
+    assert_eq!(orders.foreign_keys[0].references_table, "customers");
+    assert_eq!(orders.foreign_keys[0].references_columns, ["id"]);
+    assert!(orders.columns.windows(2).all(|w| w[0].position < w[1].position));
+    let scoped = Catalogue::read(&mut *src, "local", Some("main")).unwrap();
+    assert_eq!(scoped.tables.len(), 3);
+    assert!(Catalogue::read(&mut *src, "local", Some("nowhere")).unwrap().tables.is_empty());
 }

@@ -40,10 +40,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Built in cross's container like the arm64 one: DuckDB is C++,
+          # and musl-tools on the runner has a C compiler but no C++.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             asset: zsql-x86_64-linux
-            cross: false
+            cross: true
           # No arm64 Linux runner on this plan, so this one is built in
           # a container for the target rather than on it.
           - target: aarch64-unknown-linux-musl
@@ -74,12 +76,9 @@ jobs:
       # names: it loads its name service modules at runtime and dumps
       # core without them. musl resolves names and still links
       # statically, so the binary runs on any distribution and can be
-      # given a hostname to bind or to reach. SQLite, behind accounts,
-      # is C, so the target needs a C compiler of its own; cross brings
-      # one for the arm64 build.
-      - name: musl C toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      # given a hostname to bind or to reach. SQLite is C and DuckDB is
+      # C++, so both Linux targets build in cross's container, which
+      # carries a musl toolchain with both compilers.
 
       - name: cross
         if: matrix.cross
@@ -90,8 +89,6 @@ jobs:
 
       # The default build: the CLI with the server.
       - name: Build
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --locked --target ${{ matrix.target }} -p zsql-cli
