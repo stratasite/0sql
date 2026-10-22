@@ -121,7 +121,7 @@ drivers must be present on the host, so installation becomes "the
 binary plus a directory of drivers", and the Rust bindings have had a
 breaking change every quarterly release since 0.20. The two drivers
 behind closed source are two of our thirteen. The API is blocking and
-serialised per connection, so each call is a `spawn_blocking`.
+serialized per connection, so each call is a `spawn_blocking`.
 
 Verdict: the best engine and the wrong packaging for a static binary.
 Viable only inside a second process (see F).
@@ -245,7 +245,7 @@ and apply to any approach:
 - Per-user OAuth means a connection pool per identity, not per
   datasource (Cube's `context_to_orchestrator_id`, Superset's per-user
   token table).
-- Token refresh must be serialised per credential: Snowflake refresh
+- Token refresh must be serialized per credential: Snowflake refresh
   tokens are single-use and Databricks rotates them, and both
   Lightdash and dbt Fusion shipped bugs before adding the lock.
 - Snowflake blocks password auth for service users from October 2026,
@@ -325,7 +325,7 @@ as the documented escape hatch.
 - A `Credential` type with token sources: static secret, file path
   re-read on connect, OAuth client-credentials with a token endpoint,
   refresh-token exchange, AWS credential chain. Pools keyed by
-  datasource plus identity. Refresh serialised per credential.
+  datasource plus identity. Refresh serialized per credential.
 - DuckDB: a `duckdb` cargo feature, off in the release build, for
   developers who build it themselves, until a measurement says
   otherwise. Note that the only remote DuckDB is MotherDuck and it
@@ -342,7 +342,7 @@ without touching the main binary if it is ever needed.
 ## To verify before building
 
 - Snowflake SQL API v2 against a real account: partition sizes,
-  statement timeout behaviour, whether `resultSetMetaData` types are
+  statement timeout behavior, whether `resultSetMetaData` types are
   enough to type the rows without the driver protocol.
 - Databricks: whether JSON_ARRAY inline at 25 MiB is enough for the
   result sizes we expect, or external links are needed from day one.
@@ -474,7 +474,7 @@ security reviewer approves. Three facts bear on whether to spend it:
   availability on 2026-04-02 and feed Genie. Each is single-platform,
   which is exactly the gap a thirteen-dialect planner fills, and
   executing does nothing to widen that gap.
-- The model, not the plan, is what the industry is standardising. Open
+- The model, not the plan, is what the industry is standardizing. Open
   Semantic Interchange released spec 0.1.1 in December 2025, launched it
   publicly on 2026-01-27 and entered the Apache Incubator as Apache
   Ossie on 2026-07-10, with Snowflake, Databricks, dbt Labs, Microsoft
@@ -541,7 +541,7 @@ local engine, a cache and cubes, reached over Arrow Flight. This is the
 only shape that gives an agent "ask and get numbers" in one tool call
 without the customer's credentials leaving the customer. It is also the
 big build: a local engine, twelve connectors or ADBC, identity-keyed
-pools, serialised token refresh, cube lifecycle, and the RLS rules
+pools, serialized token refresh, cube lifecycle, and the RLS rules
 above. It should wait for a customer who asks for it by name.
 
 **5. A hosted data plane on app.0sql.io.** The same thing, holding

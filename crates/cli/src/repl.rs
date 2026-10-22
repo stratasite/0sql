@@ -19,7 +19,7 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
     let mut field_names = side.borrow_mut().announce()?;
     println!("{}", dim("type a line: projections, filters, calculations, segments; tab completes, .help for the forms, .quit to leave"));
 
-    // The line editor, with the grammar's completion, hints and colour,
+    // The line editor, with the grammar's completion, hints and color,
     // when stdin is a terminal; a plain read otherwise.
     let mut editor: Option<Editor<S>> = if std::io::stdin().is_terminal() {
         let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
@@ -37,7 +37,7 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
         }
         let _ = ed.load_history(h);
     }
-    // After the model changes: the field names here, the helper's catalogue.
+    // After the model changes: the field names here, the helper's catalog.
     let reread = |editor: &mut Option<Editor<S>>, side: &Rc<RefCell<S>>| -> Result<Vec<String>> {
         let names = side.borrow_mut().announce()?;
         if let Some(h) = editor.as_ref().and_then(|ed| ed.helper()) {

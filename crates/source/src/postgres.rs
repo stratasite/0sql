@@ -105,7 +105,7 @@ impl Source for Postgres {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
         // The simple-query protocol: every value arrives as the server's
-        // own text, whatever its type, which is what a catalogue and a
+        // own text, whatever its type, which is what a catalog and a
         // sample want. The extended protocol sends binary, and reading a
         // boolean or a number as a string there yields nothing at all —
         // which is how every non-text cell was null until a test asked

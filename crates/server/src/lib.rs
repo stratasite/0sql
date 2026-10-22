@@ -30,7 +30,7 @@
 //! - `auth`: who is calling, and the guard every request meets
 //! - `tenancy`: the tenant a request lives in and the gate on each branch
 //! - `deploy`: an archive in, a model out
-//! - `reads`: sql, explain, explore and the catalogue
+//! - `reads`: sql, explain, explore and the catalog
 //! - `accounts_api`: sign-up, sessions, members, keys and grants
 //! - `error`: the one error the API answers with
 //! - `mcp`: the same reads as MCP tools

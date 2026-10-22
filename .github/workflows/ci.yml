@@ -101,7 +101,7 @@ jobs:
         if: always()
         run: docker compose -f harness/sources/compose.yml down -v
 
-  # Advisories, licences and sources of every crate in the tree, from
+  # Advisories, licenses and sources of every crate in the tree, from
   # deny.toml. No build, so it is quick and runs on its own.
   deny:
     runs-on: ubuntu-latest

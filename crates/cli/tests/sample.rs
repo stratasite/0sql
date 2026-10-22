@@ -121,7 +121,7 @@ fn sampling_writes_what_the_model_asks_for_and_says_why_not_otherwise() {
 
 /// Sampling the Postgres fixture through a model `generate` drafted from
 /// it: the width it inferred sampling from, the real values most frequent
-/// first with their distinct total, and the warning the catalogue's
+/// first with their distinct total, and the warning the catalog's
 /// declared type raises when a text column is turned on by hand.
 /// `ZSQL_TEST_PG_*` as the sources job sets them; ignored otherwise.
 #[test]
@@ -150,7 +150,7 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
         format!("wh:\n  password: {}\n", std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD")),
     )
     .unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "wh"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "wh"])).0);
     assert!(run(zsql(&home, &project).args(["generate", "wh"])).0);
 
     // The draft turned sampling on for name (varchar(80)) and not for notes (text).
@@ -165,7 +165,7 @@ fn sampling_a_postgres_fixture_through_a_generated_model() {
     assert_eq!(name.distinct, Some(2));
     assert_eq!(name.sample_size, Some(1000));
 
-    // Turn the text column on by hand: the catalogue's declared type warns.
+    // Turn the text column on by hand: the catalog's declared type warns.
     let path = project.join("models/shop/tbl.customers.yml");
     let yml = std::fs::read_to_string(&path).unwrap();
     let on = yml.replacen("    name: Notes\n", "    name: Notes\n    enable_sampling: true\n", 1);

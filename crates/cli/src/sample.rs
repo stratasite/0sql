@@ -3,7 +3,7 @@
 //! dimensions, through `enable_sampling`; this command takes it at its
 //! word and warns when what came back looks like long text. See
 //! `docs/introspection.md`, phase D, and the project's AGENTS.md for the
-//! judgement the flag asks of a modeller.
+//! judgment the flag asks of a modeller.
 
 use crate::{config, local};
 use anyhow::{bail, Context, Result};
@@ -12,7 +12,7 @@ use std::path::Path;
 use zsql_project::values::{DimensionValues, ValueCatalog, ValueCount};
 use zsql_semantic::{Field, FieldKind, Snapshot, Table};
 use zsql_service::{Model, Trust};
-use zsql_source::{Catalogue, Connection};
+use zsql_source::{Catalog, Connection};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,
@@ -24,9 +24,9 @@ pub struct Options<'a> {
 }
 
 /// A value longer than this, on average, is prose and not a value: the
-/// catalogue fills with text that matches every request a little.
+/// catalog fills with text that matches every request a little.
 const LONG_TEXT: usize = 100;
-/// A declared width past this is the same signal, from the catalogue,
+/// A declared width past this is the same signal, from the catalog,
 /// before any row is read; it is the number in AGENTS.md.
 const WIDE: i64 = 255;
 
@@ -110,11 +110,11 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     // A policy needs a context to plan under; none of these projections
     // names a policy's trigger, so an empty one fires nothing.
     let context = (!s.security_policies.is_empty()).then(zsql_spec::SecurityContext::default);
-    let catalogues: BTreeMap<String, Catalogue> = s
+    let catalogs: BTreeMap<String, Catalog> = s
         .datasources
         .iter()
         .filter_map(|ds| {
-            let text = std::fs::read_to_string(crate::introspect::path(&project.dir, &ds.uid)).ok()?;
+            let text = std::fs::read_to_string(crate::catalog::path(&project.dir, &ds.uid)).ok()?;
             Some((ds.uid.clone(), serde_json::from_str(&text).ok()?))
         })
         .collect();
@@ -123,7 +123,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     let mut sampled = 0;
     for j in &jobs {
         let size = j.field.sample_size;
-        let result = sample_one(&model, &project.dir, s, j, context.as_ref(), &mut sources, &catalogues);
+        let result = sample_one(&model, &project.dir, s, j, context.as_ref(), &mut sources, &catalogs);
         let (values, distinct, via) = match result {
             Ok(r) => r,
             Err(e) => {
@@ -157,7 +157,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             uid: j.field.uid.clone(),
             name: j.field.name.clone(),
             table: via.clone(),
-            sampled_at: zsql_source::catalogue::now(),
+            sampled_at: zsql_source::catalog::now(),
             sample_size: (!own).then_some(size),
             distinct,
             values,
@@ -194,7 +194,7 @@ fn sample_one(
     j: &Job<'_>,
     context: Option<&zsql_spec::SecurityContext>,
     sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>,
-    catalogues: &BTreeMap<String, Catalogue>,
+    catalogs: &BTreeMap<String, Catalog>,
 ) -> Result<(Vec<ValueCount>, Option<i64>, String)> {
     let size = j.field.sample_size;
     let open = |uid: &str, sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>| -> Result<()> {
@@ -284,12 +284,12 @@ fn sample_one(
         }
     };
 
-    // What the catalogue declares for the column behind a bare-column
+    // What the catalog declares for the column behind a bare-column
     // expression, on any table the field has one on.
     for e in s.expressions.iter().filter(|e| e.field_id == j.field.id) {
         let Some(t) = s.tables.iter().find(|t| t.id == e.table_id) else { continue };
         let Some(ds) = s.datasources.iter().find(|d| d.id == t.datasource_id) else { continue };
-        let (Some(cat), Some(expr)) = (catalogues.get(&ds.uid), e.sql.as_deref()) else { continue };
+        let (Some(cat), Some(expr)) = (catalogs.get(&ds.uid), e.sql.as_deref()) else { continue };
         if let Some(col) = declared(cat, &t.physical_name, expr) {
             match col.max_length {
                 Some(w) if w > WIDE => eprintln!(
@@ -337,9 +337,9 @@ fn why_not(s: &Snapshot, f: &Field) -> Option<String> {
     None
 }
 
-/// The catalogue's column behind a bare-column expression, if the
-/// catalogue has the table.
-fn declared<'a>(cat: &'a Catalogue, physical: &str, expr: &str) -> Option<&'a zsql_source::Column> {
+/// The catalog's column behind a bare-column expression, if the
+/// catalog has the table.
+fn declared<'a>(cat: &'a Catalog, physical: &str, expr: &str) -> Option<&'a zsql_source::Column> {
     let name = expr.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
     let (schema, table) = match physical.rsplit_once('.') {
         Some((s, t)) => (Some(s), t),

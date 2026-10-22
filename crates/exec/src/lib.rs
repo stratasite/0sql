@@ -504,7 +504,7 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// RFC 3339 at second precision, the same arithmetic the catalogue uses.
+/// RFC 3339 at second precision, the same arithmetic the catalog uses.
 fn rfc3339(secs: u64) -> String {
     let (y, m, d, hh, mm, ss) = civil_time(secs);
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")

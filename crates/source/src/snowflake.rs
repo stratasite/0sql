@@ -287,7 +287,7 @@ fn credentials(conn: &Connection, secrets: Secrets) -> std::result::Result<Auth,
 
 /// The account as a key-pair token names it: the identifier's first label,
 /// upper-cased. A locator with its region and cloud (`xy12345.us-east-2.aws`)
-/// becomes `XY12345`; an organisation form (`myorg-myaccount`) stays whole.
+/// becomes `XY12345`; an organization form (`myorg-myaccount`) stays whole.
 fn jwt_account(account: &str) -> String {
     account.trim().split('.').next().unwrap_or_default().to_uppercase()
 }

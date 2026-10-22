@@ -61,7 +61,7 @@ impl Dialect {
 
     /// A copy with per-query overrides applied (the query's `db_settings`).
     /// This dialect with a query's `db_settings` laid over it. Without
-    /// any, the dialect itself: a plan shares the catalogue's copy rather
+    /// any, the dialect itself: a plan shares the catalog's copy rather
     /// than cloning the whole settings map.
     pub fn with_overrides<'a>(
         self: &std::sync::Arc<Self>,
@@ -494,7 +494,7 @@ mod tests {
 
     /// Every built-in dialect quotes a literal so that a quote inside it
     /// cannot end it, and quotes an identifier to something other than
-    /// the bare word; a query's `db_settings` lay over the catalogue's
+    /// the bare word; a query's `db_settings` lay over the catalog's
     /// copy without touching it.
     #[test]
     fn every_builtin_dialect_quotes_and_overlays() {
@@ -511,10 +511,10 @@ mod tests {
         }
         let pg = dialects.get("postgres").unwrap();
         let same = pg.with_overrides(std::iter::empty());
-        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalogue's copy");
+        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalog's copy");
         let over = pg.with_overrides([("final_pass_measure_join_type", &serde_json::json!("inner"))]);
         assert_eq!(over.final_pass_measure_join_type(), "inner");
-        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalogue's copy is untouched");
+        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalog's copy is untouched");
     }
 
     #[test]

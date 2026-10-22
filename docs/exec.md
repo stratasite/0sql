@@ -33,7 +33,7 @@ Phases are at the end and are the checklist; tick them off here.
 3. **Every execution is bounded four times** — by the warehouse, by the
    statement, by the streaming loop, and by the kernel — because each
    of the first three is something a warehouse can be found not to
-   honour.
+   honor.
 4. **The first thing built is not the endpoint.** It is numeric
    goldens: the executor trait proven against fixture data in DuckDB,
    with no product surface, no credentials and no promise spent. It is
@@ -141,7 +141,7 @@ GET    .../exec                  this principal's recent jobs
 - **Client disconnect is a cancel.** Axum gives us the dropped future;
   a `CancellationToken` carries it to the adapter. Otherwise an agent
   that gives up leaves the warehouse running.
-- **Streaming is the optimisation, not the contract.** With
+- **Streaming is the optimization, not the contract.** With
   `Accept: application/x-ndjson` rows go out as they arrive under
   chunked transfer. It is still bounded by the proxy's ceiling, so the
   job model stays primary and streaming is for the self-hosted and
@@ -233,7 +233,7 @@ a column of 10 MB strings is a thing that happens.
   and silent wrongness is the one failure mode this product exists to
   prevent.
 - The one exception is the MCP tool's page, which is an explicit,
-  labelled first page of a job the caller can continue — a different
+  labeled first page of a job the caller can continue — a different
   thing from a truncated total.
 
 ### 4. Memory, accounted globally
@@ -285,7 +285,7 @@ will be.
   bill; retrying without a budget is how a slow dependency becomes an
   outage.
 - A **pool per identity** (the mode table above), with an idle reaper,
-  a maximum age, and **refresh serialised per credential**: Snowflake's
+  a maximum age, and **refresh serialized per credential**: Snowflake's
   refresh tokens are single-use and Databricks rotates them, and the
   survey records two products shipping this bug before adding the lock.
 
@@ -314,7 +314,7 @@ The resource a customer notices first.
 **Arrow inside, JSON at the edge.** The internal type is an Arrow
 batch, because the moment a result is merged, totalled, cached or
 spilled it is columnar, and every local engine speaks Arrow. The agent
-and API path serialises to JSON, because a hundred rows going to a
+and API path serializes to JSON, because a hundred rows going to a
 model gains nothing from Arrow and the planner's statements are
 aggregated: hundreds to tens of thousands of rows, where per-query
 latency dominates and bulk throughput does not.
@@ -377,7 +377,7 @@ measures' additivity and the policies — so this is 0sql's to do and
 nobody else's. Bounded by the same byte budget, evicted by LRU, scoped
 to the key and context that created it.
 
-**3. Pre-aggregations.** A planned query materialised to Parquet at a
+**3. Pre-aggregations.** A planned query materialized to Parquet at a
 declared grain, which the pruner then prefers because it already ranks
 candidate tables by tier and cost (`crates/planner/src/pruner.rs`). A
 cube is a table in a hot-tier datasource; selection is machinery that
@@ -593,7 +593,7 @@ be its own commit on this branch before any executor exists.
 - [ ] **Phase 2 — the exec plane, self-hosted only.** `zsql-exec` as a
       second artifact over a local socket; the connection registry and
       schema bump; the three credential modes with identity-keyed pools
-      and serialised refresh; `Verb::Exec`; the job model and all four
+      and serialized refresh; `Verb::Exec`; the job model and all four
       bound layers; the byte budget and spill; the result cache with
       its per-mode security rule; the query log; egress policy; the
       chaos and leak suites; the eight HTTP adapters and three wire

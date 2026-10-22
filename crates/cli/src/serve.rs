@@ -484,7 +484,7 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
     // Wait for it to say where it listens, which is also when a bad
     // bind or a held data directory has been refused. The child is
-    // reaped here, not just signalled, since an exited child answers a
+    // reaped here, not just signaled, since an exited child answers a
     // signal until it is.
     let t0 = Instant::now();
     loop {

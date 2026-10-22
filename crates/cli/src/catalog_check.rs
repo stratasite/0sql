@@ -1,7 +1,7 @@
-//! `zsql check` against a catalogue: does the model name tables and
+//! `zsql check` against a catalog: does the model name tables and
 //! columns the warehouse has, and types it agrees with? The commonest
 //! defect in a hand-written model is a typo in a physical name, and until
-//! `zsql introspect` nothing could catch one; now a catalogue file beside
+//! `zsql catalog` nothing could catch one; now a catalog file beside
 //! the model is enough, and no query is run.
 //!
 //! Folding follows the planner's own rule for identifiers: a bare name
@@ -13,9 +13,9 @@ use crate::generate::{map_type, Mapped};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use zsql_service::Model;
-use zsql_source::{Catalogue, Table};
+use zsql_source::{Catalog, Table};
 
-/// Findings per datasource that has a catalogue; a datasource without one
+/// Findings per datasource that has a catalog; a datasource without one
 /// is listed as unchecked. `fails` is true when a table or column the
 /// model names is not in the warehouse.
 pub fn findings(model: &Model) -> Value {
@@ -26,13 +26,13 @@ pub fn findings(model: &Model) -> Value {
     let mut out: Vec<Value> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
     for ds in &s.datasources {
-        let path = crate::introspect::path(dir, &ds.uid);
+        let path = crate::catalog::path(dir, &ds.uid);
         let Ok(text) = std::fs::read_to_string(&path) else {
             unchecked.push(ds.uid.clone());
             continue;
         };
-        let Ok(cat) = serde_json::from_str::<Catalogue>(&text) else {
-            unchecked.push(format!("{} (catalogue unreadable)", ds.uid));
+        let Ok(cat) = serde_json::from_str::<Catalog>(&text) else {
+            unchecked.push(format!("{} (catalog unreadable)", ds.uid));
             continue;
         };
         let quotes = model
@@ -84,7 +84,7 @@ pub fn findings(model: &Model) -> Value {
         }
         if outside > 0 {
             unchecked.push(format!(
-                "{} ({outside} table{} outside the catalogue's scope {})",
+                "{} ({outside} table{} outside the catalog's scope {})",
                 ds.uid,
                 if outside == 1 { "" } else { "s" },
                 cat.scope.as_deref().unwrap_or("")
@@ -119,7 +119,7 @@ fn same(a: &str, b: &str, exact: bool) -> bool {
 
 /// A physical name split on the dots outside its quotes: the last part is
 /// the table, the one before it the schema, and anything earlier (a
-/// database, a catalog, a project) is not the catalogue's to know.
+/// database, a catalog, a project) is not the catalog's to know.
 pub(crate) fn parts<'a>(physical: &'a str, (open, close): &(String, String)) -> (Option<&'a str>, &'a str) {
     let mut parts: Vec<&str> = Vec::new();
     let mut depth = 0usize;
@@ -149,13 +149,13 @@ pub(crate) fn parts<'a>(physical: &'a str, (open, close): &(String, String)) -> 
     (schema, table)
 }
 
-/// The catalogue table a physical name denotes, each part quoted or bare
+/// The catalog table a physical name denotes, each part quoted or bare
 /// on its own. `None` with `true` means the name is outside the
-/// catalogue's scope, so nothing can be said about it.
-fn resolve<'a>(cat: &'a Catalogue, physical: &str, quotes: &(String, String)) -> (Option<&'a Table>, bool) {
+/// catalog's scope, so nothing can be said about it.
+fn resolve<'a>(cat: &'a Catalog, physical: &str, quotes: &(String, String)) -> (Option<&'a Table>, bool) {
     let (schema, table) = parts(physical, quotes);
     let (tname, texact) = unquote(table, quotes);
-    // A catalogue with no schemas at all (SQLite's) cannot contradict a
+    // A catalog with no schemas at all (SQLite's) cannot contradict a
     // schema part, so `main.orders` is `orders` there.
     let schema = schema.map(|s| unquote(s, quotes)).filter(|_| cat.tables.iter().any(|t| t.schema.is_some()));
     if let (Some(scope), Some((sname, _))) = (&cat.scope, schema) {
@@ -193,11 +193,11 @@ pub fn print(v: &Value) -> bool {
     for d in v["datasources"].as_array().into_iter().flatten() {
         let ds = s(&d["datasource"]);
         for t in d["missing_tables"].as_array().into_iter().flatten() {
-            println!("catalogue {ds}: table {} names {}, which the warehouse does not have", s(&t["table"]), s(&t["physical_name"]));
+            println!("catalog {ds}: table {} names {}, which the warehouse does not have", s(&t["table"]), s(&t["physical_name"]));
         }
         for c in d["missing_columns"].as_array().into_iter().flatten() {
             println!(
-                "catalogue {ds}: {} has no column {} ({} on {})",
+                "catalog {ds}: {} has no column {} ({} on {})",
                 s(&c["physical_name"]),
                 s(&c["column"]),
                 s(&c["field"]),
@@ -206,7 +206,7 @@ pub fn print(v: &Value) -> bool {
         }
         for m in d["type_mismatches"].as_array().into_iter().flatten() {
             println!(
-                "catalogue {ds}: {} says {} but {}.{} is {}, which is {}",
+                "catalog {ds}: {} says {} but {}.{} is {}, which is {}",
                 s(&m["field"]),
                 s(&m["declared"]),
                 s(&m["table"]),
@@ -217,17 +217,17 @@ pub fn print(v: &Value) -> bool {
         }
         let n = d["tables_checked"].as_u64().unwrap_or(0);
         println!(
-            "catalogue {ds}: {n} table{} checked against catalogue read {}",
+            "catalog {ds}: {n} table{} checked against catalog read {}",
             if n == 1 { "" } else { "s" },
             s(&d["read_at"]).get(..10).unwrap_or("")
         );
     }
     for u in v["unchecked"].as_array().into_iter().flatten() {
         let u = s(u);
-        if u.contains("outside the catalogue's scope") {
-            println!("catalogue: {u}; `zsql introspect {}` without a schema would read them", u.split(' ').next().unwrap_or(""));
+        if u.contains("outside the catalog's scope") {
+            println!("catalog: {u}; `zsql catalog {}` without a schema would read them", u.split(' ').next().unwrap_or(""));
         } else {
-            println!("catalogue: {u} not checked; `zsql introspect {}` would make that possible", u.split(' ').next().unwrap_or(""));
+            println!("catalog: {u} not checked; `zsql catalog {}` would make that possible", u.split(' ').next().unwrap_or(""));
         }
     }
     !v["fails"].as_bool().unwrap_or(false)

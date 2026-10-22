@@ -4,7 +4,7 @@
 //! route from it; the CLI builds one from the project directory at hand
 //! and answers the same questions without a server. Both call the
 //! functions here, so what a caller gets back, the SQL, the explain
-//! graph, the field catalogue, a refusal and its class, is the same
+//! graph, the field catalog, a refusal and its class, is the same
 //! whichever binary produced it. The server adds only what is about
 //! the server: who may read which branch, rate limits, and the bounds
 //! it puts on a request's shape; those arrive here as a [`ShapeCheck`]
@@ -161,7 +161,7 @@ pub struct Model {
     /// know when it moves. Empty for a model built any other way.
     pub sources: Vec<PathBuf>,
     /// Each field's tables, by field id, in model order: built once,
-    /// since the catalogue asks for it once per field.
+    /// since the catalog asks for it once per field.
     tables_by_field: HashMap<zsql_semantic::Id, Vec<String>>,
 }
 
@@ -257,7 +257,7 @@ impl Model {
                 let _ = std::fs::remove_file(values_path);
             }
         }
-        // ProjectTest serialises its file as a file name, so nothing of
+        // ProjectTest serializes its file as a file name, so nothing of
         // the directory it was loaded from is kept.
         std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)
     }

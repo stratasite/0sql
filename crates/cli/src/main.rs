@@ -8,12 +8,12 @@
 //! `--uid` imply `-r`; `ZSQL_SERVER` in the environment does not.
 
 mod assist;
-mod catalogue_check;
+mod catalog;
+mod catalog_check;
 mod config;
 mod deploy;
 mod failure;
 mod generate;
-mod introspect;
 mod local;
 mod project;
 mod remote;
@@ -181,7 +181,7 @@ enum Command {
     },
     /// Load and validate the project here, and run its tests; with -r, validate on the server.
     Check,
-    /// Model files from catalogue/{datasource}.json: a draft per table, joins from its foreign keys. Never rewrites a file.
+    /// Model files from catalog/{datasource}.json: a draft per table, joins from its foreign keys. Never rewrites a file.
     Generate {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         datasource: Option<String>,
@@ -249,8 +249,9 @@ enum Command {
         #[command(subcommand)]
         what: Option<ResultsWhat>,
     },
-    /// Read a datasource's tables and columns into catalogue/{datasource}.json. Local only.
-    Introspect {
+    /// Read a datasource's tables and columns into catalog/{datasource}.json. Local only.
+    #[command(alias = "introspect")]
+    Catalog {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         datasource: Option<String>,
         /// Read one schema (ClickHouse: one database) instead of every non-system one.
@@ -433,7 +434,7 @@ fn run(command: Command, at: Where) -> Result<()> {
             };
             run::results(&project, cmd)
         }
-        Command::Introspect { datasource, schema } => introspect::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
+        Command::Catalog { datasource, schema } => catalog::run(at.project.as_deref(), datasource.as_deref(), schema.as_deref()),
         Command::Sample { datasource, only, dry_run, budget } => sample::run(
             at.project.as_deref(),
             sample::Options { datasource: datasource.as_deref(), only: only.as_deref(), dry_run, budget },

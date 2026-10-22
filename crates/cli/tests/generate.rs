@@ -1,4 +1,4 @@
-//! `zsql introspect` then `zsql generate`, end to end: a draft the real
+//! `zsql catalog` then `zsql generate`, end to end: a draft the real
 //! loader accepts and the planner can query, a new column listed and
 //! then added, and nothing ever rewritten. SQLite needs no server; the
 //! Postgres variant runs against the container fixture when CI has one.
@@ -45,7 +45,7 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     .unwrap();
 
     // Introspect, then generate: two drafts and a join.
-    let (ok, out) = run(zsql(&home, &project).args(["introspect", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
     assert!(ok && out.contains("2 tables"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
     assert!(ok, "{out}");
@@ -82,11 +82,11 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
 
     // The warehouse grows two columns: listed with the command to add them.
     db.execute_batch("ALTER TABLE orders ADD COLUMN status VARCHAR(20); ALTER TABLE orders ADD COLUMN discount NUMERIC(6,2);").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["introspect", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
     assert!(ok, "{out}");
     assert!(
         out.contains("column added:   orders.status") && out.contains("column added:   orders.discount"),
-        "drift is reported before the catalogue is replaced:\n{out}"
+        "drift is reported before the catalog is replaced:\n{out}"
     );
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
     assert!(ok && out.contains("2 new columns: status, discount"), "{out}");
@@ -110,7 +110,7 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
 
     // The warehouse changes under the model: check names what is gone.
     db.execute_batch("ALTER TABLE orders DROP COLUMN status; ALTER TABLE customers RENAME TO clients;").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["introspect", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "local"]));
     assert!(ok, "{out}");
     assert!(
         out.contains("column dropped: orders.status")
@@ -122,15 +122,15 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     assert!(!ok, "a missing table and column fail the check:\n{out}");
     assert!(out.contains("table Customers names customers, which the warehouse does not have"), "{out}");
     assert!(out.contains("orders has no column status"), "{out}");
-    assert!(out.contains("checked against catalogue"), "{out}");
+    assert!(out.contains("checked against catalog"), "{out}");
     db.execute_batch("ALTER TABLE clients RENAME TO customers; ALTER TABLE orders ADD COLUMN status VARCHAR(20);").unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
     let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(ok, "put back, the check passes again:\n{out}");
 
     // --dry-run writes nothing, for a new table too.
     db.execute_batch("CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT);").unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--dry-run"]));
     assert!(ok && out.contains("would create models/local/tbl.products.yml"), "{out}");
     assert!(!project.join("models/local/tbl.products.yml").exists());
@@ -164,14 +164,14 @@ fn a_postgres_schema_becomes_a_model_with_sampling_and_descriptions() {
     )
     .unwrap();
 
-    let (ok, out) = run(zsql(&home, &project).args(["introspect", "wh"]));
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "wh"]));
     assert!(ok && out.contains("in shop"), "{out}");
     if !out.contains("2 tables, 1 views") {
         // Say what this connection can see at all, so a miss explains itself.
         let ds = std::fs::read_to_string(project.join("datasources.yml")).unwrap().replace("  schema: shop\n", "");
         std::fs::write(project.join("datasources.yml"), ds).unwrap();
-        let (_, every) = run(zsql(&home, &project).args(["introspect", "wh"]));
-        let cat = std::fs::read_to_string(project.join("catalogue/wh.json")).unwrap_or_default();
+        let (_, every) = run(zsql(&home, &project).args(["catalog", "wh"]));
+        let cat = std::fs::read_to_string(project.join("catalog/wh.json")).unwrap_or_default();
         let names: Vec<String> = serde_json::from_str::<serde_json::Value>(&cat)
             .ok()
             .and_then(|v| {
@@ -223,7 +223,7 @@ fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
            ship_to_id INTEGER REFERENCES customers(id), total NUMERIC(12,2) NOT NULL);",
     )
     .unwrap();
-    assert!(run(zsql(&home, &project).args(["introspect", "local"])).0);
+    assert!(run(zsql(&home, &project).args(["catalog", "local"])).0);
 
     // An existing model, written by hand: the list at the margin, the name qualified.
     std::fs::create_dir_all(project.join("models/core")).unwrap();
@@ -235,7 +235,7 @@ fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
     .unwrap();
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local"]));
     assert!(ok, "{out}");
-    assert!(!out.contains("created models/local/tbl.orders.yml"), "the qualified name matched the catalogue's bare one: {out}");
+    assert!(!out.contains("created models/local/tbl.orders.yml"), "the qualified name matched the catalog's bare one: {out}");
     assert!(out.contains("3 new columns") || out.contains("new columns"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["generate", "local", "--new"]));
     assert!(ok && out.contains("added"), "{out}");

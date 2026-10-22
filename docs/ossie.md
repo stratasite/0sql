@@ -5,7 +5,7 @@ semantic model a superset of what Apache Ossie (incubating, formerly
 Open Semantic Interchange) can express, a subset, or something else;
 what gaps should 0sql fill first; and how should it integrate with
 Ossie over time. The execution engine investigation in
-`docs/execution-engine.md` is paused in favour of this.
+`docs/execution-engine.md` is paused in favor of this.
 
 ## Ossie, as it actually stands
 
@@ -189,7 +189,7 @@ are simply not present, and the planner falls back to its defaults.
 | Snapshot (semi-additive) measures | none; Snowflake and Hex stash non-additive dimensions |
 | Extended blend groups (role-playing dates aligned across facts) | none |
 | Row-level security and masking policies | none; ThoughtSpot's converter marks RLS as unrepresentable and security-bearing; proposals #87, #58, #59 |
-| Segments, named filters, default filters | open and contested: semantic filters (#5); maintainer favours a minimal spec |
+| Segments, named filters, default filters | open and contested: semantic filters (#5); maintainer favors a minimal spec |
 | Format, hidden, value sampling | none; extended metadata PR #287 proposes `display_format` and `default_aggregation` |
 | Grains on a time dimension | none; dbt's converter assigns every time dimension DAY |
 | Period-over-period, windows, contribution | query-time decorators in 0sql; Ossie permits `OVER()` in strings but has no grain or window declaration, and dbt's converter reports `CUMULATIVE_SEMANTICS_LOSS` |
@@ -372,7 +372,7 @@ must stay).
      Imports of field files are unaffected.
 
 Order of value: 1 first, because it is small and improves agent
-behaviour now; 4 next, because import depends on it; 3 and 5 as the
+behavior now; 4 next, because import depends on it; 3 and 5 as the
 importer reaches them; 2 only after it is discussed and settled. Nothing here is implemented; this is the list a decision
 would start from.
 
@@ -440,7 +440,7 @@ community outcome, not a feature, and it is earned by Phases 2 and 3.
   discussion before any key is added.
 
 - Whether `security.yml` policies should be proposed to Ossie or kept
-  as an extension. The project's maintainers favour a minimal core and
+  as an extension. The project's maintainers favor a minimal core and
   the converters treat security as unrepresentable by design; propose
   tags and PII attributes (#58, #59) and keep policies in the
   extension.

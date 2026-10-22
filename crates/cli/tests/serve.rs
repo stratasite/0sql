@@ -332,13 +332,13 @@ fn the_background_server_starts_reports_and_stops() {
     let out = run(&root.0, &["server", "stop"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("no server is running"));
     std::thread::sleep(Duration::from_millis(100));
-    assert!(alive(decoy.id()), "stop signalled a process that is not the server");
+    assert!(alive(decoy.id()), "stop signaled a process that is not the server");
     let _ = decoy.kill();
     let _ = decoy.wait();
 }
 
 /// The environment file a deployment loads is the base: a `ZSQL_*`
-/// variable is honoured when no flag names the setting, and a flag
+/// variable is honored when no flag names the setting, and a flag
 /// wins over its variable.
 #[cfg(unix)]
 #[test]

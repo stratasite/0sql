@@ -365,7 +365,7 @@ fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorat
             None => Some(base_sql.clone()),
         };
         if let Some(sql) = sql {
-            // Rails normalises the customizer's template to lowercase.
+            // Rails normalizes the customizer's template to lowercase.
             let mut attrs = zsql_spec::Attrs::new();
             attrs.insert("custom_sql".into(), serde_json::Value::String(sql.trim().to_lowercase()));
             p.local_decorators.push(Decorator::custom(DecoratorKind::Customize, attrs));

@@ -219,8 +219,8 @@ pub fn print_deploy(v: &Value) -> bool {
     for w in v["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or(""));
     }
-    let catalogue_ok = if v["catalogue"].is_object() { crate::catalogue_check::print(&v["catalogue"]) } else { true };
-    print_tests(&v["test_results"]) && catalogue_ok
+    let catalog_ok = if v["catalog"].is_object() { crate::catalog_check::print(&v["catalog"]) } else { true };
+    print_tests(&v["test_results"]) && catalog_ok
 }
 
 /// Prints test results; true when none failed.

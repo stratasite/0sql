@@ -45,7 +45,7 @@ services:
     volumes:
       - ./mysql-init.sql:/docker-entrypoint-initdb.d/shop.sql:ro
 
-  # The image is large and its licence is for development. If it is the
+  # The image is large and its license is for development. If it is the
   # one that makes CI slow, it moves to a nightly job and the wire
   # transport stays proven by Postgres and MySQL.
   sqlserver:

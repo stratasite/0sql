@@ -166,7 +166,7 @@ fn within_partition(part: &zsql_semantic::Partition, f: &RFilter) -> bool {
     }
 }
 
-/// A list value's entries as the SQL visitor splits them (quotes honoured),
+/// A list value's entries as the SQL visitor splits them (quotes honored),
 /// trimmed and lower-cased.
 fn split_list(value: &str) -> Vec<String> {
     crate::visitors::sql::split_list(value)

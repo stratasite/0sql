@@ -28,7 +28,7 @@ pub fn install_ring() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// The platform's roots, the bundle if the platform has none, and
-/// `ca_file` on top. Loaded on every call: a catalogue read opens one
+/// `ca_file` on top. Loaded on every call: a catalog read opens one
 /// connection, and a stale store is worse than a slow one.
 pub fn roots(uid: &str, ca_file: Option<&Path>) -> Result<RootCertStore> {
     let mut store = RootCertStore::empty();

@@ -26,13 +26,13 @@ was written against: a spec, a security context, a universe, and the
 SQL or the refusal expected. They are never edited to make a change
 pass. A change that alters planned SQL is a change to the contract, and
 the pull request should say why the new statement is right and the old
-one was not; adding a case is the way to pin new behaviour.
+one was not; adding a case is the way to pin new behavior.
 
 ## What a pull request looks like
 
 - One concern per pull request, with a message that says what changed
   and why, written for someone reading `git log` next year.
-- Tests for behaviour, next to the code that has it. The server's
+- Tests for behavior, next to the code that has it. The server's
   isolation tests drive the real router; a change to who may reach what
   belongs there.
 - Formatted with `rustfmt` (the width is in `rustfmt.toml`), clean under

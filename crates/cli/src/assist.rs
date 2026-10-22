@@ -1,5 +1,5 @@
 //! The repl's line helper: tab completion, the dimmed hint as you type,
-//! colour, and a line that continues while a parenthesis is open. The
+//! color, and a line that continues while a parenthesis is open. The
 //! grammar says what may come next (`zsql_shorthand::complete`); this
 //! maps each offer to the model's fields, sampled values and tables.
 
@@ -291,7 +291,7 @@ const CONTEXTUAL: [&str; 17] = [
 ];
 
 /// Keywords bold, strings dim, an unclosed opener and what follows it red.
-pub fn colour(line: &str) -> String {
+pub fn color(line: &str) -> String {
     let red_from = unclosed(line);
     let mut out = String::with_capacity(line.len() * 2);
     let mut i = 0;
@@ -360,7 +360,7 @@ impl<L: Lookup> Highlighter for Assist<L> {
         if line.trim_start().starts_with('.') {
             return Cow::Borrowed(line);
         }
-        Cow::Owned(colour(line))
+        Cow::Owned(color(line))
     }
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
         Cow::Owned(format!("{DIM}{hint}{RESET}"))
@@ -486,22 +486,22 @@ mod tests {
 
     #[test]
     fn colour_and_balance() {
-        assert_eq!(colour("country = Canada"), "country = Canada");
-        assert_eq!(colour("x desc"), format!("x {BOLD}desc{RESET}"));
-        assert_eq!(colour("order date, month(d)"), format!("order date, {BOLD}month{RESET}(d)"));
+        assert_eq!(color("country = Canada"), "country = Canada");
+        assert_eq!(color("x desc"), format!("x {BOLD}desc{RESET}"));
+        assert_eq!(color("order date, month(d)"), format!("order date, {BOLD}month{RESET}(d)"));
         assert_eq!(
-            colour("rank(x by a order by b)"),
+            color("rank(x by a order by b)"),
             format!("{BOLD}rank{RESET}(x {BOLD}by{RESET} a {BOLD}order{RESET} {BOLD}by{RESET} b)")
         );
-        assert_eq!(colour("created by"), "created by");
-        assert_eq!(colour("x = 'a, b'"), format!("x = {DIM}'a, b'{RESET}"));
-        assert_eq!(colour("x = 'open"), format!("x = {RED}'open{RESET}"));
-        assert_eq!(colour("month(x"), format!("{BOLD}month{RESET}{RED}(x{RESET}"));
+        assert_eq!(color("created by"), "created by");
+        assert_eq!(color("x = 'a, b'"), format!("x = {DIM}'a, b'{RESET}"));
+        assert_eq!(color("x = 'open"), format!("x = {RED}'open{RESET}"));
+        assert_eq!(color("month(x"), format!("{BOLD}month{RESET}{RED}(x{RESET}"));
         assert_eq!(unclosed("a (b [c] 'd') e"), None);
         assert_eq!(unclosed("a (b"), Some(2));
         assert_eq!(unclosed("who = O'Brien"), None, "an apostrophe inside a word is a letter");
         assert_eq!(unclosed("'it''s'"), None);
         assert_eq!(unclosed("x = 'a"), Some(4));
-        assert_eq!(colour("who = O'Brien"), "who = O'Brien");
+        assert_eq!(color("who = O'Brien"), "who = O'Brien");
     }
 }

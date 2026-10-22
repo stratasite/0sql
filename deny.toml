@@ -18,7 +18,7 @@ ignore = [
 ]
 
 [licenses]
-# This project is MIT; its tree may carry the permissive licences below.
+# This project is MIT; its tree may carry the permissive licenses below.
 version = 2
 allow = [
   "MIT",

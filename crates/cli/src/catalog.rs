@@ -1,18 +1,18 @@
-//! `zsql introspect`: read a datasource's catalogue and write it beside
+//! `zsql catalog`: read a datasource's catalog and write it beside
 //! the model. Local only: the server never holds a warehouse credential.
 
 use crate::config;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::time::Instant;
-use zsql_source::{Catalogue, Connection, Drift};
+use zsql_source::{Catalog, Connection, Drift};
 
-/// Where a datasource's catalogue is written: one file per datasource,
+/// Where a datasource's catalog is written: one file per datasource,
 /// so re-reading one never rewrites another, and committed rather than
 /// gitignored, because it is schema and a diff in review is where drift
 /// wants to be seen.
 pub fn path(project_dir: &Path, uid: &str) -> std::path::PathBuf {
-    project_dir.join("catalogue").join(format!("{uid}.json"))
+    project_dir.join("catalog").join(format!("{uid}.json"))
 }
 
 pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<&str>) -> Result<()> {
@@ -50,14 +50,14 @@ pub fn run(project_dir: Option<&Path>, datasource: Option<&str>, schema: Option<
             // is the schema.
             matches!(conn.adapter.as_str(), "clickhouse" | "mysql" | "athena").then(|| conn.database.clone()).flatten()
         });
-        let cat = Catalogue::read(src.as_mut(), &conn.uid, scope.as_deref()).with_context(|| format!("reading {}", conn.uid))?;
+        let cat = Catalog::read(src.as_mut(), &conn.uid, scope.as_deref()).with_context(|| format!("reading {}", conn.uid))?;
 
         let out = path(&project.dir, &conn.uid);
-        // What moved since the committed catalogue, said before it is replaced.
-        if let Some(before) = std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<Catalogue>(&t).ok()) {
+        // What moved since the committed catalog, said before it is replaced.
+        if let Some(before) = std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<Catalog>(&t).ok()) {
             let drift = Drift::between(&before, &cat);
             if !drift.is_empty() {
-                println!("{}: since the catalogue read {}:", conn.uid, before.read_at.get(..10).unwrap_or(&before.read_at));
+                println!("{}: since the catalog read {}:", conn.uid, before.read_at.get(..10).unwrap_or(&before.read_at));
                 for line in drift.lines() {
                     println!("  {line}");
                 }

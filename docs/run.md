@@ -38,7 +38,7 @@ zsql run (--expr LINE | --spec FILE) [--context FILE]
 
 It reuses `QueryArgs` from `crates/cli/src/main.rs`, so a line that
 works for `zsql sql` works for `zsql run`. It is local-only, like
-`sample` and `introspect`: the credentials are on this machine and the
+`sample` and `catalog`: the credentials are on this machine and the
 hosted service holds none, so `-r` is refused with the wording
 `Where::mode` already uses.
 
@@ -82,7 +82,7 @@ exactly as `sample_one` does. The connect timeout is the transport's
 ten seconds. The statement timeout follows strata's precedence, which
 is the right one for a command that may run a long query: `--timeout`
 for this run, else the datasource's `query_timeout`, else a
-`query_timeout` in `project.yml`, else ten minutes. The catalogue and
+`query_timeout` in `project.yml`, else ten minutes. The catalog and
 sampling reads keep their sixty-second default; a run is a different
 kind of statement.
 
@@ -152,7 +152,7 @@ Second phase, not first.
 
 ## Result storage
 
-**Where.** `~/.zsql/results/<project-uid>/<id>/`, honouring
+**Where.** `~/.zsql/results/<project-uid>/<id>/`, honoring
 `ZSQL_HOME` through `config::home()`, with `ZSQL_RESULTS_DIR` for a
 user who wants them on an encrypted volume. Directories 0700, files
 0600. Outside the project by construction, so a result cannot be
@@ -302,7 +302,7 @@ the SQL. Secrets are never in the key.
    through the day. Either way it is one line in `datasources.yml` to
    change.
 3. `data_updated_at` on a table, from the snapshot, when the result
-   predates it. Nothing writes that field today; `introspect` could,
+   predates it. Nothing writes that field today; `catalog` could,
    from the warehouse's own last-modified metadata where it exists.
    Recorded as the hook.
 
@@ -345,7 +345,7 @@ the design in six places and adds the reasons.
 
 **What the cache might be asked to be.** A server endpoint serving
 slices of a stored result to many clients without re-running it; a
-dashboard reading a dozen results at once; a materialised or
+dashboard reading a dozen results at once; a materialized or
 scheduled result refreshed on a timer, which is strata's subscription;
 a team cache on a bucket, so one analyst's run serves the next; a
 local engine that re-aggregates a superset result for a narrower

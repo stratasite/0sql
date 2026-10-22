@@ -1,13 +1,13 @@
-//! `zsql generate`: model files from a catalogue. A draft for a person,
+//! `zsql generate`: model files from a catalog. A draft for a person,
 //! never a replacement for one: an existing file is never rewritten, every
 //! guess is marked on its line, and what could not be mapped is listed
 //! rather than silently left out. See `docs/introspection.md`, phase C.
 
-use crate::{config, introspect};
+use crate::{catalog, config};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use zsql_source::{Catalogue, Column, Connection, Table};
+use zsql_source::{Catalog, Column, Connection, Table};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,
@@ -32,7 +32,7 @@ pub(crate) enum Mapped {
 /// The warehouse's spelling, lower-cased, parameters and ClickHouse's
 /// wrappers stripped: `character varying(80)` is `character varying`,
 /// `Nullable(LowCardinality(String))` is `string`.
-fn normalise(data_type: &str) -> (String, bool) {
+fn normalize(data_type: &str) -> (String, bool) {
     let mut t = data_type.trim().to_lowercase();
     let mut array = t.ends_with("[]") || t.starts_with("array(") || t.starts_with("array<");
     for wrapper in ["nullable(", "lowcardinality("] {
@@ -54,7 +54,7 @@ fn normalise(data_type: &str) -> (String, bool) {
 }
 
 pub(crate) fn map_type(data_type: &str) -> Mapped {
-    let (t, array) = normalise(data_type);
+    let (t, array) = normalize(data_type);
     if array {
         return Mapped::Skip;
     }
@@ -211,7 +211,7 @@ struct Drafted {
     skipped: Vec<String>,
 }
 
-fn table_yml(cat: &Catalogue, table: &Table, today: &str) -> Drafted {
+fn table_yml(cat: &Catalog, table: &Table, today: &str) -> Drafted {
     let (cost, why) = cost(table.rows);
     let mut body = String::new();
     let (mut fields, mut measures, mut skipped) = (0, 0, Vec::new());
@@ -228,7 +228,7 @@ fn table_yml(cat: &Catalogue, table: &Table, today: &str) -> Drafted {
         }
     }
     let mut text = format!(
-        "# Generated from catalogue/{}.json on {}. Every line ending in \"inferred\"\n\
+        "# Generated from catalog/{}.json on {}. Every line ending in \"inferred\"\n\
          # is a guess from a column's name or type: check it. This file is yours\n\
          # from here; `zsql generate` never rewrites it, and lists new columns.\n",
         cat.datasource, today
@@ -255,7 +255,7 @@ fn table_yml(cat: &Catalogue, table: &Table, today: &str) -> Drafted {
 }
 
 /// The joins a schema's foreign keys declare, in the shape of a rel file.
-fn relation_yml(cat: &Catalogue, tables: &[&Table], today: &str) -> Option<String> {
+fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str) -> Option<String> {
     let mut joins = String::new();
     for t in tables {
         for fk in &t.foreign_keys {
@@ -294,7 +294,7 @@ fn relation_yml(cat: &Catalogue, tables: &[&Table], today: &str) -> Option<Strin
         return None;
     }
     Some(format!(
-        "# Generated from catalogue/{}.json on {}: one join per foreign key the\n\
+        "# Generated from catalog/{}.json on {}: one join per foreign key the\n\
          # warehouse declares. Yours from here; `zsql generate` never rewrites it.\n\
          datasource: {}\n\n{joins}",
         cat.datasource, today, cat.datasource
@@ -335,9 +335,9 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
             let Some(physical) = v.get("physical_name").and_then(|p| p.as_str()) else { continue };
             let datasource = v.get("datasource").and_then(|d| d.as_str()).map(|d| d.trim().to_lowercase());
             // Any quoting the dialect allows is stripped: what remains is
-            // compared without case, as the catalogue's own names are.
+            // compared without case, as the catalog's own names are.
             let bare = |s: &str| s.trim().trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).to_lowercase();
-            let (schema, table) = crate::catalogue_check::parts(physical, &("\"".into(), "\"".into()));
+            let (schema, table) = crate::catalog_check::parts(physical, &("\"".into(), "\"".into()));
             let (schema, table) = (schema.map(bare), bare(table));
             let mut columns = BTreeSet::new();
             if let Some(fields) = v.get("fields").and_then(|f| f.as_sequence()) {
@@ -432,11 +432,11 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             bail!("datasources.yml names several datasources ({}); say which", have.join(", "));
         }
     };
-    let cat_path = introspect::path(&project.dir, &uid);
+    let cat_path = catalog::path(&project.dir, &uid);
     let text = std::fs::read_to_string(&cat_path).with_context(|| {
-        format!("{}: run `zsql introspect {uid}` first", cat_path.strip_prefix(&project.dir).unwrap_or(&cat_path).display())
+        format!("{}: run `zsql catalog {uid}` first", cat_path.strip_prefix(&project.dir).unwrap_or(&cat_path).display())
     })?;
-    let cat: Catalogue = serde_json::from_str(&text).with_context(|| cat_path.display().to_string())?;
+    let cat: Catalog = serde_json::from_str(&text).with_context(|| cat_path.display().to_string())?;
     let today = cat.read_at.get(..10).unwrap_or(&cat.read_at).to_string();
 
     let want_table = opts.table.map(|t| t.trim().to_lowercase());
@@ -448,10 +448,10 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         .filter(|t| want_table.as_deref().is_none_or(|w| t.physical_name().eq_ignore_ascii_case(w) || t.name.eq_ignore_ascii_case(w)))
         .collect();
     if tables.is_empty() {
-        bail!("the catalogue has no table matching that; `zsql introspect {uid}` reads it again");
+        bail!("the catalog has no table matching that; `zsql catalog {uid}` reads it again");
     }
     let have = existing(&project.dir)?;
-    // A model matches a catalogue table by its last two name parts, and
+    // A model matches a catalog table by its last two name parts, and
     // by datasource when the model says one: the same `public.orders` on
     // two warehouses is two models.
     let find = |t: &Table| {
@@ -609,7 +609,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         }
     }
     if created == 0 && listed == 0 && added == 0 && !opts.dry_run {
-        println!("nothing to do: every table in the catalogue has a model, with no new columns");
+        println!("nothing to do: every table in the catalog has a model, with no new columns");
     }
     Ok(())
 }

@@ -9,7 +9,7 @@
 //! - [`Secret`], resolved at connect time from the environment or the
 //!   project's gitignored `.zsql`, and never part of a deployed model;
 //! - [`Source`], one read-only statement in and [`Rows`] out, which is
-//!   all that introspecting a catalogue and sampling a dimension need.
+//!   all that introspecting a catalog and sampling a dimension need.
 //!
 //! Statements come from `zsql` itself, never from a caller, and the
 //! guard in [`read_only`] is a second pair of eyes on that rather than a
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 pub mod athena;
 pub mod bigquery;
-pub mod catalogue;
+pub mod catalog;
 pub mod clickhouse;
 pub mod databricks;
 pub mod duckdb;
@@ -35,7 +35,7 @@ pub mod sqlserver;
 pub mod tls;
 pub mod trino;
 
-pub use catalogue::{Catalogue, Column, Drift, ForeignKey, Table};
+pub use catalog::{Catalog, Column, Drift, ForeignKey, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -198,7 +198,7 @@ pub struct Connection {
     pub client_id: Option<String>,
     /// BigQuery's project.
     pub project: Option<String>,
-    /// BigQuery's location, for a job and for a region-wide catalogue read.
+    /// BigQuery's location, for a job and for a region-wide catalog read.
     pub location: Option<String>,
     /// BigQuery's service-account key file, or an application-default
     /// credentials file.
@@ -274,7 +274,7 @@ impl Connection {
     }
 
     /// The statement timeout, from `query_timeout` or a default that is
-    /// generous for a catalogue read and short of any warehouse's own.
+    /// generous for a catalog read and short of any warehouse's own.
     pub fn timeout(&self) -> std::time::Duration {
         let secs = self.query_timeout.filter(|s| *s > 0).unwrap_or(60);
         std::time::Duration::from_secs(secs.min(3600) as u64)
@@ -416,7 +416,7 @@ pub fn secrets(project_dir: Option<&Path>, uid: &str) -> Secrets {
 
 // ---------------------------------------------------------------------- rows
 
-/// What a statement returned. Every cell is text or null: a catalogue is
+/// What a statement returned. Every cell is text or null: a catalog is
 /// strings and a sampled value is the string a consumer will match
 /// against, so nothing here needs a type system yet.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -453,7 +453,7 @@ pub trait Source {
         &[]
     }
 
-    /// The connection this was opened from, for a catalogue read that
+    /// The connection this was opened from, for a catalog read that
     /// needs more than the adapter's name: BigQuery's project and location.
     fn connection(&self) -> Option<&Connection> {
         None
@@ -463,7 +463,7 @@ pub trait Source {
 /// Refuses a statement that is not a read.
 ///
 /// `zsql` writes every statement this crate runs, so this is a second
-/// pair of eyes rather than a defence: it catches a generated statement
+/// pair of eyes rather than a defense: it catches a generated statement
 /// that went wrong, and a `sample_sql` an author wrote by hand. The
 /// protection that matters is a credential with no write grant, which the
 /// documentation asks for.

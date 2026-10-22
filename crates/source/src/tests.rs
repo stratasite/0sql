@@ -4,7 +4,7 @@
 //! B2's containers are where they get one.
 
 use super::*;
-use crate::catalogue::{self, Column, ForeignKey, Table};
+use crate::catalog::{self, Column, ForeignKey, Table};
 
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zsql-source-{name}-{}", std::process::id()));
@@ -29,7 +29,7 @@ fn a_connection_is_the_keys_the_model_reads_past() {
 
     let wh = Connection::read(&dir, "WAREHOUSE").unwrap();
     assert_eq!(wh.uid, "warehouse", "the key is matched case-insensitively");
-    assert_eq!(wh.adapter, "postgres", "the adapter is lower-cased, as the dialect catalogue spells it");
+    assert_eq!(wh.adapter, "postgres", "the adapter is lower-cased, as the dialect catalog spells it");
     assert_eq!(wh.host.as_deref(), Some("db.internal"));
     assert_eq!(wh.port, Some(5433));
     assert_eq!(wh.database.as_deref(), Some("analytics"));
@@ -291,7 +291,7 @@ fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
 }
 
 #[test]
-fn a_sqlite_catalogue_has_its_tables_views_and_columns_in_order() {
+fn a_sqlite_catalog_has_its_tables_views_and_columns_in_order() {
     let dir = temp("cat-sqlite");
     let file = dir.join("c.db");
     {
@@ -304,7 +304,7 @@ fn a_sqlite_catalogue_has_its_tables_views_and_columns_in_order() {
     }
     let conn = Connection { uid: "local".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
     let mut src = open(&conn, Secrets::default()).unwrap();
-    let cat = Catalogue::read(src.as_mut(), "local", None).unwrap();
+    let cat = Catalog::read(src.as_mut(), "local", None).unwrap();
 
     assert_eq!(cat.datasource, "local");
     assert_eq!(cat.adapter, "sqlite");
@@ -320,17 +320,17 @@ fn a_sqlite_catalogue_has_its_tables_views_and_columns_in_order() {
     assert!(orders.rows.is_none() && orders.comment.is_none(), "SQLite keeps neither");
 
     let json = serde_json::to_string(&cat).unwrap();
-    let back: Catalogue = serde_json::from_str(&json).unwrap();
+    let back: Catalog = serde_json::from_str(&json).unwrap();
     assert_eq!(back.tables.len(), 2, "the file round-trips");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The Postgres catalogue, scoped to `pg_catalog` because that schema is
+/// The Postgres catalog, scoped to `pg_catalog` because that schema is
 /// in every server and needs no fixture written: its tables have a row
 /// estimate, typed columns in order, and the odd comment.
 #[test]
 #[ignore]
-fn a_real_postgres_catalogue_reads_pg_catalog() {
+fn a_real_postgres_catalog_reads_pg_catalog() {
     let conn = Connection {
         uid: "test".into(),
         adapter: "postgres".into(),
@@ -343,7 +343,7 @@ fn a_real_postgres_catalogue_reads_pg_catalog() {
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
     let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
-    let cat = Catalogue::read(src.as_mut(), "test", Some("pg_catalog")).expect("reads");
+    let cat = Catalog::read(src.as_mut(), "test", Some("pg_catalog")).expect("reads");
 
     let class = cat.table(Some("pg_catalog"), "pg_class").expect("pg_class is in every server");
     assert_eq!(class.kind, "table");
@@ -357,12 +357,12 @@ fn a_real_postgres_catalogue_reads_pg_catalog() {
     assert!(cat.tables.iter().all(|t| t.schema.as_deref() == Some("pg_catalog")), "the scope held");
 }
 
-/// The ClickHouse catalogue, scoped to the playground's `blogs` database
+/// The ClickHouse catalog, scoped to the playground's `blogs` database
 /// by default: real tables with row counts from `system.tables`, and
 /// ClickHouse's own type spellings kept as they are.
 #[test]
 #[ignore]
-fn a_real_clickhouse_catalogue_reads_a_database() {
+fn a_real_clickhouse_catalog_reads_a_database() {
     let conn = Connection {
         uid: "ch".into(),
         adapter: "clickhouse".into(),
@@ -376,7 +376,7 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
     // The playground has `blogs`; a container has `default`, empty but
     // real. Either way the read works and the scope holds.
     let scope = std::env::var("ZSQL_TEST_CLICKHOUSE_DB").unwrap_or_else(|_| "blogs".into());
-    let cat = Catalogue::read(src.as_mut(), "ch", Some(&scope)).expect("reads");
+    let cat = Catalog::read(src.as_mut(), "ch", Some(&scope)).expect("reads");
     assert_eq!(cat.adapter, "clickhouse");
     assert!(cat.tables.iter().all(|t| t.schema.as_deref() == Some(scope.as_str())), "the scope held");
     if let Some(countries) = cat.table(Some("blogs"), "countries") {
@@ -389,7 +389,7 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
         assert_eq!(name.position, 1);
     }
     // Nothing from the system schemas leaks in when there is no scope.
-    let all = Catalogue::read(src.as_mut(), "ch", None).expect("reads");
+    let all = Catalog::read(src.as_mut(), "ch", None).expect("reads");
     assert!(all
         .tables
         .iter()
@@ -400,7 +400,7 @@ fn a_real_clickhouse_catalogue_reads_a_database() {
 /// `ZSQL_TEST_MYSQL_HOST`, `_USER`, `_PASSWORD`, `_DB`.
 #[test]
 #[ignore]
-fn a_real_mysql_answers_and_its_catalogue_reads() {
+fn a_real_mysql_answers_and_its_catalog_reads() {
     let conn = Connection {
         uid: "my".into(),
         adapter: "mysql".into(),
@@ -429,15 +429,15 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
     assert!(open(&tls(SslMode::VerifyFull), Secrets::password(pw())).is_err(), "verify-full refuses a self-signed certificate");
     let p = open(&tls(SslMode::Prefer), Secrets::password(pw())).expect("prefer connects");
     assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
-    // The catalogue of mysql's own schema: always there, never written to.
-    let cat = Catalogue::read(src.as_mut(), "my", Some("mysql")).expect("reads");
+    // The catalog of mysql's own schema: always there, never written to.
+    let cat = Catalog::read(src.as_mut(), "my", Some("mysql")).expect("reads");
     let user = cat.table(Some("mysql"), "user").expect("mysql.user is in every server");
     assert!(user.columns.iter().any(|c| c.name == "Host"), "typed columns");
     assert!(user.columns.windows(2).all(|w| w[0].position < w[1].position));
     assert!(user.columns.iter().any(|c| c.max_length.is_some()), "character_maximum_length is read");
     assert_eq!(user.primary_key, ["Host", "User"], "a composite key, in order");
     // The container's shop schema, from harness/sources/mysql-init.sql.
-    let shop = Catalogue::read(src.as_mut(), "my", Some("zsql")).expect("reads zsql");
+    let shop = Catalog::read(src.as_mut(), "my", Some("zsql")).expect("reads zsql");
     let customers = shop.table(Some("zsql"), "customers").expect("customers");
     assert_eq!(customers.comment.as_deref(), Some("Who buys"));
     assert_eq!(customers.columns.iter().find(|c| c.name == "name").unwrap().comment.as_deref(), Some("As they sign"));
@@ -459,7 +459,7 @@ fn a_real_mysql_answers_and_its_catalogue_reads() {
 /// `_USER`, `_PASSWORD`, `_DB`. Encryption off, as the transport is built.
 #[test]
 #[ignore]
-fn a_real_sqlserver_answers_and_its_catalogue_reads() {
+fn a_real_sqlserver_answers_and_its_catalog_reads() {
     let conn = Connection {
         uid: "ms".into(),
         adapter: "sqlserver".into(),
@@ -488,10 +488,10 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
     assert!(open(&tls(SslMode::VerifyFull), Secrets::password(pw())).is_err(), "verify-full refuses a self-signed certificate");
     let p = open(&tls(SslMode::Prefer), Secrets::password(pw())).expect("prefer connects");
     assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
-    // sys.objects lists user objects, so the catalogue views themselves
+    // sys.objects lists user objects, so the catalog views themselves
     // are not in it, which is right for a model. master.dbo always holds
     // the spt_ tables setup leaves behind, and spt_values is a view.
-    let cat = Catalogue::read(src.as_mut(), "ms", Some("dbo")).expect("reads");
+    let cat = Catalog::read(src.as_mut(), "ms", Some("dbo")).expect("reads");
     let monitor = cat.table(Some("dbo"), "spt_monitor").expect("master.dbo.spt_monitor is on every server");
     assert_eq!(monitor.kind, "table");
     assert_eq!(monitor.physical_name(), "dbo.spt_monitor");
@@ -504,7 +504,7 @@ fn a_real_sqlserver_answers_and_its_catalogue_reads() {
 /// and the catalog as `_DB`, `tpch` by default since the image ships it.
 #[test]
 #[ignore]
-fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
+fn a_real_trino_answers_follows_next_uri_and_its_catalog_reads() {
     let conn = Connection {
         uid: "tr".into(),
         adapter: "trino".into(),
@@ -526,7 +526,7 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalogue_reads() {
     assert_eq!(all.rows.len(), 25);
     assert!(src.query("CREATE TABLE memory.default.zsql_no (a INT)", 1).is_err());
     // The catalog is a header, so information_schema alone means tpch's.
-    let cat = Catalogue::read(src.as_mut(), "tr", Some("tiny")).expect("reads");
+    let cat = Catalog::read(src.as_mut(), "tr", Some("tiny")).expect("reads");
     let nation = cat.table(Some("tiny"), "nation").expect("tpch.tiny.nation");
     assert_eq!(nation.kind, "table");
     let name = nation.columns.iter().find(|c| c.name == "name").expect("name");
@@ -926,7 +926,7 @@ fn snowflake_key_pair_signs_a_token_the_account_can_check() {
 }
 
 #[test]
-fn a_snowflake_catalogue_reads_information_schema_and_show_keys() {
+fn a_snowflake_catalog_reads_information_schema_and_show_keys() {
     let server = fake(|_, _, body| {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         let sql = body["statement"].as_str().unwrap_or_default();
@@ -1014,7 +1014,7 @@ fn a_snowflake_catalogue_reads_information_schema_and_show_keys() {
     };
     let secrets = Secrets { personal_access_token: Some(Secret("tok".into())), ..Default::default() };
     let mut src = open(&conn, secrets).unwrap();
-    let cat = Catalogue::read(&mut *src, "snow", None).expect("reads");
+    let cat = Catalog::read(&mut *src, "snow", None).expect("reads");
     assert_eq!(cat.adapter, "snowflake");
     let names: Vec<(String, String)> = cat.tables.iter().map(|t| (t.name.clone(), t.kind.clone())).collect();
     assert_eq!(
@@ -1042,7 +1042,7 @@ fn a_snowflake_catalogue_reads_information_schema_and_show_keys() {
 
     // Scoped to a schema, the SHOWs name it and the scope is folded.
     let seen_before = server.seen.lock().unwrap().len();
-    let scoped = Catalogue::read(&mut *src, "snow", Some("public")).expect("reads one schema");
+    let scoped = Catalog::read(&mut *src, "snow", Some("public")).expect("reads one schema");
     assert_eq!(scoped.tables.len(), 3);
     let seen = server.seen.lock().unwrap();
     let statements: Vec<String> = seen[seen_before..]
@@ -1126,9 +1126,9 @@ fn redshift_key_arrays_expand_against_the_columns_read() {
             vec![Some("shop".into()), Some("nowhere".into()), Some("primary".into()), None, Some("{1}".into()), None, None, None],
         ],
     };
-    let expanded = catalogue::expand_attnums(&tables, &k);
+    let expanded = catalog::expand_attnums(&tables, &k);
     assert_eq!(expanded.rows.len(), 3, "one row per key column; a table not read contributes none");
-    catalogue::apply_keys(&mut tables, &expanded);
+    catalog::apply_keys(&mut tables, &expanded);
     let orders = &tables[1];
     assert_eq!(orders.primary_key, ["id"]);
     assert_eq!(
@@ -1161,7 +1161,7 @@ fn redshifts_column_and_key_statements_hold_on_postgres() {
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
     let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
-    let (_, columns_sql, keys_sql) = catalogue::redshift_sql(Some("shop"));
+    let (_, columns_sql, keys_sql) = catalog::redshift_sql(Some("shop"));
     let c = src.query(&columns_sql, 1000).expect("the column statement runs on Postgres");
     let name = c
         .rows
@@ -1313,7 +1313,7 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
 }
 
 #[test]
-fn a_databricks_catalogue_reads_unity_information_schema() {
+fn a_databricks_catalog_reads_unity_information_schema() {
     let server = fake(|_, path, body| {
         if path == "/oidc/v1/token" {
             return (200, r#"{"access_token":"t","expires_in":3600}"#.into());
@@ -1394,7 +1394,7 @@ fn a_databricks_catalogue_reads_unity_information_schema() {
         ..Default::default()
     };
     let mut src = open(&conn, Secrets { personal_access_token: Some(Secret("t".into())), ..Default::default() }).unwrap();
-    let cat = Catalogue::read(&mut *src, "dbx", Some("shop")).expect("reads");
+    let cat = Catalog::read(&mut *src, "dbx", Some("shop")).expect("reads");
     let orders = cat.table(Some("shop"), "orders").unwrap();
     assert!(orders.primary_key.is_empty());
     assert_eq!(orders.foreign_keys[0].references_table, "customers");
@@ -1551,7 +1551,7 @@ fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
 }
 
 #[test]
-fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
+fn a_bigquery_catalog_reads_a_dataset_or_a_region() {
     let server = fake(|_, path, body| {
         if path == "/token" {
             return (200, r#"{"access_token":"t","expires_in":3600}"#.into());
@@ -1624,7 +1624,7 @@ fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
         ..Default::default()
     };
     let mut src = open(&conn, Secrets::default()).unwrap();
-    let cat = Catalogue::read(&mut *src, "bq", Some("d")).expect("a dataset");
+    let cat = Catalog::read(&mut *src, "bq", Some("d")).expect("a dataset");
     let orders = cat.table(Some("d"), "orders").unwrap();
     assert_eq!(orders.rows, Some(100));
     assert_eq!(orders.comment.as_deref(), Some("Sales"));
@@ -1646,10 +1646,10 @@ fn a_bigquery_catalogue_reads_a_dataset_or_a_region() {
     assert!(statements[1].contains("COLUMN_FIELD_PATHS") && statements[1].contains("REGEXP_EXTRACT"), "{}", statements[1]);
 
     // Without a dataset the region is read, and that needs a location.
-    let err = Catalogue::read(&mut *src, "bq", None).err().unwrap().to_string();
+    let err = Catalog::read(&mut *src, "bq", None).err().unwrap().to_string();
     assert!(err.contains("location"), "{err}");
     let mut src = open(&Connection { location: Some("eu".into()), ..conn.clone() }, Secrets::default()).unwrap();
-    let _ = Catalogue::read(&mut *src, "bq", None).expect("a region");
+    let _ = Catalog::read(&mut *src, "bq", None).expect("a region");
     let last = server.seen.lock().unwrap();
     let regional: Vec<String> = last
         .iter()
@@ -1867,7 +1867,7 @@ fn athena_starts_polls_pages_drops_the_header_row_and_walks_the_credential_chain
 }
 
 #[test]
-fn an_athena_catalogue_reads_information_schema_without_comments_on_tables() {
+fn an_athena_catalog_reads_information_schema_without_comments_on_tables() {
     let server = fake(|_, _, body| {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         if let Some(sql) = v.get("QueryString").and_then(|q| q.as_str()) {
@@ -1918,7 +1918,7 @@ fn an_athena_catalogue_reads_information_schema_without_comments_on_tables() {
     };
     let secrets = Secrets { access_key_id: Some(Secret("a".into())), secret_access_key: Some(Secret("s".into())), ..Default::default() };
     let mut src = open(&conn, secrets).unwrap();
-    let cat = Catalogue::read(&mut *src, "ath", Some("shop")).expect("reads");
+    let cat = Catalog::read(&mut *src, "ath", Some("shop")).expect("reads");
     let orders = cat.table(Some("shop"), "orders").unwrap();
     assert_eq!(orders.rows, None);
     assert_eq!(orders.columns[0].comment.as_deref(), Some("Paid or open"));
@@ -2080,11 +2080,11 @@ fn duckdb_interrupts_a_statement_past_the_timeout() {
 }
 
 #[test]
-fn a_duckdb_catalogue_reads_tables_views_columns_comments_and_keys() {
-    let path = duckdb_file("duckdb-catalogue");
+fn a_duckdb_catalog_reads_tables_views_columns_comments_and_keys() {
+    let path = duckdb_file("duckdb-catalog");
     let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path), ..Default::default() };
     let mut src = open(&conn, Secrets::default()).unwrap();
-    let cat = Catalogue::read(&mut *src, "local", None).expect("reads");
+    let cat = Catalog::read(&mut *src, "local", None).expect("reads");
     assert_eq!(cat.adapter, "duckdb");
     let names: Vec<(String, String)> = cat.tables.iter().map(|t| (t.name.clone(), t.kind.clone())).collect();
     assert_eq!(
@@ -2106,7 +2106,7 @@ fn a_duckdb_catalogue_reads_tables_views_columns_comments_and_keys() {
     assert_eq!(orders.foreign_keys[0].references_table, "customers");
     assert_eq!(orders.foreign_keys[0].references_columns, ["id"]);
     assert!(orders.columns.windows(2).all(|w| w[0].position < w[1].position));
-    let scoped = Catalogue::read(&mut *src, "local", Some("main")).unwrap();
+    let scoped = Catalog::read(&mut *src, "local", Some("main")).unwrap();
     assert_eq!(scoped.tables.len(), 3);
-    assert!(Catalogue::read(&mut *src, "local", Some("nowhere")).unwrap().tables.is_empty());
+    assert!(Catalog::read(&mut *src, "local", Some("nowhere")).unwrap().tables.is_empty());
 }

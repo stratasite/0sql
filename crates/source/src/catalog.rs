@@ -1,7 +1,7 @@
 //! What a warehouse says it holds: the shape a model is generated from
 //! and checked against.
 //!
-//! Written to `catalogue.json` in the project, committed rather than
+//! Written to `catalog.json` in the project, committed rather than
 //! gitignored, because it is schema and not customer data and a diff in
 //! review is where drift wants to be seen. The queries that fill it are
 //! per-adapter; the shape is not.
@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 
 /// A datasource's tables and columns, as read at one moment.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Catalogue {
+pub struct Catalog {
     /// The `datasources.yml` key this was read from.
     pub datasource: String,
     pub adapter: String,
-    /// RFC 3339, so two catalogues can be diffed and dated.
+    /// RFC 3339, so two catalogs can be diffed and dated.
     pub read_at: String,
-    /// The version of `zsql` that read it: a catalogue outlives a build.
+    /// The version of `zsql` that read it: a catalog outlives a build.
     pub read_by: String,
     /// The one schema this read was narrowed to, when it was: a table
     /// outside it is unread, not absent, and `check` and drift say so.
@@ -94,7 +94,7 @@ impl Table {
     }
 }
 
-impl Catalogue {
+impl Catalog {
     pub fn table(&self, schema: Option<&str>, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name && t.schema.as_deref() == schema)
     }
@@ -104,7 +104,7 @@ impl Catalogue {
 
 use crate::{Result, Rows, Source, SourceError};
 
-/// Caps on a catalogue read. A warehouse with more tables or columns than
+/// Caps on a catalog read. A warehouse with more tables or columns than
 /// this is refused rather than half-read, so a generated model is never
 /// silently missing a schema.
 pub const MAX_TABLES: usize = 20_000;
@@ -114,12 +114,12 @@ pub const MAX_COLUMNS: usize = 200_000;
 const SYSTEM_SCHEMAS: [&str; 9] =
     ["pg_catalog", "information_schema", "INFORMATION_SCHEMA", "system", "pg_toast", "mysql", "performance_schema", "sys", "guest"];
 
-impl Catalogue {
+impl Catalog {
     /// Reads what `src` holds. `scope` narrows the read to one schema —
     /// `schema:` in `datasources.yml`, or ClickHouse's database — and
     /// without one every schema but the system ones is read. The queries
     /// are per adapter; the shape they fill is not.
-    pub fn read(src: &mut dyn Source, datasource: &str, scope: Option<&str>) -> Result<Catalogue> {
+    pub fn read(src: &mut dyn Source, datasource: &str, scope: Option<&str>) -> Result<Catalog> {
         let adapter = src.adapter().to_string();
         let tables = match adapter.as_str() {
             "postgres" => postgres(src, scope)?,
@@ -136,7 +136,7 @@ impl Catalogue {
             "duckdb" => duckdb(src, scope)?,
             other => return Err(SourceError::Unsupported(other.to_string())),
         };
-        Ok(Catalogue {
+        Ok(Catalog {
             datasource: datasource.to_string(),
             adapter,
             read_at: now(),
@@ -726,7 +726,7 @@ fn standard_keys_sql(prefix: &str, upper: bool) -> String {
 /// names one and region-wide otherwise. A dataset read joins `__TABLES__`
 /// for the row count, which the region has no view for. Descriptions
 /// live in `TABLE_OPTIONS` as quoted literals and in `COLUMN_FIELD_PATHS`
-/// for a column; a parameterised `STRING(n)` carries its width in the
+/// for a column; a parameterized `STRING(n)` carries its width in the
 /// type's spelling.
 fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     let conn = src.connection().ok_or_else(|| SourceError::Missing("bigquery".into(), "project"))?;
@@ -741,7 +741,7 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
             let location = conn
                 .location
                 .clone()
-                .ok_or_else(|| SourceError::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalogue"))?;
+                .ok_or_else(|| SourceError::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalog"))?;
             (format!("`{project}`.`region-{location}`"), String::new(), "CAST(NULL AS STRING)")
         }
     };
@@ -772,7 +772,7 @@ fn bigquery(src: &mut dyn Source, scope: Option<&str>) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
-/// DuckDB's own catalogue functions, which carry comments, a row estimate
+/// DuckDB's own catalog functions, which carry comments, a row estimate
 /// and the constraints with their column lists: `duckdb_tables()`,
 /// `duckdb_views()`, `duckdb_columns()` and `duckdb_constraints()`. A
 /// key's columns arrive as one string joined on a unit separator and are
@@ -911,7 +911,7 @@ pub fn now() -> String {
 // --------------------------------------------------------------------- drift
 
 /// What changed between two reads of the same datasource: the schema's
-/// drift, which is what a committed catalogue is for.
+/// drift, which is what a committed catalog is for.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Drift {
     /// (was, now): the two reads were narrowed differently, so what is
@@ -937,7 +937,7 @@ impl Drift {
     }
 
     /// From `before` to `after`, by qualified table name and column name.
-    pub fn between(before: &Catalogue, after: &Catalogue) -> Drift {
+    pub fn between(before: &Catalog, after: &Catalog) -> Drift {
         let key = |t: &Table| t.physical_name().to_lowercase();
         let mut d = Drift::default();
         // A table outside the other read's scope was not read, not dropped.

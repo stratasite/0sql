@@ -15,7 +15,7 @@ use crate::{Connection, Result, SourceError, SslMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The most a response body may be. A catalogue read of two hundred
+/// The most a response body may be. A catalog read of two hundred
 /// thousand columns, or one Snowflake partition, can pass ureq's own
 /// ten-megabyte default by a distance.
 const MAX_BODY: u64 = 256 * 1024 * 1024;

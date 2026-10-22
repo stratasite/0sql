@@ -279,7 +279,7 @@ pub struct Field {
     pub snapshot: Option<SnapshotKind>,
     /// Whether `zsql sample` collects this dimension's values at all. Off
     /// unless the modeller turns it on, and turning it on means sample,
-    /// whatever the field's type or width: the judgement is the
+    /// whatever the field's type or width: the judgment is the
     /// modeller's, and AGENTS.md carries the guidance rather than the
     /// loader carrying a rule.
     #[serde(default)]

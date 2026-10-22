@@ -1,4 +1,4 @@
-//! The reads: sql, explain, explore, the catalogue, the values of a
+//! The reads: sql, explain, explore, the catalog, the values of a
 //! dimension, the tests, a branch's summary and the listing. Each
 //! handler is a thin wrapper over a plain function so the MCP tools run
 //! the same code behind the same gate.

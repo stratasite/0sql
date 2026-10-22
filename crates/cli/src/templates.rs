@@ -24,8 +24,8 @@ pub const DATASOURCES_YML: &str = "\
 # The server never connects to your warehouse. It has no database driver\n\
 # in it at all: it takes a query spec and gives back SQL text, and nothing\n\
 # about your rows ever reaches it. The zsql command on this machine does\n\
-# connect, read-only, when you ask it to: `zsql introspect` reads the\n\
-# catalogue a model is drafted from, and `zsql sample` reads the values of\n\
+# connect, read-only, when you ask it to: `zsql catalog` reads the\n\
+# catalog a model is drafted from, and `zsql sample` reads the values of\n\
 # the dimensions you turn sampling on for. Give it a credential with no\n\
 # write grant.\n\
 #\n\
@@ -281,7 +281,7 @@ a channel, a product name.**
 Leave it off everywhere else.
 
 - **Long or unbounded text** — `notes`, `comments`, `description`,
-  `varchar(max)`, `text`, `clob`. Sampling these fills the catalogue with
+  `varchar(max)`, `text`, `clob`. Sampling these fills the catalog with
   prose that matches every request a little and nothing well, which makes
   resolution worse than no samples at all. This is the mistake to avoid.
 - **High-cardinality keys and identifiers** — an id, an order number, an
