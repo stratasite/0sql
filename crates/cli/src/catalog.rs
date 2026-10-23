@@ -81,14 +81,21 @@ fn write(project_dir: &Path, cat: &Catalog) -> Result<std::path::PathBuf> {
     Ok(out)
 }
 
-fn say_drift(uid: &str, before: &Catalog, fresh: &Catalog) {
+/// Prints what changed since the last read, and returns the same lines so
+/// a caller answering in JSON can carry them instead.
+fn say_drift(uid: &str, before: &Catalog, fresh: &Catalog, quiet: bool) -> Vec<String> {
     let drift = Drift::between(before, fresh);
-    if !drift.is_empty() {
+    if drift.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<String> = drift.lines();
+    if !quiet {
         println!("{uid}: since the catalog read {}:", before.read_at.get(..10).unwrap_or(&before.read_at));
-        for line in drift.lines() {
+        for line in &lines {
             println!("  {line}");
         }
     }
+    lines
 }
 
 /// `schema.table` or `table`, as a user names one.
@@ -199,7 +206,14 @@ pub fn status(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) 
 
 /// `zsql catalog read`: named schemas and tables, read and merged in.
 /// With nothing named, a schema picker on a terminal.
-pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[String], tables: &[String], all: bool) -> Result<()> {
+pub fn read(
+    project_dir: Option<&Path>,
+    datasource: Option<&str>,
+    schemas: &[String],
+    tables: &[String],
+    all: bool,
+    json: bool,
+) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let conn = choose(&project.dir, datasource)?;
     let t0 = Instant::now();
@@ -230,11 +244,14 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
         scopes = chosen.into_iter().map(|i| Some(seen[i].0.clone())).collect();
     }
     let mut failed = Vec::new();
+    let mut drift: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
     for scope in &scopes {
         match Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::schema(scope.as_deref())) {
             Ok(fresh) => {
                 if let Some(b) = &before {
-                    say_drift(&conn.uid, b, &fresh);
+                    drift.extend(say_drift(&conn.uid, b, &fresh, json));
                 }
                 if fresh.tables.is_empty() {
                     eprintln!(
@@ -265,8 +282,11 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
                     })
                 });
                 if recorded {
-                    println!("{}: table dropped:  {name}", conn.uid);
+                    if !json {
+                        println!("{}: table dropped:  {name}", conn.uid);
+                    }
                     merged.forget(schema, table);
+                    gone.push(name.clone());
                     dropped += 1;
                 } else {
                     missing.push(name.clone());
@@ -274,10 +294,13 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
             }
             Ok(fresh) => {
                 if let Some(b) = &before {
-                    say_drift(&conn.uid, b, &fresh);
+                    drift.extend(say_drift(&conn.uid, b, &fresh, json));
                 }
                 for t in &fresh.tables {
-                    println!("added   {}", t.physical_name());
+                    added.push(t.physical_name());
+                    if !json {
+                        println!("added   {}", t.physical_name());
+                    }
                 }
                 merged.merge(fresh);
             }
@@ -304,15 +327,63 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
         (m, n) => format!(", {m} not found, {n} dropped"),
     };
     let out = write(&project.dir, &merged)?;
-    summary(&merged, &out, &project.dir, t0, &note);
-    if !missing.is_empty() {
-        bail!("{}: not every name was found; the catalog holds what did read", conn.uid);
+    let problem = if !missing.is_empty() {
+        Some(format!("{}: not every name was found; the catalog holds what did read", conn.uid))
+    } else if !failed.is_empty() {
+        Some(format!("{}: not every read succeeded; the file keeps what it had for those", conn.uid))
+    } else {
+        None
+    };
+    if json {
+        // One document, whether it went well or not: what the file holds
+        // now, and the failure if there was one.
+        let mut v = outcome(&merged, &out, &project.dir, &added, &gone, &missing, &failed, &drift);
+        if let Some(p) = &problem {
+            v["error"] = serde_json::json!({ "class": "Error", "message": p });
+        }
+        crate::show::print_json(&v)?;
+        return match problem {
+            Some(p) => Err(crate::failure::Reported(p).into()),
+            None => Ok(()),
+        };
     }
-    if !failed.is_empty() {
-        bail!("{}: not every read succeeded; the file keeps what it had for those", conn.uid);
+    summary(&merged, &out, &project.dir, t0, &note);
+    if let Some(p) = problem {
+        bail!("{p}");
     }
     eprintln!("next: zsql generate");
     Ok(())
+}
+
+/// What a read or a sync did, for `--json`: the file as it stands and what
+/// this run changed about it.
+#[allow(clippy::too_many_arguments)]
+fn outcome(
+    cat: &Catalog,
+    out: &Path,
+    project_dir: &Path,
+    added: &[String],
+    dropped: &[String],
+    missing: &[String],
+    failed: &[String],
+    drift: &[String],
+) -> serde_json::Value {
+    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+    serde_json::json!({
+        "datasource": cat.datasource,
+        "adapter": cat.adapter,
+        "read_at": cat.read_at,
+        "tables": cat.tables.len() - views,
+        "views": views,
+        "columns": cat.tables.iter().map(|t| t.columns.len()).sum::<usize>(),
+        "scopes": cat.scopes,
+        "file": out.strip_prefix(project_dir).unwrap_or(out).display().to_string(),
+        "added": added,
+        "dropped": dropped,
+        "not_found": missing,
+        "failed": failed,
+        "drift": drift,
+    })
 }
 
 /// The schemas a connection can see, with a table count each: a read of
@@ -332,7 +403,7 @@ fn schemas_of(src: &mut dyn Source, conn: &Connection) -> Result<Vec<(String, us
 
 /// `zsql catalog sync`: every scope and every added table the file
 /// records, re-read; what a successful read did not find is dropped.
-pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> {
+pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let conn = choose(&project.dir, datasource)?;
     let Some(before) = load(&project.dir, &conn.uid)? else {
@@ -347,10 +418,12 @@ pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> 
         before.scopes.iter().map(|s| s.schema.clone()).collect()
     };
     let mut failed = Vec::new();
+    let mut drift: Vec<String> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
     for scope in &scopes {
         match Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::schema(scope.as_deref())) {
             Ok(fresh) => {
-                say_drift(&conn.uid, &before, &fresh);
+                drift.extend(say_drift(&conn.uid, &before, &fresh, json));
                 merged.merge(fresh);
             }
             Err(e) => failed.push(format!("{}: kept as it was: {e}", scope.as_deref().unwrap_or("every schema"))),
@@ -364,11 +437,15 @@ pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> 
         match Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::table(a.schema.as_deref(), &a.name)) {
             Ok(fresh) if fresh.tables.is_empty() => {
                 // Asked for by name and not there: dropped, not unread.
-                println!("{}: table dropped:  {}{}", conn.uid, a.schema.as_deref().map(|s| format!("{s}.")).unwrap_or_default(), a.name);
+                let name = format!("{}{}", a.schema.as_deref().map(|s| format!("{s}.")).unwrap_or_default(), a.name);
+                if !json {
+                    println!("{}: table dropped:  {name}", conn.uid);
+                }
+                gone.push(name);
                 merged.forget(a.schema.as_deref(), &a.name);
             }
             Ok(fresh) => {
-                say_drift(&conn.uid, &before, &fresh);
+                drift.extend(say_drift(&conn.uid, &before, &fresh, json));
                 merged.merge(fresh);
             }
             Err(e) => failed.push(format!("{}: kept as it was: {e}", a.name)),
@@ -378,9 +455,21 @@ pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> 
         eprintln!("warning: {}: {f}", conn.uid);
     }
     let out = write(&project.dir, &merged)?;
+    let problem = (!failed.is_empty()).then(|| format!("{}: not every read succeeded; the file keeps what it had for those", conn.uid));
+    if json {
+        let mut v = outcome(&merged, &out, &project.dir, &[], &gone, &[], &failed, &drift);
+        if let Some(p) = &problem {
+            v["error"] = serde_json::json!({ "class": "Error", "message": p });
+        }
+        crate::show::print_json(&v)?;
+        return match problem {
+            Some(p) => Err(crate::failure::Reported(p).into()),
+            None => Ok(()),
+        };
+    }
     summary(&merged, &out, &project.dir, t0, "");
-    if !failed.is_empty() {
-        bail!("{}: not every read succeeded; the file keeps what it had for those", conn.uid);
+    if let Some(p) = problem {
+        bail!("{p}");
     }
     Ok(())
 }

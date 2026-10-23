@@ -18,8 +18,11 @@ fn out(cmd: &mut Command) -> (bool, String) {
     (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Parses the whole of stdout as one JSON document, which also proves
+/// there is exactly one: `from_str` refuses trailing content, so a command
+/// that printed its answer and then an error would fail here.
 fn parses(label: &str, text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|e| panic!("{label} did not answer in JSON ({e}):\n{text}"))
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("{label} did not answer in one JSON document ({e}):\n{text}"))
 }
 
 #[test]
@@ -67,6 +70,58 @@ fn the_commands_an_agent_drives_all_answer_in_json() {
     let v = parses("spec", &text);
     assert!(ok && v["projections"][0]["field"] == "status", "{v}");
 
+    // A command that answers and then fails still prints one document,
+    // with the failure inside it, and still exits non-zero.
+    std::fs::create_dir_all(project.join("tests")).unwrap();
+    std::fs::write(project.join("tests/fails.yml"), "name: fails\nprojections:\n  - Status\nassert_regex: ZZZ_NEVER_MATCHES\n").unwrap();
+    for args in [vec!["test", "--json"], vec!["check", "--json"]] {
+        let label = args.join(" ");
+        let (ok, text) = out(zsql(&home, &project).args(&args));
+        assert!(!ok, "{label} must fail when a test fails:\n{text}");
+        let v = parses(&label, &text);
+        assert_eq!(v["error"]["message"], "tests failed", "the failure is in the document: {v}");
+    }
+    // The text path keeps its own exit code and says the same thing.
+    let (ok, text) = out(zsql(&home, &project).arg("test"));
+    assert!(!ok, "{text}");
+    std::fs::remove_file(project.join("tests/fails.yml")).unwrap();
+
+    // The catalog family answers in JSON too, including the read that finds
+    // a name the warehouse does not have.
+    let db = rusqlite::Connection::open(project.join("shop.db")).unwrap();
+    // The columns the model maps, so the catalog check stays happy.
+    db.execute_batch("CREATE TABLE orders (status TEXT);").unwrap();
+    drop(db);
+    let (ok, text) = out(zsql(&home, &project).args(["catalog", "read", "orders", "--json"]));
+    let v = parses("catalog read --json", &text);
+    assert!(ok && v["added"][0] == "orders", "{v}");
+    let (ok, text) = out(zsql(&home, &project).args(["catalog", "sync", "--json"]));
+    assert!(ok, "{text}");
+    parses("catalog sync --json", &text);
+    let (ok, text) = out(zsql(&home, &project).args(["catalog", "read", "ordrs", "--json"]));
+    let v = parses("catalog read a typo --json", &text);
+    assert!(!ok, "a name that is not there fails: {v}");
+    assert!(v["not_found"][0] == "ordrs" && v["error"]["message"].is_string(), "one document carries both: {v}");
+
+    // A refusal goes to stdout as JSON too, which is the documented
+    // contract and the only thing an agent can act on. Checked from a
+    // directory with no project in it.
+    let empty = root.join("not-a-project");
+    std::fs::create_dir_all(&empty).unwrap();
+    for args in [
+        vec!["check", "--json"],
+        vec!["test", "--json"],
+        vec!["sample", "--json"],
+        vec!["catalog", "--json"],
+        vec!["datasource", "list", "--json"],
+    ] {
+        let label = args.join(" ");
+        let (ok, text) = out(zsql(&home, &empty).args(&args));
+        assert!(!ok, "{label} should refuse outside a project:\n{text}");
+        let v = parses(&format!("{label} refusal"), &text);
+        assert!(v["error"]["message"].is_string(), "{label} refusal has the error shape: {v}");
+    }
+
     // And with the global --agent instead, which implies it.
     for args in [
         vec!["--agent", "check"],
@@ -75,6 +130,7 @@ fn the_commands_an_agent_drives_all_answer_in_json() {
         vec!["--agent", "datasource", "list"],
         vec!["--agent", "sample", "--dry-run"],
         vec!["--agent", "server", "status"],
+        vec!["--agent", "catalog", "sync"],
     ] {
         let label = args.join(" ");
         let (ok, text) = out(zsql(&home, &project).args(&args));

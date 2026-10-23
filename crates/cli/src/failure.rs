@@ -27,6 +27,20 @@ impl From<zsql_service::ServiceError> for Refusal {
     }
 }
 
+/// A failure the command has already written into its own JSON answer.
+/// The exit code still says it failed, and nothing more is printed, so
+/// stdout holds exactly one document.
+#[derive(Debug, Clone)]
+pub struct Reported(pub String);
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Reported {}
+
 /// The class and message of any error: a refusal's own, else `Error`
 /// and the error's chain.
 pub fn parts(e: &anyhow::Error) -> (String, String) {
@@ -38,6 +52,15 @@ pub fn parts(e: &anyhow::Error) -> (String, String) {
 
 /// Reports the error the way the command's output mode asks for.
 pub fn report(e: &anyhow::Error, json: bool) {
+    if let Some(already) = e.downcast_ref::<Reported>() {
+        // The command's own answer carries it. Under --json that answer is
+        // the one document on stdout; without --json it has said its piece
+        // in lines already, so only the bare message is left to add.
+        if !json {
+            eprintln!("error: {already}");
+        }
+        return;
+    }
     let (class, message) = parts(e);
     if json {
         println!("{}", json!({ "error": { "class": class, "message": message } }));

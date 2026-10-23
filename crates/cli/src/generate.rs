@@ -725,7 +725,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             if tty::interactive()
                 && tty::confirm(&format!("{uid}: no catalog yet. Read it now?"), "zsql catalog read -d {uid} --schema NAME")?
             {
-                crate::catalog::read(Some(&project.dir), Some(&uid), &[], &[], false)?;
+                crate::catalog::read(Some(&project.dir), Some(&uid), &[], &[], false, false)?;
                 catalog::load(&project.dir, &uid)?.ok_or_else(|| anyhow::anyhow!("{uid}: still no catalog"))?
             } else {
                 bail!("{uid}: no catalog yet; `zsql catalog read -d {uid} --schema NAME` reads one");
@@ -751,7 +751,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                 );
             }
             let read: Vec<String> = missing.iter().map(|m| m.to_string()).collect();
-            crate::catalog::read(Some(&project.dir), Some(&uid), &[], &read, false)?;
+            crate::catalog::read(Some(&project.dir), Some(&uid), &[], &read, false, false)?;
             cat = catalog::load(&project.dir, &uid)?.ok_or_else(|| anyhow::anyhow!("{uid}: no catalog"))?;
         }
     }

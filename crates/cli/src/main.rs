@@ -530,12 +530,18 @@ enum CatalogWhat {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         #[arg(short = 'd', long)]
         datasource: Option<String>,
+        /// Print what was read as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Re-read every schema and table the file records, report drift, drop what the warehouse says is gone.
     Sync {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         #[arg(short = 'd', long)]
         datasource: Option<String>,
+        /// Print what changed as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Tables whose name holds the pattern: in the file, or in the warehouse with --live.
     Search {
@@ -638,7 +644,16 @@ impl Command {
                 format.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("json"))
             }
             Command::Results { what: Some(ResultsWhat::List { json }) } => *json,
-            Command::Catalog { what: Some(CatalogWhat::Search { json, .. }), .. } => *json,
+            Command::Check { json, .. } | Command::Test { json, .. } | Command::Sample { json, .. } => *json,
+            Command::Catalog { what: Some(CatalogWhat::Search { json, .. }), .. }
+            | Command::Catalog { what: Some(CatalogWhat::Show { json, .. }), .. }
+            | Command::Catalog { what: Some(CatalogWhat::Read { json, .. }), .. }
+            | Command::Catalog { what: Some(CatalogWhat::Sync { json, .. }), .. } => *json,
+            Command::Catalog { what: None, json, .. } => *json,
+            // The flag on the parent reaches a subcommand that has its own.
+            Command::Catalog { json: true, .. } => true,
+            Command::Datasource { what: datasource::DatasourceWhat::List { json } } => *json,
+            Command::Server { what: serve::ServerCommand::Status { json, .. } } => *json,
             _ => false,
         }
     }
@@ -748,9 +763,13 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Catalog { what, datasource, json } => match what {
             None => catalog::status(dir, datasource.as_deref(), json || tty::agent()),
-            Some(CatalogWhat::Read { tables, schema, all, datasource }) => catalog::read(dir, datasource.as_deref(), &schema, &tables, all),
-            Some(CatalogWhat::Add { tables, datasource }) => catalog::read(dir, datasource.as_deref(), &[], &tables, false),
-            Some(CatalogWhat::Sync { datasource }) => catalog::sync(dir, datasource.as_deref()),
+            Some(CatalogWhat::Read { tables, schema, all, datasource, json: want }) => {
+                catalog::read(dir, datasource.as_deref(), &schema, &tables, all, want || json || tty::agent())
+            }
+            Some(CatalogWhat::Add { tables, datasource }) => {
+                catalog::read(dir, datasource.as_deref(), &[], &tables, false, json || tty::agent())
+            }
+            Some(CatalogWhat::Sync { datasource, json: want }) => catalog::sync(dir, datasource.as_deref(), want || json || tty::agent()),
             Some(CatalogWhat::Search { pattern, live, json, datasource }) => {
                 catalog::search(dir, datasource.as_deref(), &pattern, live, json || tty::agent())
             }
@@ -829,17 +848,21 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             let t0 = Instant::now();
             let mut side = at.mode()?.side()?;
             let v = side.check()?;
-            let ok = if json || tty::agent() {
-                show::print_json(&v)?;
-                show::deploy_ok(&v)
-            } else {
-                let ok = show::print_deploy(&v);
-                if side.origin() == "local" {
-                    eprintln!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
-                    show::next_after_check(&v, &at.project_dir()?);
+            if json || tty::agent() {
+                // One document: the whole check, and the failure in it.
+                let ok = show::deploy_ok(&v);
+                let mut v = v;
+                if !ok {
+                    v["error"] = serde_json::json!({ "class": "Error", "message": "tests failed" });
                 }
-                ok
-            };
+                show::print_json(&v)?;
+                return if ok { Ok(()) } else { Err(failure::Reported("tests failed".into()).into()) };
+            }
+            let ok = show::print_deploy(&v);
+            if side.origin() == "local" {
+                eprintln!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+                show::next_after_check(&v, &at.project_dir()?);
+            }
             if !ok {
                 bail!("tests failed");
             }
@@ -848,13 +871,16 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         Command::Test { new: Some(name), .. } => scaffold::new_test(dir, &name),
         Command::Test { json, remote, .. } => {
             let v = Where::with(project, remote).mode()?.side()?.test()?;
-            let ok = if json || tty::agent() {
+            if json || tty::agent() {
+                let ok = show::tests_passed(&v);
+                let mut v = v;
+                if !ok {
+                    v["error"] = serde_json::json!({ "class": "Error", "message": "tests failed" });
+                }
                 show::print_json(&v)?;
-                show::tests_passed(&v)
-            } else {
-                show::print_tests(&v)
-            };
-            if !ok {
+                return if ok { Ok(()) } else { Err(failure::Reported("tests failed".into()).into()) };
+            }
+            if !show::print_tests(&v) {
                 bail!("tests failed");
             }
             Ok(())
