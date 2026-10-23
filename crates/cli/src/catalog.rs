@@ -23,6 +23,12 @@ pub fn path(project_dir: &Path, uid: &str) -> std::path::PathBuf {
     project_dir.join("catalog").join(format!("{uid}.json"))
 }
 
+/// Whether `datasources.yml` names anything at all, for the commands that
+/// can work without one.
+pub fn any_datasource(project_dir: &Path) -> bool {
+    Connection::read_all(project_dir).map(|all| !all.is_empty()).unwrap_or(false)
+}
+
 /// The datasource a command means: the one named, or the only one.
 pub fn choose(project_dir: &Path, datasource: Option<&str>) -> Result<Connection> {
     let all = Connection::read_all(project_dir).context("reading datasources.yml")?;
@@ -94,7 +100,7 @@ pub fn split(name: &str) -> (Option<&str>, &str) {
 }
 
 /// The summary line, last and on stderr: what the file holds now.
-fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant) {
+fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant, note: &str) {
     let columns: usize = cat.tables.iter().map(|t| t.columns.len()).sum();
     let views = cat.tables.iter().filter(|t| t.kind == "view").count();
     let mut scope: Vec<String> = cat.scopes.iter().map(|s| s.schema.clone().unwrap_or_else(|| "every schema".into())).collect();
@@ -102,13 +108,14 @@ fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant) {
         scope.push(format!("{} added by name", cat.added.len()));
     }
     eprintln!(
-        "{}: {} tables, {} views, {} columns ({}) -> {} ({:.0} ms)",
+        "{}: {} tables, {} views, {} columns ({}) -> {}{} ({:.0} ms)",
         cat.datasource,
         cat.tables.len() - views,
         views,
         columns,
         scope.join(", "),
         out.strip_prefix(project_dir).unwrap_or(out).display(),
+        note,
         t0.elapsed().as_secs_f64() * 1e3
     );
 }
@@ -215,10 +222,29 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
         }
     }
     let mut missing = Vec::new();
+    let mut dropped = 0;
     for name in tables {
         let (schema, table) = split(name);
         match Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::table(schema, table)) {
-            Ok(fresh) if fresh.tables.is_empty() => missing.push(name.clone()),
+            Ok(fresh) if fresh.tables.is_empty() => {
+                // A name the catalog already holds and the warehouse no
+                // longer does was dropped, not misspelled. That is what
+                // `sync` calls it, and a refresh that finds it gone has
+                // done its job.
+                let recorded = before.as_ref().is_some_and(|b| {
+                    b.tables.iter().any(|t| {
+                        t.name.eq_ignore_ascii_case(table)
+                            && schema.is_none_or(|s| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s)))
+                    })
+                });
+                if recorded {
+                    println!("{}: table dropped:  {name}", conn.uid);
+                    merged.forget(schema, table);
+                    dropped += 1;
+                } else {
+                    missing.push(name.clone());
+                }
+            }
             Ok(fresh) => {
                 if let Some(b) = &before {
                     say_drift(&conn.uid, b, &fresh);
@@ -234,10 +260,26 @@ pub fn read(project_dir: Option<&Path>, datasource: Option<&str>, schemas: &[Str
     for f in &failed {
         eprintln!("warning: {}: {f}", conn.uid);
     }
-    let out = write(&project.dir, &merged)?;
-    summary(&merged, &out, &project.dir, t0);
+    // What went wrong is said before the summary, so the summary is never
+    // read as the whole story. The file still keeps every table that did
+    // read: a typo in the twenty-first name should not throw away twenty.
     if !missing.is_empty() {
-        bail!("{}: the warehouse has no table named {}; `zsql catalog search <pattern> --live` finds names", conn.uid, missing.join(", "));
+        eprintln!(
+            "error: {}: the warehouse has no table named {}; `zsql catalog search <pattern> --live` finds names",
+            conn.uid,
+            missing.join(", ")
+        );
+    }
+    let note = match (missing.len(), dropped) {
+        (0, 0) => String::new(),
+        (0, n) => format!(", {n} dropped"),
+        (m, 0) => format!(", {m} not found"),
+        (m, n) => format!(", {m} not found, {n} dropped"),
+    };
+    let out = write(&project.dir, &merged)?;
+    summary(&merged, &out, &project.dir, t0, &note);
+    if !missing.is_empty() {
+        bail!("{}: not every name was found; the catalog holds what did read", conn.uid);
     }
     if !failed.is_empty() {
         bail!("{}: not every read succeeded; the file keeps what it had for those", conn.uid);
@@ -309,7 +351,7 @@ pub fn sync(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> 
         eprintln!("warning: {}: {f}", conn.uid);
     }
     let out = write(&project.dir, &merged)?;
-    summary(&merged, &out, &project.dir, t0);
+    summary(&merged, &out, &project.dir, t0, "");
     if !failed.is_empty() {
         bail!("{}: not every read succeeded; the file keeps what it had for those", conn.uid);
     }

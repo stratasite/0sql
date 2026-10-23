@@ -768,11 +768,19 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             let _ = (schema, all, columns, new_columns, live);
             match kind.as_str() {
                 "table" => {
-                    let conn = catalog::choose(&here.project_dir()?.dir, datasource.as_deref())?;
                     let Some(name) = tables.first() else {
                         bail!("--empty table needs the table's name: zsql generate orders --empty table")
                     };
-                    scaffold::empty_table(dir, name, &conn.uid, physical_name.as_deref(), domain.as_deref())
+                    // An empty scaffold needs no warehouse, so a project with
+                    // no datasource yet still gets its file, with the key left
+                    // blank for whatever is added later.
+                    let project_dir = here.project_dir()?.dir;
+                    let uid = if datasource.is_none() && !catalog::any_datasource(&project_dir) {
+                        String::new()
+                    } else {
+                        catalog::choose(&project_dir, datasource.as_deref())?.uid
+                    };
+                    scaffold::empty_table(dir, name, &uid, physical_name.as_deref(), domain.as_deref(), dry_run)
                 }
                 "relation" => generate::relationships(
                     dir,

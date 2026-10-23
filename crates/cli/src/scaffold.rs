@@ -60,9 +60,18 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>, no_
 }
 
 fn write_new(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
+    write_or_say(project_dir, rel, text, false)
+}
+
+/// The same, or what it would have written when `dry_run` is set.
+fn write_or_say(project_dir: &Path, rel: &str, text: &str, dry_run: bool) -> Result<()> {
     let path = project_dir.join(rel);
     if path.exists() {
         bail!("{} exists", path.display());
+    }
+    if dry_run {
+        println!("would create {rel}");
+        return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -80,13 +89,16 @@ pub fn empty_table(
     datasource: &str,
     physical_name: Option<&str>,
     domain: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
     let p = project_of(project_dir.map(Path::to_path_buf))?;
     let domain = domain.unwrap_or("core");
     let file = zsql_project::parameterize(name).replace('-', "_");
     let physical = physical_name.unwrap_or(name);
-    write_new(&p.dir, &format!("models/{domain}/tbl.{file}.yml"), &templates::table_yml(name, physical, datasource))?;
-    eprintln!("next: name its fields, then zsql check");
+    write_or_say(&p.dir, &format!("models/{domain}/tbl.{file}.yml"), &templates::table_yml(name, physical, datasource), dry_run)?;
+    if !dry_run {
+        eprintln!("next: name its fields, then zsql check");
+    }
     Ok(())
 }
 

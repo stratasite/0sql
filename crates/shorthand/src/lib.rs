@@ -187,7 +187,7 @@ mod tests {
                 json!({"projections": [{"field": "item category"}, {"field": "orders"}],
                        "segments": [{"name": "Book pairs", "keys": ["customer id"],
                                      "filters": [{"field": "item category", "predicate": "equals", "value": "Books"}],
-                                     "expanding": [{"field": "item category", "alias": "Also bought"}],
+                                     "expanding": [{"field": "item category", "as": "Also bought"}],
                                      "join": "left", "pair_dedupe": "none"}]}),
             ),
         ];

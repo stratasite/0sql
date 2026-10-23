@@ -228,3 +228,45 @@ fn datasources_are_listed_added_and_tested() {
     let test = std::fs::read_to_string(project.join("tests/smoke.yml")).unwrap();
     assert!(test.contains("  - Total") || test.contains("  - Id"), "from the model's own fields:\n{test}");
 }
+
+/// `catalog read` serves two jobs: adding a table by name, and refreshing
+/// one it already holds. A name the warehouse does not have means something
+/// different in each case, and the command used to call both a typo: it
+/// kept the stale table, printed its success summary, and only then failed.
+#[test]
+fn a_dropped_table_is_forgotten_by_a_read_and_a_typo_is_named_first() {
+    let root = std::env::temp_dir().join(format!("zsql-catalog-dropped-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, project) = (root.join("home"), root.join("shop"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop"])).0);
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n").unwrap();
+    let db = rusqlite::Connection::open(project.join("shop.db")).unwrap();
+    db.execute_batch("CREATE TABLE orders (id INTEGER); CREATE TABLE legacy (id INTEGER);").unwrap();
+    drop(db);
+
+    // Both read by name, so both are recorded with their provenance.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "orders", "legacy"]));
+    assert!(ok, "{out}");
+    assert_eq!(names(&file(&project)), ["legacy", "orders"], "both are in the file");
+
+    // One is dropped upstream. Re-reading it by name is a refresh that
+    // found it gone, which is success, and the entry leaves the file.
+    let db = rusqlite::Connection::open(project.join("shop.db")).unwrap();
+    db.execute_batch("DROP TABLE legacy;").unwrap();
+    drop(db);
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "legacy"]));
+    assert!(ok, "a refresh that finds the table dropped is not a failure: {out}");
+    assert!(out.contains("table dropped"), "and says so: {out}");
+    assert_eq!(names(&file(&project)), ["orders"], "the stale table leaves the file, the rest stays");
+
+    // A name the catalog never held is a mistake, and it is said before the
+    // summary rather than after it.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "ordrs"]));
+    assert!(!ok, "a name that is not there fails: {out}");
+    assert!(out.contains("ordrs"), "and is named: {out}");
+    let summary = out.find("-> catalog").expect("the summary is printed");
+    assert!(out.find("ordrs").unwrap() < summary, "the error comes before the summary:\n{out}");
+    assert!(out.contains("1 not found"), "and the summary says it is partial: {out}");
+}

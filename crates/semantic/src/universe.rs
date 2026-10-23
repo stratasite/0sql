@@ -182,6 +182,19 @@ impl Universe {
         self.tables_by_uid.get(&uid.trim().to_lowercase()).map(|&i| &self.snap.tables[i])
     }
 
+    /// A table by its uid or its name, ignoring case and the spacing and
+    /// punctuation that separate words, so a hint can be written either way.
+    pub fn table_by_uid_or_name(&self, term: &str) -> Option<&Table> {
+        if let Some(t) = self.table_by_uid(term) {
+            return Some(t);
+        }
+        let want = squash(term);
+        if want.is_empty() {
+            return None;
+        }
+        self.snap.tables.iter().find(|t| squash(&t.name) == want || squash(&t.uid) == want)
+    }
+
     pub fn field(&self, id: Id) -> Option<&Field> {
         self.fields_by_id.get(&id).map(|&i| &self.snap.fields[i])
     }
@@ -250,4 +263,10 @@ impl Universe {
     pub fn policies(&self) -> &[SecurityPolicy] {
         &self.snap.security_policies
     }
+}
+
+/// A name reduced to its letters and digits, lowercased: `Fact Transactions`,
+/// `fact-transactions` and `fact_transactions` all squash to the same thing.
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }

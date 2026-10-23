@@ -286,6 +286,32 @@ impl<'a> RFilter<'a> {
     }
 }
 
+/// Hints name tables, by uid or by name. One that resolves to nothing is a
+/// mistake rather than a preference, so it refuses instead of going quiet.
+fn resolve_hints<'a>(universe: &'a Universe, hints: &[String], whose: &str) -> Result<Vec<&'a Table>> {
+    let mut out = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
+    for h in hints {
+        match universe.table_by_uid_or_name(h) {
+            Some(t) => out.push(t),
+            None => unknown.push(h.as_str()),
+        }
+    }
+    if let Some(first) = unknown.first() {
+        let mut near: Vec<(f64, &str)> = universe
+            .tables()
+            .iter()
+            .map(|t| (zsql_spec::fuzzy::similarity(first, &t.name), t.name.as_str()))
+            .filter(|(score, _)| *score >= zsql_spec::fuzzy::FLOOR)
+            .collect();
+        near.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let names: Vec<&str> = near.iter().take(zsql_spec::fuzzy::SUGGESTIONS).map(|(_, n)| *n).collect();
+        let tail = if names.is_empty() { String::new() } else { format!("; did you mean {}", names.join(", ")) };
+        return Err(PlanError::Resolution(format!("{whose} hints name no table: {}{tail}", unknown.join(", "))));
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub struct RQuery<'a> {
     pub def: Query,
@@ -458,7 +484,7 @@ impl<'a> RQuery<'a> {
             Some(t) => FilledTree::from_tree(t, &by_ref).unwrap_or(FilledTree::Group("and".into(), vec![])),
             None => FilledTree::Group("and".into(), (0..filters.len()).map(FilledTree::Leaf).collect()),
         };
-        let hints = def.hints.iter().filter_map(|u| universe.table_by_uid(u)).collect();
+        let hints = resolve_hints(universe, &def.hints, "the query's")?;
 
         // Segments: their own components, then links resolved onto the
         // query's projections and carried columns onto their definitions.
@@ -526,7 +552,7 @@ impl<'a> RQuery<'a> {
                     (l.mode, target, l.rank)
                 })
                 .collect();
-            let hints = s.hints.iter().filter_map(|u| universe.table_by_uid(u)).collect();
+            let hints = resolve_hints(universe, &s.hints, &format!("segment '{}'", s.name.as_deref().unwrap_or("?")))?;
             segments.push(RSegment {
                 sid,
                 def: s.clone(),

@@ -336,7 +336,13 @@ fn declared_types(tables: &[&Table], have: &[Existing]) -> Declared {
 }
 
 /// One field's lines, or why it has none.
-fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared) -> std::result::Result<String, String> {
+fn field(
+    column: &Column,
+    table: &Table,
+    lists: &Lists,
+    declared: &Declared,
+    described: &mut BTreeSet<String>,
+) -> std::result::Result<String, String> {
     let (mapped, mut note) = match map_type(&column.data_type) {
         Mapped::Known(t) => (t.to_string(), column.data_type.clone()),
         Mapped::Text => ("string".to_string(), format!("{}; inferred: text-shaped, so a string", column.data_type)),
@@ -366,12 +372,22 @@ fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared) -> 
     } else {
         out.push_str("  - type: dimension\n");
     }
-    out.push_str(&format!("    name: {}\n", yaml(&title(&column.name))));
-    if let Some(c) = &column.comment {
-        out.push_str(&format!("    description: {}\n", yaml(c)));
+    // A field named on several tables is one field, and the loader fills
+    // what a later definition leaves out. So it is described once, where it
+    // is first written, rather than once per table with the last file
+    // loaded deciding which description the model ends up with.
+    let name = title(&column.name);
+    let first = described.insert(name.to_lowercase());
+    if first {
+        out.push_str(&format!("    name: {}\n", yaml(&name)));
+        if let Some(c) = &column.comment {
+            out.push_str(&format!("    description: {}\n", yaml(c)));
+        }
+    } else {
+        out.push_str(&format!("{:<32}# described where this field is first mapped\n", format!("    name: {}", yaml(&name))));
     }
     out.push_str(&format!("{:<32}# {}\n", format!("    data_type: {data_type}"), note));
-    if data_type == "string" && !measure {
+    if data_type == "string" && !measure && first {
         if let Some(n) = column.max_length.filter(|n| (1..=255).contains(n)) {
             let key = table.primary_key.iter().any(|k| k.eq_ignore_ascii_case(&column.name))
                 || table.foreign_keys.iter().any(|f| f.columns.iter().any(|k| k.eq_ignore_ascii_case(&column.name)));
@@ -410,12 +426,20 @@ struct Drafted {
     skipped: Vec<String>,
 }
 
-fn table_yml(cat: &Catalog, table: &Table, today: &str, lists: &Lists, declared: &Declared) -> Drafted {
+fn table_yml(
+    cat: &Catalog,
+    table: &Table,
+    today: &str,
+    lists: &Lists,
+    declared: &Declared,
+    models: &Models,
+    described: &mut BTreeSet<String>,
+) -> Drafted {
     let (cost, why) = cost(table.rows);
     let mut body = String::new();
     let (mut fields, mut measures, mut skipped) = (0, 0, Vec::new());
     for column in &table.columns {
-        match field(column, table, lists, declared) {
+        match field(column, table, lists, declared, described) {
             Ok(lines) => {
                 fields += 1;
                 if lines.starts_with("  - type: measure") {
@@ -440,7 +464,7 @@ fn table_yml(cat: &Catalog, table: &Table, today: &str, lists: &Lists, declared:
     }
     text.push_str(&format!(
         "name: {}\nphysical_name: {}\ndatasource: {}\n",
-        yaml(&title(&table.name)),
+        yaml(&model_name(models, table)),
         yaml(&table.physical_name()),
         cat.datasource
     ));
@@ -453,8 +477,52 @@ fn table_yml(cat: &Catalog, table: &Table, today: &str, lists: &Lists, declared:
     Drafted { text, fields, measures, skipped }
 }
 
+/// What each table's model is called, by (schema, table) lower-cased.
+type Models = BTreeMap<(Option<String>, String), String>;
+
+fn key_of(t: &Table) -> (Option<String>, String) {
+    (t.schema.as_deref().map(str::to_lowercase), t.name.to_lowercase())
+}
+
+/// The name a table's model goes by, which is its own name titled, unless
+/// something has already taken that: another table in this run, or a model
+/// already on disk. Then the schema goes in front. Two schemas each with a
+/// `customer` table would otherwise write the name twice and the project
+/// would not load at all.
+fn model_names(tables: &[&Table], have: &[Existing]) -> Models {
+    let mut taken: BTreeSet<String> = have.iter().map(|e| e.model_name.to_lowercase()).collect();
+    let mut out: Models = BTreeMap::new();
+    for t in tables {
+        let key = key_of(t);
+        // A table that already has a model keeps the name that model uses.
+        if let Some(e) = have.iter().find(|e| e.table == key.1 && (e.schema.is_none() || e.schema == key.0)) {
+            out.insert(key, e.model_name.clone());
+            continue;
+        }
+        let bare = title(&t.name);
+        let name = match &t.schema {
+            Some(schema) if taken.contains(&bare.to_lowercase()) => format!("{} {bare}", title(schema)),
+            _ => bare,
+        };
+        taken.insert(name.to_lowercase());
+        out.insert(key, name);
+    }
+    out
+}
+
+/// The same, for one table, falling back to its own name.
+fn model_name(models: &Models, t: &Table) -> String {
+    models.get(&key_of(t)).cloned().unwrap_or_else(|| title(&t.name))
+}
+
+/// The file a model is written to, which follows its name so the two never
+/// drift apart: `Staging Customer` lives in `tbl.staging_customer.yml`.
+fn model_file(name: &str) -> String {
+    format!("tbl.{}.yml", name.to_lowercase().replace([' ', '-'], "_"))
+}
+
 /// The joins a schema's foreign keys declare, in the shape of a rel file.
-fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str, lists: &Lists) -> Option<String> {
+fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str, lists: &Lists, models: &Models) -> Option<String> {
     let mut joins = String::new();
     for t in tables {
         for fk in &t.foreign_keys {
@@ -487,8 +555,8 @@ fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str, lists: &Lists) ->
             }
             joins.push_str(&format!(
                 "{key}:\n  left: {}\n  right: {}\n  sql: {}\n{:<32}# inferred: a foreign key\n  join: inner\n",
-                yaml(&title(&t.name)),
-                yaml(&title(&right.name)),
+                yaml(&model_name(models, t)),
+                yaml(&model_name(models, right)),
                 yaml(&on.join(" AND ")),
                 "  cardinality: many_to_one"
             ));
@@ -517,6 +585,11 @@ struct Existing {
     /// (field name, data_type) as this file declares them, so a new
     /// draft of another table agrees with what the model already says.
     declared: Vec<(String, String)>,
+    /// The name the model goes by, which a new draft must not take.
+    model_name: String,
+    /// Field names this file already describes, so a new draft of another
+    /// table does not write a second description of the same field.
+    described: BTreeSet<String>,
 }
 
 fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
@@ -548,10 +621,17 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
             let (schema, table) = (schema.map(bare), bare(table));
             let mut columns = BTreeSet::new();
             let mut declared = Vec::new();
+            let mut described = BTreeSet::new();
             if let Some(fields) = v.get("fields").and_then(|f| f.as_sequence()) {
                 for f in fields {
                     if let (Some(n), Some(d)) = (f.get("name").and_then(|x| x.as_str()), f.get("data_type").and_then(|x| x.as_str())) {
                         declared.push((n.trim().to_string(), d.trim().to_lowercase()));
+                    }
+                    if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
+                        let says = f.get("description").and_then(|d| d.as_str()).is_some_and(|d| !d.trim().is_empty());
+                        if says {
+                            described.insert(n.trim().to_lowercase());
+                        }
                     }
                     let expr = match f.get("expression") {
                         Some(serde_yaml::Value::String(s)) => Some(s.clone()),
@@ -563,7 +643,8 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
                     }
                 }
             }
-            out.push(Existing { path, schema, table, datasource, columns, declared });
+            let model_name = v.get("name").and_then(|n| n.as_str()).unwrap_or(&table).trim().to_string();
+            out.push(Existing { path, schema, table, datasource, columns, declared, model_name, described });
         }
     }
     Ok(out)
@@ -775,15 +856,37 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         by_domain.entry(domain).or_default().push(t);
     }
 
+    let models = model_names(&tables, &have);
+    // Field names a model on disk already describes, so a new draft adds to
+    // the model rather than contradicting it.
+    let mut described: BTreeSet<String> = have.iter().flat_map(|e| e.described.iter().cloned()).collect();
     let mut created = 0;
     let mut listed = 0;
     let mut added = 0;
+    // What `--columns` asked for, so a name that matched nothing is not
+    // mistaken for success. Keyed by the name lowercased.
+    let mut asked_seen: BTreeSet<String> = BTreeSet::new();
+    let mut asked_added: BTreeSet<String> = BTreeSet::new();
+    let mut asked_present: BTreeMap<String, String> = BTreeMap::new();
+    let mut asked_untyped: BTreeMap<String, String> = BTreeMap::new();
     for (domain, group) in &by_domain {
         let dir = project.dir.join("models").join(domain);
         for t in group {
             let rel = |p: &Path| p.strip_prefix(&project.dir).map(|p| p.display().to_string()).unwrap_or_else(|_| p.display().to_string());
             match find(t) {
                 Some(e) => {
+                    // What was asked for by name, recorded before anything is
+                    // skipped: whether the column is on the table at all, and
+                    // whether the model already holds it.
+                    for want in opts.columns {
+                        let Some(c) = t.columns.iter().find(|c| c.name.eq_ignore_ascii_case(want)) else { continue };
+                        asked_seen.insert(want.to_lowercase());
+                        if e.columns.contains(&c.name.to_lowercase()) {
+                            asked_present.insert(want.to_lowercase(), rel(&e.path));
+                        } else if map_type(&c.data_type) == Mapped::Skip {
+                            asked_untyped.insert(want.to_lowercase(), c.data_type.clone());
+                        }
+                    }
                     let absent: Vec<&Column> = t.columns.iter().filter(|c| !e.columns.contains(&c.name.to_lowercase())).collect();
                     let (new, untyped): (Vec<&Column>, Vec<&Column>) =
                         absent.into_iter().partition(|c| map_type(&c.data_type) != Mapped::Skip);
@@ -816,7 +919,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     let mut entries = String::new();
                     let mut skipped = Vec::new();
                     for c in &chosen {
-                        match field(c, t, &lists, &declared) {
+                        match field(c, t, &lists, &declared, &mut described) {
                             Ok(lines) => entries.push_str(&lines),
                             Err(why) => skipped.push(why),
                         }
@@ -829,8 +932,14 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     }
                     if opts.dry_run {
                         println!("would add to {}:\n{entries}", rel(&e.path));
+                        for c in &chosen {
+                            asked_added.insert(c.name.to_lowercase());
+                        }
                     } else if append_fields(&e.path, &entries)? {
                         added += 1;
+                        for c in &chosen {
+                            asked_added.insert(c.name.to_lowercase());
+                        }
                         println!(
                             "added   {} field{} to {}",
                             chosen.len() - skipped.len(),
@@ -842,12 +951,13 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     }
                 }
                 None => {
-                    let path = dir.join(format!("tbl.{}.yml", t.name.to_lowercase()));
+                    let name = model_name(&models, t);
+                    let path = dir.join(model_file(&name));
                     if path.exists() {
                         println!("exists  {} (for another table; not touched)", rel(&path));
                         continue;
                     }
-                    let d = table_yml(&cat, t, &today, &lists, &declared);
+                    let d = table_yml(&cat, t, &today, &lists, &declared, &models, &mut described);
                     let summary = format!(
                         "{} field{}, {} measure{}{}",
                         d.fields,
@@ -863,6 +973,12 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     std::fs::create_dir_all(&dir)?;
                     std::fs::write(&path, d.text)?;
                     created += 1;
+                    for want in opts.columns {
+                        if t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(want)) {
+                            asked_seen.insert(want.to_lowercase());
+                            asked_added.insert(want.to_lowercase());
+                        }
+                    }
                     println!("created {} ({summary})", rel(&path));
                     for s in &d.skipped {
                         println!("        skipped {s}");
@@ -872,7 +988,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         }
         // One rel file per domain, from the foreign keys, written once.
         let rel_path = dir.join(format!("rel.{domain}.yml"));
-        if let Some(text) = relation_yml(&cat, group, &today, &lists) {
+        if let Some(text) = relation_yml(&cat, group, &today, &lists, &models) {
             let rel = rel_path.strip_prefix(&project.dir).unwrap_or(&rel_path).display().to_string();
             if rel_path.exists() {
                 // Name only the joins the file lacks, by their ON clause.
@@ -916,13 +1032,47 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     if created > 0 || added > 0 {
         eprintln!("next: zsql check, then zsql sample");
     }
-    if created == 0 && listed == 0 && added == 0 && !opts.dry_run {
+    // A column asked for by name and already modeled is the request already
+    // satisfied, so it is said and nothing fails.
+    for (want, file) in &asked_present {
+        if !asked_added.contains(want) {
+            println!("already {file} has a field for {want}");
+        }
+    }
+    // One that is not on the table, or that 0sql has no type for, is not
+    // satisfied at all, and an exit code is the only thing an agent reads.
+    let missing: Vec<&String> = opts.columns.iter().filter(|w| !asked_seen.contains(&w.to_lowercase())).collect();
+    if !missing.is_empty() {
+        let named: Vec<String> = tables.iter().map(|t| t.physical_name()).collect();
+        bail!(
+            "no column named {} on {}; `zsql catalog show <table>` lists the columns",
+            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            named.join(", ")
+        );
+    }
+    let untyped: Vec<String> = asked_untyped
+        .iter()
+        .filter(|(want, _)| !asked_added.contains(*want))
+        .map(|(want, data_type)| format!("{want} ({data_type})"))
+        .collect();
+    if !untyped.is_empty() {
+        bail!("0sql has no type for {}, so there is no field to add", untyped.join(", "));
+    }
+    if created == 0 && listed == 0 && added == 0 && asked_present.is_empty() && !opts.dry_run {
         println!("nothing to do: every table named has a model, with no new columns");
     }
     Ok(())
 }
 
 // ------------------------------------------------------- relationships
+
+/// A column as its model file declares it: the name a join writes, whether
+/// the file marks it a primary key, and the type the field declares.
+struct Col {
+    name: String,
+    key: bool,
+    data_type: Option<String>,
+}
 
 /// A table as its model file declares it, which is all the inference has
 /// to go on: the name a join refers to it by, its datasource, and the
@@ -931,55 +1081,130 @@ struct Modeled {
     name: String,
     subject: String,
     datasource: Option<String>,
-    /// (column as the file spells it, declared a primary key)
-    columns: Vec<(String, bool)>,
+    columns: Vec<Col>,
 }
 
-/// What a table is about: its name without a warehouse's prefix or a
-/// plural, which is what a key column's name is matched against.
-/// `dim_households` and `Dim Household` are both about a household.
+/// The word endings that mark a key column.
+const KEY_ENDINGS: [&str; 5] = ["key", "id", "sk", "fk", "code"];
+/// What a warehouse puts in front of a table's own name.
+const TABLE_PREFIXES: [&str; 9] = ["dimension_", "dim_", "d_", "fact_", "fct_", "f_", "tbl_", "stg_", "raw_"];
+/// And behind it. A namespace such as `cs_` is not stripped: it only looks
+/// like a namespace in the warehouse you happen to be reading.
+const TABLE_SUFFIXES: [&str; 11] = ["_dimension", "_dim", "_fact", "_fct", "_table", "_tbl", "_view", "_vw", "_d", "_f", "_v"];
+
+/// A word without its plural. Crude on purpose, and applied to both sides
+/// of a comparison, so `statuses` and `status` meet in the middle even
+/// though neither lands on a word anybody would write.
+fn singular(word: &str) -> String {
+    if let Some(r) = word.strip_suffix("ies") {
+        return format!("{r}y");
+    }
+    if ["ses", "xes", "ches", "shes"].iter().any(|e| word.ends_with(e)) {
+        return word[..word.len() - 2].to_string();
+    }
+    if word.ends_with('s') && !word.ends_with("ss") {
+        return word[..word.len() - 1].to_string();
+    }
+    word.to_string()
+}
+
+/// What a table is about: its name without a warehouse's prefix, its kind
+/// suffix or a trailing version. `dim_households`, `Dim Household` and
+/// `household_d_v2` are all about a household.
 fn subject(name: &str) -> String {
     let bare = name.rsplit('.').next().unwrap_or(name);
     let mut s: String = bare.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-    for p in ["dimension_", "dim_", "d_", "fact_", "fct_", "f_", "tbl_", "stg_", "raw_"] {
+    for p in TABLE_PREFIXES {
         if let Some(rest) = s.strip_prefix(p) {
-            s = rest.to_string();
-            break;
+            if !rest.is_empty() {
+                s = rest.to_string();
+                break;
+            }
         }
     }
-    if let Some(r) = s.strip_suffix("ies") {
-        format!("{r}y")
-    } else if ["ses", "xes", "ches", "shes"].iter().any(|e| s.ends_with(e)) {
-        s[..s.len() - 2].to_string()
-    } else if s.ends_with('s') && !s.ends_with("ss") {
-        s[..s.len() - 1].to_string()
-    } else {
-        s
+    // A trailing version comes off before the kind: ab_test_d_v2 is a d.
+    if let Some((head, tail)) = s.rsplit_once('_') {
+        if !head.is_empty() && tail.starts_with('v') && tail[1..].chars().all(|c| c.is_ascii_digit()) && tail.len() > 1 {
+            s = head.to_string();
+        }
     }
+    for suffix in TABLE_SUFFIXES {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            if !rest.is_empty() {
+                s = rest.to_string();
+                break;
+            }
+        }
+    }
+    s
+}
+
+/// The words of a name, each without its plural, for comparing one name
+/// against another: `Call_Centers` and `call_center` both read as two
+/// words, call and center.
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(singular).collect()
+}
+
+/// Whether the first run of words appears whole inside the second.
+fn run_of(needle: &[String], haystack: &[String]) -> bool {
+    !needle.is_empty() && needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether a column's name and a table's subject are about the same thing:
+/// either one holds the other as a run of whole words. `call_center_id`
+/// and `cs_call_center` are about a call center; `week_no` and `date` are
+/// not about anything in common.
+fn about_same(column: &[String], subject: &[String]) -> bool {
+    run_of(column, subject) || run_of(subject, column)
 }
 
 /// Whether a column is shaped like a key by its name alone.
 fn key_shaped(column: &str) -> bool {
     let c = column.to_lowercase();
-    c == "id" || c == "key" || ["_key", "_id", "_sk", "_fk", "_code", "_num"].iter().any(|s| c.ends_with(s))
+    c == "id" || c == "key" || KEY_ENDINGS.iter().any(|s| c.ends_with(&format!("_{s}")))
 }
 
-/// What a key column points at, when its name says: `household_key` is
-/// about households, `product_id` about products.
-fn key_subject(column: &str) -> Option<String> {
-    let c = column.to_lowercase();
-    for suffix in ["_key", "_id", "_sk", "_fk", "_code", "_num"] {
-        if let Some(rest) = c.strip_suffix(suffix) {
-            return (!rest.is_empty()).then(|| subject(rest));
-        }
+/// What a key column is about, as words: `household_key` is about a
+/// household, `coupon_upc` about a coupon upc, since nobody can enumerate
+/// every suffix a warehouse puts on a key.
+fn column_subject(column: &str) -> Vec<String> {
+    let mut w = words(column);
+    if w.len() > 1 && w.last().is_some_and(|last| KEY_ENDINGS.contains(&last.as_str())) {
+        w.pop();
     }
-    None
+    w
 }
 
-/// The subjects a column's name mentions: `coupon_upc` mentions a coupon,
-/// which is how a key whose suffix nobody could enumerate is still found.
-fn mentions(column: &str) -> Vec<String> {
-    column.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(subject).collect()
+/// The same, spelled the way the column spells it, for a message a person
+/// reads. `membership_status_id` is about a membership status, not a
+/// membership statu.
+fn column_subject_text(column: &str) -> Option<String> {
+    let raw: Vec<&str> = column.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    if raw.len() < 2 || !KEY_ENDINGS.contains(&singular(&raw[raw.len() - 1].to_lowercase()).as_str()) {
+        return None;
+    }
+    Some(raw[..raw.len() - 1].join(" ").to_lowercase())
+}
+
+/// `a` or `an`, for the same.
+fn article(text: &str) -> &'static str {
+    match text.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
+/// Two declared types that could key the same thing: the same type, or one
+/// a widening of the other. A type nobody stated cannot contradict one.
+fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            a == b || widen(&a, &b).is_some()
+        }
+        _ => true,
+    }
 }
 
 /// The one column a bare-column expression names, as the file spells it.
@@ -1016,10 +1241,19 @@ fn modeled(dir: &Path) -> Result<Vec<Modeled>> {
             let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) else { continue };
             let Some(table) = v.get("name").and_then(|n| n.as_str()) else { continue };
             let physical = v.get("physical_name").and_then(|p| p.as_str()).unwrap_or(table);
-            let columns = v
+            let columns: Vec<Col> = v
                 .get("fields")
                 .and_then(|f| f.as_sequence())
-                .map(|fields| fields.iter().filter_map(|f| f.get("expression").and_then(bare_column)).collect())
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|f| {
+                            let (name, key) = f.get("expression").and_then(bare_column)?;
+                            let data_type = f.get("data_type").and_then(|d| d.as_str()).map(|d| d.trim().to_lowercase());
+                            Some(Col { name, key, data_type })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             out.push(Modeled {
                 name: table.to_string(),
@@ -1043,57 +1277,92 @@ struct Inferred {
 }
 
 /// The joins the table files imply, and what they could not place.
-/// Nothing is queried: a column that names another table in the set is
-/// matched to that table's own key column, and a column that names
-/// nothing here is left alone. `week_no` on a fact names no table, so it
-/// never joins a date dimension it does not key.
+/// Nothing is queried: a column whose name is about another table in the
+/// set is matched to that table's own key column, and a column that is
+/// about nothing here is left alone. `week_no` on a fact is about no
+/// table, so it never joins a date dimension it does not key.
 fn infer(tables: &[Modeled]) -> (Vec<Inferred>, Vec<String>) {
     let mut joins: Vec<Inferred> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
     for t in tables {
-        for (column, _) in &t.columns {
-            let said = mentions(column);
-            let owner = tables.iter().find(|o| o.name != t.name && !o.subject.is_empty() && said.contains(&o.subject));
+        for col in &t.columns {
+            let column = col.name.as_str();
+            let said = column_subject(column);
+            // The table it is most about: the one whose subject differs
+            // from the column's by the fewest words, so customer_id takes
+            // customer over customer_address.
+            let owner = tables
+                .iter()
+                .filter(|o| o.name != t.name && !o.subject.is_empty())
+                .filter(|o| about_same(&said, &words(&o.subject)))
+                .min_by_key(|o| words(&o.subject).len().abs_diff(said.len()));
             let Some(o) = owner else {
-                // A key-shaped column naming a table that is not here is
-                // worth saying: it is a join the author still needs.
-                if let Some(s) = key_subject(column).filter(|s| !tables.iter().any(|x| x.subject == *s)) {
-                    loose.push(format!("{}.{column} points at a {s}, and no table here is one", t.name));
+                // A key-shaped column about a table that is not here is
+                // worth saying: it is a join the author still needs. A
+                // table's own key is about itself, which is no gap.
+                let mine = about_same(&said, &words(&t.subject));
+                if key_shaped(column) && !mine {
+                    if let Some(text) = column_subject_text(column) {
+                        loose.push(format!("{}.{column} points at {} {text}, and no table here is about one", t.name, article(&text)));
+                    }
                 }
                 continue;
             };
-            // Their side of it: the same column name, else the key they
-            // declare, else a bare id.
-            let theirs = o
-                .columns
-                .iter()
-                .find(|(c, _)| c.eq_ignore_ascii_case(column))
-                .or_else(|| o.columns.iter().find(|(_, key)| *key))
-                .or_else(|| o.columns.iter().find(|(c, _)| c.eq_ignore_ascii_case("id") || c.eq_ignore_ascii_case("key")));
-            let Some((theirs, declared)) = theirs else {
-                loose.push(format!("{}.{column} points at {}, which has no key column of its own", t.name, o.name));
+            // Their side of it. The same column name is the strong case.
+            // Otherwise our column has to look like a key and agree on
+            // type with the key they declare, or this is a guess.
+            let same_name = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(column));
+            let theirs = match same_name {
+                Some(c) => Some(c),
+                None if key_shaped(column) => o
+                    .columns
+                    .iter()
+                    .filter(|c| c.key || c.name.eq_ignore_ascii_case("id") || c.name.eq_ignore_ascii_case("key"))
+                    .find(|c| compatible(col.data_type.as_deref(), c.data_type.as_deref())),
+                None => None,
+            };
+            let Some(theirs) = theirs else {
+                if key_shaped(column) {
+                    loose.push(format!("{}.{column} is about {}, which declares no key it could match", t.name, o.name));
+                }
                 continue;
             };
-            // How sure: what they declare, what the name says, or that it
-            // is the first column there, which a drafted dimension's key
-            // nearly always is.
-            let why = if *declared {
+            // How sure: what they declare, that it is the first column
+            // there, which a drafted dimension's key nearly always is, or
+            // that it is named like one.
+            let why = if theirs.key {
                 "a declared key"
-            } else if key_shaped(column) {
-                "the name"
-            } else if o.columns.first().is_some_and(|(first, _)| first == theirs) {
+            } else if o.columns.first().is_some_and(|first| first.name == theirs.name) {
                 "the name, and the first column there"
+            } else if theirs.name.eq_ignore_ascii_case("id") || theirs.name.eq_ignore_ascii_case("key") {
+                "the name"
             } else {
-                loose.push(format!("{}.{column} names {}, but is not a key there", t.name, o.name));
+                loose.push(format!("{}.{column} is about {}, but is not a key there", t.name, o.name));
                 continue;
             };
+            // One column on their side can only mean one thing, so a
+            // second of ours claiming it is a guess too far.
+            let taken = joins
+                .iter()
+                .find(|j| j.left == t.name && j.right == o.name)
+                .and_then(|j| j.on.iter().find(|(_, r)| r.eq_ignore_ascii_case(&theirs.name)));
+            if let Some((already, _)) = taken {
+                loose.push(format!(
+                    "{}.{column} and {}.{already} are both about {}.{}; only the first joins on it",
+                    t.name, t.name, o.name, theirs.name
+                ));
+                continue;
+            }
             match joins.iter_mut().find(|j| j.left == t.name && j.right == o.name) {
                 // One join per pair of tables, so a second key column is
                 // another part of the same condition.
-                Some(j) => j.on.push((column.clone(), theirs.clone())),
-                None => {
-                    joins.push(Inferred { left: t.name.clone(), right: o.name.clone(), on: vec![(column.clone(), theirs.clone())], why })
-                }
+                Some(j) => j.on.push((column.to_string(), theirs.name.clone())),
+                None => joins.push(Inferred {
+                    left: t.name.clone(),
+                    right: o.name.clone(),
+                    on: vec![(column.to_string(), theirs.name.clone())],
+                    why,
+                }),
             }
         }
     }

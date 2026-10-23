@@ -301,7 +301,7 @@ fn segments_at_their_edges() {
     let s = spec("expand (a, b = 1) with (c, d as D) inner dedupe lt as E");
     let g = &s["segments"][0];
     assert_eq!(g.get("mode"), None);
-    assert_eq!(g["expanding"], json!([{"field": "c"}, {"field": "d", "alias": "D"}]));
+    assert_eq!(g["expanding"], json!([{"field": "c"}, {"field": "d", "as": "D"}]));
     assert_eq!(g["join"], "inner");
     assert_eq!(g["pair_dedupe"], "lt");
     assert_eq!(g["name"], "E");

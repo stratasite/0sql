@@ -605,6 +605,23 @@ fn window_sql<'a>(cx: &Ctx<'_, 'a>, d: &zsql_spec::Decorator, _p: &Projected<'a>
             }
         }
     }
+    // No order given. A rank over an unordered window ranks every row the
+    // same, so order by what the author named. The functions that keep the
+    // expression as their argument take the query's date instead, and fall
+    // back to the expression only when the query has no date.
+    if orders.is_empty() {
+        const RANKS: [&str; 6] = ["rank", "dense_rank", "row_number", "percent_rank", "cume_dist", "ntile"];
+        const OFFSETS: [&str; 4] = ["lag", "lead", "first_value", "last_value"];
+        if RANKS.contains(&function) {
+            orders.push(format!("{expr} desc"));
+        } else if OFFSETS.contains(&function) {
+            let dates: Vec<&Projected<'a>> = node.projections.iter().filter(|x| x.field().map(|f| f.is_date()).unwrap_or(false)).collect();
+            match dates.iter().find(|x| x.proj.def.axis == "x").or(dates.first()) {
+                Some(dt) => orders.push(projection_to_sql(cx, dt, node)?),
+                None => orders.push(expr.to_string()),
+            }
+        }
+    }
     let mut win = format!("{call} OVER (");
     if !partitions.is_empty() {
         win.push_str(&format!("PARTITION BY {}", partitions.join(", ")));

@@ -442,3 +442,125 @@ fn a_target_directory_and_an_inferred_joins_file() {
         "the template declares no join:\n{blank}"
     );
 }
+
+/// A warehouse that puts the kind on the end of a table's name rather than
+/// the front, and a namespace in front of it: `cs_call_center_d` is a
+/// dimension about a call center. Inference once stripped prefixes only,
+/// and compared one word of a column against a whole table name, so it
+/// found nothing at all here and then said each table was absent.
+#[test]
+fn suffixed_table_names_still_infer_their_joins() {
+    let (home, project) = scratch("suffixes");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Service", "--uid", "svc", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  file: ./svc.duckdb\n").unwrap();
+    let dir = project.join("models/main");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let table = |file: &str, name: &str, physical: &str, fields: &str| {
+        std::fs::write(
+            dir.join(format!("tbl.{file}.yml")),
+            format!("name: {name}\nphysical_name: {physical}\ndatasource: wh\ncost: 1\nfields:\n{fields}"),
+        )
+        .unwrap()
+    };
+    let key = |name: &str, column: &str, kind: &str| {
+        format!(
+            "  - type: dimension\n    name: {name}\n    data_type: {kind}\n    expression:\n      sql: {column}\n      primary_key: true\n"
+        )
+    };
+    let plain = |name: &str, column: &str, kind: &str| {
+        format!("  - type: dimension\n    name: {name}\n    data_type: {kind}\n    expression: {column}\n")
+    };
+
+    table(
+        "cs_call_center_d",
+        "Call Center",
+        "main.cs_call_center_d",
+        &format!("{}{}", key("Call Center Id", "call_center_id", "bigint"), plain("Call Center Name", "name", "string")),
+    );
+    table(
+        "account_d",
+        "Account",
+        "main.account_d",
+        &format!("{}{}", key("Account Id", "account_id", "bigint"), plain("Account Type", "account_type", "string")),
+    );
+    table(
+        "cs_contact_f",
+        "Contact",
+        "main.cs_contact_f",
+        &format!(
+            "{}{}{}",
+            plain("Contact Call Center Id", "call_center_id", "bigint"),
+            plain("Contact Account Id", "account_id", "bigint"),
+            "  - type: measure\n    name: Contacts\n    data_type: integer\n    expression: count(*)\n"
+        ),
+    );
+
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--relationships", "main/service", "--infer"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("(2 joins inferred)"), "both keys find their dimension: {out}");
+    let rel = std::fs::read_to_string(dir.join("rel.service.yml")).unwrap();
+    assert!(rel.contains("left.call_center_id = right.call_center_id"), "{rel}");
+    assert!(rel.contains("left.account_id = right.account_id"), "{rel}");
+    // And no line claiming a table that is right there is missing.
+    assert!(!rel.contains("no table here"), "nothing is reported absent: {rel}");
+    assert!(ok && run(zsql(&home, &project).arg("check")).0, "the inferred file loads");
+}
+
+/// Two schemas with a table of the same name. The model's name must not be
+/// written twice, or the project will not load at all; the second one takes
+/// its schema in front of it, and the file follows the name.
+#[test]
+fn two_schemas_sharing_a_table_name_get_two_names() {
+    let (home, project) = scratch("collide");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch(
+        "CREATE SCHEMA alpha; CREATE SCHEMA beta;\
+         CREATE TABLE alpha.customer (customer_id BIGINT, name VARCHAR);\
+         CREATE TABLE beta.customer (customer_id BIGINT, email VARCHAR);",
+    )
+    .unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+
+    // One directory, so the names have to do the work.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all", "--dir", "shop"]));
+    assert!(ok, "{out}");
+    let a = std::fs::read_to_string(project.join("models/shop/tbl.customer.yml")).unwrap();
+    let b = std::fs::read_to_string(project.join("models/shop/tbl.beta_customer.yml")).unwrap();
+    assert!(a.contains("name: Customer\n"), "the first keeps its name:\n{a}");
+    assert!(b.contains("name: Beta Customer\n"), "the second takes its schema:\n{b}");
+    assert!(a.contains("physical_name: alpha.customer") && b.contains("physical_name: beta.customer"), "{a}{b}");
+
+    // Which is the point: it loads.
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("2 tables"), "both tables load:\n{out}");
+}
+
+/// `--columns` names a column. One that is not there is a mistake and has
+/// to fail, since an exit code is all an agent reads; one that is already a
+/// field is the request already satisfied, and says so.
+#[test]
+fn a_column_asked_for_by_name_is_answered_either_way() {
+    let (home, project) = scratch("columns");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch("CREATE TABLE orders (order_id BIGINT, qty_shipped BIGINT, total DOUBLE);").unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+    assert!(run(zsql(&home, &project).args(["generate", "orders"])).0);
+
+    // A typo: named, and a non-zero exit.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders", "--columns", "qty_shipepd"]));
+    assert!(!ok, "a column that is not there fails: {out}");
+    assert!(out.contains("qty_shipepd"), "and is named: {out}");
+    assert!(!out.contains("nothing to do"), "and is not reported as success: {out}");
+
+    // Already a field: said, and nothing fails.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders", "--columns", "qty_shipped"]));
+    assert!(ok, "{out}");
+    assert!(out.to_lowercase().contains("already"), "it says the model has it: {out}");
+}

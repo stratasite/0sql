@@ -300,6 +300,10 @@ struct Builder<'d> {
     pending_expressions: Vec<PendingExpression>,
     pending_tables: Vec<PendingTable>,
     pending_rules: Vec<PendingRule>,
+    /// What each definition of a field said about an attribute, and where:
+    /// by (field index, attribute). Two files that both speak and disagree
+    /// get a warning, since only the last one loaded takes effect.
+    field_said: HashMap<(usize, &'static str), (String, PathBuf)>,
     sources: Vec<PathBuf>,
     phases: Vec<(&'static str, u128)>,
     /// By datasource index.
@@ -373,6 +377,7 @@ impl<'d> Builder<'d> {
             pending_expressions: vec![],
             pending_tables: vec![],
             pending_rules: vec![],
+            field_said: HashMap::new(),
             sources: vec![],
             phases: vec![],
             dialect_lists: HashMap::new(),
@@ -830,28 +835,109 @@ impl<'d> Builder<'d> {
                 self.fields.len() - 1
             }
         };
-        // Every definition of a field updates it; the last one deployed wins,
-        // as on the server.
+        // A field named on several tables is one field, and every definition
+        // updates it -- but only with what that definition actually says. An
+        // absent or empty attribute says nothing and leaves what another
+        // table's definition gave, so a bare mapping no longer erases a
+        // description written next to the dimension. Two definitions that
+        // both speak and disagree keep the last one loaded, as a deploy
+        // does; `zsql check` reports the disagreement.
+        let declares_rules = exclusion_type.is_some() || inclusions.is_some();
+        // What this definition says, to compare with what another file said.
+        let mut spoke: Vec<(&'static str, String)> = Vec::new();
         {
+            let said = |k: &str| get(fm, k).is_some();
+            let tags = strs_of(fm, "tags");
+            let synonyms = strs_of(fm, "synonyms");
+            if let Some(d) = str_of(fm, "description") {
+                spoke.push(("description", d));
+            }
+            if !synonyms.is_empty() {
+                spoke.push(("synonyms", synonyms.join(", ")));
+            }
+            if !tags.is_empty() {
+                spoke.push(("tags", tags.join(", ")));
+            }
+            if !grains.is_empty() {
+                spoke.push(("grains", grains.join(", ")));
+            }
+            if said("hidden") {
+                spoke.push(("hidden", bool_of(fm, "hidden").unwrap_or(false).to_string()));
+            }
+            if said("enable_sampling") {
+                spoke.push(("enable_sampling", bool_of(fm, "enable_sampling").unwrap_or(false).to_string()));
+            }
+            if said("sample_size") {
+                spoke.push(("sample_size", sample_size.to_string()));
+            }
+            if let Some(q) = str_of(fm, "sample_sql") {
+                spoke.push(("sample_sql", q));
+            }
+            if let Some(f) = &format {
+                spoke.push(("format", f.to_string()));
+            }
             let f = &mut self.fields[field_index];
             f.name = name.clone();
             f.data_type = Some(data_type);
-            f.hidden = bool_of(fm, "hidden").unwrap_or(false);
-            f.tags = strs_of(fm, "tags");
-            f.grains = grains;
-            f.format = format;
-            f.exclusion_type = exclusion_type;
-            f.exclusions = exclusions;
-            f.inclusions = inclusions;
-            f.extended_blend_group = str_of(fm, "extended_blend_group").map(|g| g.to_lowercase());
-            f.snapshot = snapshot;
-            f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
-            f.sample_size = sample_size;
-            f.sample_sql = str_of(fm, "sample_sql");
-            f.synonyms = strs_of(fm, "synonyms");
-            f.description = str_of(fm, "description");
+            if said("hidden") {
+                f.hidden = bool_of(fm, "hidden").unwrap_or(false);
+            }
+            if !tags.is_empty() {
+                f.tags = tags;
+            }
+            if !grains.is_empty() {
+                f.grains = grains;
+            }
+            if format.is_some() {
+                f.format = format;
+            }
+            if exclusion_type.is_some() {
+                f.exclusion_type = exclusion_type;
+            }
+            if !exclusions.is_empty() {
+                f.exclusions = exclusions;
+            }
+            if inclusions.is_some() {
+                f.inclusions = inclusions;
+            }
+            if let Some(g) = str_of(fm, "extended_blend_group") {
+                f.extended_blend_group = Some(g.to_lowercase());
+            }
+            if snapshot.is_some() {
+                f.snapshot = snapshot;
+            }
+            if said("enable_sampling") {
+                f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
+            }
+            if said("sample_size") {
+                f.sample_size = sample_size;
+            }
+            if let Some(q) = str_of(fm, "sample_sql") {
+                f.sample_sql = Some(q);
+            }
+            if !synonyms.is_empty() {
+                f.synonyms = synonyms;
+            }
+            if let Some(d) = str_of(fm, "description") {
+                f.description = Some(d);
+            }
         }
-        if self.fields[field_index].exclusion_type.is_some() || self.fields[field_index].inclusions.is_some() {
+        for (key, value) in spoke {
+            if let Some((before, elsewhere)) = self.field_said.get(&(field_index, key)) {
+                if *before != value {
+                    let (before, elsewhere) = (before.clone(), self.relative(elsewhere));
+                    self.warn(
+                        file,
+                        format!(
+                            "field {name}: {key} is '{value}' here and '{before}' in {elsewhere}; the last file loaded wins, so say it in one place"
+                        ),
+                    );
+                }
+            }
+            self.field_said.insert((field_index, key), (value, file.to_path_buf()));
+        }
+        // Only the file that declares the rules is held to account for them.
+        if declares_rules {
             self.pending_rules.push(PendingRule { field_index, file: file.to_path_buf() });
         }
 
@@ -1063,6 +1149,19 @@ impl<'d> Builder<'d> {
             allow_measure_expansion: bool_of(jm, "allow_measure_expansion").unwrap_or(false),
             source: source.clone(),
         });
+        // A one_to_one join walks both ways, so either table can be the root
+        // of a plan. Cost is what ranks them; equal costs leave the planner
+        // nothing to prefer, and the tie falls to counting fields.
+        if cardinality == Cardinality::OneToOne && self.tables[left].cost == self.tables[right].cost {
+            let (a, b) = (self.tables[left].name.clone(), self.tables[right].name.clone());
+            let each = self.tables[left].cost;
+            self.warn(
+                file,
+                format!(
+                    "join {key} is one_to_one and {a} and {b} both cost {each}, so neither is preferred as a plan's root; the tie breaks on how many of the query's own fields live on each table, then on the table name. Raise the cost of the one you would rather the planner avoid."
+                ),
+            );
+        }
         // A one_to_one join walks both ways (`JoinDef#create_bi_directional_join`).
         if cardinality == Cardinality::OneToOne {
             let id = self.join_defs.len() as Id + 1;

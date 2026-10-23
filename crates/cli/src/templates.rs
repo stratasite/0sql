@@ -143,6 +143,9 @@ policies: []\n\
 #      project_admin: false\n";
 
 pub fn table_yml(name: &str, physical_name: &str, datasource: &str) -> String {
+    // No datasource configured yet: the key stays, with a note, so the file
+    // is one edit away from loading rather than silently wrong.
+    let datasource = if datasource.is_empty() { "              # the datasource's key, from datasources.yml" } else { datasource };
     format!(
         "# A table and the dimensions and measures it holds. Joins between tables\n\
 # live in rel.*.yml files.\n\
@@ -340,6 +343,13 @@ request resolve, and they deserve more care than anything else here.
 
 A measure's `expression.sql` carries its aggregate (`sum(revenue)`). A
 dimension's does not.
+
+A field named on several tables is one field, with one description, one set
+of synonyms and one type; the tables only say where it is mapped. Describe
+it on the table it belongs to and leave the others bare. A later file fills
+in only what an earlier one left out, so two files that both describe it
+differently leave the answer to whichever loads last. `zsql check` warns
+when that happens, and `zsql generate` writes the description once.
 
 ## Sampling: enable it only for short string dimensions
 
