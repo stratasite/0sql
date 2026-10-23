@@ -107,10 +107,16 @@ pub fn split(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// What a catalog holds: tables, views and columns. One place, because
+/// three answers quote these and they must agree.
+fn counts(cat: &Catalog) -> (usize, usize, usize) {
+    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+    (cat.tables.len() - views, views, cat.tables.iter().map(|t| t.columns.len()).sum())
+}
+
 /// The summary line, last and on stderr: what the file holds now.
 fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant, note: &str) {
-    let columns: usize = cat.tables.iter().map(|t| t.columns.len()).sum();
-    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+    let (tables, views, columns) = counts(cat);
     let mut scope: Vec<String> = cat.scopes.iter().map(|s| s.schema.clone().unwrap_or_else(|| "every schema".into())).collect();
     if !cat.added.is_empty() {
         scope.push(format!("{} added by name", cat.added.len()));
@@ -118,7 +124,7 @@ fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant, note: &st
     eprintln!(
         "{}: {} tables, {} views, {} columns ({}) -> {}{} ({:.0} ms)",
         cat.datasource,
-        cat.tables.len() - views,
+        tables,
         views,
         columns,
         scope.join(", "),
@@ -152,16 +158,16 @@ pub fn status(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) 
             match load(&project.dir, &conn.uid)? {
                 None => rows.push(serde_json::json!({ "datasource": conn.uid, "catalog": false })),
                 Some(cat) => {
-                    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+                    let (tables, views, columns) = counts(&cat);
                     rows.push(serde_json::json!({
                         "datasource": conn.uid,
                         "catalog": true,
                         "read_at": cat.read_at,
                         "read_by": cat.read_by,
                         "adapter": cat.adapter,
-                        "tables": cat.tables.len() - views,
+                        "tables": tables,
                         "views": views,
-                        "columns": cat.tables.iter().map(|t| t.columns.len()).sum::<usize>(),
+                        "columns": columns,
                         "scopes": cat.scopes,
                         "added": cat.added,
                     }));
@@ -174,12 +180,11 @@ pub fn status(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) 
         match load(&project.dir, &conn.uid)? {
             None => println!("{}: no catalog yet; `zsql catalog read -d {} --schema <name>` reads one", conn.uid, conn.uid),
             Some(cat) => {
-                let views = cat.tables.iter().filter(|t| t.kind == "view").count();
-                let columns: usize = cat.tables.iter().map(|t| t.columns.len()).sum();
+                let (tables, views, columns) = counts(&cat);
                 println!(
                     "{}: {} tables, {} views, {} columns; read {}",
                     conn.uid,
-                    cat.tables.len() - views,
+                    tables,
                     views,
                     columns,
                     cat.read_at.get(..10).unwrap_or(&cat.read_at)
@@ -397,14 +402,14 @@ fn outcome(
     failed: &[String],
     drift: &[String],
 ) -> serde_json::Value {
-    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+    let (tables, views, columns) = counts(cat);
     serde_json::json!({
         "datasource": cat.datasource,
         "adapter": cat.adapter,
         "read_at": cat.read_at,
-        "tables": cat.tables.len() - views,
+        "tables": tables,
         "views": views,
-        "columns": cat.tables.iter().map(|t| t.columns.len()).sum::<usize>(),
+        "columns": columns,
         "scopes": cat.scopes,
         "file": out.strip_prefix(project_dir).unwrap_or(out).display().to_string(),
         "added": added,

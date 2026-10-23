@@ -1088,14 +1088,10 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     }
     // One that is not on the table, or that 0sql has no type for, is not
     // satisfied at all, and an exit code is the only thing an agent reads.
-    let missing: Vec<&String> = opts.columns.iter().filter(|w| !asked_seen.contains(&w.to_lowercase())).collect();
+    let missing: Vec<&str> = opts.columns.iter().filter(|w| !asked_seen.contains(&w.to_lowercase())).map(String::as_str).collect();
     if !missing.is_empty() {
         let named: Vec<String> = tables.iter().map(|t| t.physical_name()).collect();
-        bail!(
-            "no column named {} on {}; `zsql catalog show <table>` lists the columns",
-            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-            named.join(", ")
-        );
+        bail!("no column named {} on {}; `zsql catalog show <table>` lists the columns", missing.join(", "), named.join(", "));
     }
     let untyped: Vec<String> = asked_untyped
         .iter()
@@ -1171,7 +1167,8 @@ fn subject(name: &str) -> String {
     }
     // A trailing version comes off before the kind: ab_test_d_v2 is a d.
     if let Some((head, tail)) = s.rsplit_once('_') {
-        if !head.is_empty() && tail.starts_with('v') && tail[1..].chars().all(|c| c.is_ascii_digit()) && tail.len() > 1 {
+        let version = tail.strip_prefix('v').is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        if !head.is_empty() && version {
             s = head.to_string();
         }
     }
@@ -1406,23 +1403,21 @@ fn infer(tables: &[Modeled]) -> (Vec<Inferred>, Vec<String>) {
                 loose.push(format!("{}.{column} is about {}, but is not a key there", t.name, o.name));
                 continue;
             };
-            // One column on their side can only mean one thing, so a
-            // second of ours claiming it is a guess too far.
-            let taken = joins
-                .iter()
-                .find(|j| j.left == t.name && j.right == o.name)
-                .and_then(|j| j.on.iter().find(|(_, r)| r.eq_ignore_ascii_case(&theirs.name)));
-            if let Some((already, _)) = taken {
-                loose.push(format!(
-                    "{}.{column} and {}.{already} are both about {}.{}; only the first joins on it",
-                    t.name, t.name, o.name, theirs.name
-                ));
-                continue;
-            }
             match joins.iter_mut().find(|j| j.left == t.name && j.right == o.name) {
                 // One join per pair of tables, so a second key column is
-                // another part of the same condition.
-                Some(j) => j.on.push((column.to_string(), theirs.name.clone())),
+                // another part of the same condition -- unless it claims a
+                // column already used on their side, which one column can
+                // only mean once.
+                Some(j) => match j.on.iter().find(|(_, r)| r.eq_ignore_ascii_case(&theirs.name)) {
+                    Some((already, _)) => {
+                        let already = already.clone();
+                        loose.push(format!(
+                            "{}.{column} and {}.{already} are both about {}.{}; only the first joins on it",
+                            t.name, t.name, o.name, theirs.name
+                        ));
+                    }
+                    None => j.on.push((column.to_string(), theirs.name.clone())),
+                },
                 None => joins.push(Inferred {
                     left: t.name.clone(),
                     right: o.name.clone(),
@@ -1436,8 +1431,13 @@ fn infer(tables: &[Modeled]) -> (Vec<Inferred>, Vec<String>) {
     // per pair of tables. Which side is kept is settled by the name, so a
     // re-run writes the same file; the cardinality comment on the line is
     // what tells the author to check the direction.
-    let pairs: Vec<(String, String)> = joins.iter().map(|j| (j.left.clone(), j.right.clone())).collect();
-    joins.retain(|j| !pairs.iter().any(|(l, r)| *l == j.right && *r == j.left && *l < j.left));
+    let pairs: BTreeSet<(&str, &str)> = joins.iter().map(|j| (j.left.as_str(), j.right.as_str())).collect();
+    let drop: Vec<(String, String)> = joins
+        .iter()
+        .filter(|j| pairs.contains(&(j.right.as_str(), j.left.as_str())) && j.right < j.left)
+        .map(|j| (j.left.clone(), j.right.clone()))
+        .collect();
+    joins.retain(|j| !drop.iter().any(|(l, r)| *l == j.left && *r == j.right));
     (joins, loose)
 }
 

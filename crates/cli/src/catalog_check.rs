@@ -268,14 +268,16 @@ pub fn print(v: &Value) -> bool {
     }
     for u in v["unchecked"].as_array().into_iter().flatten() {
         let u = s(u);
+        // Every line names the datasource first, which is the only part of
+        // it that goes into the command to run next.
+        let ds = u.split(' ').next().unwrap_or("");
         if u.contains("outside the catalog's scope") {
-            let ds = u.split(' ').next().unwrap_or("");
             println!("catalog: {u}; `zsql catalog read -d {ds} --schema <name>` or `zsql catalog read -d {ds} <table>` would read them");
         } else if u.contains("catalog read") {
-            let ds = u.split(' ').next().unwrap_or("");
             println!("catalog: {u}; `zsql catalog sync -d {ds}` re-reads what it records");
+        } else if u.contains("no project directory") {
+            println!("catalog: {u}, so nothing was checked against it");
         } else {
-            let ds = u.split(' ').next().unwrap_or("");
             println!("catalog: {u} not checked; `zsql catalog read -d {ds} --schema <name>` reads one");
         }
     }

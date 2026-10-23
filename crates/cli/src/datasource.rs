@@ -173,6 +173,7 @@ pub fn run(project_dir: Option<&Path>, what: DatasourceWhat) -> Result<()> {
 
 fn list(dir: &Path, json: bool) -> Result<()> {
     let all = Connection::read_all(dir).context("reading datasources.yml")?;
+    let tiers = tiers(dir);
     if json {
         let rows: Vec<serde_json::Value> = all
             .iter()
@@ -180,7 +181,7 @@ fn list(dir: &Path, json: bool) -> Result<()> {
                 serde_json::json!({
                     "datasource": c.uid,
                     "adapter": c.adapter,
-                    "tier": tier_of(dir, &c.uid),
+                    "tier": tier_of(&tiers, &c.uid),
                     "where": where_of(c),
                     "secret": secret_state(dir, c),
                 })
@@ -198,7 +199,7 @@ fn list(dir: &Path, json: bool) -> Result<()> {
             "{:<16} {:<12} {:<6} {:<32} {}",
             c.uid,
             c.adapter,
-            tier_of(dir, &c.uid).unwrap_or_default(),
+            tier_of(&tiers, &c.uid).unwrap_or_default(),
             where_of(c),
             secret_state(dir, c)
         );
@@ -239,10 +240,17 @@ fn secret_state(dir: &Path, c: &Connection) -> &'static str {
     }
 }
 
-fn tier_of(dir: &Path, uid: &str) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("datasources.yml")).ok()?;
-    let v: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
-    v.get(uid)?.get("tier")?.as_str().map(str::to_string)
+/// The tiers `datasources.yml` states, by datasource key. Read once: a
+/// listing asked per datasource and re-parsed the whole file each time.
+fn tiers(dir: &Path) -> serde_yaml::Value {
+    std::fs::read_to_string(dir.join("datasources.yml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str(&text).ok())
+        .unwrap_or(serde_yaml::Value::Null)
+}
+
+fn tier_of(all: &serde_yaml::Value, uid: &str) -> Option<String> {
+    all.get(uid)?.get("tier")?.as_str().map(str::to_string)
 }
 
 fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin: bool) -> Result<()> {

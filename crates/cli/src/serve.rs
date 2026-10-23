@@ -585,28 +585,33 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
         None => home()?.join("data"),
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
+    let held = lock_holder(&dir);
     if json {
-        let held = lock_holder(&dir);
-        let (running, pid, url) = match &held {
-            Lock::Held { pid, addr: Some(addr), .. } => (true, *pid, Some(url_of(addr))),
-            Lock::Held { pid, addr: None, .. } => (true, *pid, None),
-            Lock::Free | Lock::Unreachable => (false, None, None),
-        };
-        let public = match &held {
-            Lock::Held { public, .. } => public.clone(),
-            _ => None,
+        // One destructure, so the two answers cannot drift. `Unreachable`
+        // means the lock could not be read, which is not the same as free,
+        // and the document says which it was rather than flattening both
+        // to "not running".
+        let (running, pid, addr, public) = match &held {
+            Lock::Held { pid, addr, public } => (true, *pid, addr.clone(), public.clone()),
+            Lock::Free | Lock::Unreachable => (false, None, None, None),
         };
         return crate::show::print_json(&serde_json::json!({
             "running": running,
             "started_by": if running { "the foreground" } else { "nothing" },
+            "held": matches!(held, Lock::Held { .. }),
+            "lock": match held {
+                Lock::Held { .. } => "held",
+                Lock::Free => "free",
+                Lock::Unreachable => "unreadable",
+            },
             "pid": pid,
-            "url": url,
+            "url": addr.as_deref().map(url_of),
             "public_url": public,
-            "answers": matches!(&held, Lock::Held { addr: Some(a), .. } if answering(a)),
+            "answers": addr.as_deref().is_some_and(answering),
             "data_dir": dir.display().to_string(),
         }));
     }
-    match lock_holder(&dir) {
+    match held {
         Lock::Held { pid: Some(pid), addr: Some(addr), public } => println!(
             "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}{}; {}",
             dir.display(),
