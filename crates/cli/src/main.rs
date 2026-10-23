@@ -653,6 +653,7 @@ impl Command {
             // The flag on the parent reaches a subcommand that has its own.
             Command::Catalog { json: true, .. } => true,
             Command::Datasource { what: datasource::DatasourceWhat::List { json } } => *json,
+            #[cfg(feature = "server")]
             Command::Server { what: serve::ServerCommand::Status { json, .. } } => *json,
             _ => false,
         }
