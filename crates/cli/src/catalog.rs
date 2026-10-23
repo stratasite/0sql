@@ -121,10 +121,13 @@ fn summary(cat: &Catalog, out: &Path, project_dir: &Path, t0: Instant, note: &st
 }
 
 /// Bare `zsql catalog`: what the file holds, for one datasource or all.
-pub fn status(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()> {
+pub fn status(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let all = Connection::read_all(&project.dir).context("reading datasources.yml")?;
     if all.is_empty() {
+        if json {
+            return crate::show::print_json(&serde_json::json!({ "datasources": [] }));
+        }
         println!("no datasource yet; `zsql datasource add`, or edit datasources.yml");
         return Ok(());
     }
@@ -135,6 +138,30 @@ pub fn status(project_dir: Option<&Path>, datasource: Option<&str>) -> Result<()
             .ok_or_else(|| anyhow::anyhow!("datasources.yml names no datasource {d}"))?],
         None => all.iter().collect(),
     };
+    if json {
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for conn in chosen {
+            match load(&project.dir, &conn.uid)? {
+                None => rows.push(serde_json::json!({ "datasource": conn.uid, "catalog": false })),
+                Some(cat) => {
+                    let views = cat.tables.iter().filter(|t| t.kind == "view").count();
+                    rows.push(serde_json::json!({
+                        "datasource": conn.uid,
+                        "catalog": true,
+                        "read_at": cat.read_at,
+                        "read_by": cat.read_by,
+                        "adapter": cat.adapter,
+                        "tables": cat.tables.len() - views,
+                        "views": views,
+                        "columns": cat.tables.iter().map(|t| t.columns.len()).sum::<usize>(),
+                        "scopes": cat.scopes,
+                        "added": cat.added,
+                    }));
+                }
+            }
+        }
+        return crate::show::print_json(&serde_json::json!({ "datasources": rows }));
+    }
     for conn in chosen {
         match load(&project.dir, &conn.uid)? {
             None => println!("{}: no catalog yet; `zsql catalog read -d {} --schema <name>` reads one", conn.uid, conn.uid),

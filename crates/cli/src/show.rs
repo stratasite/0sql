@@ -228,6 +228,18 @@ pub fn print_deploy(v: &Value) -> bool {
     print_tests(&v["test_results"]) && catalog_ok
 }
 
+/// Whether a check passed, for the callers that print the JSON instead
+/// of the lines. The same judgment as [`print_deploy`], without the
+/// printing.
+pub fn deploy_ok(v: &Value) -> bool {
+    tests_passed(&v["test_results"]) && !v["catalog"]["fails"].as_bool().unwrap_or(false)
+}
+
+/// The same for test results alone.
+pub fn tests_passed(t: &Value) -> bool {
+    t["failed"].as_u64().unwrap_or(0) == 0
+}
+
 /// Prints test results; true when none failed.
 pub fn print_tests(t: &Value) -> bool {
     let results = t["results"].as_array().cloned().unwrap_or_default();

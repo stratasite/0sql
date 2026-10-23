@@ -222,6 +222,9 @@ enum Command {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         #[arg(short = 'd', long)]
         datasource: Option<String>,
+        /// Print what the catalog holds as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Draft model files from the catalog for the tables you pick. Never rewrites a file.
     #[command(
@@ -274,6 +277,9 @@ enum Command {
     /// Load the model, check it against the catalog, and run its tests. Connects to nothing (`datasource test` does); with -r, on the server.
     #[command(display_order = 5)]
     Check {
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         remote: Remote,
     },
@@ -294,6 +300,9 @@ enum Command {
         /// Run without asking.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Report the plan and the outcome as JSON. Counts only; the values go to the samples file.
+        #[arg(long)]
+        json: bool,
     },
     /// Run a query on the datasource the planner chooses and keep its rows under ~/.zsql/results. Local only.
     #[command(display_order = 7)]
@@ -428,6 +437,9 @@ enum Command {
         /// Write tests/{name}.yml from the template, projecting the model's first fields, and run nothing.
         #[arg(long, value_name = "NAME")]
         new: Option<String>,
+        /// Print the results as JSON.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         remote: Remote,
     },
@@ -734,8 +746,8 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             };
             run::results(&project, cmd)
         }
-        Command::Catalog { what, datasource } => match what {
-            None => catalog::status(dir, datasource.as_deref()),
+        Command::Catalog { what, datasource, json } => match what {
+            None => catalog::status(dir, datasource.as_deref(), json || tty::agent()),
             Some(CatalogWhat::Read { tables, schema, all, datasource }) => catalog::read(dir, datasource.as_deref(), &schema, &tables, all),
             Some(CatalogWhat::Add { tables, datasource }) => catalog::read(dir, datasource.as_deref(), &[], &tables, false),
             Some(CatalogWhat::Sync { datasource }) => catalog::sync(dir, datasource.as_deref()),
@@ -744,9 +756,10 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             }
             Some(CatalogWhat::Show { table, json, datasource }) => catalog::show(dir, datasource.as_deref(), &table, json || tty::agent()),
         },
-        Command::Sample { names, datasource, dry_run, budget, yes } => {
-            sample::run(dir, sample::Options { datasource: datasource.as_deref(), names: &names, dry_run, budget, yes })
-        }
+        Command::Sample { names, datasource, dry_run, budget, yes, json } => sample::run(
+            dir,
+            sample::Options { datasource: datasource.as_deref(), names: &names, dry_run, budget, yes, json: json || tty::agent() },
+        ),
         Command::Generate { relationships: Some(path), infer, datasource, dry_run, .. } => generate::relationships(
             dir,
             generate::RelOptions { path: Some(path.as_str()), infer, datasource: datasource.as_deref(), dry_run },
@@ -811,24 +824,37 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
                 },
             )
         }
-        Command::Check { remote } => {
+        Command::Check { json, remote } => {
             let at = Where::with(project, remote);
             let t0 = Instant::now();
             let mut side = at.mode()?.side()?;
             let v = side.check()?;
-            let ok = show::print_deploy(&v);
-            if side.origin() == "local" {
-                eprintln!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
-                show::next_after_check(&v, &at.project_dir()?);
-            }
+            let ok = if json || tty::agent() {
+                show::print_json(&v)?;
+                show::deploy_ok(&v)
+            } else {
+                let ok = show::print_deploy(&v);
+                if side.origin() == "local" {
+                    eprintln!("-- local {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+                    show::next_after_check(&v, &at.project_dir()?);
+                }
+                ok
+            };
             if !ok {
                 bail!("tests failed");
             }
             Ok(())
         }
         Command::Test { new: Some(name), .. } => scaffold::new_test(dir, &name),
-        Command::Test { remote, .. } => {
-            if !show::print_tests(&Where::with(project, remote).mode()?.side()?.test()?) {
+        Command::Test { json, remote, .. } => {
+            let v = Where::with(project, remote).mode()?.side()?.test()?;
+            let ok = if json || tty::agent() {
+                show::print_json(&v)?;
+                show::tests_passed(&v)
+            } else {
+                show::print_tests(&v)
+            };
+            if !ok {
                 bail!("tests failed");
             }
             Ok(())

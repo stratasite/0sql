@@ -14,7 +14,11 @@ use zsql_source::{Catalog, Connection, Filter};
 #[allow(clippy::large_enum_variant)]
 pub enum DatasourceWhat {
     /// The datasources in datasources.yml: key, adapter, tier, and whether a secret is at hand.
-    List,
+    List {
+        /// Print them as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Add a datasource: the entry to datasources.yml, the secret to .zsql. Asks on a terminal; flags say it otherwise.
     Add {
         /// The key other files refer to it by.
@@ -122,7 +126,7 @@ const ADAPTERS: [&str; 12] = [
 pub fn run(project_dir: Option<&Path>, what: DatasourceWhat) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     match what {
-        DatasourceWhat::List => list(&project.dir),
+        DatasourceWhat::List { json } => list(&project.dir, json || crate::tty::agent()),
         DatasourceWhat::Test { datasource } => test(&project.dir, datasource.as_deref()),
         DatasourceWhat::Auth { datasource, field, secret_stdin } => {
             auth(&project.dir, datasource.as_deref(), field.as_deref(), secret_stdin)
@@ -167,49 +171,72 @@ pub fn run(project_dir: Option<&Path>, what: DatasourceWhat) -> Result<()> {
     }
 }
 
-fn list(dir: &Path) -> Result<()> {
+fn list(dir: &Path, json: bool) -> Result<()> {
     let all = Connection::read_all(dir).context("reading datasources.yml")?;
+    if json {
+        let rows: Vec<serde_json::Value> = all
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "datasource": c.uid,
+                    "adapter": c.adapter,
+                    "tier": tier_of(dir, &c.uid),
+                    "where": where_of(c),
+                    "secret": secret_state(dir, c),
+                })
+            })
+            .collect();
+        return crate::show::print_json(&serde_json::json!({ "datasources": rows }));
+    }
     if all.is_empty() {
         println!("no datasource yet; `zsql datasource add`, or edit datasources.yml (it has an example of every kind)");
         return Ok(());
     }
     println!("{:<16} {:<12} {:<6} {:<32} secret", "key", "adapter", "tier", "where");
     for c in &all {
-        let secrets = zsql_source::secrets(Some(dir), &c.uid);
-        let has = secrets.password.is_some()
-            || secrets.personal_access_token.is_some()
-            || secrets.private_key.is_some()
-            || secrets.oauth_client_secret.is_some()
-            || secrets.secret_access_key.is_some()
-            || c.private_key_file.is_some()
-            || c.key_file.is_some();
-        let needs = shape(&c.adapter).1.is_some() || matches!(c.adapter.as_str(), "bigquery" | "athena");
-        let where_ = c
-            .file
-            .as_ref()
-            .map(|f| f.display().to_string())
-            .or_else(|| c.host.clone())
-            .or_else(|| c.account.clone())
-            .or_else(|| c.project.clone())
-            .or_else(|| c.url.clone())
-            .unwrap_or_default();
-        let tier = tier_of(dir, &c.uid).unwrap_or_default();
         println!(
             "{:<16} {:<12} {:<6} {:<32} {}",
             c.uid,
             c.adapter,
-            tier,
-            where_,
-            if !needs {
-                "none needed"
-            } else if has {
-                "yes"
-            } else {
-                "missing: .zsql or ZSQL_DS_*"
-            }
+            tier_of(dir, &c.uid).unwrap_or_default(),
+            where_of(c),
+            secret_state(dir, c)
         );
     }
     Ok(())
+}
+
+/// Where a datasource is, in one word: the file, host, account, project or
+/// url, whichever it has.
+fn where_of(c: &Connection) -> String {
+    c.file
+        .as_ref()
+        .map(|f| f.display().to_string())
+        .or_else(|| c.host.clone())
+        .or_else(|| c.account.clone())
+        .or_else(|| c.project.clone())
+        .or_else(|| c.url.clone())
+        .unwrap_or_default()
+}
+
+/// Whether the secret this adapter needs is at hand.
+fn secret_state(dir: &Path, c: &Connection) -> &'static str {
+    let secrets = zsql_source::secrets(Some(dir), &c.uid);
+    let has = secrets.password.is_some()
+        || secrets.personal_access_token.is_some()
+        || secrets.private_key.is_some()
+        || secrets.oauth_client_secret.is_some()
+        || secrets.secret_access_key.is_some()
+        || c.private_key_file.is_some()
+        || c.key_file.is_some();
+    let needs = shape(&c.adapter).1.is_some() || matches!(c.adapter.as_str(), "bigquery" | "athena");
+    if !needs {
+        "none needed"
+    } else if has {
+        "yes"
+    } else {
+        "missing: .zsql or ZSQL_DS_*"
+    }
 }
 
 fn tier_of(dir: &Path, uid: &str) -> Option<String> {

@@ -198,6 +198,9 @@ pub enum ServerCommand {
         /// The data directory to look at for a foreground server; $ZSQL_HOME/data when neither this nor the variable says.
         #[arg(long, env = "ZSQL_DATA_DIR")]
         data_dir: Option<PathBuf>,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// The last lines of the background server's log.
     Logs {
@@ -449,7 +452,7 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
             println!("{} {}", client.server, v.as_str().unwrap_or("ok"));
             Ok(())
         }
-        ServerCommand::Status { data_dir } => status(data_dir),
+        ServerCommand::Status { data_dir, json } => status(data_dir, json || crate::tty::agent()),
         ServerCommand::Logs { lines } => {
             let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
             let all: Vec<&str> = text.lines().collect();
@@ -562,8 +565,18 @@ fn stop() -> Result<()> {
 /// The server `start` recorded, if it is running; failing that, the
 /// data directory's lock, which a foreground `zsql serve` holds too.
 /// That server was not started here, so `stop` will not stop it.
-fn status(data_dir: Option<PathBuf>) -> Result<()> {
+fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
     if let Some(s) = running()? {
+        if json {
+            return crate::show::print_json(&serde_json::json!({
+                "running": true,
+                "started_by": "zsql server start",
+                "pid": s.pid,
+                "url": url_of(&s.bind),
+                "public_url": s.public_url,
+                "answers": answers(&s.bind) == "it answers",
+            }));
+        }
         println!("running as process {} at {}{}; {}", s.pid, url_of(&s.bind), public_note(s.public_url.as_deref()), answers(&s.bind));
         return Ok(());
     }
@@ -572,6 +585,27 @@ fn status(data_dir: Option<PathBuf>) -> Result<()> {
         None => home()?.join("data"),
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
+    if json {
+        let held = lock_holder(&dir);
+        let (running, pid, url) = match &held {
+            Lock::Held { pid, addr: Some(addr), .. } => (true, *pid, Some(url_of(addr))),
+            Lock::Held { pid, addr: None, .. } => (true, *pid, None),
+            Lock::Free | Lock::Unreachable => (false, None, None),
+        };
+        let public = match &held {
+            Lock::Held { public, .. } => public.clone(),
+            _ => None,
+        };
+        return crate::show::print_json(&serde_json::json!({
+            "running": running,
+            "started_by": if running { "the foreground" } else { "nothing" },
+            "pid": pid,
+            "url": url,
+            "public_url": public,
+            "answers": matches!(&held, Lock::Held { addr: Some(a), .. } if answers(a) == "it answers"),
+            "data_dir": dir.display().to_string(),
+        }));
+    }
     match lock_holder(&dir) {
         Lock::Held { pid: Some(pid), addr: Some(addr), public } => println!(
             "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}{}; {}",
