@@ -24,9 +24,10 @@ pub fn path(project_dir: &Path, uid: &str) -> std::path::PathBuf {
 }
 
 /// Whether `datasources.yml` names anything at all, for the commands that
-/// can work without one.
-pub fn any_datasource(project_dir: &Path) -> bool {
-    Connection::read_all(project_dir).map(|all| !all.is_empty()).unwrap_or(false)
+/// can work without one. A file that does not parse is not "no datasource":
+/// it is an error, and the caller gets it rather than a half-built file.
+pub fn any_datasource(project_dir: &Path) -> Result<bool> {
+    Ok(!Connection::read_all(project_dir).context("reading datasources.yml")?.is_empty())
 }
 
 /// The datasource a command means: the one named, or the only one.
@@ -204,6 +205,32 @@ pub fn status(project_dir: Option<&Path>, datasource: Option<&str>, json: bool) 
     Ok(())
 }
 
+/// The tables the catalog records under a name. An unqualified name matches
+/// whatever schema holds it, which is how `read` accepts one; each match
+/// carries its own schema, which is what `forget` needs.
+fn recorded_as(before: Option<&Catalog>, schema: Option<&str>, table: &str) -> Vec<(Option<String>, String)> {
+    let Some(b) = before else { return Vec::new() };
+    b.tables
+        .iter()
+        .filter(|t| {
+            t.name.eq_ignore_ascii_case(table) && schema.is_none_or(|s| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s)))
+        })
+        .map(|t| (t.schema.clone(), t.name.clone()))
+        .collect()
+}
+
+/// Drops recorded tables the warehouse no longer has, and says which.
+fn forget_dropped(merged: &mut Catalog, gone: &mut Vec<String>, uid: &str, json: bool, dropped: &[(Option<String>, String)]) {
+    for (schema, table) in dropped {
+        let full = format!("{}{table}", schema.as_deref().map(|s| format!("{s}.")).unwrap_or_default());
+        if !json {
+            println!("{uid}: table dropped:  {full}");
+        }
+        merged.forget(schema.as_deref(), table);
+        gone.push(full);
+    }
+}
+
 /// `zsql catalog read`: named schemas and tables, read and merged in.
 /// With nothing named, a schema picker on a terminal.
 pub fn read(
@@ -266,7 +293,6 @@ pub fn read(
         }
     }
     let mut missing = Vec::new();
-    let mut dropped = 0;
     for name in tables {
         let (schema, table) = split(name);
         match Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::table(schema, table)) {
@@ -275,21 +301,11 @@ pub fn read(
                 // longer does was dropped, not misspelled. That is what
                 // `sync` calls it, and a refresh that finds it gone has
                 // done its job.
-                let recorded = before.as_ref().is_some_and(|b| {
-                    b.tables.iter().any(|t| {
-                        t.name.eq_ignore_ascii_case(table)
-                            && schema.is_none_or(|s| t.schema.as_deref().is_some_and(|ts| ts.eq_ignore_ascii_case(s)))
-                    })
-                });
-                if recorded {
-                    if !json {
-                        println!("{}: table dropped:  {name}", conn.uid);
-                    }
-                    merged.forget(schema, table);
-                    gone.push(name.clone());
-                    dropped += 1;
-                } else {
+                let recorded = recorded_as(before.as_ref(), schema, table);
+                if recorded.is_empty() {
                     missing.push(name.clone());
+                } else {
+                    forget_dropped(&mut merged, &mut gone, &conn.uid, json, &recorded);
                 }
             }
             Ok(fresh) => {
@@ -302,7 +318,20 @@ pub fn read(
                         println!("added   {}", t.physical_name());
                     }
                 }
+                // Two schemas can hold the name and only one of them still.
+                // The read answered, so the other is gone and would go
+                // unreported if only an empty read counted as a drop.
+                let vanished: Vec<(Option<String>, String)> = recorded_as(before.as_ref(), schema, table)
+                    .into_iter()
+                    .filter(|(s, t)| {
+                        !fresh.tables.iter().any(|f| {
+                            f.name.eq_ignore_ascii_case(t)
+                                && f.schema.as_deref().map(str::to_lowercase) == s.as_deref().map(str::to_lowercase)
+                        })
+                    })
+                    .collect();
                 merged.merge(fresh);
+                forget_dropped(&mut merged, &mut gone, &conn.uid, json, &vanished);
             }
             Err(e) => failed.push(format!("{name}: {e}")),
         }
@@ -320,7 +349,7 @@ pub fn read(
             missing.join(", ")
         );
     }
-    let note = match (missing.len(), dropped) {
+    let note = match (missing.len(), gone.len()) {
         (0, 0) => String::new(),
         (0, n) => format!(", {n} dropped"),
         (m, 0) => format!(", {m} not found"),

@@ -564,3 +564,37 @@ fn a_column_asked_for_by_name_is_answered_either_way() {
     assert!(ok, "{out}");
     assert!(out.to_lowercase().contains("already"), "it says the model has it: {out}");
 }
+
+/// `--empty table` needs no warehouse, so it honours `--dry-run` like every
+/// other write and works before a datasource is configured. Both were
+/// silently ignored: the flag was accepted and the file written anyway, and
+/// the command insisted on a datasource it never used.
+#[test]
+fn an_empty_scaffold_needs_no_warehouse_and_honours_dry_run() {
+    let (home, project) = scratch("empty");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    // init writes a datasources.yml of comments only: nothing is configured.
+    assert!(std::fs::read_to_string(project.join("datasources.yml"))
+        .unwrap()
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')));
+
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty", "table", "--dry-run"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("would create models/core/tbl.widgets.yml"), "{out}");
+    assert!(!project.join("models/core/tbl.widgets.yml").exists(), "dry-run writes nothing: {out}");
+
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty", "table"]));
+    assert!(ok && out.contains("create models/core/tbl.widgets.yml"), "{out}");
+    let text = std::fs::read_to_string(project.join("models/core/tbl.widgets.yml")).unwrap();
+    assert!(text.contains("name: widgets") && text.contains("datasource:"), "{text}");
+    assert!(text.contains("the datasource's key"), "the blank says what to put there:\n{text}");
+
+    // A datasources.yml that does not parse is an error, not "no datasource".
+    std::fs::write(project.join("datasources.yml"), "local: [not a mapping\n").unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "gadgets", "--empty", "table"]));
+    assert!(!ok, "a broken file is reported, not worked around: {out}");
+    assert!(out.contains("datasources.yml"), "{out}");
+    assert!(!project.join("models/core/tbl.gadgets.yml").exists(), "and nothing is written: {out}");
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}

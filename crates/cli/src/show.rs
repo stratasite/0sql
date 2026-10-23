@@ -235,9 +235,10 @@ pub fn deploy_ok(v: &Value) -> bool {
     tests_passed(&v["test_results"]) && !v["catalog"]["fails"].as_bool().unwrap_or(false)
 }
 
-/// The same for test results alone.
+/// The same for test results alone: no test failed, and a shape with no
+/// results at all has nothing that could have.
 pub fn tests_passed(t: &Value) -> bool {
-    t["failed"].as_u64().unwrap_or(0) == 0
+    t["results"].as_array().is_none_or(|r| r.is_empty()) || t["failed"].as_u64().unwrap_or(0) == 0
 }
 
 /// Prints test results; true when none failed.
@@ -265,7 +266,7 @@ pub fn print_tests(t: &Value) -> bool {
         }
     }
     println!("tests: {} passed, {} failed", t["passed"], t["failed"]);
-    t["failed"].as_u64().unwrap_or(0) == 0
+    tests_passed(t)
 }
 
 fn indent(s: &str) -> String {

@@ -16,7 +16,12 @@ fn sql_for(fx: &Fixtures, universe_id: &str, line: &str) -> String {
 fn a_rank_with_no_order_ranks_by_what_it_decorates() {
     let fx = Fixtures::open(Fixtures::default_root());
     let cases = fx.cases().unwrap();
-    let base_case = cases.values().flatten().find(|c| c.id.starts_with("BasketPairTest#test_dedupe_lt")).expect("a basket-pair case");
+    // By its whole id: two cases share that prefix, with different universes.
+    let base_case = cases
+        .values()
+        .flatten()
+        .find(|c| c.id == "BasketPairTest#test_dedupe_lt_keeps_one_canonical_ordering_per_pair#1")
+        .expect("the basket-pair case");
 
     let sql = sql_for(&fx, &base_case.universe, "Product Name, rank(Web Net Paid)");
     let line = sql.lines().find(|l| l.to_uppercase().contains("RANK()")).unwrap_or_else(|| panic!("a rank column: {sql}"));
@@ -29,10 +34,42 @@ fn a_rank_with_no_order_ranks_by_what_it_decorates() {
 fn an_explicit_order_still_wins() {
     let fx = Fixtures::open(Fixtures::default_root());
     let cases = fx.cases().unwrap();
-    let base_case = cases.values().flatten().find(|c| c.id.starts_with("BasketPairTest#test_dedupe_lt")).expect("a basket-pair case");
+    // By its whole id: two cases share that prefix, with different universes.
+    let base_case = cases
+        .values()
+        .flatten()
+        .find(|c| c.id == "BasketPairTest#test_dedupe_lt_keeps_one_canonical_ordering_per_pair#1")
+        .expect("the basket-pair case");
 
     let sql = sql_for(&fx, &base_case.universe, "Product Name, rank(Web Net Paid order by Product Name asc)");
     let line = sql.lines().find(|l| l.to_uppercase().contains("RANK()")).unwrap_or_else(|| panic!("a rank column: {sql}"));
     assert!(line.to_lowercase().contains("asc"), "the author's own order: {line}");
     assert!(!line.to_lowercase().contains("desc"), "and not the default: {line}");
+}
+
+/// `last_value` is the trap in the rank family's neighbourhood: an ORDER BY
+/// with no frame means "up to this row", so the function answers with the
+/// row it is on. Where the order is ours, the frame has to be ours too.
+#[test]
+fn last_value_gets_the_frame_it_needs_when_the_order_is_ours() {
+    let fx = Fixtures::open(Fixtures::default_root());
+    let cases = fx.cases().unwrap();
+    let base_case = cases
+        .values()
+        .flatten()
+        .find(|c| c.id == "BasketPairTest#test_dedupe_lt_keeps_one_canonical_ordering_per_pair#1")
+        .expect("the basket-pair case");
+
+    let sql = sql_for(&fx, &base_case.universe, "Product Name, last_value(Web Net Paid)");
+    let line = sql.lines().find(|l| l.to_lowercase().contains("last_value")).unwrap_or_else(|| panic!("a last_value column: {sql}"));
+    assert!(line.to_uppercase().contains("ORDER BY"), "ordered: {line}");
+    assert!(
+        line.to_uppercase().contains("UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"),
+        "over the whole partition, or it answers with the current row: {line}"
+    );
+
+    // A rank needs no frame: the default one is what ranking means.
+    let sql = sql_for(&fx, &base_case.universe, "Product Name, rank(Web Net Paid)");
+    let line = sql.lines().find(|l| l.to_uppercase().contains("RANK()")).unwrap();
+    assert!(!line.to_uppercase().contains("UNBOUNDED"), "no frame on a rank: {line}");
 }

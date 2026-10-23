@@ -63,6 +63,19 @@ fn write_new(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
     write_or_say(project_dir, rel, text, false)
 }
 
+/// The same, with the answer left to the caller.
+fn write_quietly(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
+    let path = project_dir.join(rel);
+    if path.exists() {
+        bail!("{} exists", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, text)?;
+    Ok(())
+}
+
 /// The same, or what it would have written when `dry_run` is set.
 fn write_or_say(project_dir: &Path, rel: &str, text: &str, dry_run: bool) -> Result<()> {
     let path = project_dir.join(rel);
@@ -105,7 +118,7 @@ pub fn empty_table(
 /// `zsql test --new NAME`: a test from the template, projecting the
 /// model's own first dimension and measure when it loads, so the test
 /// runs as written; placeholders otherwise.
-pub fn new_test(project_dir: Option<&Path>, name: &str) -> Result<()> {
+pub fn new_test(project_dir: Option<&Path>, name: &str, json: bool) -> Result<()> {
     let p = project_of(project_dir.map(Path::to_path_buf))?;
     let file = zsql_project::parameterize(name).replace('-', "_");
     let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
@@ -113,7 +126,12 @@ pub fn new_test(project_dir: Option<&Path>, name: &str) -> Result<()> {
         let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
         (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))
     });
-    write_new(&p.dir, &format!("tests/{file}.yml"), &templates::test_yml(name, fields))?;
+    let rel = format!("tests/{file}.yml");
+    if json {
+        write_quietly(&p.dir, &rel, &templates::test_yml(name, fields))?;
+        return crate::show::print_json(&serde_json::json!({ "created": rel }));
+    }
+    write_new(&p.dir, &rel, &templates::test_yml(name, fields))?;
     eprintln!("next: zsql test");
     Ok(())
 }

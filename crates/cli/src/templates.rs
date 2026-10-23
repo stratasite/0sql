@@ -308,7 +308,7 @@ what to change.
 The flow, in order. Nothing prompts when stdin is not a terminal, so every
 step below is its non-interactive form; the flag forms are what you use.
 
-    zsql --agent <command>                     # JSON for every command that has an answer, and never a prompt
+    zsql --agent <command>                     # JSON from every command that answers with data, and never a prompt
     zsql datasource list                       # what datasources.yml holds, and whether each has its secret
     zsql datasource auth -d wh --secret-stdin  # set or replace its secret in .zsql
     zsql datasource test -d wh                 # open the connection; list the schemas it can see

@@ -807,7 +807,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
                     // no datasource yet still gets its file, with the key left
                     // blank for whatever is added later.
                     let project_dir = here.project_dir()?.dir;
-                    let uid = if datasource.is_none() && !catalog::any_datasource(&project_dir) {
+                    let uid = if datasource.is_none() && !catalog::any_datasource(&project_dir)? {
                         String::new()
                     } else {
                         catalog::choose(&project_dir, datasource.as_deref())?.uid
@@ -868,7 +868,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             }
             Ok(())
         }
-        Command::Test { new: Some(name), .. } => scaffold::new_test(dir, &name),
+        Command::Test { new: Some(name), json, .. } => scaffold::new_test(dir, &name, json || tty::agent()),
         Command::Test { json, remote, .. } => {
             let v = Where::with(project, remote).mode()?.side()?.test()?;
             if json || tty::agent() {

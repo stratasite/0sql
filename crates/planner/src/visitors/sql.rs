@@ -570,7 +570,9 @@ fn window_sql<'a>(cx: &Ctx<'_, 'a>, d: &zsql_spec::Decorator, _p: &Projected<'a>
     let function = d.str("function").unwrap_or("");
     let call = match function {
         "lag" | "lead" => format!("{}({}, {})", function, expr, d.int("offset").unwrap_or(0)),
-        "ntile" => format!("{}({}, {})", function, expr, d.int("buckets").unwrap_or(0)),
+        // NTILE takes the bucket count alone, like the other rank
+        // functions: `ntile(expr, n)` is rejected by every engine.
+        "ntile" => format!("ntile({})", d.int("buckets").unwrap_or(0)),
         "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => format!("{function}()"),
         _ => format!("{function}({expr})"),
     };
@@ -605,23 +607,32 @@ fn window_sql<'a>(cx: &Ctx<'_, 'a>, d: &zsql_spec::Decorator, _p: &Projected<'a>
             }
         }
     }
-    // No order given. A rank over an unordered window ranks every row the
-    // same, so order by what the author named. The functions that keep the
-    // expression as their argument take the query's date instead, and fall
-    // back to the expression only when the query has no date.
+    // No order given. Rails leaves the clause empty here, which makes a
+    // rank window rank every row the same, so this is a deliberate
+    // divergence from it: order by what the author named. The functions
+    // that keep the expression as their argument take the query's date
+    // instead, falling back to the expression when there is no date.
+    let mut supplied_order = false;
     if orders.is_empty() {
         const RANKS: [&str; 6] = ["rank", "dense_rank", "row_number", "percent_rank", "cume_dist", "ntile"];
         const OFFSETS: [&str; 4] = ["lag", "lead", "first_value", "last_value"];
         if RANKS.contains(&function) {
             orders.push(format!("{expr} desc"));
+            supplied_order = true;
         } else if OFFSETS.contains(&function) {
             let dates: Vec<&Projected<'a>> = node.projections.iter().filter(|x| x.field().map(|f| f.is_date()).unwrap_or(false)).collect();
-            match dates.iter().find(|x| x.proj.def.axis == "x").or(dates.first()) {
+            match dates.iter().find(|x| x.proj.def.axis == "x").or_else(|| dates.first()) {
                 Some(dt) => orders.push(projection_to_sql(cx, dt, node)?),
                 None => orders.push(expr.to_string()),
             }
+            supplied_order = true;
         }
     }
+    // An ORDER BY with no frame means "from the start of the partition to
+    // this row", so LAST_VALUE over it answers with the row it is on. Where
+    // the order above is ours rather than the author's, say the frame we
+    // meant: the whole partition, in that order.
+    let whole_partition = supplied_order && matches!(function, "first_value" | "last_value");
     let mut win = format!("{call} OVER (");
     if !partitions.is_empty() {
         win.push_str(&format!("PARTITION BY {}", partitions.join(", ")));
@@ -631,6 +642,8 @@ fn window_sql<'a>(cx: &Ctx<'_, 'a>, d: &zsql_spec::Decorator, _p: &Projected<'a>
     }
     if d.str("mode") == Some("moving") {
         win.push_str(&format!(" ROWS BETWEEN {} PRECEDING AND CURRENT ROW", d.int("size").unwrap_or(0)));
+    } else if whole_partition {
+        win.push_str(" ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING");
     }
     win.push(')');
     Ok(win)

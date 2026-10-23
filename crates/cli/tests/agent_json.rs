@@ -37,7 +37,10 @@ fn the_commands_an_agent_drives_all_answer_in_json() {
     std::fs::create_dir_all(project.join("models")).unwrap();
     std::fs::write(
         project.join("models/tbl.orders.yml"),
-        "name: Orders\nphysical_name: orders\ndatasource: local\ncost: 1\nfields:\n  - type: dimension\n    name: Status\n    data_type: string\n    expression: status\n  - type: measure\n    name: Orders\n    data_type: integer\n    expression: count(*)\n",
+        // Sampling on, so `sample` has something to plan: without it the
+        // command answers "nothing to sample" and the plan branch is never
+        // reached, which a `written == false` assertion cannot tell apart.
+        "name: Orders\nphysical_name: orders\ndatasource: local\ncost: 1\nfields:\n  - type: dimension\n    name: Status\n    data_type: string\n    enable_sampling: true\n    expression: status\n  - type: measure\n    name: Orders\n    data_type: integer\n    expression: count(*)\n",
     )
     .unwrap();
 
@@ -61,6 +64,8 @@ fn the_commands_an_agent_drives_all_answer_in_json() {
     let (ok, text) = out(zsql(&home, &project).args(["sample", "--dry-run", "--json"]));
     let v = parses("sample --json", &text);
     assert!(ok && v["written"] == false, "{v}");
+    assert_eq!(v["plan"][0]["field"], "Status", "the dimension it would read: {v}");
+    assert_eq!(v["planned_queries"], 2, "the values and their distinct total: {v}");
 
     let (ok, text) = out(zsql(&home, &project).args(["server", "status", "--json"]));
     let v = parses("server status --json", &text);
@@ -137,4 +142,6 @@ fn the_commands_an_agent_drives_all_answer_in_json() {
         assert!(ok, "{label} failed:\n{text}");
         parses(&label, &text);
     }
+    // A passing run leaves nothing behind; a failing one keeps it to read.
+    let _ = std::fs::remove_dir_all(&root);
 }

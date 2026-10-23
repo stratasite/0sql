@@ -9,7 +9,12 @@ use zsql_golden::Fixtures;
 fn a_shorthand_expand_alias_reaches_the_plan() {
     let fx = Fixtures::open(Fixtures::default_root());
     let cases = fx.cases().unwrap();
-    let base_case = cases.values().flatten().find(|c| c.id.starts_with("BasketPairTest#test_dedupe_lt")).expect("a basket-pair case");
+    // By its whole id: two cases share that prefix, with different universes.
+    let base_case = cases
+        .values()
+        .flatten()
+        .find(|c| c.id == "BasketPairTest#test_dedupe_lt_keeps_one_canonical_ordering_per_pair#1")
+        .expect("the basket-pair case");
     let universe = fx.universe(&base_case.universe).unwrap();
 
     let line = "Product Name, Web Net Paid, \

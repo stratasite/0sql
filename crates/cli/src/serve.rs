@@ -574,7 +574,7 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
                 "pid": s.pid,
                 "url": url_of(&s.bind),
                 "public_url": s.public_url,
-                "answers": answers(&s.bind) == "it answers",
+                "answers": answering(&s.bind),
             }));
         }
         println!("running as process {} at {}{}; {}", s.pid, url_of(&s.bind), public_note(s.public_url.as_deref()), answers(&s.bind));
@@ -602,7 +602,7 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
             "pid": pid,
             "url": url,
             "public_url": public,
-            "answers": matches!(&held, Lock::Held { addr: Some(a), .. } if answers(a) == "it answers"),
+            "answers": matches!(&held, Lock::Held { addr: Some(a), .. } if answering(a)),
             "data_dir": dir.display().to_string(),
         }));
     }
@@ -625,6 +625,11 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
 
 /// The address as a URL to go to: a server bound to every interface is
 /// reached on the loopback from here.
+/// Whether the server at the bind answers `/healthz`.
+fn answering(bind: &str) -> bool {
+    remote::Client::new(&url_of(bind), None).get("/healthz").is_ok()
+}
+
 fn url_of(bind: &str) -> String {
     let host_port = match bind.rsplit_once(':') {
         Some(("0.0.0.0" | "[::]" | "::", port)) => format!("127.0.0.1:{port}"),
@@ -638,7 +643,9 @@ fn public_note(public: Option<&str>) -> String {
     public.map(|u| format!(" (public URL {u})")).unwrap_or_default()
 }
 
-/// Whether the server at the bind answers `/healthz`.
+/// Whether the server at the bind answers `/healthz`, as a sentence. The
+/// boolean form is [`answering`]: deriving one by comparing against this
+/// string would turn into `false` the day the wording changes.
 fn answers(bind: &str) -> String {
     match remote::Client::new(&url_of(bind), None).get("/healthz") {
         Ok(_) => "it answers".to_string(),

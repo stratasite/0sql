@@ -30,6 +30,42 @@ pub struct Options<'a> {
     pub json: bool,
 }
 
+/// What each dimension this run would read is, which every answer carries
+/// whether or not the reading happened.
+fn plan_of(jobs: &[Job<'_>]) -> Vec<serde_json::Value> {
+    jobs.iter()
+        .map(|j| {
+            serde_json::json!({
+                "field": j.field.name,
+                "uid": j.field.uid,
+                "sample_sql": j.field.sample_sql.is_some(),
+                "sample_size": j.field.sample_size,
+            })
+        })
+        .collect()
+}
+
+/// One shape for every answer this command can give, so a caller reads the
+/// same keys whether it planned, read nothing or wrote a file. Counts only:
+/// the values are customer data and go to the samples file.
+fn answer(
+    plan: &[serde_json::Value],
+    sampled: &[serde_json::Value],
+    skipped: &[serde_json::Value],
+    planned_queries: usize,
+    file: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "plan": plan,
+        "planned_queries": planned_queries,
+        "sampled": sampled,
+        "skipped": skipped,
+        "written": file.is_some(),
+        "file": file,
+        "note": "a samples file is customer data: it ships with the model on deploy and is gitignored by default",
+    })
+}
+
 /// Queries a run may need before it is refused without a budget said.
 const DEFAULT_BUDGET: usize = 100;
 
@@ -101,13 +137,14 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             println!("{line}");
         }
     };
-    let skip_rows: Vec<serde_json::Value> = skipped.iter().map(|(name, why)| serde_json::json!({ "field": name, "why": why })).collect();
+    let skip_rows: Vec<serde_json::Value> =
+        if opts.json { skipped.iter().map(|(name, why)| serde_json::json!({ "field": name, "why": why })).collect() } else { Vec::new() };
     for (name, why) in &skipped {
         say(format!("skip    {name}: {why}"));
     }
     if jobs.is_empty() {
         if opts.json {
-            return crate::show::print_json(&serde_json::json!({ "sampled": [], "skipped": skip_rows, "written": false }));
+            return crate::show::print_json(&answer(&[], &[], &skip_rows, 0, None));
         }
         println!("nothing to sample: no dimension has enable_sampling: true, or none matched");
         return Ok(());
@@ -155,20 +192,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     }
     if opts.dry_run {
         if opts.json {
-            let plan: Vec<serde_json::Value> = jobs
-                .iter()
-                .map(|j| {
-                    serde_json::json!({
-                        "field": j.field.name,
-                        "uid": j.field.uid,
-                        "sample_sql": j.field.sample_sql.is_some(),
-                        "sample_size": j.field.sample_size,
-                    })
-                })
-                .collect();
-            return crate::show::print_json(&serde_json::json!({
-                "planned_queries": planned, "plan": plan, "skipped": skip_rows, "written": false
-            }));
+            return crate::show::print_json(&answer(&plan_of(&jobs), &[], &skip_rows, planned, None));
         }
         println!("nothing run, nothing written");
         return Ok(());
@@ -229,14 +253,16 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         ));
         // Counts, never the values: those are customer data and belong in
         // the samples file, which is gitignored and never printed.
-        rows.push(serde_json::json!({
-            "field": j.field.name,
-            "uid": j.field.uid,
-            "table": via,
-            "values": values.len(),
-            "distinct": distinct,
-            "complete": complete,
-        }));
+        if opts.json {
+            rows.push(serde_json::json!({
+                "field": j.field.name,
+                "uid": j.field.uid,
+                "table": via,
+                "values": values.len(),
+                "distinct": distinct,
+                "complete": complete,
+            }));
+        }
         let record = DimensionValues {
             uid: j.field.uid.clone(),
             name: j.field.name.clone(),
@@ -253,7 +279,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     }
     if sampled == 0 {
         if opts.json {
-            return crate::show::print_json(&serde_json::json!({ "sampled": [], "skipped": skip_rows, "written": false }));
+            return crate::show::print_json(&answer(&plan_of(&jobs), &[], &skip_rows, planned, None));
         }
         println!("nothing sampled");
         return Ok(());
@@ -265,13 +291,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     catalog.write(&out_path).with_context(|| out_path.display().to_string())?;
     let file = out_path.strip_prefix(&project.dir).unwrap_or(&out_path).display().to_string();
     if opts.json {
-        return crate::show::print_json(&serde_json::json!({
-            "sampled": rows,
-            "skipped": skip_rows,
-            "written": true,
-            "file": file,
-            "note": "that file is customer data: it ships with the model on deploy and is gitignored by default",
-        }));
+        return crate::show::print_json(&answer(&plan_of(&jobs), &rows, &skip_rows, planned, Some(&file)));
     }
     println!("{sampled} dimension{} -> {file}", if sampled == 1 { "" } else { "s" });
     println!("that file is customer data: it ships with the model on deploy and is gitignored by default; committing it is a decision about where those values may go");

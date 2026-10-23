@@ -128,6 +128,14 @@ fn a_catalog_is_a_union_with_its_provenance_and_a_sync_re_reads_it() {
     let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(ok, "{out}");
     assert!(out.contains("1 table outside the catalog's scope") && out.contains("zsql catalog read -d local <table>"), "{out}");
+
+    // Every next step `check` names has to be a command that exists: two of
+    // these three used to print `zsql catalog <uid>`, which is not one.
+    std::fs::remove_file(project.join("catalog/local.json")).unwrap();
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok, "{out}");
+    assert!(out.contains("`zsql catalog read -d local --schema <name>` reads one"), "no catalog yet: {out}");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// `zsql datasource`: list says what is there and whether a secret is at
@@ -266,7 +274,74 @@ fn a_dropped_table_is_forgotten_by_a_read_and_a_typo_is_named_first() {
     let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "ordrs"]));
     assert!(!ok, "a name that is not there fails: {out}");
     assert!(out.contains("ordrs"), "and is named: {out}");
-    let summary = out.find("-> catalog").expect("the summary is printed");
-    assert!(out.find("ordrs").unwrap() < summary, "the error comes before the summary:\n{out}");
+    // Both lines are on stderr, so compare them there: an offset into
+    // stdout ++ stderr would satisfy this for the wrong reason if one of
+    // them ever moved streams.
+    let stderr = String::from_utf8_lossy(&zsql(&home, &project).args(["catalog", "read", "ordrs"]).output().unwrap().stderr).to_string();
+    let summary = stderr.find("-> catalog").expect("the summary is on stderr");
+    assert!(stderr.find("ordrs").expect("the error is on stderr") < summary, "the error comes before the summary:\n{stderr}");
     assert!(out.contains("1 not found"), "and the summary says it is partial: {out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same, on a warehouse whose tables have schemas, which SQLite's do
+/// not. An unqualified name matches whatever schema holds it, but forgetting
+/// one matches the schema exactly, so a read that passed the user's spelling
+/// through said "dropped" and removed nothing. DuckDB needs no server.
+#[test]
+fn a_dropped_table_is_forgotten_by_its_own_schema_not_the_name_you_typed() {
+    let root = std::env::temp_dir().join(format!("zsql-catalog-schemas-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, project) = (root.join("home"), root.join("shop"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop"])).0);
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch(
+        "CREATE SCHEMA sales; CREATE SCHEMA ops;\
+         CREATE TABLE sales.orders (id BIGINT);\
+         CREATE TABLE sales.legacy (id BIGINT);\
+         CREATE TABLE ops.legacy (id BIGINT);",
+    )
+    .unwrap();
+    drop(db);
+
+    // Read all three by name, unqualified for the pair that share one.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "sales.orders", "legacy"]));
+    assert!(ok, "{out}");
+    let listed = |project: &Path| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(project.join("catalog/local.json")).unwrap()).unwrap();
+        v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| format!("{}.{}", t["schema"].as_str().unwrap_or("-"), t["name"].as_str().unwrap()))
+            .collect()
+    };
+    assert_eq!(listed(&project), ["ops.legacy", "sales.legacy", "sales.orders"], "all three recorded");
+
+    // Drop one of the pair. The unqualified name still finds the survivor,
+    // so the read succeeds, and the one that went has to be reported anyway.
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch("DROP TABLE ops.legacy;").unwrap();
+    drop(db);
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "legacy"]));
+    assert!(ok, "the survivor answered, so this is not a failure: {out}");
+    assert!(out.contains("table dropped:  ops.legacy"), "the one that went is named with its schema: {out}");
+    assert_eq!(listed(&project), ["sales.legacy", "sales.orders"], "and it leaves the file");
+
+    // Now the last of that name. A qualified read removes it too.
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch("DROP TABLE sales.legacy;").unwrap();
+    drop(db);
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "legacy"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("table dropped:  sales.legacy"), "{out}");
+    assert_eq!(listed(&project), ["sales.orders"], "nothing of that name is left");
+
+    // And a name the catalog never held is still a mistake.
+    let (ok, out) = run(zsql(&home, &project).args(["catalog", "read", "legacyy"]));
+    assert!(!ok && out.contains("legacyy"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
 }

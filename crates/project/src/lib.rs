@@ -836,19 +836,36 @@ impl<'d> Builder<'d> {
             }
         };
         // A field named on several tables is one field, and every definition
-        // updates it -- but only with what that definition actually says. An
-        // absent or empty attribute says nothing and leaves what another
-        // table's definition gave, so a bare mapping no longer erases a
-        // description written next to the dimension. Two definitions that
-        // both speak and disagree keep the last one loaded, as a deploy
-        // does; `zsql check` reports the disagreement.
-        let declares_rules = exclusion_type.is_some() || inclusions.is_some();
-        // What this definition says, to compare with what another file said.
+        // updates it. What a definition leaves out is treated two ways,
+        // and the line between them matters.
+        //
+        // Its metadata -- what the field is called and how it reads --
+        // blank-fills: an absent or empty description, synonym list, tag
+        // list, format or sampling setting says nothing and leaves what
+        // another table's definition gave, so a bare mapping no longer
+        // erases the description written next to the dimension.
+        //
+        // Everything that changes the plan does not: the type, the date
+        // grains, the snapshot, the blend group and the exclusion and
+        // inclusion rules are taken from the last definition loaded,
+        // whether it states them or not, exactly as before. Blank-filling
+        // those would mean a bare mapping could no longer clear a rule
+        // another file set, and two files could between them assemble a
+        // field this loader rejects when one file writes it.
+        //
+        // Where two definitions both state the same metadata differently,
+        // the last one loaded wins and `zsql check` reports it.
+        // What this definition says, recorded whether or not it is the
+        // first: the first has nothing to disagree with, but the second
+        // needs to know what the first said and where it said it.
         let mut spoke: Vec<(&'static str, String)> = Vec::new();
         {
             let said = |k: &str| get(fm, k).is_some();
             let tags = strs_of(fm, "tags");
             let synonyms = strs_of(fm, "synonyms");
+            // The type is not metadata and does not blank-fill, so a
+            // disagreement about it is the one worth saying loudest.
+            spoke.push(("data_type", format!("{data_type:?}").to_lowercase()));
             if let Some(d) = str_of(fm, "description") {
                 spoke.push(("description", d));
             }
@@ -878,33 +895,23 @@ impl<'d> Builder<'d> {
             }
             let f = &mut self.fields[field_index];
             f.name = name.clone();
+            // Semantics: the last definition decides, stated or not.
             f.data_type = Some(data_type);
+            f.grains = grains;
+            f.exclusion_type = exclusion_type;
+            f.exclusions = exclusions;
+            f.inclusions = inclusions;
+            f.extended_blend_group = str_of(fm, "extended_blend_group").map(|g| g.to_lowercase());
+            f.snapshot = snapshot;
+            // Metadata: only what this definition states.
             if said("hidden") {
                 f.hidden = bool_of(fm, "hidden").unwrap_or(false);
             }
             if !tags.is_empty() {
                 f.tags = tags;
             }
-            if !grains.is_empty() {
-                f.grains = grains;
-            }
             if format.is_some() {
                 f.format = format;
-            }
-            if exclusion_type.is_some() {
-                f.exclusion_type = exclusion_type;
-            }
-            if !exclusions.is_empty() {
-                f.exclusions = exclusions;
-            }
-            if inclusions.is_some() {
-                f.inclusions = inclusions;
-            }
-            if let Some(g) = str_of(fm, "extended_blend_group") {
-                f.extended_blend_group = Some(g.to_lowercase());
-            }
-            if snapshot.is_some() {
-                f.snapshot = snapshot;
             }
             if said("enable_sampling") {
                 f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
@@ -936,8 +943,7 @@ impl<'d> Builder<'d> {
             }
             self.field_said.insert((field_index, key), (value, file.to_path_buf()));
         }
-        // Only the file that declares the rules is held to account for them.
-        if declares_rules {
+        if self.fields[field_index].exclusion_type.is_some() || self.fields[field_index].inclusions.is_some() {
             self.pending_rules.push(PendingRule { field_index, file: file.to_path_buf() });
         }
 
@@ -1149,16 +1155,18 @@ impl<'d> Builder<'d> {
             allow_measure_expansion: bool_of(jm, "allow_measure_expansion").unwrap_or(false),
             source: source.clone(),
         });
-        // A one_to_one join walks both ways, so either table can be the root
-        // of a plan. Cost is what ranks them; equal costs leave the planner
-        // nothing to prefer, and the tie falls to counting fields.
+        // A one_to_one join walks both ways, so either table can root a
+        // plan. The planner weighs coverage, partitions and tier first and
+        // only then cost, so equal costs do not always decide anything --
+        // but where the rest ties, cost is the lever the author has, and
+        // two equal ones leave it to the field count and then the uid.
         if cardinality == Cardinality::OneToOne && self.tables[left].cost == self.tables[right].cost {
             let (a, b) = (self.tables[left].name.clone(), self.tables[right].name.clone());
             let each = self.tables[left].cost;
             self.warn(
                 file,
                 format!(
-                    "join {key} is one_to_one and {a} and {b} both cost {each}, so neither is preferred as a plan's root; the tie breaks on how many of the query's own fields live on each table, then on the table name. Raise the cost of the one you would rather the planner avoid."
+                    "join {key} is one_to_one and {a} and {b} both cost {each}; where a query ties on everything else, the root is then picked by field count and finally by table uid. Raise the cost of the one to avoid."
                 ),
             );
         }
