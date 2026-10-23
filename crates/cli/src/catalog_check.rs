@@ -43,18 +43,26 @@ pub fn findings(model: &Model) -> Value {
             .unwrap_or(("\"".into(), "\"".into()));
         let mut missing_tables = Vec::new();
         let mut missing_columns = Vec::new();
-        let mut type_mismatches = Vec::new();
         let mut checked = 0;
         let mut outside = 0;
+        // What each field's columns hold, over every table of this
+        // datasource, and which tables could not be looked at: a field's
+        // declared type is judged against all of its columns at once,
+        // not one table at a time, because the model holds one type for
+        // the field however many tables map it.
+        let mut columns_of: BTreeMap<zsql_semantic::Id, Vec<Value>> = BTreeMap::new();
+        let mut unseen: Vec<zsql_semantic::Id> = Vec::new();
         for table in s.tables.iter().filter(|t| t.datasource_id == ds.id) {
             let found = match resolve(&cat, &table.physical_name, &quotes) {
                 (Some(found), _) => found,
                 (None, true) => {
                     outside += 1;
+                    unseen.push(table.id);
                     continue;
                 }
                 (None, false) => {
                     missing_tables.push(json!({ "table": table.name, "physical_name": table.physical_name }));
+                    unseen.push(table.id);
                     continue;
                 }
             };
@@ -69,17 +77,41 @@ pub fn findings(model: &Model) -> Value {
                     };
                     // One bare column, so the field's type is the column's.
                     if e.column_refs.len() == 1 && e.sql.as_deref().map(str::trim).is_some_and(|q| q.eq_ignore_ascii_case(col)) {
-                        if let (Some(f), Some(declared)) = (field, field.and_then(|f| f.data_type)) {
-                            if let Mapped::Known(actual) = map_type(&c.data_type) {
-                                let declared =
-                                    serde_json::to_value(declared).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-                                if !crate::generate::covers(&declared, actual) {
-                                    type_mismatches.push(json!({ "table": table.name, "field": f.name, "column": c.name, "declared": declared, "warehouse": c.data_type, "maps_to": actual }));
-                                }
-                            }
+                        if let (Some(f), Mapped::Known(actual)) = (field, map_type(&c.data_type)) {
+                            columns_of
+                                .entry(f.id)
+                                .or_default()
+                                .push(json!({ "table": table.name, "column": c.name, "warehouse": c.data_type, "maps_to": actual }));
                         }
                     }
                 }
+            }
+        }
+        // The declared type must be the widest of the columns the field
+        // maps to: that one covers them all, and a narrower one claims
+        // less than the data holds. A field some of whose tables could
+        // not be looked at is left alone when its declaration is wider
+        // than what was seen, since an unread table may be the reason.
+        let mut type_mismatches = Vec::new();
+        for (id, columns) in &columns_of {
+            let Some(f) = s.fields.iter().find(|f| f.id == *id) else { continue };
+            let Some(declared) = f.data_type.and_then(|d| serde_json::to_value(d).ok()).and_then(|v| v.as_str().map(str::to_string)) else {
+                continue;
+            };
+            let mapped: Vec<&str> = columns.iter().filter_map(|c| c["maps_to"].as_str()).collect();
+            if mapped.iter().all(|m| *m == declared) {
+                continue;
+            }
+            let complete = !s.expressions.iter().any(|e| e.field_id == *id && unseen.contains(&(e.table_id)));
+            let widest = crate::generate::widest(mapped.iter().copied());
+            match widest {
+                Some(w) if w == declared => {}
+                // Wider than every column seen, and a table was not seen:
+                // the declaration may be right for that one.
+                Some(w) if !complete && crate::generate::widen(&declared, w) == Some(name_static(&declared)) => {}
+                _ => type_mismatches.push(json!({
+                    "field": f.name, "declared": declared, "should_be": widest, "columns": columns, "complete": complete,
+                })),
             }
         }
         if outside > 0 {
@@ -102,6 +134,12 @@ pub fn findings(model: &Model) -> Value {
     let fails =
         out.iter().any(|d| !d["missing_tables"].as_array().unwrap().is_empty() || !d["missing_columns"].as_array().unwrap().is_empty());
     json!({ "datasources": out, "unchecked": unchecked, "fails": fails })
+}
+
+/// A declared type as the static str the widening tables hold.
+fn name_static(t: &str) -> &'static str {
+    const ALL: [&str; 8] = ["string", "integer", "bigint", "decimal", "date", "date_time", "boolean", "binary"];
+    ALL.iter().find(|x| **x == t).copied().unwrap_or("")
 }
 
 /// A name as written in the model: quoted means exact, bare means any case.
@@ -207,14 +245,18 @@ pub fn print(v: &Value) -> bool {
             );
         }
         for m in d["type_mismatches"].as_array().into_iter().flatten() {
+            let columns = m["columns"].as_array().cloned().unwrap_or_default();
+            let where_: Vec<String> = columns.iter().map(|c| format!("{} on {}", s(&c["warehouse"]), s(&c["table"]))).collect();
+            let advice = match m["should_be"].as_str() {
+                Some(w) => format!("declare {w}"),
+                None => "those are different kinds of thing, so one of them is wrong".to_string(),
+            };
             println!(
-                "catalog {ds}: {} says {} but {}.{} is {}, which is {}",
+                "catalog {ds}: {} says {}, and its column{} {}: {advice}",
                 s(&m["field"]),
                 s(&m["declared"]),
-                s(&m["table"]),
-                s(&m["column"]),
-                s(&m["warehouse"]),
-                s(&m["maps_to"])
+                if columns.len() == 1 { " is" } else { "s are" },
+                where_.join(", ")
             );
         }
         let n = d["tables_checked"].as_u64().unwrap_or(0);

@@ -260,22 +260,30 @@ pub(crate) type Declared = BTreeMap<String, (String, Option<String>)>;
 
 /// The wider of two 0sql types, where one is wider; `None` when they are
 /// different kinds of thing and no warehouse type reconciles them.
-/// Whether a declared type covers what the warehouse holds: the same
-/// type, or a wider one of the same kind. A field mapped to a TINYINT on
-/// one table and a BIGINT on another can only declare one type, and the
-/// wider one is right for both, so `check` accepts it. The other
-/// direction is a weaker claim than the data supports and is reported.
-pub(crate) fn covers(declared: &str, actual: &str) -> bool {
-    declared == actual || widen(declared, actual) == Some(declared_static(declared))
+/// The widest of what a field's columns hold, where one is widest; a
+/// field mapped to a TINYINT and a BIGINT should declare bigint, which
+/// covers both. `None` when the types are different kinds of thing and
+/// no declaration describes them all.
+pub(crate) fn widest<'a>(types: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+    let mut it = types.into_iter();
+    let first = it.next()?;
+    let mut held: &'static str = widen(first, first).unwrap_or_else(|| name_of(first));
+    for next in it {
+        if next == held {
+            continue;
+        }
+        held = widen(held, next)?;
+    }
+    Some(held)
 }
 
-/// The declared type as the static str the families hold, for comparison.
-fn declared_static(declared: &str) -> &'static str {
+/// A type name as the static str the tables hold.
+fn name_of(t: &str) -> &'static str {
     const ALL: [&str; 8] = ["string", "integer", "bigint", "decimal", "date", "date_time", "boolean", "binary"];
-    ALL.iter().find(|x| **x == declared).copied().unwrap_or("")
+    ALL.iter().find(|x| **x == t).copied().unwrap_or("")
 }
 
-fn widen(a: &str, b: &str) -> Option<&'static str> {
+pub(crate) fn widen(a: &str, b: &str) -> Option<&'static str> {
     const FAMILIES: [&[&str]; 2] = [&["integer", "bigint", "decimal"], &["date", "date_time"]];
     FAMILIES.iter().find_map(|fam| {
         let (i, j) = (fam.iter().position(|x| *x == a)?, fam.iter().position(|x| *x == b)?);

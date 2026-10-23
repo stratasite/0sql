@@ -273,7 +273,7 @@ fn a_reserved_column_is_quoted_and_one_field_name_gets_one_type() {
     std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
     let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
     db.execute_batch(
-        "CREATE TABLE fact_transactions (BASKET_ID BIGINT, \"DAY\" SMALLINT, WEEK_NO TINYINT, PRODUCT_ID INTEGER, \"Gross Sales\" DOUBLE);\
+        "CREATE TABLE fact_transactions (BASKET_ID BIGINT, \"DAY\" SMALLINT, WEEK_NO TINYINT, PRODUCT_ID INTEGER, \"Gross Sales\" DOUBLE, LABEL VARCHAR);\
          CREATE TABLE dim_date (Week_No BIGINT, AnchorDate DATE);",
     )
     .unwrap();
@@ -303,9 +303,65 @@ fn a_reserved_column_is_quoted_and_one_field_name_gets_one_type() {
     // Which is the whole point: the model loads, and check finds no
     // disagreement between what it declares and what the warehouse says.
     let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("2 tables"), "{out}");
+    assert!(!out.contains("and its column"), "no type finding against the catalog:\n{out}");
+
+    // check judges a field against every column it maps to, at once, and
+    // names the type to declare. The loader keeps the first declaration
+    // it reads, so narrowing the field means narrowing both files.
+    let dates = project.join("models/main/tbl.dim_date.yml");
+    let facts_path = project.join("models/main/tbl.fact_transactions.yml");
+    let retype = |to: &str| {
+        for p in [&dates, &facts_path] {
+            let yml = std::fs::read_to_string(p).unwrap();
+            let lines: Vec<String> = yml
+                .lines()
+                .scan(false, |seen_week, l| {
+                    if l.contains("name: Week No") {
+                        *seen_week = true;
+                        return Some(l.to_string());
+                    }
+                    if *seen_week && l.trim_start().starts_with("data_type:") {
+                        *seen_week = false;
+                        return Some(format!("    data_type: {to}"));
+                    }
+                    Some(l.to_string())
+                })
+                .collect();
+            std::fs::write(p, lines.join("\n") + "\n").unwrap();
+        }
+    };
+    retype("integer");
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok, "a type finding is advice, not a failure: {out}");
+    assert_eq!(out.matches("Week No says").count(), 1, "one line per field, not per table:\n{out}");
+    assert!(
+        out.contains("Week No says integer, and its columns are")
+            && out.contains("BIGINT on Dim Date")
+            && out.contains("TINYINT on Fact Transactions")
+            && out.contains("declare bigint"),
+        "{out}"
+    );
+    // Wider than every column it maps to is said too, with the type to use.
+    retype("decimal");
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("Week No says decimal") && out.contains("declare bigint"), "{out}");
+    retype("bigint");
+    assert!(!run(zsql(&home, &project).arg("check")).1.contains("Week No says"), "the widest is accepted");
+
+    // Different kinds of thing: no declaration describes both, and the
+    // line says so rather than naming a type.
+    let yml = std::fs::read_to_string(&facts_path).unwrap();
+    std::fs::write(&facts_path, yml.replacen("      sql: WEEK_NO", "      sql: LABEL", 1)).unwrap();
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
     assert!(ok, "{out}");
-    assert!(!out.contains("says") || !out.contains("which is"), "no type mismatch against the catalog:\n{out}");
-    assert!(out.contains("2 tables"), "{out}");
+    assert!(
+        out.contains("Week No says bigint") && out.contains("VARCHAR on Fact Transactions") && out.contains("different kinds of thing"),
+        "{out}"
+    );
+    std::fs::write(&facts_path, std::fs::read_to_string(&facts_path).unwrap().replacen("      sql: LABEL", "      sql: WEEK_NO", 1))
+        .unwrap();
+
     // And the planner can use the reserved column.
     let (ok, out) = run(zsql(&home, &project).args(["sql", "day"]));
     assert!(ok && out.contains(r#""DAY""#), "{out}");
