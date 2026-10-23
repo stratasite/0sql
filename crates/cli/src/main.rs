@@ -229,8 +229,11 @@ enum Command {
         after_help = "With no table and a terminal, pick from a list; without a terminal, name the tables, a --schema, or --all."
     )]
     Generate {
-        /// Tables to draft, as schema.table or table; with none, a picker on a terminal.
+        /// Tables to draft, as schema.table or table; with none, a picker on a terminal. A word ending in `/` is the directory to draft into.
         tables: Vec<String>,
+        /// The models/{dir} the files go in; each table's own schema when unsaid. The directories are the model's subject areas and need not mirror the warehouse.
+        #[arg(long)]
+        dir: Option<String>,
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         #[arg(short = 'd', long)]
         datasource: Option<String>,
@@ -249,9 +252,15 @@ enum Command {
         /// A named table the catalog lacks is read from the warehouse first and added to the catalog.
         #[arg(long)]
         live: bool,
-        /// An empty model file for the table named, from the template and no catalog; `--empty relation` for a rel file.
-        #[arg(long, value_name = "table|relation")]
+        /// An empty model file for the table named, from the template and no catalog.
+        #[arg(long, value_name = "table")]
         empty: Option<String>,
+        /// The joins file for a set of tables, at models/{domain}/rel.{name}.yml: the template, or --infer to fill it in. Takes {domain}/{name}, {domain}, or nothing for every domain with tables.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DOMAIN/NAME", conflicts_with = "empty", alias = "rel")]
+        relationships: Option<String>,
+        /// With --relationships: infer the joins from the table files there, by matching key column names. No query is run.
+        #[arg(long, requires = "relationships")]
+        infer: bool,
         /// With --empty: the physical name; the table's name when unsaid.
         #[arg(long, requires = "empty")]
         physical_name: Option<String>,
@@ -738,35 +747,62 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         Command::Sample { names, datasource, dry_run, budget, yes } => {
             sample::run(dir, sample::Options { datasource: datasource.as_deref(), names: &names, dry_run, budget, yes })
         }
+        Command::Generate { relationships: Some(path), infer, datasource, dry_run, .. } => generate::relationships(
+            dir,
+            generate::RelOptions { path: Some(path.as_str()), infer, datasource: datasource.as_deref(), dry_run },
+        ),
         Command::Generate {
-            tables, datasource, schema, all, columns, new_columns, live, empty: Some(kind), physical_name, domain, ..
+            tables,
+            datasource,
+            schema,
+            all,
+            columns,
+            new_columns,
+            live,
+            empty: Some(kind),
+            physical_name,
+            domain,
+            dry_run,
+            ..
         } => {
-            let conn = catalog::choose(&here.project_dir()?.dir, datasource.as_deref())?;
             let _ = (schema, all, columns, new_columns, live);
             match kind.as_str() {
                 "table" => {
+                    let conn = catalog::choose(&here.project_dir()?.dir, datasource.as_deref())?;
                     let Some(name) = tables.first() else {
                         bail!("--empty table needs the table's name: zsql generate orders --empty table")
                     };
                     scaffold::empty_table(dir, name, &conn.uid, physical_name.as_deref(), domain.as_deref())
                 }
-                "relation" => scaffold::empty_relation(dir, &conn.uid, domain.as_deref()),
-                other => bail!("--empty takes table or relation, not {other}"),
+                "relation" => generate::relationships(
+                    dir,
+                    generate::RelOptions { path: domain.as_deref(), infer: false, datasource: datasource.as_deref(), dry_run },
+                ),
+                other => bail!("--empty takes table, not {other}; `--relationships` writes a joins file"),
             }
         }
-        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run, .. } => generate::run(
-            dir,
-            generate::Options {
-                datasource: datasource.as_deref(),
-                tables: &tables,
-                schema: schema.as_deref(),
-                all,
-                columns: &columns,
-                new_columns,
-                live,
-                dry_run,
-            },
-        ),
+        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run, dir: into, .. } => {
+            // `generate coupons/ orders` names the directory and a table.
+            let (slashed, tables): (Vec<String>, Vec<String>) = tables.into_iter().partition(|t| t.ends_with('/'));
+            let into = into.or_else(|| slashed.first().map(|d| d.trim_end_matches('/').to_string()));
+            if slashed.len() > 1 {
+                bail!("one directory at a time: {}", slashed.join(", "));
+            }
+            generate::run(
+                dir,
+                generate::Options {
+                    datasource: datasource.as_deref(),
+                    tables: &tables,
+                    dir: into.as_deref(),
+                    schema: schema.as_deref(),
+                    all,
+                    columns: &columns,
+                    new_columns,
+                    live,
+                    dry_run,
+                },
+            )
+        }
         Command::Check { remote } => {
             let at = Where::with(project, remote);
             let t0 = Instant::now();

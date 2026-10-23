@@ -3,7 +3,7 @@
 //! guess is marked on its line, and what could not be mapped is listed
 //! rather than silently left out. See `docs/introspection.md`, phase C.
 
-use crate::{catalog, config, tty};
+use crate::{catalog, config, templates, tty};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,11 @@ pub struct Options<'a> {
     pub datasource: Option<&'a str>,
     /// Tables to draft, as schema.table or table; none means the picker.
     pub tables: &'a [String],
+    /// The `models/<dir>` the files go in. Without one, each table goes
+    /// under its own schema, which is a reasonable default and not a
+    /// rule: the directories are the model's subject areas, and need not
+    /// mirror the warehouse.
+    pub dir: Option<&'a str>,
     pub schema: Option<&'a str>,
     /// Every table in the catalog: never the default.
     pub all: bool,
@@ -763,7 +768,11 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
 
     let mut by_domain: BTreeMap<String, Vec<&Table>> = BTreeMap::new();
     for t in &tables {
-        by_domain.entry(t.schema.clone().unwrap_or_else(|| uid.clone())).or_default().push(t);
+        let domain = match opts.dir {
+            Some(d) => d.trim().trim_matches('/').to_string(),
+            None => t.schema.clone().unwrap_or_else(|| uid.clone()),
+        };
+        by_domain.entry(domain).or_default().push(t);
     }
 
     let mut created = 0;
@@ -910,6 +919,339 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     if created == 0 && listed == 0 && added == 0 && !opts.dry_run {
         println!("nothing to do: every table named has a model, with no new columns");
     }
+    Ok(())
+}
+
+// ------------------------------------------------------- relationships
+
+/// A table as its model file declares it, which is all the inference has
+/// to go on: the name a join refers to it by, its datasource, and the
+/// columns its fields are, with whether the file marks one a key.
+struct Modeled {
+    name: String,
+    subject: String,
+    datasource: Option<String>,
+    /// (column as the file spells it, declared a primary key)
+    columns: Vec<(String, bool)>,
+}
+
+/// What a table is about: its name without a warehouse's prefix or a
+/// plural, which is what a key column's name is matched against.
+/// `dim_households` and `Dim Household` are both about a household.
+fn subject(name: &str) -> String {
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    let mut s: String = bare.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+    for p in ["dimension_", "dim_", "d_", "fact_", "fct_", "f_", "tbl_", "stg_", "raw_"] {
+        if let Some(rest) = s.strip_prefix(p) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    if let Some(r) = s.strip_suffix("ies") {
+        format!("{r}y")
+    } else if ["ses", "xes", "ches", "shes"].iter().any(|e| s.ends_with(e)) {
+        s[..s.len() - 2].to_string()
+    } else if s.ends_with('s') && !s.ends_with("ss") {
+        s[..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
+/// Whether a column is shaped like a key by its name alone.
+fn key_shaped(column: &str) -> bool {
+    let c = column.to_lowercase();
+    c == "id" || c == "key" || ["_key", "_id", "_sk", "_fk", "_code", "_num"].iter().any(|s| c.ends_with(s))
+}
+
+/// What a key column points at, when its name says: `household_key` is
+/// about households, `product_id` about products.
+fn key_subject(column: &str) -> Option<String> {
+    let c = column.to_lowercase();
+    for suffix in ["_key", "_id", "_sk", "_fk", "_code", "_num"] {
+        if let Some(rest) = c.strip_suffix(suffix) {
+            return (!rest.is_empty()).then(|| subject(rest));
+        }
+    }
+    None
+}
+
+/// The subjects a column's name mentions: `coupon_upc` mentions a coupon,
+/// which is how a key whose suffix nobody could enumerate is still found.
+fn mentions(column: &str) -> Vec<String> {
+    column.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(subject).collect()
+}
+
+/// The one column a bare-column expression names, as the file spells it.
+fn bare_column(expression: &serde_yaml::Value) -> Option<(String, bool)> {
+    let (sql, key) = match expression {
+        serde_yaml::Value::String(s) => (s.clone(), false),
+        v => (v.get("sql")?.as_str()?.to_string(), v.get("primary_key").and_then(|p| p.as_bool()).unwrap_or(false)),
+    };
+    let name = sql.trim();
+    let inner = name.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'));
+    let plain = !inner.is_empty()
+        && inner.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && inner.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == ' ');
+    plain.then(|| (inner.to_string(), key))
+}
+
+/// Every `tbl.*.yml` under this directory, as the inference reads them.
+fn modeled(dir: &Path) -> Result<Vec<Modeled>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !(name.starts_with("tbl.") && (name.ends_with(".yml") || name.ends_with(".yaml"))) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)?;
+            let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) else { continue };
+            let Some(table) = v.get("name").and_then(|n| n.as_str()) else { continue };
+            let physical = v.get("physical_name").and_then(|p| p.as_str()).unwrap_or(table);
+            let columns = v
+                .get("fields")
+                .and_then(|f| f.as_sequence())
+                .map(|fields| fields.iter().filter_map(|f| f.get("expression").and_then(bare_column)).collect())
+                .unwrap_or_default();
+            out.push(Modeled {
+                name: table.to_string(),
+                subject: subject(physical),
+                datasource: v.get("datasource").and_then(|d| d.as_str()).map(|d| d.trim().to_lowercase()),
+                columns,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// One inferred join: which tables, on which columns, and why.
+struct Inferred {
+    left: String,
+    right: String,
+    on: Vec<(String, String)>,
+    /// `a declared key` or `the name`, for the comment.
+    why: &'static str,
+}
+
+/// The joins the table files imply, and what they could not place.
+/// Nothing is queried: a column that names another table in the set is
+/// matched to that table's own key column, and a column that names
+/// nothing here is left alone. `week_no` on a fact names no table, so it
+/// never joins a date dimension it does not key.
+fn infer(tables: &[Modeled]) -> (Vec<Inferred>, Vec<String>) {
+    let mut joins: Vec<Inferred> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    for t in tables {
+        for (column, _) in &t.columns {
+            let said = mentions(column);
+            let owner = tables.iter().find(|o| o.name != t.name && !o.subject.is_empty() && said.contains(&o.subject));
+            let Some(o) = owner else {
+                // A key-shaped column naming a table that is not here is
+                // worth saying: it is a join the author still needs.
+                if let Some(s) = key_subject(column).filter(|s| !tables.iter().any(|x| x.subject == *s)) {
+                    loose.push(format!("{}.{column} points at a {s}, and no table here is one", t.name));
+                }
+                continue;
+            };
+            // Their side of it: the same column name, else the key they
+            // declare, else a bare id.
+            let theirs = o
+                .columns
+                .iter()
+                .find(|(c, _)| c.eq_ignore_ascii_case(column))
+                .or_else(|| o.columns.iter().find(|(_, key)| *key))
+                .or_else(|| o.columns.iter().find(|(c, _)| c.eq_ignore_ascii_case("id") || c.eq_ignore_ascii_case("key")));
+            let Some((theirs, declared)) = theirs else {
+                loose.push(format!("{}.{column} points at {}, which has no key column of its own", t.name, o.name));
+                continue;
+            };
+            // How sure: what they declare, what the name says, or that it
+            // is the first column there, which a drafted dimension's key
+            // nearly always is.
+            let why = if *declared {
+                "a declared key"
+            } else if key_shaped(column) {
+                "the name"
+            } else if o.columns.first().is_some_and(|(first, _)| first == theirs) {
+                "the name, and the first column there"
+            } else {
+                loose.push(format!("{}.{column} names {}, but is not a key there", t.name, o.name));
+                continue;
+            };
+            match joins.iter_mut().find(|j| j.left == t.name && j.right == o.name) {
+                // One join per pair of tables, so a second key column is
+                // another part of the same condition.
+                Some(j) => j.on.push((column.clone(), theirs.clone())),
+                None => {
+                    joins.push(Inferred { left: t.name.clone(), right: o.name.clone(), on: vec![(column.clone(), theirs.clone())], why })
+                }
+            }
+        }
+    }
+    // A pair joined from both sides is one join: the model holds one per
+    // pair of tables, and the many side goes left.
+    let pairs: Vec<(String, String)> = joins.iter().map(|j| (j.left.clone(), j.right.clone())).collect();
+    joins.retain(|j| !pairs.iter().any(|(l, r)| *l == j.right && *r == j.left && *l < j.left));
+    (joins, loose)
+}
+
+pub struct RelOptions<'a> {
+    /// `domain/name`, `domain`, or nothing for every domain that has tables.
+    pub path: Option<&'a str>,
+    pub infer: bool,
+    pub datasource: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+/// `zsql generate --relationships`: the joins file, from the template or
+/// inferred from the table files beside it.
+pub fn relationships(project_dir: Option<&Path>, opts: RelOptions<'_>) -> Result<()> {
+    let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
+    let models = project.dir.join("models");
+    // Where the file goes, and which directory's tables it is about.
+    let targets: Vec<(PathBuf, String)> = match opts.path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let path = path.trim_matches('/');
+            let (dir, name) = match path.rsplit_once('/') {
+                Some((d, n)) => (models.join(d), n.to_string()),
+                None => (models.join(path), path.to_string()),
+            };
+            vec![(dir, name)]
+        }
+        None => {
+            let mut out: Vec<(PathBuf, String)> = Vec::new();
+            let mut stack = vec![models.clone()];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else { continue };
+                let mut has_table = false;
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("tbl.")) {
+                        has_table = true;
+                    }
+                }
+                if has_table {
+                    let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("core").to_string();
+                    out.push((d, name));
+                }
+            }
+            if out.is_empty() {
+                bail!(
+                    "no table files under {}; `zsql generate` drafts some, or name the file: --relationships <domain>/<name>",
+                    models.display()
+                );
+            }
+            out.sort();
+            out
+        }
+    };
+
+    for (dir, name) in &targets {
+        let path = dir.join(format!("rel.{}.yml", name.to_lowercase()));
+        let rel = |p: &Path| p.strip_prefix(&project.dir).unwrap_or(p).display().to_string();
+        if path.exists() {
+            println!("exists  {} (not touched; a joins file is yours once written)", rel(&path));
+            continue;
+        }
+        let tables = modeled(dir)?;
+        // One datasource per joins file, which is what the key declares.
+        let uid = match opts.datasource {
+            Some(d) => catalog::choose(&project.dir, Some(d))?.uid,
+            None => {
+                let mut said: Vec<String> = tables.iter().filter_map(|t| t.datasource.clone()).collect();
+                said.sort();
+                said.dedup();
+                match said.as_slice() {
+                    [one] => one.clone(),
+                    [] => catalog::choose(&project.dir, None)?.uid,
+                    many => bail!(
+                        "the tables in {} name {} datasources ({}); a joins file is about one, so say which with -d",
+                        rel(dir),
+                        many.len(),
+                        many.join(", ")
+                    ),
+                }
+            }
+        };
+        let mut text = templates::relation_yml(&uid);
+        if opts.infer {
+            let mine: Vec<Modeled> = tables.into_iter().filter(|t| t.datasource.as_deref().is_none_or(|d| d == uid)).collect();
+            if mine.is_empty() {
+                bail!("no table files for {uid} under {}; `zsql generate` drafts some first", rel(dir));
+            }
+            let lists = Lists::of(&catalog::choose(&project.dir, Some(&uid))?.adapter);
+            let (joins, loose) = infer(&mine);
+            let mut body = String::new();
+            for j in &joins {
+                let on: Vec<String> = j.on.iter().map(|(l, r)| format!("left.{} = right.{}", lists.column(l), lists.column(r))).collect();
+                let key = format!("{}_{}", subject(&j.left), subject(&j.right));
+                body.push_str(&format!(
+                    "\n{key}:\n  left: {}\n  right: {}\n  sql: {}\n{:<32}# inferred from {}: check the direction\n{:<32}# inferred: a guess, so no row is dropped by it; inner once you trust it\n",
+                    yaml(&j.left),
+                    yaml(&j.right),
+                    yaml(&on.join(" AND ")),
+                    "  cardinality: many_to_one",
+                    j.why,
+                    "  join: left"
+                ));
+            }
+            let alone: Vec<&str> =
+                mine.iter().filter(|t| !joins.iter().any(|j| j.left == t.name || j.right == t.name)).map(|t| t.name.as_str()).collect();
+            let mut head = String::from(
+                "# Inferred by `zsql generate --relationships --infer` from the table\n\
+                 # files in this directory, by matching key column names. No query was\n\
+                 # run and nothing here is checked against the warehouse: read every\n\
+                 # line. This file is yours from here; `zsql generate` never rewrites it.\n",
+            );
+            if joins.is_empty() {
+                head.push_str("#\n# Nothing was inferred: no column shaped like a key named another table\n# here. The examples below are the forms; write the joins by hand.\n");
+            }
+            if !alone.is_empty() {
+                head.push_str(&format!("#\n# In no join, so they need one written by hand: {}.\n", alone.join(", ")));
+            }
+            for l in &loose {
+                head.push_str(&format!("#   {l}\n"));
+            }
+            // What was inferred first, the forms under it.
+            text = format!(
+                "{head}datasource: {uid}\n{body}\n# Other forms, for the joins you write by hand:\n{}",
+                templates::relation_examples()
+            );
+            if opts.dry_run {
+                println!("would create {} ({} join{})\n{text}", rel(&path), joins.len(), if joins.len() == 1 { "" } else { "s" });
+                continue;
+            }
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&path, &text)?;
+            println!("created {} ({} join{} inferred)", rel(&path), joins.len(), if joins.len() == 1 { "" } else { "s" });
+            for j in &joins {
+                println!("        {} -> {} on {}", j.left, j.right, j.on.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            if !alone.is_empty() {
+                println!("        in no join: {}", alone.join(", "));
+            }
+        } else {
+            if opts.dry_run {
+                println!("would create {} (the template)", rel(&path));
+                continue;
+            }
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&path, &text)?;
+            println!("created {} (the template; --infer to fill it in)", rel(&path));
+        }
+    }
+    eprintln!("next: zsql check");
     Ok(())
 }
 

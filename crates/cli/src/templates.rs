@@ -195,18 +195,57 @@ fields:\n\
 
 pub fn relation_yml(datasource: &str) -> String {
     format!(
-        "# Joins between this datasource's tables, by the names in their table files.\n\
-# Cardinality is required; many_to_one is the common shape (fact to dimension).\n\
+        "# Joins between this datasource's tables, keyed by a name of your own.\n\
+# `left` and `right` are the names in the table files, not physical names.\n\
+# `sql` is always written `left.column = right.column`; several columns are\n\
+# ANDed. `cardinality` is required, and `many_to_one` is the common shape:\n\
+# many fact rows to one dimension row, with the dimension on the right.\n\
+#\n\
+# `zsql generate --relationships <domain>/<name> --infer` writes this file\n\
+# from the table files it finds, by matching key column names. `zsql check`\n\
+# tells you whether what you write here loads.\n\
 datasource: {datasource}\n\
-\n\
-# orders_customer:\n\
-#   left: Orders\n\
-#   right: Customers\n\
-#   sql: left.customer_id = right.id\n\
-#   cardinality: many_to_one        # many_to_one | one_to_many | one_to_one\n\
-#   join: inner                     # inner | left | right\n\
-#   # allow_measure_expansion: false\n"
+{}",
+        relation_examples()
     )
+}
+
+/// The forms a join takes, commented, for the bottom of a joins file.
+pub fn relation_examples() -> &'static str {
+    "\n\
+# A fact to its dimension, the usual case:\n\
+# transactions_household:\n\
+#   left: Fact Transactions\n\
+#   right: Dim Household\n\
+#   sql: left.household_key = right.household_key\n\
+#   cardinality: many_to_one        # many_to_one | one_to_many | one_to_one\n\
+#   join: inner                     # inner | left | right; left keeps the\n\
+#                                   # left rows that have no match\n\
+\n\
+# A composite key, ANDed:\n\
+# sales_store_day:\n\
+#   left: Fact Sales\n\
+#   right: Dim Store Day\n\
+#   sql: left.store_id = right.store_id AND left.day_id = right.day_id\n\
+#   cardinality: many_to_one\n\
+\n\
+# A dimension that extends another, one row each:\n\
+# household_demographics:\n\
+#   left: Dim Household\n\
+#   right: Dim Demographics\n\
+#   sql: left.household_key = right.household_key\n\
+#   cardinality: one_to_one\n\
+#   join: left\n\
+\n\
+# A bridge whose own measures may be aggregated through the join, which\n\
+# double counts unless you mean it:\n\
+# basket_lines:\n\
+#   left: Dim Basket\n\
+#   right: Fact Lines\n\
+#   sql: left.basket_id = right.basket_id\n\
+#   cardinality: one_to_many\n\
+#   allow_measure_expansion: true\n\
+#   description: a basket's lines, for counting items per basket\n"
 }
 
 pub fn test_yml(name: &str, fields: Option<(Option<String>, Option<String>)>) -> String {
@@ -253,7 +292,9 @@ what to change.
   read it. Committed: it is schema, not data, and `zsql check` validates
   the model against it.
 - `models/<domain>/tbl.<name>.yml` — a table with its dimensions and
-  measures. `models/<domain>/rel.<domain>.yml` — the joins between them.
+  measures. `models/<domain>/rel.<name>.yml` — the joins between them.
+  The `<domain>` directories are the model's subject areas and need not
+  mirror the warehouse's schemas; `zsql generate <domain>/ ...` picks one.
 - `security.yml` — row-level policies.
 - `tests/*.yml` — planner tests, run on every deploy.
 - `samples/values.jsonl.gz` — sampled dimension values. Customer data;
@@ -275,7 +316,10 @@ step below is its non-interactive form; the flag forms are what you use.
     zsql catalog sync -d wh                    # re-read what the file records; drift is printed
     zsql generate orders customers             # draft models for named tables; --schema S or --all for more
     zsql generate orders --new-columns         # add the columns a model lacks
+    zsql generate shopping/ --all              # draft into models/shopping/, whatever the warehouse's schemas are
     zsql generate returns --empty table        # an empty model from the template, no catalog behind it
+    zsql generate --relationships main/sales --infer   # the joins file, inferred from the table files there
+    zsql generate --relationships main/sales   # the same file as a template, to write by hand
     zsql check                                 # load the model, check it against the catalog, run the tests
     zsql sample --yes [Status Region]          # collect sampled values; asks first on a terminal
     zsql sql 'revenue by region, order date >= 28d'

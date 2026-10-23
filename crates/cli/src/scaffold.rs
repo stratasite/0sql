@@ -90,13 +90,6 @@ pub fn empty_table(
     Ok(())
 }
 
-/// `zsql generate --empty relation`: a rel file from the template.
-pub fn empty_relation(project_dir: Option<&Path>, datasource: &str, domain: Option<&str>) -> Result<()> {
-    let p = project_of(project_dir.map(Path::to_path_buf))?;
-    let domain = domain.unwrap_or("core");
-    write_new(&p.dir, &format!("models/{domain}/rel.{domain}.yml"), &templates::relation_yml(datasource))
-}
-
 /// `zsql test --new NAME`: a test from the template, projecting the
 /// model's own first dimension and measure when it loads, so the test
 /// runs as written; placeholders otherwise.

@@ -366,3 +366,79 @@ fn a_reserved_column_is_quoted_and_one_field_name_gets_one_type() {
     let (ok, out) = run(zsql(&home, &project).args(["sql", "day"]));
     assert!(ok && out.contains(r#""DAY""#), "{out}");
 }
+
+/// `--dir` and a trailing slash put the drafts where the model wants
+/// them rather than where the warehouse keeps them, and
+/// `--relationships --infer` writes the joins file from the table files
+/// alone: a column that names another table joins to that table's key,
+/// and a column that names nothing is left alone.
+#[test]
+fn a_target_directory_and_an_inferred_joins_file() {
+    let (home, project) = scratch("relationships");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch(
+        "CREATE SCHEMA retail;\
+         CREATE TABLE retail.fact_transactions (household_key BIGINT, PRODUCT_ID BIGINT, COUPON_UPC BIGINT, \
+           BASKET_ID BIGINT, WEEK_NO TINYINT, SALES_VALUE DOUBLE);\
+         CREATE TABLE retail.dim_household (household_key BIGINT, AGE_DESC VARCHAR);\
+         CREATE TABLE retail.dim_products (PRODUCT_ID BIGINT, BRAND VARCHAR);\
+         CREATE TABLE retail.dim_coupon (COUPON_UPC BIGINT, campaign BIGINT);\
+         CREATE TABLE retail.dim_date (Day_Idx BIGINT, Week_No BIGINT);",
+    )
+    .unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+
+    // The warehouse's schema is `retail`; the model's directory is ours.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all", "--dir", "shopping"]));
+    assert!(ok && out.contains("created models/shopping/tbl.fact_transactions.yml"), "{out}");
+    assert!(!project.join("models/retail").exists(), "not the warehouse's schema: {out}");
+    // A trailing slash says the same thing.
+    std::fs::remove_dir_all(project.join("models/shopping")).unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "basket/", "--all"]));
+    assert!(ok && out.contains("created models/basket/tbl.dim_coupon.yml"), "{out}");
+    assert_eq!(std::fs::read_dir(project.join("models/basket")).unwrap().count(), 5, "every table, one directory");
+
+    // The joins file, inferred from those files and nothing else.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--relationships", "basket/retail", "--infer"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("created models/basket/rel.retail.yml (3 joins inferred)"), "{out}");
+    let rel = std::fs::read_to_string(project.join("models/basket/rel.retail.yml")).unwrap();
+    assert!(rel.contains("datasource: wh"), "{rel}");
+    // The key by its name, the key by a plural table name, and a key
+    // whose suffix nobody could enumerate, found because it names the table.
+    assert!(rel.contains("left.household_key = right.household_key"), "{rel}");
+    assert!(rel.contains("left.PRODUCT_ID = right.PRODUCT_ID"), "a plural table still owns its key:\n{rel}");
+    assert!(rel.contains("left.COUPON_UPC = right.COUPON_UPC"), "a column that names the table:\n{rel}");
+    assert!(rel.contains("cardinality: many_to_one") && rel.contains("join: left"), "a guess drops no rows:\n{rel}");
+    // WEEK_NO is on the fact and the date dimension and keys neither, so
+    // it is no join, and the file says the date dimension needs one.
+    assert!(!rel.contains("week_no") && !rel.contains("WEEK_NO"), "a shared non-key is not a join:\n{rel}");
+    assert!(rel.contains("Dim Date"), "the table left out is named:\n{rel}");
+    assert!(rel.contains("BASKET_ID points at a basket"), "a key pointing nowhere is named:\n{rel}");
+    // The forms stay in the file, under what was inferred.
+    assert!(rel.contains("# Other forms") && rel.contains("allow_measure_expansion"), "{rel}");
+    let (joins, examples) = (rel.find("household_key = right").unwrap(), rel.find("# Other forms").unwrap());
+    assert!(joins < examples, "what was inferred comes first:\n{rel}");
+
+    // It loads, with the joins the planner can use.
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("5 tables") && out.contains("3 joins"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["sql", "\"Age Desc\", sales value"]));
+    assert!(ok && out.to_lowercase().contains("join") && out.contains("dim_household"), "a join across the inferred model:\n{out}");
+
+    // Never rewritten, and the template is there without --infer.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--relationships", "basket/retail", "--infer"]));
+    assert!(ok && out.contains("not touched"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--relationships", "basket/by-hand"]));
+    assert!(ok && out.contains("the template"), "{out}");
+    let blank = std::fs::read_to_string(project.join("models/basket/rel.by-hand.yml")).unwrap();
+    assert!(blank.contains("datasource: wh") && blank.contains("cardinality: many_to_one"), "{blank}");
+    // Nothing but comments and the datasource: the joins are the author's.
+    assert!(
+        blank.lines().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#') || l.starts_with("datasource:")),
+        "the template declares no join:\n{blank}"
+    );
+}

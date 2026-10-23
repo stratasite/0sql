@@ -719,6 +719,30 @@ read, and a sync re-reads exactly that.
 Proven on the SQLite fixture end to end; the schema scopes on the
 Postgres fixture.
 
+## Joins, inferred from the model files
+
+Added 2026-10-23, after a real grocery-store model had five tables and
+no joins: the warehouse was CSVs loaded into DuckDB, so it declared no
+foreign keys, and the catalog-driven rel file had nothing to write.
+
+`zsql generate --relationships <domain>/<name>` writes
+`models/<domain>/rel.<name>.yml`, as a template to fill in by hand, or
+with `--infer` from the `tbl.*.yml` files in that directory. Nothing is
+queried: a column joins when its name mentions another table in the
+directory and that table has the column as a key, which it is when the
+file declares it one, when the name is key-shaped, or when it is that
+table's first column. So `household_key`, `PRODUCT_ID` and
+`COUPON_UPC` each found their dimension, `BASKET_ID` was reported as
+pointing at a table that is not there, and `WEEK_NO`, shared by a fact
+and a date dimension but keying neither, was correctly left alone with
+the date dimension named as still needing a join. An inferred join is
+`many_to_one` and `left`, since a guess should drop no rows, and every
+line says what it was inferred from. The file is never rewritten.
+
+`zsql generate <domain>/ ...` or `--dir <domain>` drafts tables into one
+directory instead of one per warehouse schema: the directories are the
+model's subject areas, and the warehouse's shape is not the model's.
+
 ## The command line, reviewed
 
 On 2026-10-22 an independent review of the command line, from 112 real
