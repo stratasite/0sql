@@ -49,3 +49,6 @@ workspace = true
 [dev-dependencies]
 zsql-project.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+# The engine is already linked through zsql-source; the tests build a
+# file with it the way a warehouse would hold one.
+duckdb = { version = "1.20000.0", features = ["bundled"] }

@@ -259,3 +259,54 @@ fn generate_keeps_a_margin_list_loadable_and_names_two_keys_to_one_table() {
     let customers = std::fs::read_to_string(project.join("models/local/tbl.customers.yml")).unwrap();
     assert!(customers.contains("enable_sampling: true"), "VARCHAR(80) is a short string:\n{customers}");
 }
+
+/// Two defects a real grocery-store model found. A column named for a
+/// reserved word (`DAY`) must be quoted, or the dimension's expression
+/// parses to no column and the loader refuses the file. And a column
+/// name on two tables is one field in the model, so the two drafts must
+/// declare one type: the loader keeps the first it reads and `check`
+/// would report the other table as a mismatch.
+#[test]
+fn a_reserved_column_is_quoted_and_one_field_name_gets_one_type() {
+    let (home, project) = scratch("reserved");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE fact_transactions (BASKET_ID BIGINT, \"DAY\" SMALLINT, WEEK_NO TINYINT, PRODUCT_ID INTEGER, \"Gross Sales\" DOUBLE);\
+         CREATE TABLE dim_date (Week_No BIGINT, AnchorDate DATE);",
+    )
+    .unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
+    assert!(ok, "{out}");
+
+    let facts = std::fs::read_to_string(project.join("models/main/tbl.fact_transactions.yml")).unwrap();
+    // The reserved word and the name holding a space are quoted the way
+    // DuckDB quotes an identifier; the plain ones are left bare.
+    assert!(facts.contains(r#"sql: "\"DAY\"""#), "a reserved column is quoted:\n{facts}");
+    assert!(facts.contains(r#"sql: "\"Gross Sales\"""#), "a name with a space is quoted:\n{facts}");
+    assert!(facts.contains("sql: BASKET_ID"), "a plain name stays bare:\n{facts}");
+
+    // WEEK_NO is TINYINT here and Week_No is BIGINT there: one field, so
+    // the wider type is declared on both, and the line says why.
+    let dates = std::fs::read_to_string(project.join("models/main/tbl.dim_date.yml")).unwrap();
+    assert_eq!(facts.matches("name: Week No").count(), 1, "{facts}");
+    assert_eq!(dates.matches("name: Week No").count(), 1, "{dates}");
+    for (file, text) in [("facts", &facts), ("dates", &dates)] {
+        let line = text.lines().skip_while(|l| !l.contains("name: Week No")).nth(1).unwrap_or("");
+        assert!(line.contains("data_type: bigint"), "{file}: the wider type on both: {line}");
+    }
+    assert!(facts.contains("one field across tables, so the wider of"), "the draft says why:\n{facts}");
+
+    // Which is the whole point: the model loads, and check finds no
+    // disagreement between what it declares and what the warehouse says.
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok, "{out}");
+    assert!(!out.contains("says") || !out.contains("which is"), "no type mismatch against the catalog:\n{out}");
+    assert!(out.contains("2 tables"), "{out}");
+    // And the planner can use the reserved column.
+    let (ok, out) = run(zsql(&home, &project).args(["sql", "day"]));
+    assert!(ok && out.contains(r#""DAY""#), "{out}");
+}

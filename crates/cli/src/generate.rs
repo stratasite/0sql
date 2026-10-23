@@ -207,13 +207,144 @@ fn yaml(s: &str) -> String {
     }
 }
 
+/// What the warehouse needs of a column name in an expression: the words
+/// it reads as syntax rather than as a name, and how it quotes a name.
+pub(crate) struct Lists {
+    reserved: Vec<String>,
+    quote: (String, String),
+}
+
+impl Lists {
+    pub(crate) fn of(adapter: &str) -> Lists {
+        let dialect = crate::local::dialects().get(adapter).ok();
+        let reserved = dialect.as_ref().map(|d| d.reserved_keywords()).unwrap_or_default();
+        let quote = dialect
+            .as_ref()
+            .and_then(|d| d.get("quote").and_then(|v| v.as_str()).map(zsql_spec::expr::quote_pair))
+            .unwrap_or_else(|| ("\"".into(), "\"".into()));
+        Lists { reserved, quote }
+    }
+
+    /// A column as an expression reads it: bare when the warehouse would
+    /// take it for a name, quoted when it is a reserved word or holds
+    /// anything a bare name may not. A dimension whose expression is a
+    /// reserved word parses to no column at all, and the loader refuses
+    /// it, which is what `DAY` on a transactions table used to do.
+    pub(crate) fn column(&self, name: &str) -> String {
+        let mut chars = name.chars();
+        let plain = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            && !self.reserved.iter().any(|r| r.eq_ignore_ascii_case(name));
+        if plain {
+            name.to_string()
+        } else {
+            let (open, close) = (&self.quote.0, &self.quote.1);
+            format!("{open}{}{close}", name.replace(close.as_str(), &format!("{close}{close}")))
+        }
+    }
+}
+
+/// The data type each field name is declared with, reconciled over every
+/// table of this run and whatever the models already say.
+///
+/// A field is one field in the model however many tables map it, which is
+/// how a conformed dimension works: `Week No` on the fact and on the date
+/// table is one field with two expressions. The loader keeps the first
+/// declaration it reads and drops the rest, so two drafts that disagree
+/// about a column's type would leave whichever file loaded first in
+/// charge, and `check` would report the other table as a mismatch. So the
+/// type is decided once here, for every table at once: the widest of what
+/// the warehouse says, with a note when a widening or a disagreement
+/// happened.
+pub(crate) type Declared = BTreeMap<String, (String, Option<String>)>;
+
+/// The wider of two 0sql types, where one is wider; `None` when they are
+/// different kinds of thing and no warehouse type reconciles them.
+/// Whether a declared type covers what the warehouse holds: the same
+/// type, or a wider one of the same kind. A field mapped to a TINYINT on
+/// one table and a BIGINT on another can only declare one type, and the
+/// wider one is right for both, so `check` accepts it. The other
+/// direction is a weaker claim than the data supports and is reported.
+pub(crate) fn covers(declared: &str, actual: &str) -> bool {
+    declared == actual || widen(declared, actual) == Some(declared_static(declared))
+}
+
+/// The declared type as the static str the families hold, for comparison.
+fn declared_static(declared: &str) -> &'static str {
+    const ALL: [&str; 8] = ["string", "integer", "bigint", "decimal", "date", "date_time", "boolean", "binary"];
+    ALL.iter().find(|x| **x == declared).copied().unwrap_or("")
+}
+
+fn widen(a: &str, b: &str) -> Option<&'static str> {
+    const FAMILIES: [&[&str]; 2] = [&["integer", "bigint", "decimal"], &["date", "date_time"]];
+    FAMILIES.iter().find_map(|fam| {
+        let (i, j) = (fam.iter().position(|x| *x == a)?, fam.iter().position(|x| *x == b)?);
+        Some(fam[i.max(j)])
+    })
+}
+
+fn declared_types(tables: &[&Table], have: &[Existing]) -> Declared {
+    let mut out: Declared = BTreeMap::new();
+    // What the models already declare comes first: a new draft agrees
+    // with the files rather than contradicting them.
+    for e in have {
+        for (name, data_type) in &e.declared {
+            out.entry(name.to_lowercase()).or_insert((data_type.clone(), None));
+        }
+    }
+    for t in tables {
+        for c in &t.columns {
+            let fresh = match map_type(&c.data_type) {
+                Mapped::Known(x) => x.to_string(),
+                Mapped::Text => "string".to_string(),
+                Mapped::Skip => continue,
+            };
+            let key = title(&c.name).to_lowercase();
+            match out.get(&key) {
+                None => {
+                    out.insert(key, (fresh, None));
+                }
+                Some((held, _)) if *held == fresh => {}
+                Some((held, _)) => match widen(held, &fresh) {
+                    Some(wider) => {
+                        let note = format!("one field across tables, so the wider of {held} and {fresh}");
+                        out.insert(key, (wider.to_string(), Some(note)));
+                    }
+                    None => {
+                        let note = format!("one field across tables, and another declares it {fresh}: one of the two is wrong");
+                        let held = held.clone();
+                        out.insert(key, (held, Some(note)));
+                    }
+                },
+            }
+        }
+    }
+    out
+}
+
 /// One field's lines, or why it has none.
-fn field(column: &Column, table: &Table) -> std::result::Result<String, String> {
-    let (data_type, note) = match map_type(&column.data_type) {
-        Mapped::Known(t) => (t, column.data_type.clone()),
-        Mapped::Text => ("string", format!("{}; inferred: text-shaped, so a string", column.data_type)),
+fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared) -> std::result::Result<String, String> {
+    let (mapped, mut note) = match map_type(&column.data_type) {
+        Mapped::Known(t) => (t.to_string(), column.data_type.clone()),
+        Mapped::Text => ("string".to_string(), format!("{}; inferred: text-shaped, so a string", column.data_type)),
         Mapped::Skip => return Err(format!("{}: {} has no 0sql type", column.name, column.data_type)),
     };
+    // The field's type is the model's, not this table's: see `Declared`.
+    let data_type = match declared.get(&title(&column.name).to_lowercase()) {
+        Some((t, why)) => {
+            if *t != mapped {
+                note = match why {
+                    Some(w) => format!("{} here; {w}", column.data_type),
+                    None => format!("{} here; the model declares this field {t}", column.data_type),
+                };
+            } else if let Some(w) = why {
+                note = format!("{}; {w}", column.data_type);
+            }
+            t.clone()
+        }
+        None => mapped,
+    };
+    let data_type = data_type.as_str();
     let numeric = matches!(data_type, "integer" | "bigint" | "decimal");
     let measure = numeric && looks_additive(column, table);
     let mut out = String::new();
@@ -247,10 +378,11 @@ fn field(column: &Column, table: &Table) -> std::result::Result<String, String> 
         }
     }
     out.push_str("    expression:\n");
+    let sql = lists.column(&column.name);
     if measure {
-        out.push_str(&format!("      sql: sum({})\n", column.name));
+        out.push_str(&format!("      sql: sum({sql})\n"));
     } else {
-        out.push_str(&format!("      sql: {}\n", column.name));
+        out.push_str(&format!("      sql: {}\n", yaml(&sql)));
         if table.primary_key.len() == 1 && table.primary_key[0].eq_ignore_ascii_case(&column.name) {
             out.push_str("      primary_key: true\n");
         }
@@ -265,12 +397,12 @@ struct Drafted {
     skipped: Vec<String>,
 }
 
-fn table_yml(cat: &Catalog, table: &Table, today: &str) -> Drafted {
+fn table_yml(cat: &Catalog, table: &Table, today: &str, lists: &Lists, declared: &Declared) -> Drafted {
     let (cost, why) = cost(table.rows);
     let mut body = String::new();
     let (mut fields, mut measures, mut skipped) = (0, 0, Vec::new());
     for column in &table.columns {
-        match field(column, table) {
+        match field(column, table, lists, declared) {
             Ok(lines) => {
                 fields += 1;
                 if lines.starts_with("  - type: measure") {
@@ -309,14 +441,19 @@ fn table_yml(cat: &Catalog, table: &Table, today: &str) -> Drafted {
 }
 
 /// The joins a schema's foreign keys declare, in the shape of a rel file.
-fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str) -> Option<String> {
+fn relation_yml(cat: &Catalog, tables: &[&Table], today: &str, lists: &Lists) -> Option<String> {
     let mut joins = String::new();
     for t in tables {
         for fk in &t.foreign_keys {
             let Some(right) = cat.table(fk.references_schema.as_deref().or(t.schema.as_deref()), &fk.references_table) else {
                 continue;
             };
-            let on: Vec<String> = fk.columns.iter().zip(&fk.references_columns).map(|(l, r)| format!("left.{l} = right.{r}")).collect();
+            let on: Vec<String> = fk
+                .columns
+                .iter()
+                .zip(&fk.references_columns)
+                .map(|(l, r)| format!("left.{} = right.{}", lists.column(l), lists.column(r)))
+                .collect();
             let key = format!("{}_{}", t.name, right.name).to_lowercase();
             // The model holds one join per pair of tables. A second key to
             // the same table (bill_to and ship_to, say) wants a second
@@ -364,6 +501,9 @@ struct Existing {
     table: String,
     datasource: Option<String>,
     columns: BTreeSet<String>,
+    /// (field name, data_type) as this file declares them, so a new
+    /// draft of another table agrees with what the model already says.
+    declared: Vec<(String, String)>,
 }
 
 fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
@@ -394,8 +534,12 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
             let (schema, table) = crate::catalog_check::parts(physical, &("\"".into(), "\"".into()));
             let (schema, table) = (schema.map(bare), bare(table));
             let mut columns = BTreeSet::new();
+            let mut declared = Vec::new();
             if let Some(fields) = v.get("fields").and_then(|f| f.as_sequence()) {
                 for f in fields {
+                    if let (Some(n), Some(d)) = (f.get("name").and_then(|x| x.as_str()), f.get("data_type").and_then(|x| x.as_str())) {
+                        declared.push((n.trim().to_string(), d.trim().to_lowercase()));
+                    }
                     let expr = match f.get("expression") {
                         Some(serde_yaml::Value::String(s)) => Some(s.clone()),
                         Some(m) => m.get("sql").and_then(|s| s.as_str()).map(str::to_string),
@@ -406,7 +550,7 @@ fn existing(project_dir: &Path) -> Result<Vec<Existing>> {
                     }
                 }
             }
-            out.push(Existing { path, schema, table, datasource, columns });
+            out.push(Existing { path, schema, table, datasource, columns, declared });
         }
     }
     Ok(out)
@@ -592,6 +736,9 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     if tables.is_empty() {
         bail!("the catalog has no table matching that; `zsql catalog search <pattern>` finds names");
     }
+    // What the warehouse reads as a name, and one type per field name.
+    let lists = Lists::of(&cat.adapter);
+    let declared = declared_types(&tables, &have);
     // A model matches a catalog table by its last two name parts, and
     // by datasource when the model says one: the same `public.orders` on
     // two warehouses is two models.
@@ -652,7 +799,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                     let mut entries = String::new();
                     let mut skipped = Vec::new();
                     for c in &chosen {
-                        match field(c, t) {
+                        match field(c, t, &lists, &declared) {
                             Ok(lines) => entries.push_str(&lines),
                             Err(why) => skipped.push(why),
                         }
@@ -683,7 +830,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                         println!("exists  {} (for another table; not touched)", rel(&path));
                         continue;
                     }
-                    let d = table_yml(&cat, t, &today);
+                    let d = table_yml(&cat, t, &today, &lists, &declared);
                     let summary = format!(
                         "{} field{}, {} measure{}{}",
                         d.fields,
@@ -708,7 +855,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         }
         // One rel file per domain, from the foreign keys, written once.
         let rel_path = dir.join(format!("rel.{domain}.yml"));
-        if let Some(text) = relation_yml(&cat, group, &today) {
+        if let Some(text) = relation_yml(&cat, group, &today, &lists) {
             let rel = rel_path.strip_prefix(&project.dir).unwrap_or(&rel_path).display().to_string();
             if rel_path.exists() {
                 // Name only the joins the file lacks, by their ON clause.

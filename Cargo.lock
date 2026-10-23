@@ -3707,6 +3707,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "duckdb",
  "flate2",
  "inquire",
  "libc",

@@ -73,7 +73,7 @@ pub fn findings(model: &Model) -> Value {
                             if let Mapped::Known(actual) = map_type(&c.data_type) {
                                 let declared =
                                     serde_json::to_value(declared).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-                                if declared != actual {
+                                if !crate::generate::covers(&declared, actual) {
                                     type_mismatches.push(json!({ "table": table.name, "field": f.name, "column": c.name, "declared": declared, "warehouse": c.data_type, "maps_to": actual }));
                                 }
                             }
