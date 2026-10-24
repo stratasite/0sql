@@ -320,7 +320,7 @@ step below is its non-interactive form; the flag forms are what you use.
     zsql generate orders customers             # draft models for named tables; --schema S or --all for more
     zsql generate orders --new-columns         # add the columns a model lacks
     zsql generate shopping/ --all              # draft into models/shopping/, whatever the warehouse's schemas are
-    zsql generate returns --empty table        # an empty model from the template, no catalog behind it
+    zsql generate returns --empty              # an empty model from the template, no catalog behind it
     zsql generate --relationships main/sales --infer   # the joins file, inferred from the table files there
     zsql generate --relationships main/sales   # the same file as a template, to write by hand
     zsql check                                 # load the model, check it against the catalog, run the tests

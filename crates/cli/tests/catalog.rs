@@ -229,7 +229,7 @@ fn datasources_are_listed_added_and_tested() {
     assert!(!ok && out.contains("takes no secret"), "sqlite opens a file: {out}");
 
     // An empty model from the template, and a test from the model's own fields.
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "returns", "--empty", "table", "-d", "local"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "returns", "--empty", "-d", "local"]));
     assert!(ok && out.contains("create models/core/tbl.returns.yml"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["test", "--new", "smoke"]));
     assert!(ok && out.contains("create tests/smoke.yml"), "{out}");

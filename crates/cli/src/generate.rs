@@ -1533,13 +1533,16 @@ pub fn relationships(project_dir: Option<&Path>, opts: RelOptions<'_>) -> Result
             for j in &joins {
                 let on: Vec<String> = j.on.iter().map(|(l, r)| format!("left.{} = right.{}", lists.column(l), lists.column(r))).collect();
                 let key = format!("{}_{}", subject(&j.left), subject(&j.right));
+                // One comment, over the join it is about. The direction and
+                // the join type are both guesses and both want checking,
+                // which is one sentence rather than a note per line.
                 body.push_str(&format!(
-                    "\n{key}:\n  left: {}\n  right: {}\n  sql: {}\n{}{}",
+                    "\n# inferred from {}: check the direction, and `inner` once you trust it\n\
+                     {key}:\n  left: {}\n  right: {}\n  sql: {}\n  cardinality: many_to_one\n  join: left\n",
+                    j.why,
                     yaml(&j.left),
                     yaml(&j.right),
                     yaml(&on.join(" AND ")),
-                    noted("  cardinality: many_to_one", &format!("inferred from {}: check the direction", j.why)),
-                    noted("  join: left", "inferred: a guess, so no row is dropped by it; inner once you trust it"),
                 ));
             }
             let alone: Vec<&str> =
@@ -1555,9 +1558,6 @@ pub fn relationships(project_dir: Option<&Path>, opts: RelOptions<'_>) -> Result
             }
             if !alone.is_empty() {
                 head.push_str(&format!("#\n# In no join, so they need one written by hand: {}.\n", alone.join(", ")));
-            }
-            for l in &loose {
-                head.push_str(&format!("#   {l}\n"));
             }
             // What was inferred first, the forms under it.
             text = format!(
@@ -1576,6 +1576,11 @@ pub fn relationships(project_dir: Option<&Path>, opts: RelOptions<'_>) -> Result
             }
             if !alone.is_empty() {
                 println!("        in no join: {}", alone.join(", "));
+            }
+            // What could not be placed is worth saying once, here, rather
+            // than kept at the top of the file for as long as it exists.
+            for l in &loose {
+                println!("        {l}");
             }
         } else {
             if opts.dry_run {

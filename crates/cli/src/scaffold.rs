@@ -94,7 +94,7 @@ fn write_or_say(project_dir: &Path, rel: &str, text: &str, dry_run: bool) -> Res
     Ok(())
 }
 
-/// `zsql generate NAME --empty table`: a table model from the template,
+/// `zsql generate NAME --empty`: a table model from the template,
 /// with no catalog behind it.
 pub fn empty_table(
     project_dir: Option<&Path>,

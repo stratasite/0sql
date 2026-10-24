@@ -255,9 +255,9 @@ enum Command {
         /// A named table the catalog lacks is read from the warehouse first and added to the catalog.
         #[arg(long)]
         live: bool,
-        /// An empty model file for the table named, from the template and no catalog.
-        #[arg(long, value_name = "table")]
-        empty: Option<String>,
+        /// An empty model file for the table named, from the template and no catalog: `zsql generate orders --empty`, or `help/sessions` to say the directory too.
+        #[arg(long)]
+        empty: bool,
         /// The joins file for a set of tables, at models/{domain}/rel.{name}.yml: the template, or --infer to fill it in. Takes {domain}/{name}, {domain}, or nothing for every domain with tables.
         #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DOMAIN/NAME", conflicts_with = "empty", alias = "rel")]
         relationships: Option<String>,
@@ -792,35 +792,36 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             columns,
             new_columns,
             live,
-            empty: Some(kind),
+            empty: true,
             physical_name,
             domain,
+            dir: into,
             dry_run,
             ..
         } => {
             let _ = (schema, all, columns, new_columns, live);
-            match kind.as_str() {
-                "table" => {
-                    let Some(name) = tables.first() else {
-                        bail!("--empty table needs the table's name: zsql generate orders --empty table")
-                    };
-                    // An empty scaffold needs no warehouse, so a project with
-                    // no datasource yet still gets its file, with the key left
-                    // blank for whatever is added later.
-                    let project_dir = here.project_dir()?.dir;
-                    let uid = if datasource.is_none() && !catalog::any_datasource(&project_dir)? {
-                        String::new()
-                    } else {
-                        catalog::choose(&project_dir, datasource.as_deref())?.uid
-                    };
-                    scaffold::empty_table(dir, name, &uid, physical_name.as_deref(), domain.as_deref(), dry_run)
-                }
-                "relation" => generate::relationships(
-                    dir,
-                    generate::RelOptions { path: domain.as_deref(), infer: false, datasource: datasource.as_deref(), dry_run },
-                ),
-                other => bail!("--empty takes table, not {other}; `--relationships` writes a joins file"),
-            }
+            let Some(named) = tables.first() else { bail!("--empty needs the table's name: zsql generate orders --empty") };
+            // `help/sessions` says the directory and the name at once, which
+            // is how the rest of generate takes a target directory; --dir and
+            // --domain say the same thing the long way. A trailing slash is a
+            // directory everywhere else, so here it is a missing table name
+            // rather than a table whose name ends in one.
+            let (from_path, name) = match named.rsplit_once('/') {
+                Some((_, "")) => bail!("{named} names a directory, not a table: zsql generate {}orders --empty", named),
+                Some((d, n)) => (Some(d.trim_matches('/').to_string()), n),
+                None => (None, named.as_str()),
+            };
+            let domain = domain.or(into).or(from_path);
+            // An empty scaffold needs no warehouse, so a project with no
+            // datasource yet still gets its file, with the key left blank
+            // for whatever is added later.
+            let project_dir = here.project_dir()?.dir;
+            let uid = if datasource.is_none() && !catalog::any_datasource(&project_dir)? {
+                String::new()
+            } else {
+                catalog::choose(&project_dir, datasource.as_deref())?.uid
+            };
+            scaffold::empty_table(dir, name, &uid, physical_name.as_deref(), domain.as_deref(), dry_run)
         }
         Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run, dir: into, .. } => {
             // `generate coupons/ orders` names the directory and a table.

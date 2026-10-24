@@ -417,7 +417,13 @@ fn a_target_directory_and_an_inferred_joins_file() {
     // it is no join, and the file says the date dimension needs one.
     assert!(!rel.contains("week_no") && !rel.contains("WEEK_NO"), "a shared non-key is not a join:\n{rel}");
     assert!(rel.contains("Dim Date"), "the table left out is named:\n{rel}");
-    assert!(rel.contains("BASKET_ID points at a basket"), "a key pointing nowhere is named:\n{rel}");
+    // A key pointing at no table here is said as the command runs, not kept
+    // at the top of the file: there can be dozens of them on a real schema.
+    assert!(out.contains("BASKET_ID points at a basket"), "a key pointing nowhere is named:\n{out}");
+    assert!(!rel.contains("points at a basket"), "and not left in the file:\n{rel}");
+    // One comment over the join, rather than one on each line under it.
+    assert!(rel.contains("# inferred from the name, and the first column there: check the direction"), "{rel}");
+    assert_eq!(rel.matches("# inferred").count(), 3, "one note per join and no more:\n{rel}");
     // The forms stay in the file, under what was inferred.
     assert!(rel.contains("# Other forms") && rel.contains("allow_measure_expansion"), "{rel}");
     let (joins, examples) = (rel.find("household_key = right").unwrap(), rel.find("# Other forms").unwrap());
@@ -565,7 +571,7 @@ fn a_column_asked_for_by_name_is_answered_either_way() {
     assert!(out.to_lowercase().contains("already"), "it says the model has it: {out}");
 }
 
-/// `--empty table` needs no warehouse, so it honours `--dry-run` like every
+/// `--empty` needs no warehouse, so it honours `--dry-run` like every
 /// other write and works before a datasource is configured. Both were
 /// silently ignored: the flag was accepted and the file written anyway, and
 /// the command insisted on a datasource it never used.
@@ -579,20 +585,29 @@ fn an_empty_scaffold_needs_no_warehouse_and_honours_dry_run() {
         .lines()
         .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')));
 
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty", "table", "--dry-run"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty", "--dry-run"]));
     assert!(ok, "{out}");
     assert!(out.contains("would create models/core/tbl.widgets.yml"), "{out}");
     assert!(!project.join("models/core/tbl.widgets.yml").exists(), "dry-run writes nothing: {out}");
 
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty", "table"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "widgets", "--empty"]));
     assert!(ok && out.contains("create models/core/tbl.widgets.yml"), "{out}");
+
+    // The name can carry its directory, as the rest of generate's targets do.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "help/sessions", "--empty"]));
+    assert!(ok && out.contains("create models/help/tbl.sessions.yml"), "{out}");
+    let text = std::fs::read_to_string(project.join("models/help/tbl.sessions.yml")).unwrap();
+    assert!(text.contains("name: sessions") && !text.contains("help/sessions"), "the directory is not part of the name:\n{text}");
+    // A trailing slash is a directory everywhere else, so it is one here too.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "coupons/", "--empty"]));
+    assert!(!ok && out.contains("names a directory, not a table"), "{out}");
     let text = std::fs::read_to_string(project.join("models/core/tbl.widgets.yml")).unwrap();
     assert!(text.contains("name: widgets") && text.contains("datasource:"), "{text}");
     assert!(text.contains("the datasource's key"), "the blank says what to put there:\n{text}");
 
     // A datasources.yml that does not parse is an error, not "no datasource".
     std::fs::write(project.join("datasources.yml"), "local: [not a mapping\n").unwrap();
-    let (ok, out) = run(zsql(&home, &project).args(["generate", "gadgets", "--empty", "table"]));
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "gadgets", "--empty"]));
     assert!(!ok, "a broken file is reported, not worked around: {out}");
     assert!(out.contains("datasources.yml"), "{out}");
     assert!(!project.join("models/core/tbl.gadgets.yml").exists(), "and nothing is written: {out}");
