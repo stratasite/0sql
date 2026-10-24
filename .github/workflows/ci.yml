@@ -9,6 +9,11 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  # bin/ci runs the same steps here and signs the commit off with
+  # `gh signoff`. When hosted minutes run short, drop push and
+  # pull_request above and keep this one for manual reruns, as strata
+  # does; nothing else changes.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,8 +36,72 @@ jobs:
         run: cargo run --release --locked -p zsql-devtool -- golden --strict
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
+      # The same list bin/ci runs; this is the step it had and CI did not,
+      # and the first local run caught an unclosed tag in a doc comment.
+      - name: Docs without warnings
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
-  # Advisories, licences and sources of every crate in the tree, from
+  # The transports in zsql-source against real servers, one container per
+  # warehouse that can run without a cloud account. Its own job so a slow
+  # image never holds up the planner's tests; the ignored tests are the
+  # ones that need a server, and here they get one.
+  sources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Warehouses
+        run: docker compose -f harness/sources/compose.yml up -d --wait --wait-timeout 540
+      - name: Transports against them
+        env:
+          ZSQL_TEST_PG_HOST: localhost
+          ZSQL_TEST_PG_PORT: 5466
+          ZSQL_TEST_PG_USER: postgres
+          ZSQL_TEST_PG_DB: postgres
+          ZSQL_TEST_PG_PASSWORD: zsql
+          ZSQL_TEST_PG_TLS: "1"
+          ZSQL_TEST_PG_CA: harness/sources/tls/ca.crt
+          ZSQL_TEST_CLICKHOUSE_URL: http://localhost:8123
+          ZSQL_TEST_CLICKHOUSE_USER: default
+          ZSQL_TEST_CLICKHOUSE_PASSWORD: zsql
+          ZSQL_TEST_CLICKHOUSE_DB: default
+          ZSQL_TEST_MYSQL_HOST: localhost
+          ZSQL_TEST_MYSQL_USER: root
+          ZSQL_TEST_MYSQL_PASSWORD: zsql
+          ZSQL_TEST_MYSQL_DB: zsql
+          ZSQL_TEST_MSSQL_HOST: localhost
+          ZSQL_TEST_MSSQL_USER: sa
+          ZSQL_TEST_MSSQL_PASSWORD: Zsql-test-1
+          ZSQL_TEST_MSSQL_DB: master
+          ZSQL_TEST_TRINO_URL: http://localhost:8080
+          ZSQL_TEST_TRINO_DB: tpch
+        run: |
+          cargo test --locked -p zsql-source -- --ignored
+          cargo test --locked -p zsql-cli --test generate -- --ignored
+          cargo test --locked -p zsql-cli --test sample -- --ignored
+      # When a container never comes up, say which and why before it is
+      # torn down: the runner has two cores and seven gigabytes, and five
+      # warehouses can exhaust either.
+      - name: What the warehouses said
+        if: failure()
+        run: |
+          docker compose -f harness/sources/compose.yml ps -a
+          free -m
+          for s in postgres mysql sqlserver clickhouse trino; do
+            echo "::group::$s"
+            docker compose -f harness/sources/compose.yml logs --no-color --tail=60 "$s"
+            docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{end}}' "sources-$s-1" || true
+            echo "::endgroup::"
+          done
+      - name: Warehouses down
+        if: always()
+        run: docker compose -f harness/sources/compose.yml down -v
+
+  # Advisories, licenses and sources of every crate in the tree, from
   # deny.toml. No build, so it is quick and runs on its own.
   deny:
     runs-on: ubuntu-latest

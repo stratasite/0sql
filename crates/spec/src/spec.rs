@@ -7,7 +7,7 @@
 //!
 //! The vocabulary is strata's `Query::Spec`, kept so specs written for
 //! strata plan here unchanged; the differences are that calculations
-//! listed among the projections keep their place, `hidden` is honoured, a
+//! listed among the projections keep their place, `hidden` is honored, a
 //! date projection is truncated only when the spec says so, `customize`
 //! is a decorator type, and `limit`, `db_settings`, `hints` and a
 //! segment's `pair_dedupe` are spec keys. Filters are plain: a caller who

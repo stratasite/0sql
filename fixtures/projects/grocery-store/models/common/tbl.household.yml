@@ -12,7 +12,6 @@ fields:
     name: Household Key
     description: Unique household identifier
     data_type: integer
-    disable_listing: true
     expression:
       primary_key: true
       sql: household_key

@@ -23,6 +23,9 @@ server = ["dep:zsql-server"]
 [dependencies]
 zsql-server = { workspace = true, optional = true }
 zsql-service.workspace = true
+zsql-source.workspace = true
+zsql-exec.workspace = true
+zsql-semantic.workspace = true
 zsql-project.workspace = true
 zsql-shorthand.workspace = true
 zsql-dialect.workspace = true
@@ -37,6 +40,15 @@ tar = "0.4"
 ureq = { version = "3", features = ["json"] }
 rustyline = "15"
 libc = "0.2"
+inquire = "0.7"
+clap_complete = "4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+zsql-project.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The engine is already linked through zsql-source; the tests build a
+# file with it the way a warehouse would hold one.
+duckdb = { version = "1.20000.0", features = ["bundled"] }

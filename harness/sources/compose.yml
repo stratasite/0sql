@@ -1,0 +1,94 @@
+# The warehouses zsql-source can be proven against without a cloud
+# account, one per transport and then some: Postgres, MySQL and SQL Server
+# on the wire, ClickHouse and Trino over HTTP. SQLite needs no server.
+#
+#   docker compose -f harness/sources/compose.yml up -d --wait
+#   ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PORT=5466 \
+#   ZSQL_TEST_PG_PASSWORD=zsql \
+#   ZSQL_TEST_CLICKHOUSE_URL=http://localhost:8123 \
+#     cargo test -p zsql-source -- --ignored
+#
+# Every password here is for a throwaway container on loopback, and is
+# the same word so the test variables are easy to type.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: zsql
+    # 5432 is often taken on a development machine, so this one is
+    # published high and every caller is told the port.
+    ports: ["5466:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # The pair in tls/ so it offers TLS, and the shop schema with keys;
+    # both run once, on first start, from docker-entrypoint-initdb.d.
+    volumes:
+      - ./tls:/tls:ro
+      - ./postgres-tls.sh:/docker-entrypoint-initdb.d/tls.sh:ro
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/shop.sql:ro
+
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: zsql
+      MYSQL_DATABASE: zsql
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pzsql"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    # The shop schema with keys, run once on first start against MYSQL_DATABASE.
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/shop.sql:ro
+
+  # The image is large and its license is for development. If it is the
+  # one that makes CI slow, it moves to a nightly job and the wire
+  # transport stays proven by Postgres and MySQL.
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Zsql-test-1"
+      MSSQL_PID: Developer
+    ports: ["1433:1433"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Zsql-test-1' -C -Q 'SELECT 1' || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      # Failed checks during the start period do not count towards the
+      # retries, so a slow boot is waited for rather than given up on.
+      start_period: 90s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: zsql
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The image ships with the tpch, tpcds, memory and jmx catalogs, so
+  # INFORMATION_SCHEMA answers without a configuration mounted, and it
+  # ships its own health probe, which is the one to call: a curl against
+  # /v1/info passed one CI run and then never again, while the server
+  # itself was up in fourteen seconds every time. Whatever the base image
+  # does or does not carry, the script is the image's own promise.
+  trino:
+    image: trinodb/trino:latest
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 120s

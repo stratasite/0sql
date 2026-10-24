@@ -1,17 +1,19 @@
 //! Sampled dimension values: what a dimension's column actually holds,
 //! so a question like "shoes" can be matched to a value before any
-//! warehouse probe. Written by the project's own tooling to
-//! `samples/values.jsonl.gz`, one JSON object per line, gzipped, and
-//! shipped with the model; 0sql never runs SQL to make it.
+//! warehouse probe. `zsql sample` writes it to `samples/values.jsonl.gz`,
+//! one JSON object per line, gzipped, from the warehouse, for every
+//! dimension whose model says `enable_sampling: true` — never a hidden
+//! dimension, never one a security policy names — and it ships with the
+//! model on deploy.
 //!
-//! The file is customer data: gitignored by default, and best kept to
-//! dimensions that are listable (not hidden, listing not disabled, not
-//! named by a security policy's triggers).
+//! The file is customer data. It is gitignored by default, and committing
+//! it is a decision about where those values may go. Collecting it for a
+//! project's own model is one consent; pooling it into anything beyond
+//! that project is a second, separate one, and nothing here does that.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use zsql_semantic::ValueSampling;
 
 pub const FILE_NAME: &str = "values.jsonl.gz";
 /// The most the file may hold once inflated: a thousand values for
@@ -27,11 +29,16 @@ pub struct ValueCatalog {
 pub struct DimensionValues {
     pub uid: String,
     pub name: String,
-    /// The table the values were read from.
+    /// Where the values came from: the datasource the planner chose for
+    /// them, or the one an author's `sample_sql` ran on.
     pub table: String,
     /// RFC 3339.
     pub sampled_at: String,
-    pub mode: ValueSampling,
+    /// The limit the sampling query ran with. With `distinct` it says
+    /// whether the list is complete; without `distinct`, a list as long
+    /// as this is the only sign that it was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_size: Option<i64>,
     /// Distinct values in the column, when counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinct: Option<i64>,
@@ -86,15 +93,19 @@ impl ValueCatalog {
         Ok(Some(ValueCatalog { dimensions }))
     }
 
+    /// Written beside the target and renamed over it, so a run that dies
+    /// mid-write leaves the old file whole rather than a truncated gzip
+    /// that nothing can read.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
+        let tmp = path.with_extension("gz.tmp");
+        let file = std::fs::File::create(&tmp)?;
         let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         for d in &self.dimensions {
             enc.write_all(serde_json::to_string(d)?.as_bytes())?;
             enc.write_all(b"\n")?;
         }
-        enc.finish()?;
-        Ok(())
+        enc.finish()?.sync_all()?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn get(&self, uid: &str) -> Option<&DimensionValues> {

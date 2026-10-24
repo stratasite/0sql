@@ -300,6 +300,10 @@ struct Builder<'d> {
     pending_expressions: Vec<PendingExpression>,
     pending_tables: Vec<PendingTable>,
     pending_rules: Vec<PendingRule>,
+    /// What each definition of a field said about an attribute, and where:
+    /// by (field index, attribute). Two files that both speak and disagree
+    /// get a warning, since only the last one loaded takes effect.
+    field_said: HashMap<(usize, &'static str), (String, PathBuf)>,
     sources: Vec<PathBuf>,
     phases: Vec<(&'static str, u128)>,
     /// By datasource index.
@@ -331,12 +335,7 @@ const FIELD_KEYS: &[&str] = &[
     "hidden",
     "grains",
     "data_type",
-    "display_type",
     "format",
-    "secure",
-    "disable_listing",
-    "disable_value_listing",
-    "value_list_size",
     "snapshot",
     "exclusion_type",
     "exclusions",
@@ -345,7 +344,9 @@ const FIELD_KEYS: &[&str] = &[
     "synonyms",
     "tags",
     "expression",
-    "values",
+    "enable_sampling",
+    "sample_size",
+    "sample_sql",
 ];
 const EXPRESSION_KEYS: &[&str] = &["sql", "array", "lookup", "primary_key"];
 const JOIN_KEYS: &[&str] = &["left", "right", "sql", "cardinality", "join", "allow_measure_expansion", "description"];
@@ -376,6 +377,7 @@ impl<'d> Builder<'d> {
             pending_expressions: vec![],
             pending_tables: vec![],
             pending_rules: vec![],
+            field_said: HashMap::new(),
             sources: vec![],
             phases: vec![],
             dialect_lists: HashMap::new(),
@@ -519,6 +521,11 @@ impl<'d> Builder<'d> {
             return Err(invalid(&file, "datasources.yml is required"));
         }
         let v = self.read(&file)?;
+        // A file of comments alone is YAML null: a project with no
+        // datasource yet, not a broken one.
+        if v.is_null() {
+            return Ok(());
+        }
         let m = as_map(&v).ok_or_else(|| invalid(&file, "datasources.yml must map each datasource key to its settings"))?;
         for (key, def) in m {
             let Some(uid) = key.as_str() else {
@@ -745,9 +752,15 @@ impl<'d> Builder<'d> {
                 .map_err(|_| invalid(file, format!("Field {name} errors: Data type '{d}' is not included in the list (one of: string, integer, decimal, date, date_time, boolean, bigint, binary)")))?,
             None => return Err(invalid(file, format!("Field {name} errors: Data type can't be blank"))),
         };
-        let display_type = str_of(fm, "display_type").map(|d| d.to_lowercase()).unwrap_or_else(|| "default".into());
-        if !["default", "html", "url", "email", "phone_number", "image"].contains(&display_type.as_str()) {
-            return Err(invalid(file, format!("Field {name} errors: Display type '{display_type}' is not included in the list (one of: default, html, url, email, phone_number, image)")));
+        let sample_size = match get(fm, "sample_size") {
+            None => zsql_semantic::default_sample_size(),
+            Some(_) => {
+                int_of(fm, "sample_size").ok_or_else(|| invalid(file, format!("Field {name} errors: sample_size is not a whole number")))?
+            }
+        };
+        if !(1..=zsql_semantic::MAX_SAMPLE_SIZE).contains(&sample_size) {
+            let most = zsql_semantic::MAX_SAMPLE_SIZE;
+            return Err(invalid(file, format!("Field {name} errors: sample_size {sample_size} is not between 1 and {most}")));
         }
         let grains = strs_of(fm, "grains").into_iter().map(|g| g.to_lowercase()).collect::<Vec<_>>();
         if let Some(bad) = grains.iter().find(|g| !DATE_GRAINS.contains(&g.as_str())) {
@@ -802,7 +815,6 @@ impl<'d> Builder<'d> {
                     name: name.clone(),
                     kind,
                     data_type: Some(data_type),
-                    display_type: display_type.clone(),
                     hidden: false,
                     tags: vec![],
                     grains: vec![],
@@ -812,10 +824,9 @@ impl<'d> Builder<'d> {
                     inclusions: None,
                     extended_blend_group: None,
                     snapshot: None,
-                    secure: false,
-                    disable_listing: false,
-                    value_list_size: 1000,
-                    value_sampling: ValueSampling::Sample,
+                    enable_sampling: false,
+                    sample_size,
+                    sample_sql: None,
                     synonyms: vec![],
                     description: None,
                     rank: 0,
@@ -824,33 +835,113 @@ impl<'d> Builder<'d> {
                 self.fields.len() - 1
             }
         };
-        // Every definition of a field updates it; the last one deployed wins,
-        // as on the server.
+        // A field named on several tables is one field, and every definition
+        // updates it. What a definition leaves out is treated two ways,
+        // and the line between them matters.
+        //
+        // Its metadata -- what the field is called and how it reads --
+        // blank-fills: an absent or empty description, synonym list, tag
+        // list, format or sampling setting says nothing and leaves what
+        // another table's definition gave, so a bare mapping no longer
+        // erases the description written next to the dimension.
+        //
+        // Everything that changes the plan does not: the type, the date
+        // grains, the snapshot, the blend group and the exclusion and
+        // inclusion rules are taken from the last definition loaded,
+        // whether it states them or not, exactly as before. Blank-filling
+        // those would mean a bare mapping could no longer clear a rule
+        // another file set, and two files could between them assemble a
+        // field this loader rejects when one file writes it.
+        //
+        // Where two definitions both state the same metadata differently,
+        // the last one loaded wins and `zsql check` reports it.
+        // What this definition says, recorded whether or not it is the
+        // first: the first has nothing to disagree with, but the second
+        // needs to know what the first said and where it said it.
+        let mut spoke: Vec<(&'static str, String)> = Vec::new();
         {
+            let said = |k: &str| get(fm, k).is_some();
+            let tags = strs_of(fm, "tags");
+            let synonyms = strs_of(fm, "synonyms");
+            // The type is not metadata and does not blank-fill, so a
+            // disagreement about it is the one worth saying loudest.
+            spoke.push(("data_type", format!("{data_type:?}").to_lowercase()));
+            if let Some(d) = str_of(fm, "description") {
+                spoke.push(("description", d));
+            }
+            if !synonyms.is_empty() {
+                spoke.push(("synonyms", synonyms.join(", ")));
+            }
+            if !tags.is_empty() {
+                spoke.push(("tags", tags.join(", ")));
+            }
+            if !grains.is_empty() {
+                spoke.push(("grains", grains.join(", ")));
+            }
+            if said("hidden") {
+                spoke.push(("hidden", bool_of(fm, "hidden").unwrap_or(false).to_string()));
+            }
+            if said("enable_sampling") {
+                spoke.push(("enable_sampling", bool_of(fm, "enable_sampling").unwrap_or(false).to_string()));
+            }
+            if said("sample_size") {
+                spoke.push(("sample_size", sample_size.to_string()));
+            }
+            if let Some(q) = str_of(fm, "sample_sql") {
+                spoke.push(("sample_sql", q));
+            }
+            if let Some(f) = &format {
+                spoke.push(("format", f.to_string()));
+            }
             let f = &mut self.fields[field_index];
             f.name = name.clone();
+            // Semantics: the last definition decides, stated or not.
             f.data_type = Some(data_type);
-            f.display_type = display_type;
-            f.hidden = bool_of(fm, "hidden").unwrap_or(false);
-            f.tags = strs_of(fm, "tags");
             f.grains = grains;
-            f.format = format;
             f.exclusion_type = exclusion_type;
             f.exclusions = exclusions;
             f.inclusions = inclusions;
             f.extended_blend_group = str_of(fm, "extended_blend_group").map(|g| g.to_lowercase());
             f.snapshot = snapshot;
-            f.secure = bool_of(fm, "secure").unwrap_or(false);
-            f.disable_listing = bool_of(fm, "disable_listing").or_else(|| bool_of(fm, "disable_value_listing")).unwrap_or(false);
-            f.value_list_size = int_of(fm, "value_list_size").unwrap_or(1000);
-            f.value_sampling = match str_of(fm, "values").map(|v| v.to_lowercase()).as_deref() {
-                None | Some("sample") => ValueSampling::Sample,
-                Some("full") => ValueSampling::Full,
-                Some("none") | Some("false") => ValueSampling::None,
-                Some(other) => return Err(invalid(file, format!("Field {name} errors: values '{other}' should be sample, full or none"))),
-            };
-            f.synonyms = strs_of(fm, "synonyms");
-            f.description = str_of(fm, "description");
+            // Metadata: only what this definition states.
+            if said("hidden") {
+                f.hidden = bool_of(fm, "hidden").unwrap_or(false);
+            }
+            if !tags.is_empty() {
+                f.tags = tags;
+            }
+            if format.is_some() {
+                f.format = format;
+            }
+            if said("enable_sampling") {
+                f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
+            }
+            if said("sample_size") {
+                f.sample_size = sample_size;
+            }
+            if let Some(q) = str_of(fm, "sample_sql") {
+                f.sample_sql = Some(q);
+            }
+            if !synonyms.is_empty() {
+                f.synonyms = synonyms;
+            }
+            if let Some(d) = str_of(fm, "description") {
+                f.description = Some(d);
+            }
+        }
+        for (key, value) in spoke {
+            if let Some((before, elsewhere)) = self.field_said.get(&(field_index, key)) {
+                if *before != value {
+                    let (before, elsewhere) = (before.clone(), self.relative(elsewhere));
+                    self.warn(
+                        file,
+                        format!(
+                            "field {name}: {key} is '{value}' here and '{before}' in {elsewhere}; the last file loaded wins, so say it in one place"
+                        ),
+                    );
+                }
+            }
+            self.field_said.insert((field_index, key), (value, file.to_path_buf()));
         }
         if self.fields[field_index].exclusion_type.is_some() || self.fields[field_index].inclusions.is_some() {
             self.pending_rules.push(PendingRule { field_index, file: file.to_path_buf() });
@@ -1064,6 +1155,21 @@ impl<'d> Builder<'d> {
             allow_measure_expansion: bool_of(jm, "allow_measure_expansion").unwrap_or(false),
             source: source.clone(),
         });
+        // A one_to_one join walks both ways, so either table can root a
+        // plan. The planner weighs coverage, partitions and tier first and
+        // only then cost, so equal costs do not always decide anything --
+        // but where the rest ties, cost is the lever the author has, and
+        // two equal ones leave it to the field count and then the uid.
+        if cardinality == Cardinality::OneToOne && self.tables[left].cost == self.tables[right].cost {
+            let (a, b) = (self.tables[left].name.clone(), self.tables[right].name.clone());
+            let each = self.tables[left].cost;
+            self.warn(
+                file,
+                format!(
+                    "join {key} is one_to_one and {a} and {b} both cost {each}; where a query ties on everything else, the root is then picked by field count and finally by table uid. Raise the cost of the one to avoid."
+                ),
+            );
+        }
         // A one_to_one join walks both ways (`JoinDef#create_bi_directional_join`).
         if cardinality == Cardinality::OneToOne {
             let id = self.join_defs.len() as Id + 1;

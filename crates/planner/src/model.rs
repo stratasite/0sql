@@ -286,6 +286,62 @@ impl<'a> RFilter<'a> {
     }
 }
 
+/// Hints name tables, by uid or by name. One that resolves to nothing is a
+/// mistake rather than a preference, so it refuses instead of going quiet;
+/// one that resolves to two tables is the same mistake with more than one
+/// way to read it, and says both.
+fn resolve_hints<'a>(universe: &'a Universe, hints: &[String], whose: &dyn Fn() -> String) -> Result<Vec<&'a Table>> {
+    let mut out = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for h in hints {
+        match universe.tables_by_uid_or_name(h).as_slice() {
+            [one] => out.push(*one),
+            [] => unknown.push(format!("{h}{}", did_you_mean(universe, h))),
+            several => {
+                let names: Vec<&str> = several.iter().map(|t| t.uid.as_str()).collect();
+                return Err(PlanError::Resolution(format!(
+                    "{} hint {h} names {} tables; say which by uid: {}",
+                    whose(),
+                    several.len(),
+                    names.join(", ")
+                )));
+            }
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(PlanError::Resolution(format!("{} hints name no table: {}", whose(), unknown.join("; "))));
+    }
+    Ok(out)
+}
+
+/// The nearest table names to a term, for a refusal. Both sides are
+/// normalized first, as every other near-match in the system is: without
+/// that, `web sails` scores below the floor against `web_sales` and the
+/// hint spelling this resolver exists to accept gets no suggestion.
+fn did_you_mean(universe: &Universe, term: &str) -> String {
+    let want = zsql_spec::fuzzy::normalize(term);
+    if want.chars().count() < zsql_spec::fuzzy::MIN_LEN {
+        return String::new();
+    }
+    let mut near: Vec<(f64, &str)> = universe
+        .tables()
+        .iter()
+        .flat_map(|t| {
+            let best = zsql_spec::fuzzy::similarity(&want, &zsql_spec::fuzzy::normalize(&t.name))
+                .max(zsql_spec::fuzzy::similarity(&want, &zsql_spec::fuzzy::normalize(&t.uid)));
+            (best >= zsql_spec::fuzzy::FLOOR).then_some((best, t.name.as_str()))
+        })
+        .collect();
+    near.sort_by(|a, b| b.0.total_cmp(&a.0));
+    near.dedup_by(|a, b| a.1 == b.1);
+    let names: Vec<&str> = near.iter().take(zsql_spec::fuzzy::SUGGESTIONS).map(|(_, n)| *n).collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" (did you mean {})", names.join(", "))
+    }
+}
+
 #[derive(Debug)]
 pub struct RQuery<'a> {
     pub def: Query,
@@ -458,7 +514,7 @@ impl<'a> RQuery<'a> {
             Some(t) => FilledTree::from_tree(t, &by_ref).unwrap_or(FilledTree::Group("and".into(), vec![])),
             None => FilledTree::Group("and".into(), (0..filters.len()).map(FilledTree::Leaf).collect()),
         };
-        let hints = def.hints.iter().filter_map(|u| universe.table_by_uid(u)).collect();
+        let hints = resolve_hints(universe, &def.hints, &|| "the query's".to_string())?;
 
         // Segments: their own components, then links resolved onto the
         // query's projections and carried columns onto their definitions.
@@ -526,7 +582,12 @@ impl<'a> RQuery<'a> {
                     (l.mode, target, l.rank)
                 })
                 .collect();
-            let hints = s.hints.iter().filter_map(|u| universe.table_by_uid(u)).collect();
+            // Named lazily: the overwhelming majority of segments have no
+            // hints at all, and this is per segment per query.
+            let hints = resolve_hints(universe, &s.hints, &|| match s.name.as_deref() {
+                Some(name) => format!("segment '{name}'"),
+                None => "the segment's".to_string(),
+            })?;
             segments.push(RSegment {
                 sid,
                 def: s.clone(),

@@ -1,0 +1,33 @@
+[package]
+name = "zsql-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Reaching a datasource to read from it: the connection, its secret, and one read-only statement"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+ureq = { version = "3", features = ["json"] }
+ring = "0.17"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+duckdb = { version = "1.20000.0", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -193,7 +193,7 @@ docs/             design notes: accounts and access, rate limiting, MCP, operati
 directory, the settings, backups, what changes shape on disk and when.
 `docs/releasing.md` is how a release is cut.
 
-## Licence
+## License
 
 MIT. See [LICENSE](LICENSE). The dialect settings under `dialects/`
-carry their own MIT licence file.
+carry their own MIT license file.

@@ -235,7 +235,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, if keyed(app, who) { catalogue(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalogue of the branches a key may read follows the instructions once one is.".into() }),
+                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, if keyed(app, who) { catalog(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalog of the branches a key may read follows the instructions once one is.".into() }),
             }))
         }
         "ping" => Ok(json!({})),
@@ -249,23 +249,23 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
     }
 }
 
-// -------------------------------------------------------------- catalogue
+// -------------------------------------------------------------- catalog
 
-/// How much catalogue `initialize` carries, in bytes, before it falls
+/// How much catalog `initialize` carries, in bytes, before it falls
 /// back to naming the branches and leaving discovery to `fields`.
-const CATALOGUE_BYTES: usize = 48 * 1024;
+const CATALOG_BYTES: usize = 48 * 1024;
 
 /// Every field of every branch the caller may read, with its uid, as
 /// part of the instructions. A client puts the server's instructions in
 /// its system prompt, so this is what lets a question be answered in one
 /// `sql` call with no discovery round trips: the same move an
-/// application makes when it pastes the field catalogue into its own
+/// application makes when it pastes the field catalog into its own
 /// prompt. Measures carry their description and synonyms, since that is
 /// where the business definitions live; dimensions are named by table,
 /// where the table says which thing they describe. Deterministic, so the
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
-fn catalogue(app: &App, who: &Option<Principal>) -> String {
+fn catalog(app: &App, who: &Option<Principal>) -> String {
     let models = read(&app.models);
     let mut readable: Vec<Arc<Model>> =
         in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
@@ -276,11 +276,11 @@ fn catalogue(app: &App, who: &Option<Principal>) -> String {
     }
     let mut out = String::new();
     for d in &readable {
-        out.push_str(&branch_catalogue(d));
+        out.push_str(&branch_catalog(d));
         out.push('\n');
     }
-    if out.len() <= CATALOGUE_BYTES {
-        return format!("# Catalogue\nEvery field of the branches this key may read, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
+    if out.len() <= CATALOG_BYTES {
+        return format!("# Catalog\nEvery field of the branches this key may read, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
     }
     let mut short = String::from("# Branches this key may read\nToo many fields to list here; call fields with q to find them.\n");
     for d in &readable {
@@ -290,7 +290,7 @@ fn catalogue(app: &App, who: &Option<Principal>) -> String {
     short
 }
 
-fn branch_catalogue(d: &Model) -> String {
+fn branch_catalog(d: &Model) -> String {
     let u = d.universe();
     let s = u.snapshot();
     // Field id to the uids of the tables carrying it, sorted.
@@ -565,17 +565,17 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             let _seat = admit_explore(app, who).await?;
             let q = a.q.unwrap_or_default();
             if q.trim().is_empty() && !a.hidden {
-                // No search: the whole catalogue, as one text, the same
+                // No search: the whole catalog, as one text, the same
                 // one initialize carries. One call is all the discovery a
                 // question needs, and a client that cut the instructions
                 // short gets it here in full.
                 let text = branch_for(app, who, &a.project, a.branch).and_then(|b| {
                     let t = gate(app, who, &a.project, &b, Verb::Read)?;
                     let d = model(app, &t, &a.project, &b)?;
-                    Ok(branch_catalogue(&d))
+                    Ok(branch_catalog(&d))
                 });
                 return Ok(match text {
-                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalogue": text } }),
+                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalog": text } }),
                     Err(ApiError(status, class, message)) => {
                         json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true })
                     }

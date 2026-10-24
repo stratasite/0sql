@@ -4,7 +4,7 @@
 //! `zsqld` plans from the same files after a deploy, through the same
 //! type, behind the gate. These tests hold the two to byte-identical
 //! answers over the fixture projects: the SQL, the explain graph, the
-//! catalogue, the field search, and the refusals with their classes.
+//! catalog, the field search, and the refusals with their classes.
 //! A difference here is a seam the service crate was meant to close.
 
 use crate::error::ApiError;
@@ -225,7 +225,7 @@ async fn local_and_server_answer_alike() {
             assert_eq!(server, here, "{uid} expr {line}");
         }
 
-        // The catalogue and the search.
+        // The catalog and the search.
         assert_eq!(get(&router, &format!("{base}/tables")).await, (StatusCode::OK, local.tables()), "{uid} tables");
         for (q, hidden) in [("", false), ("", true), ("date", false), ("disc", true), ("zzzz", false)] {
             assert_eq!(

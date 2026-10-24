@@ -35,7 +35,7 @@ measured budgets rather than built first.
 
 The word "engine" stays reserved for the planner, as the README uses it.
 The service crate is the layer between a loaded model and a caller,
-lifted out of `server/src/main.rs` without behaviour change:
+lifted out of `server/src/main.rs` without behavior change:
 
 - `Model`: uid, branch, the self_cell pinning `Universe` to `Planner`,
   sampled values, tests, warnings. Built by `Model::from_dir(dir, Trust,
@@ -174,7 +174,7 @@ The library reads no environment, enforced by a test; the CLI's serve
 module is the one place a `ZSQL_*` variable is read. `server install` (a
 systemd user unit or a launchd agent) is parked until someone asks.
 
-Embedding beats downloading: one artefact, one version, one thing to
+Embedding beats downloading: one artifact, one version, one thing to
 test. The engine is already in the CLI for local planning; the HTTP and
 accounts layer on top of it is the smaller addition.
 
@@ -222,7 +222,7 @@ values and hold none (the history still names the host in old versions
 of the runbook, left as is). Also done: the MIT `LICENSE`, a format
 pass under `rustfmt.toml` (140 columns, the "Max" heuristic, so the
 dense style survives) checked in CI, `cargo deny` for advisories and
-licences, and Dependabot for crates and actions.
+licenses, and Dependabot for crates and actions.
 
 ## Decisions register
 
@@ -234,7 +234,7 @@ licences, and Dependabot for crates and actions.
 - SIGPIPE is decided per command.
 - Errors are one shape in both modes, text or JSON.
 - The cache is deferred behind measured budgets.
-- Embedding beats downloading: one artefact, one version, one thing to test.
+- Embedding beats downloading: one artifact, one version, one thing to test.
 - Accounts are off by default locally, and an open bind with accounts off is refused.
 - Deploy writes are atomic by rename; shutdown is graceful; data directories are locked.
 - Tests never touch the real home directory.
@@ -248,9 +248,9 @@ licences, and Dependabot for crates and actions.
 
 - 2026-10-16, from CI: a mail command that exits before reading the message broke the pipe, and the broken pipe was the whole report. The write's failure is kept and the command waited for, so what it said and how it exited are what the log gets; a command that exits 0 that way is an error, since nothing was sent. Two tests hold it, with a message larger than a pipe holds.
 
-- 2026-10-15, review's test gaps: the branch caps, the per-address login gate with its `Retry-After`, and the app's CSRF header are each held over the wire; a negative table cost is refused by name; every built-in dialect is held to quoting a literal and an identifier, and a query's `db_settings` to leaving the catalogue's copy alone; `list` and `status -r` run end to end in the CLI's serve test.
+- 2026-10-15, review's test gaps: the branch caps, the per-address login gate with its `Retry-After`, and the app's CSRF header are each held over the wire; a negative table cost is refused by name; every built-in dialect is held to quoting a literal and an identifier, and a query's `db_settings` to leaving the catalog's copy alone; `list` and `status -r` run end to end in the CLI's serve test.
 
-- 2026-10-15, review continued: every refusal is in the API's shape, including the ones axum would have made for a body that is not JSON, a path parameter of the wrong type or a query string that does not parse (`Input`, `Params`, `Search` in the server's `error` module); an IPv6 caller is limited by its /64, and an IPv4 address in IPv6 clothing by the IPv4 address; the mail command's stderr is drained on a thread and its first lines go into the error, so a loud relay cannot wedge a send; a plan's dialect is shared with its sub-graphs through an `Arc` and a query without `db_settings` shares the catalogue's copy; the CLI's slug is the project crate's `parameterize`; the devtool's `--paths` is an enum; stale docs that called the stored paths an oracle and the planner's refusals unported are reworded.
+- 2026-10-15, review continued: every refusal is in the API's shape, including the ones axum would have made for a body that is not JSON, a path parameter of the wrong type or a query string that does not parse (`Input`, `Params`, `Search` in the server's `error` module); an IPv6 caller is limited by its /64, and an IPv4 address in IPv6 clothing by the IPv4 address; the mail command's stderr is drained on a thread and its first lines go into the error, so a loud relay cannot wedge a send; a plan's dialect is shared with its sub-graphs through an `Arc` and a query without `db_settings` shares the catalog's copy; the CLI's slug is the project crate's `parameterize`; the devtool's `--paths` is an enum; stale docs that called the stored paths an oracle and the planner's refusals unported are reworded.
 
 - 2026-10-15, review: the server library is one module per concern (`auth`, `tenancy`, `error`, `deploy`, `reads`, `accounts_api`, `ui`, `run`, with `mcp`, `limits` and `mail` as before), every item crate-private unless another module needs it, the router naming handlers by module; the isolation and parity tests drive the same router through explicit imports. A deploy's work directory is named by a counter rather than the clock, which is the likely cause of the two isolation tests that failed now and then under a parallel run: two deploys in one process at the same nanosecond shared a directory and the second was refused for files that existed. The no-environment test now scans every server source file.
 
@@ -258,6 +258,6 @@ licences, and Dependabot for crates and actions.
 
 - 2026-10-15, phase B: `zsqld` is gone; `zsql serve` is the server, with `ZSQL_*` variables as the base and flags over them, read in one place (the CLI's serve module; the library still reads none). One release workflow on a `v*` tag builds `zsql` for four platforms, proves the server starts from the binary, and publishes here and on the installer's repository. The runbook describes the host's unit running `zsql serve`.
 
-- 2026-10-15, phase A: the server crate is a library with one `Config` and `run`; `zsqld` is a thin binary and the one place a `ZSQL_*` variable is read, which a test enforces; the MCP settings live on the app; the data directory is locked with the holder's pid; shutdown is graceful; a deploy is staged beside the branch and swapped in; `zsql serve` serves the project at hand and `zsql server start|stop|status|logs` keeps it running; integration tests cover a client hanging up, a second instance, SIGTERM, the in-project deploy and the background form. Review taken: only a deploy's own `.<branch>.staging-N`/`.previous-N` leftovers are swept (never another dot directory under a mistyped data dir); `start` reaps a child that exits at once and reports the log's tail; whether a server is running is answered by its data directory's lock, not by a pidfile and a pid that may have been reused; `stop` escalates to SIGKILL after 15 s; `status` probes the bind `start` recorded; an explicit `--project` that is missing is an error; one watch loop serves `deploy --watch` and `serve`, and it sees a deleted file; deploys of one branch are serialised; an unspecified bind is reached over loopback.
+- 2026-10-15, phase A: the server crate is a library with one `Config` and `run`; `zsqld` is a thin binary and the one place a `ZSQL_*` variable is read, which a test enforces; the MCP settings live on the app; the data directory is locked with the holder's pid; shutdown is graceful; a deploy is staged beside the branch and swapped in; `zsql serve` serves the project at hand and `zsql server start|stop|status|logs` keeps it running; integration tests cover a client hanging up, a second instance, SIGTERM, the in-project deploy and the background form. Review taken: only a deploy's own `.<branch>.staging-N`/`.previous-N` leftovers are swept (never another dot directory under a mistyped data dir); `start` reaps a child that exits at once and reports the log's tail; whether a server is running is answered by its data directory's lock, not by a pidfile and a pid that may have been reused; `stop` escalates to SIGKILL after 15 s; `status` probes the bind `start` recorded; an explicit `--project` that is missing is an error; one watch loop serves `deploy --watch` and `serve`, and it sees a deleted file; deploys of one branch are serialized; an unspecified bind is reached over loopback.
 
 - 2026-10-15: phase 1 done (`zsql-service` extracted; goldens, isolation tests and the determinism tests pass). Phase 2 done (`-r` and its rules, every read local by default, one error contract, fixtures `tpcds` and `grocery-store`, parity test byte-identical over both). Phase 5 done (ci.yml: clippy with warnings denied, tests, goldens, the slim CLI check, the warehouse check in its own job; the devtool keeps check, export, golden, bench, load-bench and form, and its private parser's tests moved to the shorthand crate; every crate `publish = false`; two stylistic clippy lints allowed workspace-wide, the rest fixed; version 0.6.0; README and running-it updated). Phase 4 done (loader measured and sped up: TPC-DS load 9.6 to 5.0 ms, `zsql sql` 8 to 9 ms end to end; no cache). Phase 3 done (the repl holds its model, stats `Loaded.sources` before each line, reloads and says so, keeps the old model on a failed load, `.reload`; driven through a pipe by `crates/cli/tests/repl.rs`).

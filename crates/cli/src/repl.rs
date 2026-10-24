@@ -19,7 +19,7 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
     let mut field_names = side.borrow_mut().announce()?;
     println!("{}", dim("type a line: projections, filters, calculations, segments; tab completes, .help for the forms, .quit to leave"));
 
-    // The line editor, with the grammar's completion, hints and colour,
+    // The line editor, with the grammar's completion, hints and color,
     // when stdin is a terminal; a plain read otherwise.
     let mut editor: Option<Editor<S>> = if std::io::stdin().is_terminal() {
         let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
@@ -37,7 +37,7 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
         }
         let _ = ed.load_history(h);
     }
-    // After the model changes: the field names here, the helper's catalogue.
+    // After the model changes: the field names here, the helper's catalog.
     let reread = |editor: &mut Option<Editor<S>>, side: &Rc<RefCell<S>>| -> Result<Vec<String>> {
         let names = side.borrow_mut().announce()?;
         if let Some(h) = editor.as_ref().and_then(|ed| ed.helper()) {
@@ -108,6 +108,32 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
                     side.borrow_mut().reload()?;
                     field_names = reread(&mut editor, &side)?;
                 }
+                "run" | "run!" => {
+                    // The line as a query, run and kept; `.run!` runs it fresh.
+                    if rest.is_empty() {
+                        println!("usage: .run <line or {{...spec...}}>   (.run! to bypass the cache)");
+                        return Ok(());
+                    }
+                    let query = if rest.starts_with('{') {
+                        match serde_json::from_str(rest) {
+                            Ok(v) => Query::Spec(v),
+                            Err(e) => {
+                                println!("error: {e}");
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        Query::Expr(rest.to_string())
+                    };
+                    if let Err(e) = side.borrow_mut().run(&query, context.as_ref(), cmd == "run!") {
+                        println!("error: {e}");
+                    }
+                }
+                "results" => {
+                    if let Err(e) = side.borrow_mut().results() {
+                        println!("error: {e}");
+                    }
+                }
                 "spec" => match zsql_service::spec_of(None, Some(rest), &zsql_service::unlimited).map_err(Refusal::from) {
                     Ok((spec, _, items)) => {
                         for d in items {
@@ -162,6 +188,9 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
                         }
                         Err(e) => println!("error: {e}"),
                     }
+                }
+                "catalog" | "generate" | "sample" | "check" | "test" | "deploy" => {
+                    println!("`zsql {cmd}` is a command-line step; the repl plans and runs queries. .help lists what it does.")
                 }
                 other => println!("unknown command .{other}; .help lists them"),
             }

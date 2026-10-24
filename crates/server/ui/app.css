@@ -91,7 +91,7 @@ p { margin: 0 0 8px; }
 
 /* --- scrollbars
    Subtle, and only inked in while the pointer is over the thing that
-   scrolls. Hover changes the colour and nothing else: the bar occupies
+   scrolls. Hover changes the color and nothing else: the bar occupies
    the same width whether or not you can see it, so revealing one can
    never reflow the text beside it. The page and the field list also
    hold their gutter open, because those two change length under you and

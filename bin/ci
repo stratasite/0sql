@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# The whole verification set, run here, and a sign-off when all of it
+# passes. The same steps as .github/workflows/ci.yml, in the same order,
+# so a green run on this machine means what a green run on a runner
+# means; and when it does, `gh signoff` posts that green to the commit,
+# which is what branch protection reads. The pattern is strata's bin/ci.
+#
+#   bin/ci                 run everything and sign off the commit
+#   bin/ci --no-signoff    run everything and say what happened
+#
+# The sources step needs the docker socket for harness/sources/compose.yml.
+# Without it that step fails and nothing is signed off; a sign-off is a
+# claim that all of it passed, so there is no flag to skip a step.
+set -u
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TERM_COLOR=always
+
+signoff=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-signoff) signoff=0 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "bin/ci: unknown argument $arg" >&2; exit 2 ;;
+  esac
+done
+
+names=(); results=(); times=()
+failed=0
+step() {
+  local name=$1; shift
+  printf '\n\033[1m== %s\033[0m\n' "$name"
+  local t0=$SECONDS
+  if "$@"; then results+=(ok); else results+=(FAILED); failed=1; fi
+  names+=("$name"); times+=("$((SECONDS - t0))s")
+}
+
+compose="docker compose -f harness/sources/compose.yml"
+sources() {
+  if ! docker info > /dev/null 2>&1; then
+    echo "the docker socket is not reachable, and the sources step needs it:"
+    # `id -nG` is this process's group set; `id -nG "$USER"` reads the
+    # user's memberships. They differ exactly when the shell was started
+    # before the user was added to the group, which is the common case
+    # and needs no sudo to work around.
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+      echo "  you are in the docker group, so this shell predates being added to it:"
+      echo "  one-off:   echo './bin/ci --no-signoff' | newgrp docker"
+      echo "  for good:  log out and back in"
+    else
+      echo "  one-off:   sudo $compose up -d --wait --wait-timeout 300   (then rerun bin/ci)"
+      echo "  for good:  sudo usermod -aG docker $USER, then log in again"
+    fi
+    return 1
+  fi
+  # The Postgres container copies this pair in as its own user, so the
+  # files have to be readable by someone other than whoever made them.
+  # git records them 644 and carries no other mode, so a key generated
+  # here by openssl stays 600 in the working tree and the container's
+  # init dies on `cp: can't open /tls/server.key: Permission denied`
+  # while CI, which checks out fresh, never sees it. They protect
+  # nothing: see harness/sources/tls/README.md.
+  chmod a+r harness/sources/tls/*.key 2>/dev/null || true
+  local rc=0
+  $compose up -d --wait --wait-timeout 300 || rc=$?
+  if [ $rc -eq 0 ]; then
+    ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PORT=5466 ZSQL_TEST_PG_USER=postgres ZSQL_TEST_PG_DB=postgres ZSQL_TEST_PG_PASSWORD=zsql \
+    ZSQL_TEST_PG_TLS=1 ZSQL_TEST_PG_CA=harness/sources/tls/ca.crt \
+    ZSQL_TEST_CLICKHOUSE_URL=http://localhost:8123 ZSQL_TEST_CLICKHOUSE_USER=default ZSQL_TEST_CLICKHOUSE_PASSWORD=zsql ZSQL_TEST_CLICKHOUSE_DB=default \
+    ZSQL_TEST_MYSQL_HOST=localhost ZSQL_TEST_MYSQL_USER=root ZSQL_TEST_MYSQL_PASSWORD=zsql ZSQL_TEST_MYSQL_DB=zsql \
+    ZSQL_TEST_MSSQL_HOST=localhost ZSQL_TEST_MSSQL_USER=sa ZSQL_TEST_MSSQL_PASSWORD=Zsql-test-1 ZSQL_TEST_MSSQL_DB=master \
+    ZSQL_TEST_TRINO_URL=http://localhost:8080 ZSQL_TEST_TRINO_DB=tpch \
+      sh -c 'cargo test --locked -p zsql-source -- --ignored && cargo test --locked -p zsql-cli --test generate -- --ignored && cargo test --locked -p zsql-cli --test sample -- --ignored' || rc=$?
+  else
+    $compose ps -a
+  fi
+  $compose down -v > /dev/null 2>&1 || true
+  return $rc
+}
+
+step "Format"                 cargo fmt --all --check
+step "Clippy"                 cargo clippy --workspace --all-targets --locked -- -D warnings
+step "Tests"                  cargo test --workspace --locked
+step "Goldens"                cargo run --release --locked -p zsql-devtool -- golden --strict
+step "CLI without defaults"   cargo check --locked -p zsql-cli --no-default-features
+step "Docs without warnings"  env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+step "Deny"                   cargo deny check
+step "Sources"                sources
+
+printf '\n\033[1m== Summary\033[0m\n'
+for i in "${!names[@]}"; do
+  printf '  %-24s %-7s %s\n' "${names[$i]}" "${results[$i]}" "${times[$i]}"
+done
+printf '  %-24s %-7s %s\n' "macOS compile" "remote" "the one step a Linux machine cannot run; CI's macos job keeps it"
+
+if [ $failed -ne 0 ]; then
+  printf '\n\033[31mCI failed. Do not merge or deploy.\033[0m Fix the issues and try again.\n'
+  exit 1
+fi
+if [ $signoff -eq 1 ]; then
+  printf '\n\033[1m== Signoff\033[0m\n'
+  # What ran was the working tree; the sign-off goes on HEAD. They must be
+  # the same thing, or a commit is vouched for by a run of something else.
+  if [ -n "$(git status --porcelain)" ]; then
+    printf '\033[31mThe tree has uncommitted changes, so HEAD is not what just ran. Nothing signed off.\033[0m\n'
+    exit 1
+  fi
+  gh signoff && printf '\033[32mAll systems go. Ready for merge and deploy.\033[0m\n'
+else
+  printf '\n\033[32mAll steps passed.\033[0m Nothing signed off: --no-signoff.\n'
+fi

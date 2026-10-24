@@ -9,8 +9,6 @@ pub struct Builder {
     pub having_clauses: Vec<String>,
     pub order_by: Vec<(String, String)>,
     pub from: Vec<String>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
 }
 
 impl Builder {
@@ -65,12 +63,6 @@ impl Builder {
             q.push_str("\nORDER BY");
             let parts: Vec<String> = self.order_by.iter().map(|(c, d)| format!("\n\t{c} {d}")).collect();
             q.push_str(&parts.join(", "));
-        }
-        if let Some(l) = self.limit {
-            q.push_str(&format!("\nLIMIT {l}"));
-        }
-        if let Some(o) = self.offset {
-            q.push_str(&format!("\nOFFSET {o}"));
         }
         q
     }

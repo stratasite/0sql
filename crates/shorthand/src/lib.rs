@@ -94,11 +94,12 @@ Fields are names or uids, matched without regard to case; add @d or @m when a na
 pub const REPL_COMMANDS: &str = "\
 Commands start with a dot, as in sqlite: .explain <line or {...spec...}>, .explore <line> [? term] (what the query can add),
 .fields [text], .tables, .values <dim>,
-.json {...spec...}, .spec <line> (the spec a line makes), .branch [name], .help, .quit";
+.json {...spec...}, .spec <line> (the spec a line makes), .run <line> (run it here and keep the rows; .run! runs fresh),
+.results (what .run kept), .branch [name], .help, .quit";
 
 /// The repl's `.help`: the forms, then its dot commands.
 pub fn help() -> String {
-    format!("Type comma-separated items; a newline separates items too. Each item is read from its shape.\n{FORMS}\n{REPL_COMMANDS}")
+    format!("{REPL_COMMANDS}\n\n{FORMS}")
 }
 
 #[cfg(test)]
@@ -186,7 +187,7 @@ mod tests {
                 json!({"projections": [{"field": "item category"}, {"field": "orders"}],
                        "segments": [{"name": "Book pairs", "keys": ["customer id"],
                                      "filters": [{"field": "item category", "predicate": "equals", "value": "Books"}],
-                                     "expanding": [{"field": "item category", "alias": "Also bought"}],
+                                     "expanding": [{"field": "item category", "as": "Also bought"}],
                                      "join": "left", "pair_dedupe": "none"}]}),
             ),
         ];

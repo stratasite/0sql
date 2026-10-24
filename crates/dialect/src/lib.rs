@@ -24,6 +24,10 @@ pub enum DialectError {
     Placeholder(String, String),
     #[error("unknown adapter {0}")]
     Unknown(String),
+    #[error("dialect {0} applies a limit by {1}, which is not a way this build knows")]
+    LimitStyle(String, String),
+    #[error("dialect {0} splices its limit into a SELECT, and this statement does not begin with one")]
+    NotASelect(String),
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +61,7 @@ impl Dialect {
 
     /// A copy with per-query overrides applied (the query's `db_settings`).
     /// This dialect with a query's `db_settings` laid over it. Without
-    /// any, the dialect itself: a plan shares the catalogue's copy rather
+    /// any, the dialect itself: a plan shares the catalog's copy rather
     /// than cloning the whole settings map.
     pub fn with_overrides<'a>(
         self: &std::sync::Arc<Self>,
@@ -118,6 +122,25 @@ impl Dialect {
 
     pub fn cast(&self, exp: &str, ty: &str) -> Result<String, DialectError> {
         self.render("cast", &[("exp", exp), ("type", ty)])
+    }
+
+    /// Applies a row limit to the statement that begins at `at` in `sql`.
+    /// Anything before `at` is left alone, so the common table expressions
+    /// a plan is wrapped in keep their own shape and only the statement
+    /// they feed takes the limit. `n` is interpolated as given.
+    pub fn apply_limit(&self, sql: &str, at: usize, n: &str) -> Result<String, DialectError> {
+        let clause = self.render("limit_clause", &[("n", n)])?;
+        match self.str("limit_style")? {
+            // Its own clause at the end, which is every dialect but one.
+            "suffix" => Ok(format!("{sql}\n{clause}")),
+            // Inside the SELECT, for SQL Server. The planner never emits
+            // DISTINCT, so the keyword is the whole prefix to step over.
+            "top" => match sql.get(at..).and_then(|s| s.strip_prefix("SELECT")) {
+                Some(rest) => Ok(format!("{}SELECT {clause}{rest}", &sql[..at])),
+                None => Err(DialectError::NotASelect(self.name.clone())),
+            },
+            other => Err(DialectError::LimitStyle(self.name.clone(), other.to_string())),
+        }
     }
 
     pub fn cross_join(&self, relation: &str) -> Result<String, DialectError> {
@@ -471,7 +494,7 @@ mod tests {
 
     /// Every built-in dialect quotes a literal so that a quote inside it
     /// cannot end it, and quotes an identifier to something other than
-    /// the bare word; a query's `db_settings` lay over the catalogue's
+    /// the bare word; a query's `db_settings` lay over the catalog's
     /// copy without touching it.
     #[test]
     fn every_builtin_dialect_quotes_and_overlays() {
@@ -488,10 +511,10 @@ mod tests {
         }
         let pg = dialects.get("postgres").unwrap();
         let same = pg.with_overrides(std::iter::empty());
-        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalogue's copy");
+        assert!(std::sync::Arc::ptr_eq(&pg, &same), "no overrides shares the catalog's copy");
         let over = pg.with_overrides([("final_pass_measure_join_type", &serde_json::json!("inner"))]);
         assert_eq!(over.final_pass_measure_join_type(), "inner");
-        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalogue's copy is untouched");
+        assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalog's copy is untouched");
     }
 
     #[test]
@@ -509,5 +532,57 @@ mod tests {
     #[test]
     fn literal_at_survives() {
         assert_eq!(render_template("a @ b", &[]).unwrap(), "a @ b");
+    }
+
+    /// Every adapter takes a row limit, and the one with no LIMIT takes it
+    /// in the SELECT. A dialect that answered neither way would be a
+    /// statement nothing could run, so this walks all of them.
+    #[test]
+    fn every_dialect_applies_a_row_limit() {
+        let dialects = Dialects::builtin();
+        let stmt = "SELECT\n\tx\nFROM t";
+        for name in dialects.names().unwrap() {
+            let d = dialects.get(&name).unwrap();
+            let got = d.apply_limit(stmt, 0, "25").unwrap_or_else(|e| panic!("{name}: {e}"));
+            match d.str("limit_style").unwrap() {
+                "top" => assert_eq!(got, "SELECT TOP (25)\n\tx\nFROM t", "{name}"),
+                _ => assert_eq!(got, "SELECT\n\tx\nFROM t\nLIMIT 25", "{name}"),
+            }
+        }
+    }
+
+    /// SQL Server has no LIMIT, so the count goes in the SELECT.
+    #[test]
+    fn sqlserver_takes_top_and_not_a_suffix() {
+        let d = Dialects::builtin().get("sqlserver").unwrap();
+        let got = d.apply_limit("SELECT\n\tx\nFROM t", 0, "25").unwrap();
+        assert_eq!(got, "SELECT TOP (25)\n\tx\nFROM t");
+        assert!(!got.to_uppercase().contains("LIMIT"), "LIMIT would not parse on SQL Server");
+    }
+
+    /// The limit belongs to the statement the plan ends with, never to a
+    /// common table expression in front of it, which is what the offset is
+    /// for. Spliced into the wrong SELECT, a limit would silently change
+    /// which rows an aggregate saw.
+    #[test]
+    fn the_limit_lands_past_the_common_table_expressions() {
+        let sql = "WITH a AS (\nSELECT\n\ty\nFROM u\n)\nSELECT\n\tx\nFROM a";
+        let root_at = sql.rfind("SELECT").unwrap();
+
+        let tsql = Dialects::builtin().get("sqlserver").unwrap().apply_limit(sql, root_at, "25").unwrap();
+        assert!(tsql.starts_with("WITH a AS (\nSELECT\n\ty"), "the CTE keeps its own shape:\n{tsql}");
+        assert!(tsql.ends_with("\nSELECT TOP (25)\n\tx\nFROM a"), "the root statement takes it:\n{tsql}");
+        assert_eq!(tsql.matches("TOP (25)").count(), 1, "exactly one limit:\n{tsql}");
+
+        let pg = Dialects::builtin().get("postgres").unwrap().apply_limit(sql, root_at, "25").unwrap();
+        assert_eq!(pg, format!("{sql}\nLIMIT 25"), "a suffix dialect ignores the offset");
+    }
+
+    /// A statement the splice cannot land in is named, not mangled.
+    #[test]
+    fn a_top_dialect_refuses_what_is_not_a_select() {
+        let d = Dialects::builtin().get("sqlserver").unwrap();
+        let e = d.apply_limit("INSERT INTO t VALUES (1)", 0, "25").unwrap_err();
+        assert!(matches!(e, DialectError::NotASelect(_)), "{e}");
     }
 }

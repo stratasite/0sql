@@ -182,6 +182,30 @@ impl Universe {
         self.tables_by_uid.get(&uid.trim().to_lowercase()).map(|&i| &self.snap.tables[i])
     }
 
+    /// The tables a term could name: its uid exactly, else every table
+    /// whose name or uid squashes to the same letters and digits, so a
+    /// hint can be written `Web Sales`, `web_sales` or `web-sales`.
+    /// Several means the term is ambiguous, which the caller must say
+    /// rather than resolve.
+    pub fn tables_by_uid_or_name(&self, term: &str) -> Vec<&Table> {
+        if let Some(t) = self.table_by_uid(term) {
+            return vec![t];
+        }
+        let want = squash(term);
+        if want.is_empty() {
+            return Vec::new();
+        }
+        self.snap.tables.iter().filter(|t| squash(&t.name) == want || squash(&t.uid) == want).collect()
+    }
+
+    /// The one table a term names, when it names exactly one.
+    pub fn table_by_uid_or_name(&self, term: &str) -> Option<&Table> {
+        match self.tables_by_uid_or_name(term).as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
     pub fn field(&self, id: Id) -> Option<&Field> {
         self.fields_by_id.get(&id).map(|&i| &self.snap.fields[i])
     }
@@ -250,4 +274,10 @@ impl Universe {
     pub fn policies(&self) -> &[SecurityPolicy] {
         &self.snap.security_policies
     }
+}
+
+/// A name reduced to its letters and digits, lowercased: `Fact Transactions`,
+/// `fact-transactions` and `fact_transactions` all squash to the same thing.
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }

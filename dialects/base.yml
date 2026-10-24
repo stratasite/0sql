@@ -70,6 +70,12 @@ array_unnest_join: "CROSS JOIN UNNEST(@exp) @alias"
 # joins
 cross_join: "CROSS JOIN @relation"
 
+# How a caller's row limit reaches a finished statement. "suffix" appends
+# limit_clause as its own clause; "top" splices it into the SELECT, for a
+# dialect with no LIMIT of its own. @n is the row count.
+limit_style: "suffix"
+limit_clause: "LIMIT @n"
+
 # sql output behavior
 temp_table_type: "cte" # options cte, subquery, temp
 temp_table_prefix: ""

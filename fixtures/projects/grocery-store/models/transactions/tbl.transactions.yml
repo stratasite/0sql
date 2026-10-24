@@ -12,7 +12,6 @@ fields:
     name: Basket ID
     description: Basket / trip identifier grouping line items purchased together
     data_type: bigint
-    disable_listing: true
     expression:
       sql: BASKET_ID
 

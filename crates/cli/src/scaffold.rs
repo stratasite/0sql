@@ -3,42 +3,10 @@
 
 use crate::{config, templates};
 use anyhow::{bail, Result};
-use clap::Subcommand;
 use config::Project;
 use std::path::{Path, PathBuf};
 
-#[derive(Subcommand)]
-pub enum NewCommand {
-    /// `models/<domain>/tbl.<name>.yml`
-    Table {
-        name: String,
-        #[arg(long)]
-        datasource: String,
-        #[arg(long)]
-        physical_name: Option<String>,
-        #[arg(long, default_value = "core")]
-        domain: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-    /// `models/<domain>/rel.<domain>.yml`
-    Relation {
-        #[arg(long)]
-        datasource: String,
-        #[arg(long, default_value = "core")]
-        domain: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-    /// `tests/<name>.yml`
-    Test {
-        name: String,
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-}
-
-pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> Result<()> {
+pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>, no_git: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
     if dir.join("project.yml").exists() {
@@ -64,6 +32,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
     write("project.yml", &templates::project_yml(&name, &uid))?;
     write("datasources.yml", templates::DATASOURCES_YML)?;
     write("security.yml", templates::SECURITY_YML)?;
+    write("AGENTS.md", templates::AGENTS_MD)?;
     write("models/.keep", "")?;
     write("tests/.keep", "")?;
     let gi = dir.join(".gitignore");
@@ -75,7 +44,7 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
         )?;
         println!("update .gitignore");
     }
-    if !dir.join(".git").exists() {
+    if !no_git && !dir.join(".git").exists() {
         // Deploying reads the checked-out branch, so an uncommitted
         // project cannot be deployed. Say so here, where it is a step on
         // a list, rather than at the deploy that fails; and say when git
@@ -86,32 +55,17 @@ pub fn init(dir: Option<PathBuf>, name: Option<String>, uid: Option<String>) -> 
             Err(_) => println!("git is not installed; a deploy needs the project in a git repository"),
         }
     }
-    println!("\nnext: describe your warehouses in datasources.yml, `zsql new table ...`, `zsql sql --expr ...`; then `git commit`, `zsql auth --api-key ...`, `zsql deploy`");
+    eprintln!("\nnext: zsql datasource add, or edit datasources.yml; then zsql catalog read --schema <name>, zsql generate, zsql check");
     Ok(())
 }
 
-pub fn new_file(what: NewCommand) -> Result<()> {
-    let (project_dir, rel, text) = match what {
-        NewCommand::Table { name, datasource, physical_name, domain, project } => {
-            let p = project_of(project)?;
-            let file = zsql_project::parameterize(&name).replace('-', "_");
-            (
-                p.dir,
-                format!("models/{domain}/tbl.{file}.yml"),
-                templates::table_yml(&name, physical_name.as_deref().unwrap_or(&file), &datasource),
-            )
-        }
-        NewCommand::Relation { datasource, domain, project } => {
-            let p = project_of(project)?;
-            (p.dir, format!("models/{domain}/rel.{domain}.yml"), templates::relation_yml(&datasource))
-        }
-        NewCommand::Test { name, project } => {
-            let p = project_of(project)?;
-            let file = zsql_project::parameterize(&name).replace('-', "_");
-            (p.dir, format!("tests/{file}.yml"), templates::test_yml(&name))
-        }
-    };
-    let path = project_dir.join(&rel);
+fn write_new(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
+    write_or_say(project_dir, rel, text, false)
+}
+
+/// The same, with the answer left to the caller.
+fn write_quietly(project_dir: &Path, rel: &str, text: &str) -> Result<()> {
+    let path = project_dir.join(rel);
     if path.exists() {
         bail!("{} exists", path.display());
     }
@@ -119,7 +73,66 @@ pub fn new_file(what: NewCommand) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, text)?;
+    Ok(())
+}
+
+/// The same, or what it would have written when `dry_run` is set.
+fn write_or_say(project_dir: &Path, rel: &str, text: &str, dry_run: bool) -> Result<()> {
+    let path = project_dir.join(rel);
+    if path.exists() {
+        bail!("{} exists", path.display());
+    }
+    if dry_run {
+        println!("would create {rel}");
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, text)?;
     println!("create {rel}");
+    Ok(())
+}
+
+/// `zsql generate NAME --empty table`: a table model from the template,
+/// with no catalog behind it.
+pub fn empty_table(
+    project_dir: Option<&Path>,
+    name: &str,
+    datasource: &str,
+    physical_name: Option<&str>,
+    domain: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let p = project_of(project_dir.map(Path::to_path_buf))?;
+    let domain = domain.unwrap_or("core");
+    let file = zsql_project::parameterize(name).replace('-', "_");
+    let physical = physical_name.unwrap_or(name);
+    write_or_say(&p.dir, &format!("models/{domain}/tbl.{file}.yml"), &templates::table_yml(name, physical, datasource), dry_run)?;
+    if !dry_run {
+        eprintln!("next: name its fields, then zsql check");
+    }
+    Ok(())
+}
+
+/// `zsql test --new NAME`: a test from the template, projecting the
+/// model's own first dimension and measure when it loads, so the test
+/// runs as written; placeholders otherwise.
+pub fn new_test(project_dir: Option<&Path>, name: &str, json: bool) -> Result<()> {
+    let p = project_of(project_dir.map(Path::to_path_buf))?;
+    let file = zsql_project::parameterize(name).replace('-', "_");
+    let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
+        let s = m.universe().snapshot();
+        let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
+        (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))
+    });
+    let rel = format!("tests/{file}.yml");
+    if json {
+        write_quietly(&p.dir, &rel, &templates::test_yml(name, fields))?;
+        return crate::show::print_json(&serde_json::json!({ "created": rel }));
+    }
+    write_new(&p.dir, &rel, &templates::test_yml(name, fields))?;
+    eprintln!("next: zsql test");
     Ok(())
 }
 

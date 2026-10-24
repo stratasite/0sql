@@ -59,6 +59,17 @@ pub trait Side {
     /// What `check` answers with: the summary, the test results.
     fn check(&mut self) -> Result<Value>;
     fn test(&mut self) -> Result<Value>;
+    /// `.run`: the query run on its datasource and its rows kept, which
+    /// only this machine can do, holding the credentials.
+    fn run(&mut self, _query: &Query, _context: Option<&Value>, _fresh: bool) -> Result<()> {
+        anyhow::bail!(
+            "runs here only: the credentials are on this machine, and the server holds none. Open the repl without -r to run queries."
+        )
+    }
+    /// `.results`: what `.run` kept.
+    fn results(&mut self) -> Result<()> {
+        anyhow::bail!("results are kept here only; open the repl without -r to list them")
+    }
 }
 
 // ------------------------------------------------------------------ remote
@@ -258,6 +269,14 @@ impl Side for Session {
 
     fn sql(&mut self, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
         local::sql(&self.model, query, context, explain)
+    }
+
+    fn run(&mut self, query: &Query, context: Option<&Value>, fresh: bool) -> Result<()> {
+        crate::run::run(&self.local.project, &self.model, query, context, crate::run::Options { fresh, ..Default::default() })
+    }
+
+    fn results(&mut self) -> Result<()> {
+        crate::run::results(&self.local.project, crate::run::ResultsCommand::List { json: false })
     }
 
     fn check(&mut self) -> Result<Value> {

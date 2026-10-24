@@ -912,7 +912,7 @@ async fn mcp_takes_a_key_and_nothing_else() {
 
     // No key: the handshake is answered, so a hosted client can see the
     // server is here before its user's key is applied, but it carries no
-    // catalogue, and the first tool call is a 401 with the challenge.
+    // catalog, and the first tool call is a 401 with the challenge.
     let a = s.mcp(None, &[], init.clone()).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     let text = a.body["result"]["instructions"].as_str().unwrap();
@@ -1289,10 +1289,10 @@ async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision()
 }
 
 /// What a client is told on connect and by a bare fields call: the
-/// catalogue of exactly the branches the key may read, with uids; and a
+/// catalog of exactly the branches the key may read, with uids; and a
 /// refused field name comes back with the fields nearest it.
 #[tokio::test]
-async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() {
+async fn the_catalog_follows_the_key_and_a_refusal_names_the_nearest_fields() {
     let s = server();
     let ann = s.signup("acme", "ann@acme.test", "annpassword1").await;
     let a = s.deploy(CS, "main", &ann, archive(CS, "acme")).await;
@@ -1302,7 +1302,7 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
     let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
 
     // A key with no grants is told so; a key granted one project gets
-    // that project's catalogue and not the other's.
+    // that project's catalog and not the other's.
     let (qk, secret) = s.query_key(&ann).await;
     let a = s.mcp(Some(&secret), &[], init.clone()).await;
     let text = a.body["result"]["instructions"].as_str().unwrap();
@@ -1320,12 +1320,12 @@ async fn the_catalogue_follows_the_key_and_a_refusal_names_the_nearest_fields() 
     let text = a.body["result"]["instructions"].as_str().unwrap();
     assert!(text.contains("## Project billing, branch main") && text.contains("## Project customer-service, branch main"), "{text}");
 
-    // fields with no q is the same catalogue as text; with q it is the search.
+    // fields with no q is the same catalog as text; with q it is the search.
     let a = s.tool(Some(&secret), "fields", json!({ "project": CS })).await;
     let r = &a.body["result"];
     assert!(r["isError"].is_null(), "{r}");
     assert!(r["content"][0]["text"].as_str().unwrap().starts_with("## Project customer-service, branch main"), "{r}");
-    assert!(r["structuredContent"]["catalogue"].is_string());
+    assert!(r["structuredContent"]["catalog"].is_string());
     let a = s.tool(Some(&secret), "fields", json!({ "project": CS, "q": "revenue" })).await;
     assert_eq!(a.body["result"]["structuredContent"]["fields"][0]["uid"], "revenue", "{}", a.body);
 
