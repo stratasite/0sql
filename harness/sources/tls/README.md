@@ -22,3 +22,11 @@ self-signed certificate will not do: a verifier rightly refuses a
 
 Both keys are committed on purpose and protect nothing: they are for a
 throwaway container on loopback and nothing else.
+
+Which is why they must stay readable by everyone. The Postgres container
+copies the pair in as its own user before it will serve TLS, and git
+records only the executable bit, so a key regenerated here with openssl
+keeps the 600 it was born with and the container's init dies on
+`cp: can't open '/tls/server.key': Permission denied`. A fresh checkout
+never shows it, because git writes 644. After regenerating, run
+`chmod 644 *.key`; `bin/ci` does it for you before it starts the stack.

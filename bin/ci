@@ -39,10 +39,28 @@ compose="docker compose -f harness/sources/compose.yml"
 sources() {
   if ! docker info > /dev/null 2>&1; then
     echo "the docker socket is not reachable, and the sources step needs it:"
-    echo "  one-off:   sudo $compose up -d --wait --wait-timeout 300   (then rerun bin/ci)"
-    echo "  for good:  sudo usermod -aG docker $USER, then log in again"
+    # `id -nG` is this process's group set; `id -nG "$USER"` reads the
+    # user's memberships. They differ exactly when the shell was started
+    # before the user was added to the group, which is the common case
+    # and needs no sudo to work around.
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+      echo "  you are in the docker group, so this shell predates being added to it:"
+      echo "  one-off:   echo './bin/ci --no-signoff' | newgrp docker"
+      echo "  for good:  log out and back in"
+    else
+      echo "  one-off:   sudo $compose up -d --wait --wait-timeout 300   (then rerun bin/ci)"
+      echo "  for good:  sudo usermod -aG docker $USER, then log in again"
+    fi
     return 1
   fi
+  # The Postgres container copies this pair in as its own user, so the
+  # files have to be readable by someone other than whoever made them.
+  # git records them 644 and carries no other mode, so a key generated
+  # here by openssl stays 600 in the working tree and the container's
+  # init dies on `cp: can't open /tls/server.key: Permission denied`
+  # while CI, which checks out fresh, never sees it. They protect
+  # nothing: see harness/sources/tls/README.md.
+  chmod a+r harness/sources/tls/*.key 2>/dev/null || true
   local rc=0
   $compose up -d --wait --wait-timeout 300 || rc=$?
   if [ $rc -eq 0 ]; then
