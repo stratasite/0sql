@@ -255,6 +255,9 @@ enum Command {
         /// A named table the catalog lacks is read from the warehouse first and added to the catalog.
         #[arg(long)]
         live: bool,
+        /// Draft a table that already has a model again, replacing the file and whatever was edited into it. Asked for on a terminal when the table is named.
+        #[arg(long)]
+        overwrite: bool,
         /// An empty model file for the table named, from the template and no catalog: `zsql generate orders --empty`, or `help/sessions` to say the directory too.
         #[arg(long)]
         empty: bool,
@@ -823,7 +826,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             };
             scaffold::empty_table(dir, name, &uid, physical_name.as_deref(), domain.as_deref(), dry_run)
         }
-        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, dry_run, dir: into, .. } => {
+        Command::Generate { tables, datasource, schema, all, columns, new_columns, live, overwrite, dry_run, dir: into, .. } => {
             // `generate coupons/ orders` names the directory and a table.
             let (slashed, tables): (Vec<String>, Vec<String>) = tables.into_iter().partition(|t| t.ends_with('/'));
             let into = into.or_else(|| slashed.first().map(|d| d.trim_end_matches('/').to_string()));
@@ -841,6 +844,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
                     columns: &columns,
                     new_columns,
                     live,
+                    overwrite,
                     dry_run,
                 },
             )

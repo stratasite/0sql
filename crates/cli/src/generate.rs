@@ -25,6 +25,8 @@ pub struct Options<'a> {
     pub new_columns: bool,
     /// A named table the catalog lacks is read from the warehouse first.
     pub live: bool,
+    /// Draft a table that already has a model again, replacing the file.
+    pub overwrite: bool,
     pub dry_run: bool,
 }
 
@@ -70,20 +72,44 @@ pub(crate) enum Mapped {
     /// Text-shaped but not text: a uuid, a json document, an enum. A
     /// string, and said so on the line.
     Text,
-    /// Nothing 0sql has a type for: an array, an interval, a geometry.
+    /// Nothing 0sql has a type for: an interval, a geometry.
     Skip,
 }
 
-/// The warehouse's spelling, lower-cased, parameters and ClickHouse's
-/// wrappers stripped: `character varying(80)` is `character varying`,
-/// `Nullable(LowCardinality(String))` is `string`.
+/// The warehouse's spelling, lower-cased, parameters and the wrappers
+/// that say nothing about the type stripped: `character varying(80)` is
+/// `character varying`, `Nullable(LowCardinality(String))` is `string`.
+///
+/// An array is reported as its element and a flag, because that is what
+/// the model declares: the field takes the element's type and marks the
+/// expression `array`. Every spelling means the same thing, so
+/// `varchar[]`, `array(varchar)`, `ARRAY<STRING>` and `Array(String)`
+/// all come back as a string. Snowflake's bare `ARRAY` says only that it
+/// is one, and is read as text.
 fn normalize(data_type: &str) -> (String, bool) {
     let mut t = data_type.trim().to_lowercase();
-    let mut array = t.ends_with("[]") || t.starts_with("array(") || t.starts_with("array<");
-    for wrapper in ["nullable(", "lowcardinality("] {
-        while let Some(rest) = t.strip_prefix(wrapper) {
-            t = rest.trim_end_matches(')').to_string();
+    let mut array = false;
+    loop {
+        let before = t.clone();
+        for wrapper in ["nullable(", "lowcardinality("] {
+            if let Some(rest) = t.strip_prefix(wrapper) {
+                t = rest.trim_end_matches(')').trim().to_string();
+            }
         }
+        if let Some(rest) = t.strip_prefix("array(").or_else(|| t.strip_prefix("array<")) {
+            t = rest.trim_end_matches([')', '>']).trim().to_string();
+            array = true;
+        }
+        if let Some(rest) = t.strip_suffix("[]") {
+            t = rest.trim().to_string();
+            array = true;
+        }
+        if t == before {
+            break;
+        }
+    }
+    if t == "array" {
+        array = true;
     }
     if let Some(i) = t.find('(') {
         t.truncate(i);
@@ -91,20 +117,24 @@ fn normalize(data_type: &str) -> (String, bool) {
     if let Some(i) = t.find('<') {
         t.truncate(i);
     }
-    t = t.trim().trim_end_matches("[]").to_string();
-    if t == "array" {
-        array = true;
-    }
-    (t, array)
+    (t.trim().to_string(), array)
+}
+
+/// Whether the warehouse's type is an array. 0sql has no array type and
+/// needs none: the field declares its element's type and the expression
+/// says `array: true`, which is what the planner reads to filter it with
+/// the dialect's own array operators rather than `IN`.
+pub(crate) fn is_array(data_type: &str) -> bool {
+    normalize(data_type).1
 }
 
 pub(crate) fn map_type(data_type: &str) -> Mapped {
-    let (t, array) = normalize(data_type);
-    if array {
-        return Mapped::Skip;
-    }
+    let (t, _) = normalize(data_type);
     use Mapped::*;
     match t.as_str() {
+        // A bare ARRAY, which is all Snowflake says: its elements are
+        // variants, so the nearest thing 0sql has is a string.
+        "array" => Text,
         "char" | "character" | "varchar" | "character varying" | "text" | "nvarchar" | "nchar" | "ntext" | "string" | "name" | "citext"
         | "bpchar" | "tinytext" | "mediumtext" | "longtext" | "clob" | "varchar2" | "fixedstring" => Known("string"),
         "uuid" | "uniqueidentifier" | "json" | "jsonb" | "xml" | "enum" | "enum8" | "enum16" | "set" | "inet" | "cidr" | "macaddr"
@@ -377,8 +407,14 @@ fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared, sai
         None => mapped,
     };
     let data_type = data_type.as_str();
+    // An array of numbers is not a number: nothing aggregates it, and the
+    // model's own type is its element's, so it can only be a dimension.
+    let array = is_array(&column.data_type);
+    if array {
+        note = format!("{note}; an array, so the field takes its element's type");
+    }
     let numeric = matches!(data_type, "integer" | "bigint" | "decimal");
-    let measure = numeric && looks_additive(column, table);
+    let measure = numeric && !array && looks_additive(column, table);
     let mut out = String::new();
     if measure {
         out.push_str(&noted("  - type: measure", &format!("inferred: \"{}\" looks additive; make it a dimension if not", column.name)));
@@ -403,7 +439,7 @@ fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared, sai
         said.described.insert(key.clone());
     }
     out.push_str(&noted(format!("    data_type: {data_type}"), &note));
-    if data_type == "string" && !measure && !said.sampling.contains(&key) {
+    if data_type == "string" && !measure && !array && !said.sampling.contains(&key) {
         if let Some(n) = column.max_length.filter(|n| (1..=255).contains(n)) {
             said.sampling.insert(key.clone());
             let key = table.primary_key.iter().any(|k| k.eq_ignore_ascii_case(&column.name))
@@ -429,6 +465,9 @@ fn field(column: &Column, table: &Table, lists: &Lists, declared: &Declared, sai
         out.push_str(&format!("      sql: sum({sql})\n"));
     } else {
         out.push_str(&format!("      sql: {}\n", yaml(&sql)));
+        if array {
+            out.push_str("      array: true\n");
+        }
         if table.primary_key.len() == 1 && table.primary_key[0].eq_ignore_ascii_case(&column.name) {
             out.push_str("      primary_key: true\n");
         }
@@ -926,6 +965,43 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
                         } else if map_type(&c.data_type) == Mapped::Skip {
                             asked_untyped.insert(want.to_lowercase(), c.data_type.clone());
                         }
+                    }
+                    // A model is the author's once written, so this never
+                    // replaces one without being told to. Asked for by name
+                    // on a terminal, offer it; `--overwrite` says yes in
+                    // advance, which is the only way to mean it for a whole
+                    // --all run or with no terminal to ask at.
+                    let named = !opts.tables.is_empty();
+                    let replace = opts.overwrite
+                        || (named
+                            && tty::interactive()
+                            && tty::confirm(
+                                &format!("{} already models {}. Draft it again, losing what is in it?", rel(&e.path), t.physical_name()),
+                                "--overwrite",
+                            )?);
+                    if replace {
+                        let d = table_yml(&cat, t, &today, &lists, &declared, &models, &mut said);
+                        let summary = format!(
+                            "{} field{}, {} measure{}",
+                            d.fields,
+                            if d.fields == 1 { "" } else { "s" },
+                            d.measures,
+                            if d.measures == 1 { "" } else { "s" }
+                        );
+                        if opts.dry_run {
+                            println!("would redraft {} ({summary})", rel(&e.path));
+                        } else {
+                            std::fs::write(&e.path, d.text)?;
+                            created += 1;
+                            println!("redrafted {} ({summary})", rel(&e.path));
+                        }
+                        for want in opts.columns {
+                            if t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(want)) {
+                                asked_seen.insert(want.to_lowercase());
+                                asked_added.insert(want.to_lowercase());
+                            }
+                        }
+                        continue;
                     }
                     let absent: Vec<&Column> = t.columns.iter().filter(|c| !e.columns.contains(&c.name.to_lowercase())).collect();
                     let (new, untyped): (Vec<&Column>, Vec<&Column>) =
@@ -1610,11 +1686,33 @@ mod tests {
         assert_eq!(map_type("uuid"), Mapped::Text);
         assert_eq!(map_type("jsonb"), Mapped::Text);
         assert_eq!(map_type("Enum8('a' = 1)"), Mapped::Text);
-        assert_eq!(map_type("text[]"), Mapped::Skip);
-        assert_eq!(map_type("Array(String)"), Mapped::Skip);
         assert_eq!(map_type("interval"), Mapped::Skip);
         assert_eq!(map_type("time"), Mapped::Skip);
         assert_eq!(map_type("geometry"), Mapped::Skip);
+    }
+
+    /// 0sql has no array type and needs none: a field takes its element's
+    /// type and marks the expression `array`, which is what the planner
+    /// reads to filter it with the dialect's array operators. So every
+    /// warehouse's spelling has to come back as the element.
+    #[test]
+    fn an_array_is_its_element_and_a_flag() {
+        for spelling in ["text[]", "character varying(80)[]", "Array(String)", "array(varchar)", "ARRAY<STRING>", "Array(Nullable(String))"]
+        {
+            assert_eq!(map_type(spelling), Mapped::Known("string"), "{spelling}");
+            assert!(is_array(spelling), "{spelling}");
+        }
+        assert_eq!(map_type("integer[]"), Mapped::Known("integer"));
+        assert_eq!(map_type("array(decimal(10,2))"), Mapped::Known("decimal"));
+        // Snowflake says only that it is an array; its elements are variants.
+        assert_eq!(map_type("ARRAY"), Mapped::Text);
+        assert!(is_array("ARRAY"));
+        // An array of something with no 0sql type is still no type.
+        assert_eq!(map_type("geometry[]"), Mapped::Skip);
+        // And the ordinary types are not arrays.
+        for plain in ["text", "numeric(12,2)", "Nullable(LowCardinality(String))", "timestamp without time zone"] {
+            assert!(!is_array(plain), "{plain}");
+        }
     }
 
     #[test]

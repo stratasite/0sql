@@ -38,9 +38,9 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     db.execute_batch(
         "CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL, notes TEXT);\
          CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), \
-           placed DATE NOT NULL, total NUMERIC(12,2) NOT NULL, tags TEXT[]);\
+           placed DATE NOT NULL, total NUMERIC(12,2) NOT NULL, tags TEXT[], shape GEOMETRY);\
          INSERT INTO customers VALUES (1, 'Ann', NULL), (2, 'Bo', 'vip');\
-         INSERT INTO orders VALUES (1, 1, '2026-03-01', 10.5, NULL), (2, 2, '2026-03-02', 4.25, NULL);",
+         INSERT INTO orders VALUES (1, 1, '2026-03-01', 10.5, NULL, NULL), (2, 2, '2026-03-02', 4.25, NULL, NULL);",
     )
     .unwrap();
 
@@ -51,11 +51,15 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     assert!(ok, "{out}");
     assert!(out.contains("created models/local/tbl.customers.yml") && out.contains("created models/local/tbl.orders.yml"), "{out}");
     assert!(out.contains("created models/local/rel.local.yml"), "{out}");
-    assert!(out.contains("skipped tags: TEXT[] has no 0sql type"), "an untyped column is named, not dropped silently: {out}");
+    assert!(out.contains("skipped shape: GEOMETRY has no 0sql type"), "an untyped column is named, not dropped silently: {out}");
+    // An array is a type it does understand: the element's, with the flag
+    // the planner reads to filter it with the dialect's array operators.
+    assert!(!out.contains("skipped tags"), "an array is not untyped: {out}");
 
     let orders = std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap();
     assert!(orders.contains("physical_name: orders"));
     assert!(orders.contains("type: measure") && orders.contains("sql: sum(total)"), "total looks additive:\n{orders}");
+    assert!(orders.contains("name: Tags") && orders.contains("array: true"), "the array column is a field:\n{orders}");
     assert!(orders.contains("primary_key: true"), "the key is marked:\n{orders}");
     assert!(orders.contains("# inferred"), "guesses are marked on their lines:\n{orders}");
     assert!(orders.lines().filter(|l| l.contains("name: Customer Id")).count() == 1, "a key column stays a dimension:\n{orders}");
@@ -77,7 +81,7 @@ fn a_sqlite_warehouse_becomes_a_model_the_planner_can_query() {
     let before = orders.clone();
     let (ok, out) = run(zsql(&home, &project).args(["generate", "--all"]));
     assert!(ok && out.contains("nothing to do"), "{out}");
-    assert!(out.contains("no 0sql type, so not a field: tags"), "{out}");
+    assert!(out.contains("no 0sql type, so not a field: shape"), "{out}");
     assert_eq!(std::fs::read_to_string(project.join("models/local/tbl.orders.yml")).unwrap(), before, "never rewritten");
 
     // The warehouse grows two columns: listed with the command to add them.
@@ -611,5 +615,98 @@ fn an_empty_scaffold_needs_no_warehouse_and_honours_dry_run() {
     assert!(!ok, "a broken file is reported, not worked around: {out}");
     assert!(out.contains("datasources.yml"), "{out}");
     assert!(!project.join("models/core/tbl.gadgets.yml").exists(), "and nothing is written: {out}");
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
+/// 0sql has no array type and needs none: the field takes its element's
+/// type and the expression says `array: true`, which is what the planner
+/// reads to filter it with the dialect's own array operators. Generate
+/// used to skip an array column outright, saying 0sql had no type for it.
+#[test]
+fn an_array_column_becomes_a_field_with_its_element_type() {
+    let (home, project) = scratch("arrays");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE events (id BIGINT, tags VARCHAR[], scores INTEGER[], note VARCHAR, amount DOUBLE);\
+         INSERT INTO events VALUES (1, ['a','b'], [1,2], 'x', 1.5);",
+    )
+    .unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "events"]));
+    assert!(ok, "{out}");
+    assert!(!out.contains("no 0sql type"), "an array is a type it has: {out}");
+    let text = std::fs::read_to_string(project.join("models/main/tbl.events.yml")).unwrap();
+
+    // The element's type, and the flag that says it is many of them.
+    let field = |name: &str| {
+        let at = text.find(&format!("name: {name}\n")).unwrap_or_else(|| panic!("{name} is a field:\n{text}"));
+        let end = text[at..].find("\n  - type:").map(|e| at + e).unwrap_or(text.len());
+        text[at..end].to_string()
+    };
+    let tags = field("Tags");
+    assert!(tags.contains("data_type: string"), "a varchar array is a string:\n{tags}");
+    assert!(tags.contains("array: true"), "and says it is an array:\n{tags}");
+    let scores = field("Scores");
+    assert!(scores.contains("data_type: integer"), "an integer array is an integer:\n{scores}");
+    assert!(scores.contains("array: true"), "{scores}");
+    // An array of numbers aggregates to nothing, so it cannot be a measure.
+    assert!(scores.starts_with("name: Scores"), "{scores}");
+    assert!(!text.contains("sql: sum(scores)"), "an array is never summed:\n{text}");
+    // The plain columns are untouched: amount is still a measure.
+    assert!(text.contains("sql: sum(amount)"), "{text}");
+    assert!(!field("Note").contains("array: true"), "a plain varchar is not an array");
+
+    // Which is the point: it loads, and the planner can read it.
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("1 tables"), "{out}");
+    let (ok, out) = run(zsql(&home, &project).args(["sql", "tags, amount"]));
+    assert!(ok && out.contains("tags"), "a query over the array field:\n{out}");
+    let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
+/// A model is the author's once written, so generate never replaces one
+/// without being told to. `--overwrite` tells it; on a terminal it offers,
+/// for a table named on the command line. With no terminal and no flag the
+/// answer is what it always was, so nothing an agent runs can lose a file.
+#[test]
+fn a_model_is_only_redrafted_when_asked() {
+    let (home, project) = scratch("overwrite");
+    assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop", "--no-git"])).0);
+    std::fs::write(project.join("datasources.yml"), "wh:\n  adapter: duckdb\n  tier: hot\n  file: ./shop.duckdb\n").unwrap();
+    let db = duckdb::Connection::open(project.join("shop.duckdb")).unwrap();
+    db.execute_batch("CREATE TABLE orders (id BIGINT, note VARCHAR, total DOUBLE);").unwrap();
+    drop(db);
+    assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+    assert!(run(zsql(&home, &project).args(["generate", "orders"])).0);
+
+    // The author makes it theirs.
+    let model = project.join("models/main/tbl.orders.yml");
+    let mine = format!("{}\n# a line only I would write\n", std::fs::read_to_string(&model).unwrap());
+    std::fs::write(&model, &mine).unwrap();
+
+    // No terminal and no flag: exactly what it did before, file untouched.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders"]));
+    assert!(ok && out.contains("nothing to do"), "{out}");
+    assert_eq!(std::fs::read_to_string(&model).unwrap(), mine, "the file is not touched");
+    let (ok, out) = run(zsql(&home, &project).args(["--agent", "generate", "orders"]));
+    assert!(ok, "{out}");
+    assert_eq!(std::fs::read_to_string(&model).unwrap(), mine, "and an agent cannot lose it either");
+
+    // Saying so in advance, and saying what would happen without doing it.
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders", "--overwrite", "--dry-run"]));
+    assert!(ok && out.contains("would redraft models/main/tbl.orders.yml (3 fields, 1 measure)"), "{out}");
+    assert_eq!(std::fs::read_to_string(&model).unwrap(), mine, "a dry run writes nothing");
+
+    let (ok, out) = run(zsql(&home, &project).args(["generate", "orders", "--overwrite"]));
+    assert!(ok && out.contains("redrafted models/main/tbl.orders.yml"), "{out}");
+    let after = std::fs::read_to_string(&model).unwrap();
+    assert!(!after.contains("a line only I would write"), "the draft replaced it");
+    assert!(after.contains("name: Orders") && after.contains("sql: sum(total)"), "with a whole model:\n{after}");
+    let (ok, out) = run(zsql(&home, &project).arg("check"));
+    assert!(ok && out.contains("1 tables"), "{out}");
     let _ = std::fs::remove_dir_all(home.parent().unwrap());
 }

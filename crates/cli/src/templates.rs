@@ -319,6 +319,7 @@ step below is its non-interactive form; the flag forms are what you use.
     zsql catalog sync -d wh                    # re-read what the file records; drift is printed
     zsql generate orders customers             # draft models for named tables; --schema S or --all for more
     zsql generate orders --new-columns         # add the columns a model lacks
+    zsql generate orders --overwrite           # draft it again, losing what is in the file
     zsql generate shopping/ --all              # draft into models/shopping/, whatever the warehouse's schemas are
     zsql generate returns --empty              # an empty model from the template, no catalog behind it
     zsql generate --relationships main/sales --infer   # the joins file, inferred from the table files there
