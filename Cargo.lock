@@ -3688,7 +3688,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zsql-accounts"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "argon2",
  "hex",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-cli"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-devtool"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-dialect"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "serde_json",
  "serde_yaml",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-exec"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "flate2",
  "serde",
@@ -3773,14 +3773,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-formation"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "zsql-semantic",
 ]
 
 [[package]]
 name = "zsql-golden"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "regex",
@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-planner"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "md5",
@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-project"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "flate2",
  "serde",
@@ -3827,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-semantic"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "flate2",
  "serde",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-server"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-service"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "flate2",
  "regex",
@@ -3879,14 +3879,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-shorthand"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "zsql-source"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "duckdb",
@@ -3911,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-spec"
-version = "0.6.1"
+version = "0.6.5"
 dependencies = [
  "regex",
  "serde",
