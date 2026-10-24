@@ -1,0 +1,25 @@
+# The images `cross` builds the Linux release binaries in.
+#
+# cross 0.2.5 is the last release, from 2023, and its own images carry
+# GCC 9.2 from 2019. DuckDB's C++ does not compile with it: a defaulted
+# move constructor whose exception specification that compiler computes
+# differently, and an overload cast it takes only under -fpermissive.
+# Both are errors there and neither is one for a current compiler. The
+# images below are the rolling ones, carrying GCC 14.4 for both targets,
+# and they compile what 9.2 refuses.
+#
+# Pinned by digest rather than by the `main` tag: a release build should
+# produce the same binary next month as it does today, and `main` moves.
+# To take a newer toolchain, pull the tag and put its digest here:
+#
+#   docker pull ghcr.io/cross-rs/x86_64-unknown-linux-musl:main
+#   docker images --digests ghcr.io/cross-rs/x86_64-unknown-linux-musl
+#
+# Only the Linux targets need this. macOS builds on the runner itself,
+# where Xcode's clang is current.
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:8ef2d210f1b7a9d3bbe18bd131788bd90dc3e9654264281dbc7d3954be4c6754"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:d98adcb95bf878c0c0e4572365d7be93329cc6a10ff963899480e49ea013cc73"

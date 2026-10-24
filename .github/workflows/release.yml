@@ -41,7 +41,9 @@ jobs:
       matrix:
         include:
           # Built in cross's container like the arm64 one: DuckDB is C++,
-          # and musl-tools on the runner has a C compiler but no C++.
+          # and musl-tools on the runner has a C compiler but no C++. The
+          # container is pinned in Cross.toml, because cross's own is too
+          # old to compile DuckDB.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             asset: zsql-x86_64-linux
@@ -72,6 +74,9 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustc --version
 
+      # The images are pinned by digest in Cross.toml: cross's own carry
+      # a 2019 compiler that DuckDB's C++ does not build with.
+      #
       # musl, not glibc, on Linux. A static glibc binary cannot resolve
       # names: it loads its name service modules at runtime and dumps
       # core without them. musl resolves names and still links

@@ -386,7 +386,7 @@ even where the rest is shared.
 |---|---|---|
 | one HTTP client, bearer or SigV4 header | **8**: Snowflake, Databricks, BigQuery, Trino, Druid, ClickHouse, Athena, Redshift Data API | hyper and rustls are already in the tree; a few hundred lines of request and response types each |
 | three pure-Rust wire crates | **4**: Postgres, MySQL, SQL Server; Redshift reachable either way | `tokio-postgres`, `mysql_async`, `tiberius`, measured together at about +27 s clean build and +3 MB stripped |
-| in-process libraries | **2**: SQLite, DuckDB | `rusqlite` is already in the lock via accounts; DuckDB is 317 s and 41 MB and needs a musl C++ toolchain the release workflow does not have |
+| in-process libraries | **2**: SQLite, DuckDB | `rusqlite` is already in the lock via accounts; DuckDB is 317 s and 41 MB and needs a musl C++ toolchain newer than cross's own, which `Cross.toml` pins by digest (found 2026-10-24, when the first release since bundling it failed on cross's 2019 GCC) |
 
 So it is roughly three units of work for all thirteen rather than thirteen
 units. Once a statement can be POSTed to one HTTP warehouse and JSON rows
