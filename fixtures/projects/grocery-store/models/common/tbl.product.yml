@@ -9,7 +9,6 @@ fields:
     name: Product ID
     description: Unique product identifier
     data_type: integer
-    disable_listing: true
     expression:
       primary_key: true
       sql: PRODUCT_ID
@@ -18,7 +17,6 @@ fields:
     name: Manufacturer
     description: Manufacturer code
     data_type: integer
-    disable_listing: true
     expression:
       lookup: true
       sql: MANUFACTURER
@@ -59,7 +57,6 @@ fields:
     name: Product Size
     description: Package size of the product
     data_type: string
-    disable_listing: true
     expression:
       lookup: true
       sql: CURR_SIZE_OF_PRODUCT

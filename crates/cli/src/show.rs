@@ -13,7 +13,12 @@ pub fn print_json(v: &Value) -> Result<()> {
 /// The line above every statement: which datasource runs it. A SQL
 /// comment, so the output stays pasteable into a client.
 pub fn datasource_line(v: &Value) -> String {
-    format!("-- datasource: {}", v["datasource"].as_str().unwrap_or("?"))
+    // The key, as datasources.yml and -d spell it; the display name after.
+    match (v["datasource_uid"].as_str(), v["datasource"].as_str()) {
+        (Some(uid), Some(name)) if name != uid => format!("-- datasource: {uid} ({name}, {})", v["adapter"].as_str().unwrap_or("?")),
+        (Some(uid), _) => format!("-- datasource: {uid} ({})", v["adapter"].as_str().unwrap_or("?")),
+        (None, name) => format!("-- datasource: {}", name.unwrap_or("?")),
+    }
 }
 
 /// How each item of an expression line was read, when the query came from one.
@@ -219,7 +224,21 @@ pub fn print_deploy(v: &Value) -> bool {
     for w in v["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or(""));
     }
-    print_tests(&v["test_results"])
+    let catalog_ok = if v["catalog"].is_object() { crate::catalog_check::print(&v["catalog"]) } else { true };
+    print_tests(&v["test_results"]) && catalog_ok
+}
+
+/// Whether a check passed, for the callers that print the JSON instead
+/// of the lines. The same judgment as [`print_deploy`], without the
+/// printing.
+pub fn deploy_ok(v: &Value) -> bool {
+    tests_passed(&v["test_results"]) && !v["catalog"]["fails"].as_bool().unwrap_or(false)
+}
+
+/// The same for test results alone: no test failed, and a shape with no
+/// results at all has nothing that could have.
+pub fn tests_passed(t: &Value) -> bool {
+    t["results"].as_array().is_none_or(|r| r.is_empty()) || t["failed"].as_u64().unwrap_or(0) == 0
 }
 
 /// Prints test results; true when none failed.
@@ -247,9 +266,38 @@ pub fn print_tests(t: &Value) -> bool {
         }
     }
     println!("tests: {} passed, {} failed", t["passed"], t["failed"]);
-    t["failed"].as_u64().unwrap_or(0) == 0
+    tests_passed(t)
 }
 
 fn indent(s: &str) -> String {
     s.lines().map(|l| format!("       {l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// After a local `check`: the one next step, when there is one. A
+/// model that marks dimensions for sampling and has no sample file yet
+/// is told the command; the rest is quiet.
+pub fn next_after_check(v: &Value, project: &crate::config::Project) {
+    let sampled = v["values"].as_u64().unwrap_or(0);
+    let has_file = project.dir.join("samples").join(zsql_project::values::FILE_NAME).exists();
+    if sampled > 0 || has_file {
+        return;
+    }
+    let mut declares = false;
+    let mut stack = vec![project.dir.join("models")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "yml" || x == "yaml")
+                && std::fs::read_to_string(&p).is_ok_and(|s| s.lines().any(|l| l.trim_start().starts_with("enable_sampling: true")))
+            {
+                declares = true;
+            }
+        }
+    }
+    if declares {
+        eprintln!("next: zsql sample (the model marks dimensions for sampling and none is sampled yet)");
+    }
 }

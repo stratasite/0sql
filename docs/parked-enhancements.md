@@ -86,7 +86,7 @@ list by hits (match score first when a term is given); fuzzy resolution
 uses hits only to break ties inside the margin, when one candidate's
 share clearly dominates (about 3x), so popularity never overrides a better
 string match and the feedback loop stays open. Lowering takes an optional
-ranker (uid to score); without one behaviour is unchanged. A `hits` field
+ranker (uid to score); without one behavior is unchanged. A `hits` field
 on fields and explore entries, and a top-fields endpoint per project that
 doubles as a usage report.
 

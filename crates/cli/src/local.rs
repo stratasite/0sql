@@ -43,7 +43,7 @@ impl Local {
 }
 
 /// The security context, from the JSON a `--context` file holds.
-fn context_of(v: Option<&Value>) -> Result<Option<SecurityContext>> {
+pub fn context_of(v: Option<&Value>) -> Result<Option<SecurityContext>> {
     match v {
         Some(v) => Ok(Some(serde_json::from_value(v.clone()).context("the security context does not parse")?)),
         None => Ok(None),
@@ -78,5 +78,7 @@ pub fn check(m: &Model) -> Result<Value> {
     let mut out = m.summary();
     out["test_results"] = m.run_tests().map_err(Refusal::from)?;
     out["validated_only"] = json!(true);
+    // Against the warehouse's catalog too, for every datasource that has one.
+    out["catalog"] = crate::catalog_check::findings(m);
     Ok(out)
 }

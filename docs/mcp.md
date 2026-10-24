@@ -57,7 +57,7 @@ answered; a client asking for another gets the newest. An
   hosted client such as claude.ai's connector sends `initialize` with
   no credential to check that a server is there and what it speaks,
   before its user's key is applied. So `initialize`, `ping` and
-  `tools/list` answer without a key, with no catalogue, and every tool
+  `tools/list` answer without a key, with no catalog, and every tool
   call without one is a 401 with the challenge, checked in the tool
   dispatcher itself so a keyless caller can never be read as the
   single-tenant mode. The keyless handshake is rate limited per
@@ -144,7 +144,7 @@ per-key context would let the owner of one project assert
   `400 ContextBound`. Otherwise an owner could pin a key to one group
   and the application could still assert `system_admin` on the old
   path. Explore is held to the same rule, so a key behaves the same on
-  every read. Grants with no bound context keep the old behaviour, so
+  every read. Grants with no bound context keep the old behavior, so
   existing applications that act for many users are untouched.
 
 For a query key on a branch with policies:
@@ -181,17 +181,17 @@ holder that does so on purpose, would keep the cache cold for everyone.
 ## What the client is told, and what reaches the model
 
 `initialize` answers with the instructions from `mcp_prompts.json`
-followed by a catalogue of every branch the key may read: measures by
+followed by a catalog of every branch the key may read: measures by
 table with uid, type, description and synonyms, dimensions by table with
 uid and the start of their description, under 48 KB in all. A client
 that puts the server's instructions in its system prompt then has what
-an application has when it pastes the field catalogue into its own
+an application has when it pastes the field catalog into its own
 prompt, and a question is one `sql` call. `fields` with no `q` returns
-the same catalogue as one text, for the client that does not.
+the same catalog as one text, for the client that does not.
 
 Measured on Claude Code 2.1, which is that client: it keeps about 2,000
 characters of a server's instructions and marks the rest `[truncated]`,
-so the catalogue in `initialize` never reaches the model there and the
+so the catalog in `initialize` never reaches the model there and the
 instructions themselves are kept under that cap. It also loads MCP tool
 definitions lazily behind a `ToolSearch` call, one extra model round
 trip per conversation. `ENABLE_TOOL_SEARCH=false` in the environment
@@ -199,8 +199,8 @@ turns that off; in the eval it was the single largest gain: 11.6 s and
 3.4 round trips per question against 14.8 s and 4.8, and a higher pass
 rate, because the model sees the full tool schemas from the start and
 makes its field searches in parallel. The demo application answers in
-two model turns because its catalogue is in its own prompt and it has
-no harness in between; through Claude Code the floor is the catalogue
+two model turns because its catalog is in its own prompt and it has
+no harness in between; through Claude Code the floor is the catalog
 or a search, the `sql` call, and the answer.
 
 ## Connecting

@@ -335,13 +335,14 @@ impl<'a> Node<'a> {
         }
     }
 
-    /// The node's statement with any strategy-imposed limit.
-    pub fn final_sql(&self) -> String {
-        let mut s = self.sql.borrow().clone().unwrap_or_default();
-        if let Some(n) = self.limit.borrow().as_ref() {
-            s.push_str(&format!("\nLIMIT {n}"));
+    /// The node's statement with any strategy-imposed limit, rendered the
+    /// way this dialect takes one.
+    pub fn final_sql(&self, dialect: &zsql_dialect::Dialect) -> Result<String, zsql_dialect::DialectError> {
+        let s = self.sql.borrow().clone().unwrap_or_default();
+        match self.limit.borrow().as_ref() {
+            Some(n) => dialect.apply_limit(&s, 0, n),
+            None => Ok(s),
         }
-        s
     }
 
     pub fn is_root(&self) -> bool {

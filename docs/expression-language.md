@@ -471,7 +471,9 @@ at the point where it now prunes them. That is a small change in
 `crates/spec`, and until it lands a partition written as a name is
 lost. Second, a window cannot order by a measure, only by a projected
 dimension, so `rank(x order by x desc)` has no spec to lower to and is
-reported as such.
+reported as such. A rank written with no order at all is not affected:
+the planner orders it by the expression it decorates, descending,
+since an unordered rank window ranks every row the same.
 
 ## Hazards and how the grammar handles them
 
@@ -655,7 +657,7 @@ item category, orders, expand (customer id, item category = Books) with (item ca
 {"projections": [{"field": "item category"}, {"field": "orders"}],
  "segments": [{"name": "Book pairs", "keys": ["customer id"],
                "filters": [{"field": "item category", "predicate": "equals", "value": "Books"}],
-               "expanding": [{"field": "item category", "alias": "Also bought"}],
+               "expanding": [{"field": "item category", "as": "Also bought"}],
                "join": "left", "pair_dedupe": "none"}]}
 ```
 

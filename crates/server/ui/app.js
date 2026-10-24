@@ -1,7 +1,7 @@
 // 0sql app. One shell, views rendered from the JSON API. The path says
 // which view; the session cookie says who.
 //
-// Icons are Lucide (https://lucide.dev, ISC licence; see LICENSE-lucide),
+// Icons are Lucide (https://lucide.dev, ISC license; see LICENSE-lucide),
 // inlined below as their path data and drawn in currentColor, so they stay
 // monochrome and take the rust only where the text around them does.
 (function () {
@@ -121,7 +121,7 @@
   // Scrollbars are revealed by a class rather than by `:hover`, because
   // Blink and WebKit do not restyle a custom scrollbar when the element
   // it belongs to is hovered: the class is a style change they do act
-  // on. Only the colour ever changes, so nothing reflows. Firefox needs
+  // on. Only the color ever changes, so nothing reflows. Firefox needs
   // none of this and does it in the stylesheet.
   let showing = [];
   const scrolls = (el) => {

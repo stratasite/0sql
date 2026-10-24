@@ -373,7 +373,7 @@ fn sort_call_args(line: &str, prefix: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Pass,
-    /// Identical SQL once CTE names are normalised.
+    /// Identical SQL once CTE names are normalized.
     PassRenamed,
     /// Structurally identical: same nodes and lines, nodes ordered differently.
     PassReordered,
@@ -471,7 +471,7 @@ pub fn run_case_on(planner: &Planner<'_>, dialects: &Dialects, case: &Case) -> R
 pub struct FileScore {
     pub total: usize,
     pub passed: usize,
-    /// Passes that needed CTE-name normalisation.
+    /// Passes that needed CTE-name normalization.
     pub renamed: usize,
     /// Passes that needed the structural comparison.
     pub reordered: usize,

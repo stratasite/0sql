@@ -2189,7 +2189,7 @@ mod tests {
         assert!(s.verify_email(&second).is_ok(), "the newest one works");
     }
 
-    /// An expired link is refused rather than quietly honoured.
+    /// An expired link is refused rather than quietly honored.
     #[test]
     fn an_expired_link_is_refused() {
         let s = Store::in_memory().unwrap();

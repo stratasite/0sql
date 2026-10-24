@@ -198,11 +198,21 @@ pub enum ServerCommand {
         /// The data directory to look at for a foreground server; $ZSQL_HOME/data when neither this nor the variable says.
         #[arg(long, env = "ZSQL_DATA_DIR")]
         data_dir: Option<PathBuf>,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// The last lines of the background server's log.
     Logs {
+        /// How many lines from the end.
         #[arg(long, default_value_t = 100)]
         lines: usize,
+    },
+    /// Whether a server answers: this machine's, or the one --server names.
+    Health {
+        /// The server to ask; the configured one when unsaid.
+        #[arg(long)]
+        server: Option<String>,
     },
 }
 
@@ -434,7 +444,15 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
     match command {
         ServerCommand::Start { args } => start(args, at),
         ServerCommand::Stop => stop(),
-        ServerCommand::Status { data_dir } => status(data_dir),
+        ServerCommand::Health { server } => {
+            let project = at.project_dir().ok();
+            let client =
+                crate::remote::Client::new(&config::server(server.as_deref(), project.as_ref()), config::api_key(project.as_ref()));
+            let v = client.get("/healthz")?;
+            println!("{} {}", client.server, v.as_str().unwrap_or("ok"));
+            Ok(())
+        }
+        ServerCommand::Status { data_dir, json } => status(data_dir, json || crate::tty::agent()),
         ServerCommand::Logs { lines } => {
             let text = std::fs::read_to_string(log_file()?).unwrap_or_default();
             let all: Vec<&str> = text.lines().collect();
@@ -484,7 +502,7 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
     std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
     // Wait for it to say where it listens, which is also when a bad
     // bind or a held data directory has been refused. The child is
-    // reaped here, not just signalled, since an exited child answers a
+    // reaped here, not just signaled, since an exited child answers a
     // signal until it is.
     let t0 = Instant::now();
     loop {
@@ -547,8 +565,18 @@ fn stop() -> Result<()> {
 /// The server `start` recorded, if it is running; failing that, the
 /// data directory's lock, which a foreground `zsql serve` holds too.
 /// That server was not started here, so `stop` will not stop it.
-fn status(data_dir: Option<PathBuf>) -> Result<()> {
+fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
     if let Some(s) = running()? {
+        if json {
+            return crate::show::print_json(&serde_json::json!({
+                "running": true,
+                "started_by": "zsql server start",
+                "pid": s.pid,
+                "url": url_of(&s.bind),
+                "public_url": s.public_url,
+                "answers": answering(&s.bind),
+            }));
+        }
         println!("running as process {} at {}{}; {}", s.pid, url_of(&s.bind), public_note(s.public_url.as_deref()), answers(&s.bind));
         return Ok(());
     }
@@ -557,7 +585,36 @@ fn status(data_dir: Option<PathBuf>) -> Result<()> {
         None => home()?.join("data"),
     };
     let dir = std::path::absolute(&dir).unwrap_or(dir);
-    match lock_holder(&dir) {
+    let held = lock_holder(&dir);
+    if json {
+        // One destructure, so the two answers cannot drift. `Unreachable`
+        // means the lock could not be read, which is not the same as free,
+        // and the document says which it was rather than flattening both
+        // to "not running".
+        let (running, pid, addr, public) = match &held {
+            Lock::Held { pid, addr, public } => (true, *pid, addr.clone(), public.clone()),
+            Lock::Free | Lock::Unreachable => (false, None, None, None),
+        };
+        return crate::show::print_json(&serde_json::json!({
+            "running": running,
+            "started_by": if running { "the foreground" } else { "nothing" },
+            "held": matches!(held, Lock::Held { .. }),
+            // `Unreachable` is the lock file not opening, which is as
+            // much the ordinary "this directory was never served" as it is
+            // a permission problem, so it says only that nothing is known.
+            "lock": match held {
+                Lock::Held { .. } => "held",
+                Lock::Free => "free",
+                Lock::Unreachable => "unknown",
+            },
+            "pid": pid,
+            "url": addr.as_deref().map(url_of),
+            "public_url": public,
+            "answers": addr.as_deref().is_some_and(answering),
+            "data_dir": dir.display().to_string(),
+        }));
+    }
+    match held {
         Lock::Held { pid: Some(pid), addr: Some(addr), public } => println!(
             "not started by `zsql server start`, but process {pid} serves {} in the foreground at {}{}; {}",
             dir.display(),
@@ -576,6 +633,11 @@ fn status(data_dir: Option<PathBuf>) -> Result<()> {
 
 /// The address as a URL to go to: a server bound to every interface is
 /// reached on the loopback from here.
+/// Whether the server at the bind answers `/healthz`.
+fn answering(bind: &str) -> bool {
+    remote::Client::new(&url_of(bind), None).get("/healthz").is_ok()
+}
+
 fn url_of(bind: &str) -> String {
     let host_port = match bind.rsplit_once(':') {
         Some(("0.0.0.0" | "[::]" | "::", port)) => format!("127.0.0.1:{port}"),
@@ -589,7 +651,9 @@ fn public_note(public: Option<&str>) -> String {
     public.map(|u| format!(" (public URL {u})")).unwrap_or_default()
 }
 
-/// Whether the server at the bind answers `/healthz`.
+/// Whether the server at the bind answers `/healthz`, as a sentence. The
+/// boolean form is [`answering`]: deriving one by comparing against this
+/// string would turn into `false` the day the wording changes.
 fn answers(bind: &str) -> String {
     match remote::Client::new(&url_of(bind), None).get("/healthz") {
         Ok(_) => "it answers".to_string(),

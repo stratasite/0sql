@@ -22,6 +22,9 @@ use zsql_spec::SecurityContext;
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub sql: String,
+    /// Where in `sql` the statement a row limit applies to begins: zero, or
+    /// past the common table expressions that precede it.
+    pub root_at: usize,
     /// The datasource the plan executes in: its name, its uid and its adapter.
     pub datasource: String,
     pub datasource_uid: String,
@@ -101,13 +104,16 @@ pub struct ExplainStrategy {
 }
 
 impl Plan {
-    /// The statement with the caller's row limit appended, or untouched when
+    /// The statement with the caller's row limit in it, or untouched when
     /// they did not ask for one. `sql` itself never carries it: a plan is the
     /// shape of the question, and how many rows you want back is yours.
-    pub fn sql_with_limit(&self, limit: Option<u64>) -> String {
+    ///
+    /// Where the limit goes is the dialect's business, not a suffix: SQL
+    /// Server has no `LIMIT` and takes `TOP (n)` in the SELECT instead.
+    pub fn sql_with_limit(&self, limit: Option<u64>, dialect: &zsql_dialect::Dialect) -> Result<String> {
         match limit {
-            Some(n) => format!("{}\nLIMIT {n}", self.sql),
-            None => self.sql.clone(),
+            Some(n) => Ok(dialect.apply_limit(&self.sql, self.root_at, &n.to_string())?),
+            None => Ok(self.sql.clone()),
         }
     }
 }
@@ -310,11 +316,12 @@ fn run_plan<'a>(
     phase!("reference", visitors::reference::run(&mut graph, universe, rquery)?);
     phase!("alias", visitors::alias::run(&mut graph)?);
     phase!("sql", visitors::sql::run(&graph, universe, rquery)?);
-    let sql = phase!("final_query", visitors::final_query::to_sql(&graph)?);
+    let (sql, root_at) = phase!("final_query", visitors::final_query::to_sql(&graph)?);
     let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
 
     Ok(Plan {
         sql,
+        root_at,
         datasource: graph.datasource.name.clone(),
         datasource_uid: graph.datasource.uid.clone(),
         adapter: graph.datasource.adapter.clone(),

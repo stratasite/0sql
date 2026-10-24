@@ -10,11 +10,22 @@ use std::path::Path as FsPath;
 /// default, or one renamed or removed, since every struct here is
 /// `deny_unknown_fields`. Adding a field that defaults is not such a
 /// change, and does not need a new number.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 fn first_format() -> u32 {
     1
 }
+
+/// The default for `Field::sample_size`, and the most one may ask for is
+/// `MAX_SAMPLE_SIZE`.
+pub fn default_sample_size() -> i64 {
+    1000
+}
+
+/// A ceiling on `sample_size`. The sample file is read with an inflated-size
+/// limit that refuses the whole file, costing every dimension its values, so
+/// one field cannot be allowed to spend the budget.
+pub const MAX_SAMPLE_SIZE: i64 = 20_000;
 
 /// Row id as assigned by the strata database. Kept verbatim so a branch and
 /// its clone stay distinguishable and so paths can reference joins and tables.
@@ -253,7 +264,6 @@ pub struct Field {
     #[serde(rename = "type")]
     pub kind: FieldKind,
     pub data_type: Option<DataType>,
-    pub display_type: String,
     #[serde(default)]
     pub hidden: bool,
     #[serde(default)]
@@ -267,15 +277,20 @@ pub struct Field {
     pub inclusions: Option<Inclusion>,
     pub extended_blend_group: Option<String>,
     pub snapshot: Option<SnapshotKind>,
+    /// Whether `zsql sample` collects this dimension's values at all. Off
+    /// unless the modeller turns it on, and turning it on means sample,
+    /// whatever the field's type or width: the judgment is the
+    /// modeller's, and AGENTS.md carries the guidance rather than the
+    /// loader carrying a rule.
     #[serde(default)]
-    pub secure: bool,
+    pub enable_sampling: bool,
+    /// How many values to keep, most frequent first.
+    #[serde(default = "default_sample_size")]
+    pub sample_size: i64,
+    /// A sampling query the modeller wrote, instead of the generated one:
+    /// the value in the first column, an optional count in the second.
     #[serde(default)]
-    pub disable_listing: bool,
-    pub value_list_size: i64,
-    /// How `zsql values sample` treats the field: the top `value_list_size`
-    /// values by row count, every value, or none.
-    #[serde(default)]
-    pub value_sampling: ValueSampling,
+    pub sample_sql: Option<String>,
     #[serde(default)]
     pub synonyms: Vec<String>,
     pub description: Option<String>,
@@ -293,15 +308,6 @@ impl Field {
     pub fn is_date(&self) -> bool {
         matches!(self.data_type, Some(DataType::Date) | Some(DataType::DateTime))
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueSampling {
-    #[default]
-    Sample,
-    Full,
-    None,
 }
 
 /// A measure exclusion rule: which tables, dimensions or universes the
@@ -446,6 +452,8 @@ pub enum LoadError {
     Json(#[from] serde_json::Error),
     #[error("this snapshot is in format {found}, and this build reads up to {FORMAT}; deploy it again from its project")]
     Newer { found: u32 },
+    #[error("this snapshot is in format {found}, and this build reads format {FORMAT}; deploy it again from its project")]
+    Older { found: u32 },
 }
 
 impl Snapshot {
@@ -474,6 +482,9 @@ impl Snapshot {
             // real reason when it is the reason.
             Err(e) => match Self::format_of(text) {
                 Some(found) if found > FORMAT => Err(LoadError::Newer { found }),
+                // An older one fails the same way, on a field that left;
+                // there is no migration, and the sentence says what to do.
+                Some(found) if found < FORMAT => Err(LoadError::Older { found }),
                 _ => Err(e.into()),
             },
         }

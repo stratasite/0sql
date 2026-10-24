@@ -9,6 +9,8 @@ members = [
   "crates/project",
   "crates/accounts",
   "crates/shorthand",
+  "crates/source",
+  "crates/exec",
   "crates/service",
   "crates/server",
   "crates/golden",
@@ -17,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.5"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/stratasite/0sql"
@@ -47,6 +49,15 @@ zsql-planner = { path = "crates/planner" }
 zsql-project = { path = "crates/project" }
 zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
+zsql-source = { path = "crates/source" }
+zsql-exec = { path = "crates/exec" }
 zsql-service = { path = "crates/service" }
 zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }
+
+# What a release ships: symbols stripped and thin link-time optimization,
+# which took the binary from 97 MB to 76 MB with DuckDB in it. Fat LTO
+# and one codegen unit buy little more and cost minutes of build.
+[profile.release]
+strip = true
+lto = "thin"

@@ -269,7 +269,7 @@ than after. The body is the usual shape:
 {"error": {"class": "RateLimited", "message": "too many requests: retry in 1s"}}
 ```
 
-- **The CLI** waits and asks again, up to three times, honouring the
+- **The CLI** waits and asks again, up to three times, honoring the
   server's delay up to 30 seconds, and says so on stderr so `--json`
   output stays clean. It retries a `429`, and a `503` that names a delay,
   whatever the command: both mean the server refused before running any

@@ -353,7 +353,8 @@ fn segment(s: &Segment) -> Result<Value, String> {
             .map(|(f, alias)| {
                 let mut e = json!({ "field": f.name });
                 if let Some(a) = alias {
-                    e["alias"] = Value::String(a.clone());
+                    // The spec spells the carried column's name `as`.
+                    e["as"] = Value::String(a.clone());
                 }
                 e
             })

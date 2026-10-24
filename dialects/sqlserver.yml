@@ -68,6 +68,12 @@ array_unnest_join: "CROSS JOIN UNNEST(@exp) @alias"
 # joins
 cross_join: "CROSS JOIN @relation"
 
+# SQL Server has no LIMIT: the row count goes in the SELECT clause. TOP
+# needs no ORDER BY, which OFFSET/FETCH would, so it is what a statement
+# with no ordering can take.
+limit_style: "top"
+limit_clause: "TOP (@n)"
+
 # sql output behavior
 temp_table_type: "cte" # options cte, subquery, temp
 temp_table_prefix: ""

@@ -291,6 +291,18 @@ fn the_background_server_starts_reports_and_stops() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("running as process") && text.contains("it answers"), "{text}");
     assert!(text.contains("(public URL https://zsql.example.test)"), "{text}");
+
+    // The same, as JSON. This is the only place a running server exists,
+    // so without it the `--json` answer is only ever seen with nothing to
+    // report, where `running: false` would pass if it were hardcoded.
+    let out = run(&root.0, &["server", "status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("one JSON document");
+    assert_eq!(v["running"], true, "{v}");
+    assert_eq!(v["started_by"], "zsql server start", "{v}");
+    assert_eq!(v["answers"], true, "{v}");
+    assert_eq!(v["public_url"], "https://zsql.example.test", "{v}");
+    assert!(v["pid"].as_u64().is_some_and(|p| p > 0), "{v}");
+    assert!(v["url"].as_str().is_some_and(|u| u.starts_with("http://127.0.0.1:")), "{v}");
     // The project at hand was handed over: it is deployed.
     let addr = text.split(" at http://").nth(1).and_then(|t| t.split(' ').next()).unwrap().trim().to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -311,6 +323,12 @@ fn the_background_server_starts_reports_and_stops() {
     assert!(!home.join("server.pid").exists());
     let out = run(&root.0, &["server", "status"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
+    let out = run(&root.0, &["server", "status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("one JSON document");
+    assert_eq!(v["running"], false, "and says so in JSON too: {v}");
+    // Nothing holds that directory and there is no lock file in it to read,
+    // which the text form reports as "not running" either way.
+    assert_eq!(v["lock"], "unknown", "with which of the three states it found: {v}");
 
     // A start on a port that is taken is reported as a failure, with the log's tail.
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -332,13 +350,13 @@ fn the_background_server_starts_reports_and_stops() {
     let out = run(&root.0, &["server", "stop"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("no server is running"));
     std::thread::sleep(Duration::from_millis(100));
-    assert!(alive(decoy.id()), "stop signalled a process that is not the server");
+    assert!(alive(decoy.id()), "stop signaled a process that is not the server");
     let _ = decoy.kill();
     let _ = decoy.wait();
 }
 
 /// The environment file a deployment loads is the base: a `ZSQL_*`
-/// variable is honoured when no flag names the setting, and a flag
+/// variable is honored when no flag names the setting, and a flag
 /// wins over its variable.
 #[cfg(unix)]
 #[test]

@@ -59,6 +59,52 @@ fn the_statement_carries_the_limit_only_through_sql_with_limit() {
         "the plan's own SQL must not carry the spec's limit:\n{}",
         plan.sql
     );
-    assert_eq!(plan.sql_with_limit(None), plan.sql, "no limit leaves the statement alone");
-    assert!(plan.sql_with_limit(Some(25)).trim_end().ends_with("\nLIMIT 25"), "a limit is appended as its own clause");
+    let dialect = dialects.get(&plan.adapter).expect("the plan's adapter has a dialect");
+    assert_eq!(plan.sql_with_limit(None, &dialect).unwrap(), plan.sql, "no limit leaves the statement alone");
+
+    // Where it goes is the dialect's business; that it goes in exactly once,
+    // and into the statement the plan ends with, is not.
+    let limited = plan.sql_with_limit(Some(25), &dialect).unwrap();
+    assert_ne!(limited, plan.sql, "a limit of 25 must reach the statement");
+    assert_eq!(limited[..plan.root_at], plan.sql[..plan.root_at], "anything before the root statement is untouched");
+    match dialect.str("limit_style").unwrap() {
+        "top" => assert!(limited[plan.root_at..].starts_with("SELECT TOP (25)"), "{limited}"),
+        _ => assert!(limited.trim_end().ends_with("\nLIMIT 25"), "{limited}"),
+    }
+}
+
+/// Every golden case, planned, takes its limit without the statement
+/// growing a second one and without the limit landing in a CTE. The
+/// per-dialect rendering is the dialect crate's own test; this is that the
+/// offset a plan reports is the offset its statement actually has.
+#[test]
+fn every_planned_case_takes_a_limit_in_one_place() {
+    let fx = Fixtures::open(Fixtures::default_root());
+    let dialects = fx.dialects();
+    let base = dialects.base().unwrap();
+    let mut checked = 0;
+
+    for (_, cases) in fx.cases().unwrap() {
+        for case in &cases {
+            let Ok((universe, paths)) = fx.planner_for(&case.universe, PathSource::Formed) else { continue };
+            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            let Ok(spec) = Spec::from_value(case.spec.clone()) else { continue };
+            let Ok(query) = lower(&spec, &universe, &base) else { continue };
+            let Ok(plan) = planner.plan_query(query, case.context.as_ref()) else { continue };
+            let dialect = dialects.get(&plan.adapter).unwrap();
+
+            assert!(plan.root_at <= plan.sql.len(), "{}: root_at past the end", case.id);
+            assert!(
+                plan.sql[plan.root_at..].starts_with("SELECT"),
+                "{}: the statement at root_at must be the root SELECT:\n{}",
+                case.id,
+                &plan.sql[plan.root_at..plan.sql.len().min(plan.root_at + 40)]
+            );
+            let limited = plan.sql_with_limit(Some(25), &dialect).unwrap();
+            let marker = if dialect.str("limit_style").unwrap() == "top" { "TOP (25)" } else { "LIMIT 25" };
+            assert_eq!(limited.matches(marker).count(), 1, "{}: exactly one limit\n{limited}", case.id);
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "only {checked} cases planned and were checked");
 }
