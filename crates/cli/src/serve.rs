@@ -599,10 +599,13 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
             "running": running,
             "started_by": if running { "the foreground" } else { "nothing" },
             "held": matches!(held, Lock::Held { .. }),
+            // `Unreachable` is the lock file not opening, which is as
+            // much the ordinary "this directory was never served" as it is
+            // a permission problem, so it says only that nothing is known.
             "lock": match held {
                 Lock::Held { .. } => "held",
                 Lock::Free => "free",
-                Lock::Unreachable => "unreadable",
+                Lock::Unreachable => "unknown",
             },
             "pid": pid,
             "url": addr.as_deref().map(url_of),
