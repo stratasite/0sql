@@ -61,8 +61,10 @@ pub struct Manifest {
     pub branch: String,
     pub datasource_uid: String,
     pub adapter: String,
-    /// Who the connection was, never a secret: the username, account,
-    /// profile or project the datasource names.
+    /// Which database answered, never a secret: every name, location and
+    /// timestamp that decides what a query sees, as a JSON object. Two
+    /// connections that differ here are two databases, and a result from
+    /// one is never served for the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -52,40 +52,66 @@ impl Connector for Local_ {
     /// contributed only its username, so the same user against staging
     /// and production hashed the same too.
     ///
-    /// A file is canonicalised, because `./data.duckdb` names a different
-    /// database from each directory it is read in. When it cannot be
-    /// canonicalised, usually because it does not exist yet, the path as
-    /// written is used: no worse than before, and the read will fail
-    /// anyway.
+    /// A file goes in by its canonical path and by its size and mtime,
+    /// because `./data.duckdb` names a different database from each
+    /// directory it is read in, and because the file a job rewrites
+    /// overnight is a different database from the one cached yesterday.
+    /// A path that cannot be canonicalised or stat'd is used as written:
+    /// no worse than naming nothing, and the read will fail anyway.
     ///
-    /// Nothing secret belongs here. These are names and locations, and
-    /// the identity is written into the result's manifest.
+    /// Written as JSON so it cannot be misread: joined by spaces, a
+    /// `database` of `x username=y` is indistinguishable from a database
+    /// `x` beside a username `y`, and the two hash alike.
+    ///
+    /// Nothing secret belongs here. These are names, locations and
+    /// timestamps, and the identity is written into the result's
+    /// manifest and printed by `zsql results --json`.
+    ///
+    /// What is still missing is a principal the file does not name: an
+    /// AWS profile from the environment, or a token in `.zsql` that
+    /// decides which rows a warehouse shows. Those want a digest of the
+    /// resolved credential, which is a decision about what may be
+    /// written to disk, so they are not here yet.
     fn identity(&self, uid: &str) -> Option<String> {
         let c = Connection::read(&self.dir, uid).ok()?;
-        let file = |p: Option<std::path::PathBuf>| p.map(|p| std::fs::canonicalize(&p).unwrap_or(p).display().to_string());
-        let parts: Vec<String> = [
-            ("host", c.host),
-            ("port", c.port.map(|p| p.to_string())),
-            ("database", c.database),
-            ("schema", c.schema),
-            ("username", c.username),
-            ("url", c.url),
-            ("file", file(c.file)),
-            ("account", c.account),
-            ("warehouse", c.warehouse),
-            ("role", c.role),
-            ("catalog", c.catalog),
-            ("client_id", c.client_id),
-            ("project", c.project),
-            ("location", c.location),
-            ("region", c.region),
-            ("workgroup", c.workgroup),
-            ("profile", c.profile),
-        ]
-        .into_iter()
-        .filter_map(|(name, value)| value.map(|v| format!("{name}={v}")))
-        .collect();
-        (!parts.is_empty()).then(|| parts.join(" "))
+        // A file by where it is and what it is: two different databases
+        // have been served each other's rows both ways.
+        let file = |p: Option<std::path::PathBuf>| {
+            let p = p?;
+            let at = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            let stamp = std::fs::metadata(&at).ok().map(|m| {
+                let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+                format!("@{modified}:{}", m.len())
+            });
+            Some(format!("{}{}", at.display(), stamp.unwrap_or_default()))
+        };
+        let mut parts = serde_json::Map::new();
+        let mut put = |name: &str, value: Option<String>| {
+            if let Some(v) = value {
+                parts.insert(name.to_string(), serde_json::Value::String(v));
+            }
+        };
+        put("host", c.host);
+        put("port", c.port.map(|p| p.to_string()));
+        put("database", c.database);
+        put("schema", c.schema);
+        put("username", c.username);
+        put("url", c.url);
+        put("file", file(c.file));
+        put("account", c.account);
+        put("warehouse", c.warehouse);
+        put("role", c.role);
+        put("catalog", c.catalog);
+        put("client_id", c.client_id);
+        put("project", c.project);
+        put("location", c.location);
+        put("region", c.region);
+        put("workgroup", c.workgroup);
+        put("profile", c.profile);
+        // The credential's own file, which picks the principal and so the
+        // rows, for BigQuery. Its contents are not read here.
+        put("key_file", file(c.key_file));
+        (!parts.is_empty()).then(|| serde_json::Value::Object(parts).to_string())
     }
 
     fn cache_ttl(&self, uid: &str) -> Option<Duration> {
@@ -428,4 +454,96 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsql_exec::Connector;
+
+    fn identity_of(yaml: &str, name: &str) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!("zsql-identity-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("datasources.yml"), yaml).unwrap();
+        let got = Local_ { dir: dir.clone(), timeout: None }.identity("wh");
+        let _ = std::fs::remove_dir_all(&dir);
+        got
+    }
+
+    /// The identity decides whether one database's rows can be served for
+    /// another's, so it has to say exactly which database, and say it in a
+    /// form that cannot be read two ways.
+    #[test]
+    fn an_identity_names_one_database_and_only_one() {
+        // Everything that picks the data is named.
+        let pg = identity_of(
+            "wh:\n  adapter: postgres\n  host: db.example\n  port: 5432\n  database: analytics\n  schema: shop\n  username: reader\n",
+            "pg",
+        )
+        .expect("an identity");
+        for named in ["db.example", "5432", "analytics", "shop", "reader"] {
+            assert!(pg.contains(named), "{named} is part of which data answers: {pg}");
+        }
+
+        // Staging and production under one username are not one database.
+        let staging = identity_of("wh:\n  adapter: postgres\n  host: staging\n  database: analytics\n  username: reader\n", "s");
+        let prod = identity_of("wh:\n  adapter: postgres\n  host: prod\n  database: analytics\n  username: reader\n", "p");
+        assert_ne!(staging, prod, "the host decides which rows come back");
+
+        // Nor are two databases on one host.
+        let a = identity_of("wh:\n  adapter: postgres\n  host: db\n  database: a\n  username: reader\n", "a");
+        let b = identity_of("wh:\n  adapter: postgres\n  host: db\n  database: b\n  username: reader\n", "b");
+        assert_ne!(a, b, "the database decides which rows come back");
+
+        // A value holding the separator cannot impersonate another field:
+        // joined by spaces, `database: "x username=y"` read the same as a
+        // database `x` beside a username `y`, and the two hashed alike.
+        let sneaky = identity_of("wh:\n  adapter: postgres\n  database: \"x username=y\"\n", "sneaky");
+        let plain = identity_of("wh:\n  adapter: postgres\n  database: x\n  username: y\n", "plain");
+        assert_ne!(sneaky, plain, "a value cannot be read as a second field:\n  {sneaky:?}\n  {plain:?}");
+
+        // Nothing at all to say is no identity, not an empty one.
+        assert_eq!(identity_of("wh:\n  adapter: duckdb\n", "bare"), None);
+    }
+
+    /// A file datasource is the case that started this: the path alone was
+    /// not in the key at all, and then the path alone could not tell a
+    /// rebuilt database from the one cached yesterday.
+    ///
+    /// The path is written absolute here because an adapter opens
+    /// `conn.file` as it stands, so a relative one resolves against the
+    /// process's directory; the identity canonicalises against the same
+    /// one, which is what keeps it naming the file that was opened. A
+    /// test does not run from a project, so a relative path would be
+    /// testing the fallback rather than the resolution.
+    #[test]
+    fn a_file_is_named_by_where_it_is_and_what_it_is() {
+        let dir = std::env::temp_dir().join(format!("zsql-identity-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("data.duckdb");
+        std::fs::write(&db, b"one").unwrap();
+        std::fs::write(dir.join("datasources.yml"), format!("wh:\n  adapter: duckdb\n  file: {}\n", db.display())).unwrap();
+        let local = Local_ { dir: dir.clone(), timeout: None };
+
+        let before = local.identity("wh").expect("an identity");
+        assert!(before.contains(&db.canonicalize().unwrap().display().to_string()), "the canonical path: {before}");
+
+        // The same file again is the same database, or nothing is cached.
+        assert_eq!(local.identity("wh"), Some(before.clone()), "an unchanged file still hits the cache");
+
+        // A rewritten one is not, which is what a nightly job produces.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&db, b"two and longer").unwrap();
+        assert_ne!(local.identity("wh"), Some(before), "a rewritten database is a different database");
+
+        // A path that cannot be resolved is used as written rather than
+        // dropped. Such a query cannot succeed, so nothing is cached under
+        // it: both adapters refuse a file they cannot open.
+        std::fs::write(dir.join("datasources.yml"), "wh:\n  adapter: duckdb\n  file: ./missing.duckdb\n").unwrap();
+        let missing = local.identity("wh").expect("an identity even so");
+        assert!(missing.contains("missing.duckdb"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
