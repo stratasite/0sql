@@ -42,9 +42,50 @@ impl Connector for Local_ {
         zsql_source::open(&conn, secrets)
     }
 
+    /// What the cache key uses to tell one connection from another, and
+    /// so what keeps a result from being served for a different database.
+    ///
+    /// Everything that decides which data answers goes in, not the first
+    /// of a few fields: a file datasource has no username, account or
+    /// project, so it used to contribute nothing at all and two DuckDB
+    /// files behind one datasource key hashed the same. A Postgres one
+    /// contributed only its username, so the same user against staging
+    /// and production hashed the same too.
+    ///
+    /// A file is canonicalised, because `./data.duckdb` names a different
+    /// database from each directory it is read in. When it cannot be
+    /// canonicalised, usually because it does not exist yet, the path as
+    /// written is used: no worse than before, and the read will fail
+    /// anyway.
+    ///
+    /// Nothing secret belongs here. These are names and locations, and
+    /// the identity is written into the result's manifest.
     fn identity(&self, uid: &str) -> Option<String> {
         let c = Connection::read(&self.dir, uid).ok()?;
-        [c.username, c.account, c.profile, c.project, c.client_id].into_iter().flatten().next()
+        let file = |p: Option<std::path::PathBuf>| p.map(|p| std::fs::canonicalize(&p).unwrap_or(p).display().to_string());
+        let parts: Vec<String> = [
+            ("host", c.host),
+            ("port", c.port.map(|p| p.to_string())),
+            ("database", c.database),
+            ("schema", c.schema),
+            ("username", c.username),
+            ("url", c.url),
+            ("file", file(c.file)),
+            ("account", c.account),
+            ("warehouse", c.warehouse),
+            ("role", c.role),
+            ("catalog", c.catalog),
+            ("client_id", c.client_id),
+            ("project", c.project),
+            ("location", c.location),
+            ("region", c.region),
+            ("workgroup", c.workgroup),
+            ("profile", c.profile),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| format!("{name}={v}")))
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     fn cache_ttl(&self, uid: &str) -> Option<Duration> {

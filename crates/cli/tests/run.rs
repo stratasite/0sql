@@ -168,3 +168,53 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--out", "x.parquet"]));
     assert!(!ok && err.contains("say --format for this extension"), "{err}");
 }
+
+/// A cached result must belong to the database it came from. The key once
+/// took the first of five fields for a connection's identity, and a file
+/// datasource has none of them, so two SQLite files behind one datasource
+/// key contributed nothing to tell them apart: the second project was
+/// answered with the first one's rows. Same project uid, same datasource
+/// key, same relative path, same query, different data.
+#[test]
+fn two_databases_at_one_path_do_not_share_a_cached_result() {
+    let root = std::env::temp_dir().join(format!("zsql-run-identity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Two projects, identical in every way the key used to look at, each
+    // with its own database reached by the same relative path.
+    let make = |name: &str, rows: &str| {
+        let project = root.join(name);
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(run(zsql(&home, &project).args(["init", "--name", "Shop", "--uid", "shop"])).0);
+        std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n").unwrap();
+        let db = rusqlite::Connection::open(project.join("shop.db")).unwrap();
+        db.execute_batch(&format!("CREATE TABLE sales (region TEXT, amount NUMERIC); INSERT INTO sales VALUES {rows};")).unwrap();
+        drop(db);
+        assert!(run(zsql(&home, &project).args(["catalog", "read", "--all"])).0);
+        assert!(run(zsql(&home, &project).args(["generate", "sales"])).0);
+        project
+    };
+    let one = make("one", "('north', 10.5)");
+    let two = make("two", "('north', 10.5), ('north', 2)");
+
+    // The first answers for itself, and is kept.
+    let (ok, out, _) = run(zsql(&home, &one).args(["run", "region, amount", "--format", "csv"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("north,10.5"), "the first database's total:\n{out}");
+
+    // The second must not be answered with the first's rows.
+    let (ok, out, _) = run(zsql(&home, &two).args(["run", "region, amount", "--format", "csv"]));
+    assert!(ok, "{out}");
+    assert!(out.contains("north,12.5"), "the second database's own total, not the first's:\n{out}");
+    assert!(!out.contains("north,10.5"), "{out}");
+
+    // And each still answers from the store on a second run: the fix
+    // tells the two apart, it does not stop either being cached. The
+    // footer that says so rides with the default format.
+    let (ok, out, err) = run(zsql(&home, &two).args(["run", "region, amount"]));
+    assert!(ok && out.contains("12.5"), "{out}{err}");
+    assert!(err.contains("cached"), "a second run is a hit: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
