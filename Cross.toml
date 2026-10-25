@@ -8,15 +8,25 @@
 # images below are the rolling ones, carrying GCC 14.4 for both targets,
 # and they compile what 9.2 refuses.
 #
-# Pinned by digest rather than by the `main` tag: a release build should
-# produce the same binary next month as it does today, and `main` moves.
-# To take a newer toolchain, pull the tag and put its digest here:
+# Pinned by digest rather than by the `main` tag, so the toolchain does
+# not change under a release: `main` is rebuilt nightly and has already
+# moved since these were taken. The digests below are what the registry
+# served on 2026-10-25, from cross's own nightly build. To take a newer
+# toolchain, ask the registry what the tag points at now and put that
+# here, with the date:
 #
-#   docker pull ghcr.io/cross-rs/x86_64-unknown-linux-musl:main
-#   docker images --digests ghcr.io/cross-rs/x86_64-unknown-linux-musl
+#   docker buildx imagetools inspect ghcr.io/cross-rs/x86_64-unknown-linux-musl:main
+#
+# Two things to know about the pin. It is a snapshot of a rolling tag in
+# somebody else's registry, so these manifests are untagged history
+# there and could be pruned; if a release ever fails at `docker pull`,
+# that is why, and the answer is to mirror them into our own registry.
+# And each index carries linux/amd64 only, which is all `ubuntu-latest`
+# needs; moving a Linux row to an arm64 runner would need a different
+# pin.
 #
 # Only the Linux targets need this. macOS builds on the runner itself,
-# where Xcode's clang is current.
+# where Xcode's clang is current, and is pinned to nothing.
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:8ef2d210f1b7a9d3bbe18bd131788bd90dc3e9654264281dbc7d3954be4c6754"

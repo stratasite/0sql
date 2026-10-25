@@ -13,6 +13,43 @@ use crate::{read_only, Connection, Result, Rows, Source, SourceError};
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 use std::path::PathBuf;
 
+// Why this crate names a symbol it never calls.
+//
+// `libduckdb-sys` takes the one object that registers DuckDB's linked
+// extensions out of the DuckDB library and links it whole-archive,
+// because nothing inside the library references it and the linker
+// would drop it, leaving the extensions unregistered. That object
+// calls `duckdb_register_static_extensions`, which is defined back in
+// the library; cargo bundles the library into an rlib, and rustc emits
+// that rlib before the extracted archive.
+//
+// GNU ld reads the line once. At the rlib nothing wants the symbol
+// yet, so the member that defines it is skipped, and the reference
+// arrives with nothing left to answer it. LLD keeps every archive's
+// symbols and fetches a member whenever a later reference turns up, so
+// it does not care about the order: rustc links this target's glibc
+// builds with its bundled LLD, and macOS with Apple's linker, which
+// is why only musl ever failed.
+//
+// A reference from this crate is compiled into an object file, and a
+// crate's own objects precede every rlib on the line. That makes the
+// member load whatever the linker. It replaces a `-Wl,-u` flag in
+// `.cargo/config.toml`, which an exported `RUSTFLAGS` would have
+// silently discarded and which a build from outside the checkout
+// never saw at all.
+//
+// Found 2026-10-25, when the first release to bundle DuckDB failed to
+// link on both Linux targets. Drop it when `libduckdb-sys` orders the
+// two itself.
+extern "C" {
+    fn duckdb_register_static_extensions() -> i32;
+}
+
+// Never called: the reference is the point, and `used` keeps it from
+// being optimised away before the linker sees it.
+#[used]
+static KEEP_STATIC_EXTENSIONS: unsafe extern "C" fn() -> i32 = duckdb_register_static_extensions;
+
 pub struct DuckDb {
     conn: duckdb::Connection,
     uid: String,
