@@ -38,9 +38,9 @@ serde_yaml.workspace = true
 flate2.workspace = true
 tar = "0.4"
 ureq = { version = "3", features = ["json"] }
-rustyline = "15"
+rustyline = "19"
 libc = "0.2"
-inquire = "0.7"
+inquire = "0.9"
 clap_complete = "4"
 
 [lints]
@@ -48,7 +48,7 @@ workspace = true
 
 [dev-dependencies]
 zsql-project.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # The engine is already linked through zsql-source; the tests build a
 # file with it the way a warehouse would hold one.
 duckdb = { version = "1.20000.0", features = ["bundled"] }

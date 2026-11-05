@@ -22,8 +22,8 @@ rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1", features = ["std"] }
 ureq = { version = "3", features = ["json"] }
 ring = "0.17"
-base64 = "0.22"
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+base64 = "0.23"
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
