@@ -46,6 +46,60 @@ on a command line. It is compared in constant time and never logged.
 To rotate it, change the variable and restart; there is one token at a
 time.
 
+## Deploying to it
+
+Deploy to the server directly, the way migrations are run against a
+database: on a path of its own, not through whatever the application's
+queries pass through. `zsql deploy` goes wherever `server` in
+`project.yml` or `ZSQL_SERVER` points, with the token from `.zsql` or
+`ZSQL_API_KEY`.
+
+| where you deploy from | how it reaches the server |
+|---|---|
+| the same private network or VPN | the server's private address |
+| anywhere else | a tailnet, or `ssh -L 3699:127.0.0.1:3699 <host>` and `ZSQL_SERVER=http://127.0.0.1:3699` |
+| hosted CI | a tailnet in the workflow, or the proxy, below |
+
+With deploys on their own path, the proxy in front carries reads only
+and should refuse the four write routes outright: `POST
+.../deploy`, `.../validate`, `.../test` and `DELETE
+/projects/{uid}/branches/{branch}`. A proxy that forwards a fixed list
+of read routes does this without trying.
+
+A proxy may carry deploys too, in one of two ways:
+
+- **It passes `Authorization` through** on the write routes, and the
+  server checks the token as if the caller had come direct. The proxy
+  cannot use `Authorization` for a credential of its own on those
+  routes: the CLI sends one such header.
+- **It holds the token and adds it itself**, so its users deploy
+  through the interface they already have. The proxy's own check is
+  then the only thing between a caller and a deploy. It must add the
+  token on the write routes alone, and only for a caller it has decided
+  may deploy; added to every forwarded request, the token gives a
+  deploy to everyone who can read.
+
+What to keep in mind whichever path is used:
+
+- **The token is worth what the warehouse credentials are worth.** A
+  model carries SQL expressions the application will run with its own
+  credentials, and the row policies. Whoever can deploy can drop the
+  policies or choose that SQL.
+- **One token is every project.** It is not scoped: its holder may
+  overwrite or remove any branch of any project, and the log does not
+  say which holder did.
+- **The direct path is plain HTTP.** A tailnet or an SSH tunnel
+  encrypts it. A flat VPN or VPC may not, and then the token crosses it
+  in the clear on every deploy.
+- **Bind the private address, not every address.** Reaching the server
+  over a VPN means a bind beyond the loopback, and on a host that also
+  has a public interface `0.0.0.0` is the internet. Behind an SSH
+  tunnel the loopback bind is enough.
+- **Reach is read access.** Any host that can reach the port lists
+  every model and plans under any context it claims. It gets SQL text
+  and the shape of the warehouse, not rows; policies protect data
+  through the application that runs the SQL, not against the network.
+
 ## What is on disk
 
 Everything the server keeps lives in one data directory: `--data-dir`,
