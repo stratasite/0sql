@@ -32,29 +32,6 @@ impl From<ServiceError> for ApiError {
     }
 }
 
-/// A failure of the store itself: logged here, answered with a fixed
-/// line, since what SQLite has to say is about this box.
-pub(crate) fn internal(e: zsql_accounts::Error) -> ApiError {
-    say!("zsqld: accounts: {e}");
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Accounts", "the accounts store failed; see the server's log".into())
-}
-
-pub(crate) fn accounts_error(e: zsql_accounts::Error) -> ApiError {
-    match e {
-        zsql_accounts::Error::NotFound(m) => ApiError(StatusCode::NOT_FOUND, "NotFound", m),
-        zsql_accounts::Error::Denied(m) => ApiError(StatusCode::FORBIDDEN, "Forbidden", m),
-        zsql_accounts::Error::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, "Invalid", m),
-        zsql_accounts::Error::Db(e) => internal(zsql_accounts::Error::Db(e)),
-    }
-}
-
-/// With accounts on, every read and write names a key; the one caller
-/// without one, the MCP handshake, is answered by `mcp.rs` before it
-/// reaches a gate.
-pub(crate) fn key_required() -> ApiError {
-    ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required: Authorization: Bearer <key>".into())
-}
-
 pub(crate) fn not_found(uid: &str, branch: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid} branch {branch}"))
 }

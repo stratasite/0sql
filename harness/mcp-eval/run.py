@@ -17,15 +17,18 @@ HERE = Path(__file__).resolve().parent
 SERVER = os.environ.get("ZSQL_EVAL_SERVER", "http://127.0.0.1:3699")
 PROJECT = os.environ.get("ZSQL_EVAL_PROJECT", "customer-service")
 BRANCH = os.environ.get("ZSQL_EVAL_BRANCH", "main")
-KEY = os.environ.get("ZSQL_EVAL_KEY") or (HERE / ".key").read_text().strip() if (HERE / ".key").exists() or os.environ.get("ZSQL_EVAL_KEY") else None
+# The security context every plan runs under: the server has no keys, so
+# the context a key used to be bound to is sent, in the body over REST
+# and in the Zsql-Context header over MCP.
+CONTEXT = json.loads(os.environ.get("ZSQL_EVAL_CONTEXT", '{"system_admin": true}'))
 MCP_TOOLS = ["list_projects", "fields", "tables", "values", "explore", "sql", "explain"]
 DENIED_TOOLS = "Read,Write,Edit,MultiEdit,Bash,Glob,Grep,WebFetch,WebSearch,Agent,Task,NotebookEdit,TodoWrite,LS"
 
 # ----------------------------------------------------------------- planning
 
 def plan(spec):
-    req = urllib.request.Request(f"{SERVER}/projects/{PROJECT}/branches/{BRANCH}/sql", data=json.dumps({"spec": spec}).encode(),
-                                 headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"})
+    req = urllib.request.Request(f"{SERVER}/projects/{PROJECT}/branches/{BRANCH}/sql", data=json.dumps({"spec": spec, "context": CONTEXT}).encode(),
+                                 headers={"content-type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
@@ -158,7 +161,7 @@ def final_spec(text):
 def catalogue_text():
     """The branch catalogue as the fields tool returns it with no q."""
     req = urllib.request.Request(f"{SERVER}/mcp", data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "fields", "arguments": {"project": PROJECT, "branch": BRANCH}}}).encode(),
-                                 headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"})
+                                 headers={"zsql-context": json.dumps(CONTEXT), "content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["result"]["content"][0]["text"]
 
@@ -251,7 +254,7 @@ def load_cases(only=None):
 
 def write_mcp_config(flow):
     cfg = flow.resolve() / ".mcp.json"
-    cfg.write_text(json.dumps({"mcpServers": {"zsql": {"type": "http", "url": f"{SERVER}/mcp", "headers": {"Authorization": f"Bearer {KEY}"}}}}))
+    cfg.write_text(json.dumps({"mcpServers": {"zsql": {"type": "http", "url": f"{SERVER}/mcp", "headers": {"Zsql-Context": json.dumps(CONTEXT)}}}}))
     return str(cfg)
 
 def ensure_state(flow, cases, seed=7, test_share=0.33):
@@ -298,8 +301,6 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for the claude process, e.g. ENABLE_TOOL_SEARCH=false")
     ap.add_argument("--catalogue-in-prompt", action="store_true", help="prepend the branch catalogue to the user prompt, as a client that shows server instructions whole would")
     a = ap.parse_args()
-    if not KEY:
-        sys.exit("no key: put the eval query key in harness/mcp-eval/.key or ZSQL_EVAL_KEY")
     cases = load_cases(a.cases)
     flow = Path(a.flow).resolve()
 

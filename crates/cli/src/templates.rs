@@ -12,7 +12,7 @@ description: \n\
 production_branch: main\n\
 \n\
 # The server `zsql deploy` sends to, when it is not the local one; the\n\
-# api key lives in .zsql, never here.\n\
+# server's deploy token, if it has one, lives in .zsql, never here.\n\
 # server: http://127.0.0.1:3699\n"
     )
 }

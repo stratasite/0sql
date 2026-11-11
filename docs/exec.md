@@ -106,7 +106,7 @@ off. The MCP `exec` tool is exposed only when the key carries it, and
 
 A warehouse query is seconds to minutes. The server is one process with
 a measured ceiling of 42,700 requests a second and a 30-second request
-deadline (`docs/rate-limiting.md`), and Cloudflare gives an origin a
+deadline (`docs/admission.md`), and Cloudflare gives an origin a
 hundred seconds before answering `524` itself, with no retry hint the
 caller can act on. So the contract is a job with a short synchronous
 window on the front of it:

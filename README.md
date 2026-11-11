@@ -116,15 +116,19 @@ takes it from here, joins and security included, in about ten minutes.
 - **Plans, never runs.** 0sql is given the shape of your warehouse,
   never its contents. No connection, no rows, no cache; a spec is
   planned in memory and never stored.
-- **Works with agents.** `POST /mcp` offers the same reads as MCP tools
-  under the same keys, so an agent plans against the model instead of
-  guessing at the schema. The shorthand (`country, revenue, country =
+- **Works with agents.** `POST /mcp` offers the same reads as MCP
+  tools, so an agent plans against the model instead of guessing at the
+  schema. The shorthand (`country, revenue, country =
   Canada`) is for people at a prompt; agents write specs.
 
 The model is YAML in git: branches, pull requests, tests (`zsql check`),
-and a deploy that is the checked-out branch. Accounts, users, personal
-keys and read-only query keys with per-project grants are built in and
-off by default; turn them on when the server is shared.
+and a deploy that is the checked-out branch.
+
+The server is a component, used the way a database is: it sits behind
+your own service, which signs your users in, sends the security context
+each plan runs under, and paces its callers. It has no accounts or keys
+of its own and answers whoever can reach it; an optional deploy token
+keeps deploys to whoever holds it. `docs/operating.md` has the detail.
 
 ## Where to go
 
@@ -134,7 +138,7 @@ off by default; turn them on when the server is shared.
 | Write the YAML model | [Semantic model](https://0sql.io/docs/semantic-model/) |
 | Construct a request: projections, filters, calculations, segments | [Query API](https://0sql.io/docs/query/) |
 | Lock rows down per user | [Row-level security](https://0sql.io/docs/security/) |
-| Run the server, with accounts and keys | [Running the server](https://0sql.io/docs/getting-started/server/) |
+| Run the server | [Running the server](https://0sql.io/docs/getting-started/server/) |
 | Drive it from a terminal or CI | [zsql CLI](https://0sql.io/docs/cli/) |
 | Put it behind an agent | [MCP](https://0sql.io/docs/mcp/) and the [chat dashboard tutorial](https://0sql.io/docs/examples/chat-dashboard/) |
 | Look up an endpoint | [API reference](https://0sql.io/docs/api-reference/) |
@@ -160,8 +164,8 @@ ones. 0sql is the open source core of that platform.
 
 ## Building from source
 
-The toolchain `rust-toolchain.toml` names (Rust 1.98), and a C compiler
-for the SQLite behind accounts.
+The toolchain `rust-toolchain.toml` names (Rust 1.98), and a C and C++
+compiler for the SQLite and DuckDB the CLI bundles to run queries.
 
 ```sh
 cargo build --release -p zsql-cli              # target/release/zsql
@@ -179,18 +183,18 @@ crates/planner    resolution, the node graph, the visitors, SQL
 crates/project    a project directory loaded into a snapshot
 crates/shorthand  the comma-separated line, for people at a prompt
 crates/service    a loaded model and every read over it, shared by the CLI and the server
-crates/accounts   accounts, users, keys and project access (SQLite)
-crates/server     the server: deploy, plan, accounts, the web app, MCP
+crates/server     the server: deploy, plan, MCP
 crates/cli        zsql
 crates/devtool    zsql-dev: the goldens, benches and formation checks, for developers of the engine
 crates/golden     the golden cases and the scoreboard
 fixtures/         public sample projects (TPC-DS, a grocery store) and the golden cases
 harness/          how the golden cases were captured, and the MCP wording evaluation
-docs/             design notes: accounts and access, rate limiting, MCP, operating and releasing
+docs/             design notes: admission, MCP, operating and releasing
 ```
 
 `docs/operating.md` is for whoever runs a server for others: the data
-directory, the settings, backups, what changes shape on disk and when.
+directory, the deploy token, the settings, what changes shape on disk
+and when.
 `docs/releasing.md` is how a release is cut.
 
 ## License

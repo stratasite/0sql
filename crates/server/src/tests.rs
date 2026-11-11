@@ -1,0 +1,861 @@
+//! The server, end to end, through the real router: the guard, the
+//! deploy token, the names that become directories, the archive, the
+//! models map, the data directory, and the MCP endpoint.
+//!
+//! Each test gets its own server over a scratch data directory. The
+//! fixture project is small: one table, two dimensions, one measure,
+//! one planner test, and a marker dimension named for the deploy, so
+//! that which model answers can be read off `/fields`.
+
+use crate::admission::{Admission, AdmissionCounts};
+use crate::deploy::{nanos, Capped, UNPACKED_LIMIT};
+use crate::mcp;
+use crate::run::{reload, router};
+use crate::{App, Shared};
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::http::{Method, Request};
+use axum::Router;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use tower::ServiceExt;
+use zsql_dialect::Dialects;
+
+const TOKEN: &str = "zdt_a-deploy-token-for-the-tests";
+
+struct Server {
+    app: Shared,
+    router: Router,
+    data_dir: PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+/// A server with no deploy token: every route is open.
+fn server() -> Server {
+    server_with(None)
+}
+
+fn server_with(deploy_token: Option<&str>) -> Server {
+    let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let app = app_over(&data_dir, deploy_token);
+    Server { router: router(app.clone()), app, data_dir }
+}
+
+fn app_over(data_dir: &std::path::Path, deploy_token: Option<&str>) -> Shared {
+    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
+    Arc::new(App {
+        dialects,
+        data_dir: data_dir.to_path_buf(),
+        models: RwLock::new(HashMap::new()),
+        admission: Admission::new(&AdmissionCounts::default()),
+        mcp: mcp::Settings::builtin(),
+        deploy_token: deploy_token.map(str::to_string),
+        deploying: std::sync::Mutex::new(()),
+    })
+}
+
+/// A status and a JSON body (null when the body is not JSON).
+#[derive(Debug)]
+struct Answer {
+    status: StatusCode,
+    body: Value,
+    headers: axum::http::HeaderMap,
+}
+
+impl Answer {
+    fn error(&self) -> String {
+        self.body["error"]["message"].as_str().unwrap_or("").to_string()
+    }
+    fn class(&self) -> &str {
+        self.body["error"]["class"].as_str().unwrap_or("")
+    }
+}
+
+impl Server {
+    async fn send(&self, method: Method, path: &str, headers: &[(&str, &str)], body: Option<(&str, Vec<u8>)>) -> Answer {
+        let mut req = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let body = match body {
+            Some((ct, bytes)) => {
+                req = req.header("content-type", ct);
+                Body::from(bytes)
+            }
+            None => Body::empty(),
+        };
+        let res = self.router.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 16 << 20).await.unwrap();
+        Answer { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers }
+    }
+
+    /// One JSON-RPC message to the MCP endpoint, with any headers.
+    async fn mcp(&self, headers: &[(&str, &str)], msg: Value) -> Answer {
+        self.send(Method::POST, "/mcp", headers, Some(("application/json", serde_json::to_vec(&msg).unwrap()))).await
+    }
+
+    /// A tool call; answers the JSON-RPC envelope.
+    async fn tool(&self, headers: &[(&str, &str)], name: &str, args: Value) -> Answer {
+        self.mcp(headers, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } })).await
+    }
+
+    async fn get(&self, path: &str) -> Answer {
+        self.send(Method::GET, path, &[], None).await
+    }
+    async fn post(&self, path: &str, json: Value) -> Answer {
+        self.send(Method::POST, path, &[], Some(("application/json", serde_json::to_vec(&json).unwrap()))).await
+    }
+    async fn deploy(&self, uid: &str, branch: &str, archive: Vec<u8>) -> Answer {
+        self.send(Method::POST, &format!("/projects/{uid}/branches/{branch}/deploy"), &[], Some(("application/gzip", archive))).await
+    }
+    async fn validate(&self, uid: &str, branch: &str, archive: Vec<u8>) -> Answer {
+        self.send(Method::POST, &format!("/projects/{uid}/branches/{branch}/validate"), &[], Some(("application/gzip", archive))).await
+    }
+
+    /// The field names of a branch, or the error.
+    async fn fields(&self, uid: &str, branch: &str) -> Result<Vec<String>, Answer> {
+        let a = self.get(&format!("/projects/{uid}/branches/{branch}/fields?hidden=true")).await;
+        if a.status != StatusCode::OK {
+            return Err(a);
+        }
+        Ok(a.body["fields"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str().map(str::to_string)).collect())
+    }
+
+    /// What the listing holds, as `project/branch`.
+    async fn listing(&self) -> Vec<String> {
+        let a = self.get("/projects").await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+        a.body["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// Deployment directories on disk, relative to the data directory.
+    fn on_disk(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for project in std::fs::read_dir(&self.data_dir).unwrap().flatten().filter(|e| e.path().is_dir()) {
+            for branch in std::fs::read_dir(project.path()).unwrap().flatten().filter(|e| e.path().is_dir()) {
+                if branch.path().join("snapshot.json.gz").exists() {
+                    out.push(format!("{}/{}", project.file_name().to_string_lossy(), branch.file_name().to_string_lossy()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn keys_in_memory(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.app.models.read().unwrap().keys().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+// ------------------------------------------------------------- fixtures
+
+/// The fixture project as a tar.gz, with a marker dimension so the
+/// model that answers can be told from any other.
+fn archive(uid: &str, marker: &str) -> Vec<u8> {
+    archive_of(&fixture_files(uid, marker))
+}
+
+fn fixture_files(uid: &str, marker: &str) -> Vec<(String, String)> {
+    let column = format!("marker_{}", marker.replace('-', "_"));
+    vec![
+        ("project.yml".into(), format!("name: Fixture {marker}\nuid: {uid}\nproduction_branch: main\n")),
+        ("datasources.yml".into(), "dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n".into()),
+        (
+            "models/tbl.sales.yml".into(),
+            format!(
+                "name: Sales\nphysical_name: sales\ndatasource: dw\ncost: 10\nfields:\n\
+                 \x20 - type: dimension\n    name: Category\n    data_type: string\n    expression:\n      sql: category\n\
+                 \x20 - type: dimension\n    name: Marker {marker}\n    data_type: string\n    expression:\n      sql: {column}\n\
+                 \x20 - type: measure\n    name: Revenue\n    data_type: decimal\n    expression:\n      sql: sum(revenue)\n"
+            ),
+        ),
+        ("tests/smoke.yml".into(), "name: smoke\nprojections: [Category, Revenue]\nassert_regex: SELECT\n".into()),
+    ]
+}
+
+/// The fixture with two row-level policies: `Revenue` is filtered by the
+/// groups in the context on `Region`, and `Category` by the context's
+/// email on `Owner Email`. Both deny when nothing resolves.
+fn archive_with_policies(uid: &str, marker: &str) -> Vec<u8> {
+    let mut files = fixture_files(uid, marker);
+    let model = files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap();
+    model.1.push_str(
+        "  - type: dimension\n    name: Region\n    data_type: string\n    expression:\n      sql: region\n\
+         \x20 - type: dimension\n    name: Owner Email\n    data_type: string\n    expression:\n      sql: owner_email\n",
+    );
+    files.push((
+        "security.yml".into(),
+        "policies:\n\
+         \x20 - name: regions\n    mode: filter_data\n    context_dimension: Region\n    triggers:\n      field_names: [Revenue]\n\
+         \x20   permission_resolution:\n      source: groups\n      value_from: name\n      unresolved: deny\n\
+         \x20 - name: owners\n    mode: filter_data\n    context_dimension: Owner Email\n    triggers:\n      field_names: [Category]\n\
+         \x20   permission_resolution:\n      source: user\n      value_from: email\n      unresolved: deny\n"
+            .into(),
+    ));
+    archive_of(&files)
+}
+
+/// The policy fixture plus measures whose own rules touch the context
+/// dimension: one that ignores a caller's Region filter, one that
+/// ignores every filter, and one computed per Region then rolled up.
+/// The regions policy is triggered by the `secure` tag they all carry.
+fn archive_with_exclusions(uid: &str, marker: &str) -> Vec<u8> {
+    let mut files = fixture_files(uid, marker);
+    let model = files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap();
+    model.1.push_str(
+        "  - type: dimension\n    name: Region\n    data_type: string\n    expression:\n      sql: region\n\
+         \x20 - type: measure\n    name: Total Revenue\n    data_type: decimal\n    tags: [secure]\n    exclusion_type: exclude\n    exclusions:\n      - type: dimension\n        filter: ignore\n        entities: [Region]\n    expression:\n      sql: sum(revenue)\n\
+         \x20 - type: measure\n    name: Global Revenue\n    data_type: decimal\n    tags: [secure]\n    exclusion_type: exclude_all\n    expression:\n      sql: sum(revenue)\n\
+         \x20 - type: measure\n    name: Peak Region Revenue\n    data_type: decimal\n    tags: [secure]\n    inclusions:\n      filter: ignore\n      aggregation: max\n      dimensions: [Region]\n    expression:\n      sql: sum(revenue)\n",
+    );
+    files.push((
+        "security.yml".into(),
+        "policies:\n\
+         \x20 - name: regions\n    mode: filter_data\n    context_dimension: Region\n    triggers:\n      field_tags: [secure]\n\
+         \x20   permission_resolution:\n      source: groups\n      value_from: name\n      unresolved: deny\n"
+            .into(),
+    ));
+    archive_of(&files)
+}
+
+fn archive_of(files: &[(String, String)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (path, text) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, path, text.as_bytes()).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    buf
+}
+
+/// The fixture plus a symbolic link entry pointing at `target`.
+fn archive_with_link(uid: &str, link_path: &str, target: &str) -> Vec<u8> {
+    let files = fixture_files(uid, "linked");
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (path, text) in &files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, path, text.as_bytes()).unwrap();
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_cksum();
+        tar.append_link(&mut h, link_path, target).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    buf
+}
+
+const CS: &str = "customer-service";
+const EMEA: &str = r#"{"groups":[{"name":"emea"}]}"#;
+
+/// The spec a shorthand line makes, for the tools, which take specs only.
+fn spec_of(expr: &str) -> Value {
+    zsql_shorthand::parse_line(expr).unwrap().0
+}
+
+// ---------------------------------------------------------------- tests
+
+/// With no token the server is as open to writes as to reads: the mode
+/// a developer's own machine runs in.
+#[tokio::test]
+async fn without_a_token_every_route_is_open() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(s.listing().await, ["customer-service/main"]);
+    assert_eq!(s.on_disk(), ["customer-service/main"]);
+    let a = s.send(Method::POST, &format!("/projects/{CS}/branches/main/test"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/main"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(s.listing().await.is_empty() && s.on_disk().is_empty());
+}
+
+/// With a token, the four routes that change a deployment or spend
+/// seconds on one need it, and every read stays open. Asked through the
+/// router, so a write route the guard does not know about fails here.
+#[tokio::test]
+async fn the_deploy_token_stands_in_front_of_the_writes_and_only_the_writes() {
+    let s = server_with(Some(TOKEN));
+    let bearer = format!("Bearer {TOKEN}");
+    let good: &[(&str, &str)] = &[("authorization", &bearer)];
+    let branch = format!("/projects/{CS}/branches/main");
+    let writes = || {
+        [
+            (Method::POST, format!("{branch}/deploy"), Some(("application/gzip", archive(CS, "one")))),
+            (Method::POST, format!("{branch}/validate"), Some(("application/gzip", archive(CS, "one")))),
+            (Method::POST, format!("{branch}/test"), None),
+            (Method::DELETE, branch.clone(), None),
+        ]
+    };
+
+    // No token, a wrong one, the right one under another scheme, the
+    // right one with a character more or less: all refused, with the
+    // challenge, and nothing lands.
+    let (longer, shorter) = (format!("Bearer {TOKEN}x"), format!("Bearer {}", &TOKEN[..TOKEN.len() - 1]));
+    let basic = format!("Basic {TOKEN}");
+    for wrong in [None, Some("Bearer nope"), Some(basic.as_str()), Some(TOKEN), Some(longer.as_str()), Some(shorter.as_str())] {
+        for (method, path, body) in writes() {
+            let headers: Vec<(&str, &str)> = wrong.iter().map(|w| ("authorization", *w)).collect();
+            let a = s.send(method.clone(), &path, &headers, body).await;
+            assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{method} {path} with {wrong:?}: {}", a.body);
+            assert_eq!(a.class(), "Unauthorized");
+            assert_eq!(a.headers.get("www-authenticate").unwrap().to_str().unwrap(), "Bearer realm=\"0sql\"");
+        }
+    }
+    assert!(s.on_disk().is_empty() && s.keys_in_memory().is_empty());
+
+    // With it, each works.
+    for (method, path, body) in writes() {
+        let a = s.send(method.clone(), &path, good, body).await;
+        assert_eq!(a.status, StatusCode::OK, "{method} {path}: {}", a.error());
+    }
+    assert!(s.on_disk().is_empty(), "the last of them was the removal");
+    let a = s.send(Method::POST, &format!("{branch}/deploy"), good, Some(("application/gzip", archive(CS, "one")))).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    // The reads need nothing, over REST and over MCP.
+    for path in ["/projects".to_string(), branch.clone(), format!("{branch}/fields"), format!("{branch}/tables")] {
+        let a = s.get(&path).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.error());
+    }
+    for verb in ["sql", "explain", "explore"] {
+        let a = s.post(&format!("{branch}/{verb}"), json!({ "expr": "Category, Revenue" })).await;
+        assert_eq!(a.status, StatusCode::OK, "{verb}: {}", a.error());
+    }
+    let a = s.tool(&[], "sql", json!({ "project": CS, "spec": spec_of("Category, Revenue") })).await;
+    assert!(a.body["result"]["structuredContent"]["sql"].is_string(), "{}", a.body);
+    // And a token sent where none is needed is not an error.
+    let a = s.send(Method::GET, "/projects", good, None).await;
+    assert_eq!(a.status, StatusCode::OK);
+}
+
+/// Two projects, and two branches of one, are each their own
+/// deployment: one answers for itself and removing one leaves the rest.
+#[tokio::test]
+async fn each_branch_is_its_own_deployment() {
+    let s = server();
+    for (uid, branch, marker) in [(CS, "main", "cs-main"), (CS, "dev", "cs-dev"), ("billing", "main", "billing")] {
+        let a = s.deploy(uid, branch, archive(uid, marker)).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    }
+    assert_eq!(s.listing().await, ["billing/main", "customer-service/dev", "customer-service/main"]);
+    assert_eq!(s.on_disk(), s.keys_in_memory());
+    assert!(s.fields(CS, "dev").await.unwrap().contains(&"Marker cs-dev".to_string()));
+    assert!(s.fields(CS, "main").await.unwrap().contains(&"Marker cs-main".to_string()));
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/dev"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(s.listing().await, ["billing/main", "customer-service/main"]);
+    assert_eq!(s.fields(CS, "dev").await.unwrap_err().status, StatusCode::NOT_FOUND);
+
+    // A restart finds what is on disk and nothing else.
+    let again = app_over(&s.data_dir, None);
+    let (n, skipped) = reload(&again).unwrap();
+    assert_eq!((n, skipped.len()), (2, 0));
+}
+
+/// A name that could step out of its project's directory, or out of
+/// the data directory, is refused before it is used for anything.
+#[tokio::test]
+async fn names_that_could_leave_the_data_directory_are_refused() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("billing", "main", archive("billing", "two")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let other = s.data_dir.join("billing").join("main").join("snapshot.json.gz");
+    let before = std::fs::read(&other).unwrap();
+
+    let traversal = "..%2F..%2Fbilling%2Fmain";
+    for (method, path) in [
+        (Method::POST, format!("/projects/{CS}/branches/{traversal}/deploy")),
+        (Method::POST, format!("/projects/{CS}/branches/{traversal}/validate")),
+        (Method::DELETE, format!("/projects/{CS}/branches/{traversal}")),
+        (Method::GET, format!("/projects/{CS}/branches/{traversal}/fields")),
+        (Method::GET, format!("/projects/{CS}/branches/{traversal}")),
+        (Method::POST, "/projects/..%2Fbilling/branches/main/deploy".to_string()),
+        (Method::POST, "/projects/Customer-Service/branches/main/deploy".to_string()),
+        (Method::POST, format!("/projects/{CS}/branches/feature%2Fx/deploy")),
+        (Method::POST, format!("/projects/{CS}/branches/.hidden/deploy")),
+    ] {
+        let body = (method == Method::POST).then(|| ("application/gzip", archive(CS, "evil")));
+        let a = s.send(method.clone(), &path, &[], body).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{method} {path}: {} {}", a.status, a.error());
+        assert_eq!(a.class(), "Invalid", "{method} {path}");
+    }
+    assert_eq!(std::fs::read(&other).unwrap(), before, "the other deployment is untouched");
+    assert_eq!(s.on_disk(), ["billing/main", "customer-service/main"]);
+    assert_eq!(s.keys_in_memory(), ["billing/main", "customer-service/main"]);
+}
+
+/// What is inside an archive cannot reach outside it: no links, no
+/// imports beyond the project, no server paths in what comes back, and
+/// a validate leaves nothing behind.
+#[tokio::test]
+async fn an_archive_cannot_reach_outside_itself() {
+    let s = server();
+    let a = s.deploy("billing", "main", archive("billing", "kept")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    // Something on the host that must never be read: here, a file with
+    // a marker, standing in for anything else on the machine.
+    let outside = s.data_dir.join("outside.yml");
+    std::fs::write(
+        &outside,
+        "fields:\n  - type: dimension\n    name: LEAKED_FROM_HOST\n    data_type: string\n    expression:\n      sql: x\n",
+    )
+    .unwrap();
+
+    // A symbolic link entry.
+    let a = s.validate(CS, "main", archive_with_link(CS, "tests/leak.yml", outside.to_str().unwrap())).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    assert!(a.error().contains("not a file or a directory"), "{}", a.error());
+
+    // An import by absolute path.
+    let mut files = fixture_files(CS, "importer");
+    files[2].1 = format!("imports:\n  - {}\n{}", outside.display(), files[2].1);
+    let a = s.validate(CS, "main", archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    assert!(a.error().contains("Import outside the project"), "{}", a.error());
+    assert!(!a.error().contains("LEAKED_FROM_HOST"), "nothing read is shown: {}", a.error());
+
+    // An import by relative path that climbs out. The work directory
+    // and this test's data directory are siblings under the temp
+    // directory, so from `models/` two steps up and over reaches it.
+    let mut files = fixture_files(CS, "climber");
+    files[2].1 = format!("imports:\n  - ../../{}/outside.yml\n{}", s.data_dir.file_name().unwrap().to_string_lossy(), files[2].1);
+    let a = s.validate(CS, "main", archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    assert!(a.error().contains("Import outside the project"), "{}", a.error());
+    assert!(!a.error().contains("LEAKED_FROM_HOST"), "{}", a.error());
+
+    // A broken project's error names its own files, not the server's.
+    let mut files = fixture_files(CS, "broken");
+    files[2].1 = "name: Sales\nphysical_name: sales\ndatasource: nowhere\nfields: []\n".into();
+    let a = s.validate(CS, "main", archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert!(!a.error().contains("zsqld-deploy"), "the work directory stays private: {}", a.error());
+
+    // A good validate answers and keeps nothing either.
+    let a = s.validate(CS, "main", archive(CS, "checked")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["validated_only"], true);
+
+    assert_eq!(s.listing().await, ["billing/main"]);
+    assert_eq!(s.on_disk(), ["billing/main"]);
+    assert_eq!(s.keys_in_memory(), ["billing/main"]);
+}
+
+/// An archive entry that would land above the project is refused and
+/// named, rather than silently left out of the deploy.
+#[tokio::test]
+async fn an_entry_above_the_project_is_refused() {
+    let s = server();
+    // The tar crate refuses to write such a path itself, so the name
+    // goes into the header's bytes directly, as an attacker's tool would.
+    let files = fixture_files(CS, "one");
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        for (path, text) in &files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(&mut h, path, text.as_bytes()).unwrap();
+        }
+        let text = b"name: escape\n";
+        let mut h = tar::Header::new_gnu();
+        let name = b"../escape.yml";
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+        h.set_size(text.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append(&h, &text[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    let a = s.validate(CS, "main", buf).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    assert!(a.error().contains("outside the project") || a.error().contains(".."), "{}", a.error());
+}
+
+/// Decompression stops at the limit with a message that says so,
+/// whatever the archive claimed.
+#[test]
+fn decompression_stops_at_the_limit() {
+    use std::io::Read;
+    let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut capped = Capped { inner: std::io::repeat(0u8), left: UNPACKED_LIMIT, tripped: tripped.clone() };
+    let mut sink = [0u8; 1 << 16];
+    let mut total = 0u64;
+    let err = loop {
+        match capped.read(&mut sink) {
+            Ok(n) => total += n as u64,
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(total, UNPACKED_LIMIT);
+    assert!(tripped.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+}
+
+/// Every refusal is `{"error": {"class", "message"}}`, including the
+/// ones axum itself would make: a body that is not JSON, a media type
+/// that is not JSON, a query string that does not parse. A client
+/// reads one shape from every answer.
+#[tokio::test]
+async fn refusals_from_the_extractors_are_in_the_api_shape() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+
+    let b = format!("/projects/{CS}/branches/main");
+    let a = s.send(Method::POST, &format!("{b}/sql"), &[], Some(("application/json", b"not json".to_vec()))).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+    assert!(a.headers["content-type"].to_str().unwrap().starts_with("application/json"));
+
+    let a = s.send(Method::POST, &format!("{b}/sql"), &[], Some(("text/plain", b"{}".to_vec()))).await;
+    assert_eq!(a.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+
+    let a = s.get(&format!("{b}/fields?hidden=maybe")).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    assert_eq!(a.class(), "Invalid", "{}", a.body);
+}
+
+/// The context a REST request sends is the context its plan runs
+/// under: the policy filters by it, denies without it, and a different
+/// caller's context gets a different plan from the same server.
+#[tokio::test]
+async fn a_rest_plan_runs_under_the_context_the_request_sends() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive_with_policies(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let sql = format!("/projects/{CS}/branches/main/sql");
+    let plan = |context: Value| {
+        let (s, sql) = (&s, &sql);
+        async move {
+            let a = s.post(sql, json!({ "expr": "Revenue", "context": context })).await;
+            assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+            a.body["sql"].as_str().unwrap().to_lowercase()
+        }
+    };
+    assert!(plan(json!({ "groups": [{ "name": "emea" }] })).await.contains("in ('emea')"));
+    assert!(plan(json!({ "groups": [{ "name": "apac" }] })).await.contains("in ('apac')"));
+    assert!(plan(json!({})).await.contains("1 = 0"), "a context that resolves nothing is denied");
+    // No context at all is not a plan with nobody in it: it is refused.
+    let a = s.post(&sql, json!({ "expr": "Revenue" })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "ContextRequired"), "{}", a.body);
+}
+
+/// Over MCP the context comes from the connection's header and from
+/// nowhere else: a tool's arguments may not carry one, and a header
+/// that is not a context is refused rather than read as none.
+#[tokio::test]
+async fn an_mcp_plan_runs_under_the_context_the_connection_carries() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive_with_policies(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let sql_of = |a: &Answer| a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").to_lowercase();
+
+    // The header decides.
+    let a = s.tool(&[(mcp::CONTEXT_HEADER, EMEA)], "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
+    assert!(sql_of(&a).contains("in ('emea')"), "{}", a.body);
+    let a = s
+        .tool(&[(mcp::CONTEXT_HEADER, r#"{"email":"ann@acme.test"}"#)], "sql", json!({ "project": CS, "spec": spec_of("Category") }))
+        .await;
+    assert!(sql_of(&a).contains("ann@acme.test"), "{}", a.body);
+    let a = s.tool(&[(mcp::CONTEXT_HEADER, EMEA)], "explain", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
+    assert!(sql_of(&a).contains("in ('emea')"), "{}", a.body);
+
+    // No header: no context, which a branch with policies refuses, as
+    // it does over REST; an empty one resolves nothing and is denied.
+    let a = s.tool(&[], "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().starts_with("ContextRequired"), "{}", a.body);
+    let a = s.tool(&[(mcp::CONTEXT_HEADER, "{}")], "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
+    assert!(sql_of(&a).contains("1 = 0"), "{}", a.body);
+
+    // A context in the arguments is refused, with or without the header:
+    // the model does not choose who it acts as.
+    for headers in [&[][..], &[(mcp::CONTEXT_HEADER, EMEA)][..]] {
+        for tool in ["sql", "explain", "explore"] {
+            let a = s.tool(headers, tool, json!({ "project": CS, "spec": spec_of("Revenue"), "context": { "system_admin": true } })).await;
+            assert_eq!(a.body["error"]["code"], -32602, "{tool}: {}", a.body);
+            assert!(a.body["error"]["message"].as_str().unwrap().contains("fixed by the connection"), "{}", a.body);
+        }
+    }
+
+    // A header that is not a context.
+    for bad in ["emea", r#"{"group":"emea"}"#, "[]"] {
+        let a = s.tool(&[(mcp::CONTEXT_HEADER, bad)], "sql", json!({ "project": CS, "spec": spec_of("Revenue") })).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{bad}: {}", a.body);
+        assert!(a.body["error"]["message"].as_str().unwrap().contains("zsql-context"), "{}", a.body);
+    }
+}
+
+/// A caller's own filter on the policy's context dimension must narrow
+/// the rows the policy allows, never replace the policy's filter.
+#[tokio::test]
+async fn a_user_filter_on_the_context_dimension_cannot_widen_the_policy() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive_with_policies(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let mut failed = Vec::new();
+    for expr in [
+        "Revenue, Region = apac",
+        "Category, Revenue, Region = apac",
+        "Region, Revenue, Region = apac",
+        "Revenue, Region in (apac, amer)",
+        "Revenue, Region != emea",
+        "Revenue, Region is not null",
+        "Region, Revenue, Region not in (emea)",
+        "Category, Revenue, Region = apac, Category = books",
+        "Revenue, Region = apac, Revenue > 10",
+        "Category, Revenue desc, Region = apac",
+    ] {
+        let a = s.tool(&[(mcp::CONTEXT_HEADER, EMEA)], "sql", json!({ "project": CS, "spec": spec_of(expr) })).await;
+        let sql = a.body["result"]["structuredContent"]["sql"].as_str().map(str::to_string).unwrap_or_else(|| format!("ERROR {}", a.body));
+        let lower = sql.to_lowercase();
+        let secured = lower.contains("in ('emea')") || lower.contains("1 = 0");
+        let user_filter_present = lower.contains("apac")
+            || lower.contains("amer")
+            || lower.contains("!= 'emea'")
+            || lower.contains("<> 'emea'")
+            || lower.contains("is not null")
+            || lower.contains("not in");
+        eprintln!("--- {expr}\n{sql}\n");
+        if !secured || !user_filter_present {
+            failed.push(format!("{expr}: secured={secured} user_filter={user_filter_present}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A measure's own exclusion or inclusion rule on the context dimension
+/// outranks a resolved policy filter: the modeler decided that measure
+/// is computed without regard to that dimension, and the decision holds
+/// for the policy as it does for a caller's filter. Decided 2026-10-09,
+/// on purpose: only the deployer of the model can write such a rule, so
+/// a caller cannot reach this. A denial still lands as `1 = 0`.
+#[tokio::test]
+async fn a_measure_that_ignores_the_context_dimension_is_the_modelers_decision() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive_with_exclusions(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    for expr in ["Total Revenue, Region = apac", "Global Revenue, Region = apac", "Peak Region Revenue, Region = apac"] {
+        let a = s.tool(&[(mcp::CONTEXT_HEADER, EMEA)], "sql", json!({ "project": CS, "spec": spec_of(expr) })).await;
+        let sql = a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").to_lowercase();
+        assert!(sql.contains("sum(t0.\"revenue\")"), "{expr}: {}", a.body);
+        assert!(
+            !sql.contains("in ('emea')") && !sql.contains("apac"),
+            "{expr}: the measure ignores both the caller's filter and the policy's: {sql}"
+        );
+    }
+    // A caller whose context resolves nothing is still denied.
+    let a = s.tool(&[(mcp::CONTEXT_HEADER, "{}")], "sql", json!({ "project": CS, "spec": spec_of("Global Revenue") })).await;
+    assert!(a.body["result"]["structuredContent"]["sql"].as_str().unwrap_or("").contains("1 = 0"), "{}", a.body);
+}
+
+/// The transport: the handshake, the versions, what is not offered,
+/// and what a malformed message gets.
+#[tokio::test]
+async fn the_mcp_wire() {
+    let s = server();
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "test", "version": "0" } } });
+
+    // initialize answers the version asked for, and names the server.
+    let a = s.mcp(&[], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(a.body["result"]["serverInfo"]["name"], "0sql");
+    assert!(a.body["result"]["instructions"].as_str().unwrap().contains("No branch is deployed yet."), "{}", a.body);
+    let a = s.mcp(&[], json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": "1999-01-01" } })).await;
+    assert_eq!(a.body["result"]["protocolVersion"], "2025-11-25", "an unknown version gets the newest");
+
+    // Seven tools, none of which takes a context or changes anything.
+    let a = s.mcp(&[], json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" })).await;
+    let tools = a.body["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["list_projects", "fields", "tables", "values", "explore", "sql", "explain"]);
+    for t in tools {
+        assert!(t["inputSchema"]["properties"].get("context").is_none(), "{t}");
+        assert_eq!(t["inputSchema"]["additionalProperties"], false, "{t}");
+    }
+
+    // An Authorization header, of any kind, is simply not read here.
+    let a = s.mcp(&[("authorization", "Bearer anything")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+
+    // OAuth discovery finds nothing, plainly.
+    for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"] {
+        assert_eq!(s.get(path).await.status, StatusCode::NOT_FOUND);
+    }
+
+    // No stream: GET and DELETE are not offered.
+    assert_eq!(s.get("/mcp").await.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(s.send(Method::DELETE, "/mcp", &[], None).await.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // A notification is taken, a batch is not, an unknown method and an
+    // unsupported version header are named.
+    let a = s.mcp(&[], json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+    assert_eq!(a.status, StatusCode::ACCEPTED);
+    let a = s.mcp(&[], json!([init.clone()])).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = s.mcp(&[], json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" })).await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(a.body["error"]["code"], -32601);
+    let a = s.mcp(&[("mcp-protocol-version", "2024-11-05")], init.clone()).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = s.mcp(&[("mcp-protocol-version", "2025-11-25")], json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["result"], json!({}));
+    let a = s.tool(&[], "deploy", json!({})).await;
+    assert_eq!(a.body["error"]["code"], -32602, "there is no tool that writes: {}", a.body);
+}
+
+/// What a client is told on connect and by a bare fields call: the
+/// catalog of the deployed branches, with uids; the branch a tool works
+/// on when none is named; and a refused field name coming back with
+/// the fields nearest it.
+#[tokio::test]
+async fn the_catalog_the_default_branch_and_a_refusal_with_the_nearest_fields() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy("billing", "main", archive("billing", "two")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
+
+    let a = s.mcp(&[], init).await;
+    let text = a.body["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("## Project billing, branch main") && text.contains("## Project customer-service, branch main"), "{text}");
+    assert!(text.contains("- revenue: Revenue (decimal)"), "{text}");
+    assert!(text.contains("Marker one (marker-one)"), "{text}");
+    let a = s.tool(&[], "list_projects", json!({})).await;
+    let listed: Vec<String> = a.body["result"]["structuredContent"]["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap()))
+        .collect();
+    assert_eq!(listed, ["billing/main", "customer-service/main"]);
+
+    // fields with no q is the same catalog as text; with q it is the search.
+    let a = s.tool(&[], "fields", json!({ "project": CS })).await;
+    let r = &a.body["result"];
+    assert!(r["isError"].is_null(), "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().starts_with("## Project customer-service, branch main"), "{r}");
+    assert!(r["structuredContent"]["catalog"].is_string());
+    let a = s.tool(&[], "fields", json!({ "project": CS, "q": "revenue" })).await;
+    assert_eq!(a.body["result"]["structuredContent"]["fields"][0]["uid"], "revenue", "{}", a.body);
+
+    // With no branch named: the one deployed; among several, the
+    // project's production branch; and when that is not among them, a
+    // request to name one.
+    let a = s.deploy(CS, "dev", archive(CS, "dev")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.tool(&[], "fields", json!({ "project": CS })).await;
+    let text = a.body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("## Project customer-service, branch main") && text.contains("Marker one"), "{text}");
+    let a = s.tool(&[], "fields", json!({ "project": CS, "branch": "dev" })).await;
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().contains("Marker dev"), "{}", a.body);
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/main"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.deploy(CS, "staging", archive(CS, "staging")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.tool(&[], "tables", json!({ "project": CS })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().contains("name one"), "{}", a.body);
+    let a = s.tool(&[], "tables", json!({ "project": "nothing-here" })).await;
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().starts_with("NotFound"), "{}", a.body);
+
+    // A near miss with one clear winner is corrected and said so under
+    // corrections; one the planner cannot settle between two candidates
+    // is refused, and the refusal carries the nearest fields.
+    let a = s
+        .tool(
+            &[],
+            "sql",
+            json!({ "project": "billing", "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Grand Total" }] } }),
+        )
+        .await;
+    assert_eq!(a.body["result"]["structuredContent"]["corrections"][0]["field_uid"], "revenue", "{}", a.body);
+    // A model with two revenues and no plain one, so "Revenue Total" has
+    // two candidates at the same distance and no containing match.
+    let mut files = fixture_files("billing", "two-revenues");
+    files.iter_mut().find(|(p, _)| p == "models/tbl.sales.yml").unwrap().1 =
+        "name: Sales\nphysical_name: sales\ndatasource: dw\ncost: 10\nfields:\n\
+         \x20 - type: dimension\n    name: Category\n    data_type: string\n    expression:\n      sql: category\n\
+         \x20 - type: measure\n    name: Revenue Net\n    data_type: decimal\n    expression:\n      sql: sum(net)\n\
+         \x20 - type: measure\n    name: Revenue Gross\n    data_type: decimal\n    expression:\n      sql: sum(gross)\n"
+            .into();
+    files.retain(|(p, _)| p != "tests/smoke.yml");
+    let a = s.deploy("billing", "main", archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s
+        .tool(
+            &[],
+            "sql",
+            json!({ "project": "billing", "spec": { "projections": [{ "field": "Category" }, { "field": "Revenue Total" }] } }),
+        )
+        .await;
+    let r = &a.body["result"];
+    assert_eq!(r["isError"], true, "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("FieldNotFound"), "{text}");
+    assert!(
+        text.contains("Fields near 'Revenue Total'")
+            && text.contains("- revenue-net: Revenue Net (measure, decimal)")
+            && text.contains("- revenue-gross: Revenue Gross (measure, decimal)"),
+        "{text}"
+    );
+}
+
+/// The root and the liveness route answer without a seat, a token or a
+/// model.
+#[tokio::test]
+async fn liveness_needs_nothing() {
+    let s = server_with(Some(TOKEN));
+    let res = s.router.clone().oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(&axum::body::to_bytes(res.into_body(), 1024).await.unwrap()[..], b"ok");
+    assert_eq!(s.get("/").await.status, StatusCode::OK);
+    for gone in ["/app/", "/login", "/signup", "/me", "/account/keys"] {
+        assert_eq!(s.get(gone).await.status, StatusCode::NOT_FOUND, "{gone}");
+    }
+}

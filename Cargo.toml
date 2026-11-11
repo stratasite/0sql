@@ -7,7 +7,6 @@ members = [
   "crates/spec",
   "crates/planner",
   "crates/project",
-  "crates/accounts",
   "crates/shorthand",
   "crates/source",
   "crates/exec",
@@ -19,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.5"
+version = "0.6.10"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/stratasite/0sql"
@@ -47,7 +46,6 @@ zsql-dialect = { path = "crates/dialect" }
 zsql-spec = { path = "crates/spec" }
 zsql-planner = { path = "crates/planner" }
 zsql-project = { path = "crates/project" }
-zsql-accounts = { path = "crates/accounts" }
 zsql-shorthand = { path = "crates/shorthand" }
 zsql-source = { path = "crates/source" }
 zsql-exec = { path = "crates/exec" }

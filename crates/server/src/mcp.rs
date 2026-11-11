@@ -1,51 +1,43 @@
 //! The MCP endpoint: `POST /mcp`, Streamable HTTP, stateless.
 //!
-//! An agent connects with the same key an application would and gets
-//! the server's reads as tools: the deployments it may see, a branch's
-//! fields, tables and sampled values, and the SQL for a query spec.
-//! Specs only, never the shorthand: a spec is JSON against a published
-//! schema, which is what a model writes reliably, and the schema itself
-//! is handed to the client in the tool definition. Nothing here deploys,
-//! changes or executes anything.
+//! An agent gets the server's reads as tools: the deployed branches, a
+//! branch's fields, tables and sampled values, and the SQL for a query
+//! spec. Specs only, never the shorthand: a spec is JSON against a
+//! published schema, which is what a model writes reliably, and the
+//! schema itself is handed to the client in the tool definition.
+//! Nothing here deploys, changes or executes anything.
 //!
 //! What the client is told, the server's instructions and each tool's
 //! description, lives in `mcp_prompts.json` next to this file, and the
 //! spec's schema in `mcp_spec_schema.json`. Both are compiled in. They
 //! are the instruction set an agent plans from, and they are tuned
-//! against the eval in `harness/mcp-eval`, so they are kept apart from
-//! the code that enforces who may read what.
+//! against the eval in `harness/mcp-eval`.
 //!
-//! Every tool runs the function the matching REST handler runs, with
-//! the principal the guard worked out, so a key reaches through MCP
-//! exactly what it reaches over `/projects/...` and nothing more. What
+//! Every tool runs the function the matching REST handler runs. What
 //! is different is the security context: an agent is never allowed to
-//! say who it is acting as. A personal key plans as its user's email, a
-//! query key as the context its project's owner bound to the grant, and
-//! a `context` in a tool's arguments is refused outright. See
-//! `docs/mcp.md`.
+//! say who it is acting as, so a `context` in a tool's arguments is
+//! refused outright. The context comes from the connection instead, in
+//! the `Zsql-Context` header, which the model does not write: the
+//! service in front of this server sets it per user, or whoever
+//! configures a client that connects directly sets it once. Without
+//! the header a plan runs with no context, which a branch with policies
+//! refuses exactly as it does over REST. See `docs/mcp.md`.
 //!
-//! No Origin check, on purpose. The specification asks servers to
-//! refuse unknown Origins against DNS rebinding, which is a threat to a
-//! local server that trusts whoever can reach it. This endpoint trusts
-//! nothing but a bearer key and never reads a cookie, so a page from any
-//! origin gets exactly what its key allows, which without one is a 401;
-//! and the hosted clients that matter (claude.ai's connector among them)
-//! may send an Origin of their own, which a check would turn away.
+//! No authentication and no Origin check: like the rest of the server
+//! this endpoint answers whoever can reach it, and belongs behind the
+//! developer's own service or on a loopback.
 //!
 //! The transport is the smallest the specification allows. Each HTTP
-//! request carries one JSON-RPC message and its key; there is no
-//! `Mcp-Session-Id`, no server-sent events and no GET stream, so there
-//! is no session to hijack, outlive a key, or bind to the wrong one. A
-//! JSON-RPC request is answered with `application/json`, a notification
-//! with 202. Written by hand rather than taken from a library so that
-//! every byte between the Authorization header and `gate()` is in this
-//! crate, where it is tested with the rest of the isolation suite.
+//! request carries one JSON-RPC message; there is no `Mcp-Session-Id`,
+//! no server-sent events and no GET stream, so there is no session to
+//! hijack or outlive anything. A JSON-RPC request is answered with
+//! `application/json`, a notification with 202.
 
-use crate::auth::{busy, too_many, Auth, Held};
-use crate::error::{internal, ApiError};
-use crate::limits::Class;
+use crate::admission::Class;
+use crate::error::ApiError;
+use crate::guard::{busy, Held};
+use crate::names::check_uid;
 use crate::reads::{explain_of, explore_of, fields_of, projects_of, sql_of, tables_of, values_of, FieldsQuery};
-use crate::tenancy::{check_uid, gate, in_scope, model, scope_of};
 use crate::{read, App, Shared};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -55,7 +47,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zsql_accounts::{Principal, Verb};
 use zsql_semantic::FieldKind;
 use zsql_service::{ExploreRequest, Model, SqlRequest};
 use zsql_spec::SecurityContext;
@@ -111,61 +102,35 @@ impl Settings {
 /// for one of these gets it back; any other gets the newest.
 const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
 
-/// `/mcp`, read the way the limiter reads paths.
-pub fn is_endpoint(path: &str) -> bool {
-    let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    p == ["mcp"]
-}
+/// The header that carries the security context every tool call on
+/// this request plans under, as the JSON a REST request would send in
+/// `context`.
+pub const CONTEXT_HEADER: &str = "zsql-context";
 
-/// Why a request to the endpoint was refused, for the journal: the
-/// status, whether a key was presented, and the Origin if any. Never
-/// the key. Remote clients fail silently on their side ("could not
-/// reach the server"), so this line is what says what they sent.
-pub fn note_refusal(status: StatusCode, headers: &HeaderMap) {
-    // How the Authorization header looked, never what it held: the
-    // scheme word, or that it was a bare key, or that it was absent.
-    let auth = match headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::trim) {
-        None | Some("") => "no Authorization header".to_string(),
-        Some(v) if v.starts_with("zsk_") || v.starts_with("zqk_") => "a bare key".to_string(),
-        Some(v) => match v.split_once(' ') {
-            Some((scheme, _)) => format!("scheme {scheme}"),
-            None => "one word, not a key".to_string(),
-        },
-    };
-    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    say!("zsqld: mcp: refused {} ({auth}, origin {origin}, agent {agent})", status.as_u16());
-}
-
-/// Whether the caller may read anything: with accounts on, a key must
-/// have been presented. A keyless request is let through the guard for
-/// the handshake alone, and `None` would otherwise read as the
-/// single-tenant mode, so every tool checks this first.
-fn keyed(app: &App, who: &Option<Principal>) -> bool {
-    app.accounts.is_none() || who.is_some()
-}
-
-fn needs_key() -> Response {
-    let mut r =
-        ApiError(StatusCode::UNAUTHORIZED, "Unauthorized", "an API key is required for tool calls: Authorization: Bearer <key>".into())
-            .into_response();
-    challenge(&mut r);
-    r
-}
-
-/// On a 401, the header the specification has clients read. No
-/// `resource_metadata` is named because there is no OAuth server to
-/// discover; a client falls through to the fixed credential its user
-/// configured, which is the key.
-pub fn challenge(res: &mut Response) {
-    res.headers_mut().insert("www-authenticate", "Bearer realm=\"0sql\"".parse().expect("a header"));
+/// The context the connection carries, if it carries one. A header
+/// that does not parse is refused rather than ignored: planning with no
+/// context when one was meant is the wrong answer to a typo.
+fn context_of(headers: &HeaderMap) -> Result<Option<SecurityContext>, String> {
+    let Some(raw) = headers.get(CONTEXT_HEADER) else { return Ok(None) };
+    let text = raw.to_str().map_err(|_| format!("the {CONTEXT_HEADER} header is not text"))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let bad = |why: String| format!("the {CONTEXT_HEADER} header is not a security context: {why}");
+    // An object and nothing else: serde would read a JSON array as the
+    // members in order, and `[]` as a context with nobody in it.
+    let value: Value = serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
+    if !value.is_object() {
+        return Err(bad("it must be a JSON object".into()));
+    }
+    serde_json::from_value(value).map(Some).map_err(|e| bad(e.to_string()))
 }
 
 // --------------------------------------------------------------- the wire
 
 /// A JSON-RPC error, or an HTTP answer that stands in for the whole
-/// response: a rate limit or a full server is reported the way every
-/// other route reports it, so a client's existing back-off applies.
+/// response: a full server is reported the way every other route
+/// reports it, so a client's existing back-off applies.
 enum Fail {
     Rpc(i64, String),
     Http(Response),
@@ -178,7 +143,11 @@ fn bad_request(code: i64, message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": code, "message": message } }))).into_response()
 }
 
-pub async fn endpoint(State(app): State<Shared>, Auth(who): Auth, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let context = match context_of(&headers) {
+        Ok(c) => c,
+        Err(m) => return bad_request(-32600, &m),
+    };
     if let Some(v) = headers.get("mcp-protocol-version").and_then(|v| v.to_str().ok()) {
         if !VERSIONS.contains(&v.trim()) {
             return bad_request(-32600, &format!("protocol version {v} is not supported; this server speaks {}", VERSIONS.join(", ")));
@@ -202,7 +171,7 @@ pub async fn endpoint(State(app): State<Shared>, Auth(who): Auth, headers: Heade
         return StatusCode::ACCEPTED.into_response();
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(&app, &who, &method, params).await {
+    match dispatch(&app, context, &method, params).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err(Fail::Rpc(code, message)) => {
             Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })).into_response()
@@ -211,7 +180,7 @@ pub async fn endpoint(State(app): State<Shared>, Auth(who): Auth, headers: Heade
     }
 }
 
-async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: Value) -> Result<Value, Fail> {
+async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, params: Value) -> Result<Value, Fail> {
     match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
@@ -223,19 +192,12 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
             )
             .trim()
             .to_string();
-            say!(
-                "zsqld: mcp: {} connected: {client}",
-                who.as_ref().map(Principal::describe).unwrap_or_else(|| if app.accounts.is_some() {
-                    "no key".into()
-                } else {
-                    "single-tenant".into()
-                })
-            );
+            say!("zsqld: mcp: connected: {client}");
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, if keyed(app, who) { catalog(app, who) } else { "No key was presented. Tool calls need Authorization: Bearer <key>; the catalog of the branches a key may read follows the instructions once one is.".into() }),
+                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, catalog(app)),
             }))
         }
         "ping" => Ok(json!({})),
@@ -243,7 +205,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            call(app, who, name, args).await
+            call(app, context, name, args).await
         }
         _ => Err(Fail::Rpc(METHOD_NOT_FOUND, format!("no method {method}"))),
     }
@@ -255,7 +217,7 @@ async fn dispatch(app: &Shared, who: &Option<Principal>, method: &str, params: V
 /// back to naming the branches and leaving discovery to `fields`.
 const CATALOG_BYTES: usize = 48 * 1024;
 
-/// Every field of every branch the caller may read, with its uid, as
+/// Every field of every deployed branch, with its uid, as
 /// part of the instructions. A client puts the server's instructions in
 /// its system prompt, so this is what lets a question be answered in one
 /// `sql` call with no discovery round trips: the same move an
@@ -265,25 +227,22 @@ const CATALOG_BYTES: usize = 48 * 1024;
 /// where the table says which thing they describe. Deterministic, so the
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
-fn catalog(app: &App, who: &Option<Principal>) -> String {
-    let models = read(&app.models);
-    let mut readable: Vec<Arc<Model>> =
-        in_scope(&models, &scope_of(who)).filter(|d| gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok()).cloned().collect();
-    drop(models);
-    readable.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
-    if readable.is_empty() {
-        return "This key reads no deployed branch yet.".into();
+fn catalog(app: &App) -> String {
+    let mut deployed: Vec<Arc<Model>> = read(&app.models).values().cloned().collect();
+    deployed.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+    if deployed.is_empty() {
+        return "No branch is deployed yet.".into();
     }
     let mut out = String::new();
-    for d in &readable {
+    for d in &deployed {
         out.push_str(&branch_catalog(d));
         out.push('\n');
     }
     if out.len() <= CATALOG_BYTES {
-        return format!("# Catalog\nEvery field of the branches this key may read, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
+        return format!("# Catalog\nEvery field of the deployed branches, with its uid. Write specs from it; call fields only for a term it does not settle.\n\n{out}");
     }
-    let mut short = String::from("# Branches this key may read\nToo many fields to list here; call fields with q to find them.\n");
-    for d in &readable {
+    let mut short = String::from("# Deployed branches\nToo many fields to list here; call fields with q to find them.\n");
+    for d in &deployed {
         let s = d.universe().snapshot();
         short.push_str(&format!("- {}/{}: {} tables, {} fields\n", d.uid, d.branch, s.tables.len(), s.fields.len()));
     }
@@ -453,58 +412,38 @@ fn args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, Fail> {
     if v.get("context").is_some() {
         return Err(Fail::Rpc(
             INVALID_PARAMS,
-            "a security context is not accepted here: who a query is planned for is fixed by the key".into(),
+            "a security context is not accepted here: who a query is planned for is fixed by the connection".into(),
         ));
     }
     serde_json::from_value(v).map_err(|e| Fail::Rpc(INVALID_PARAMS, format!("arguments: {e}")))
 }
 
-/// Who the plan is for, when the caller may not say. A person plans as
-/// themselves; a query key sends nothing and gets the context bound to
-/// its grant, or the refusal a missing context always got.
-fn context_for(who: &Option<Principal>) -> Option<SecurityContext> {
-    match who {
-        Some(Principal::User { user, .. }) => Some(SecurityContext { email: Some(user.email.clone()), ..Default::default() }),
-        _ => None,
-    }
-}
-
-/// The branch a tool works on: the one named, else the project's
-/// production branch, else (with accounts off) the one branch deployed.
-fn branch_for(app: &App, who: &Option<Principal>, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
+/// The branch a tool works on: the one named, else the one branch of
+/// the project that is deployed, else, among several, the project's
+/// production branch as its own project.yml names it.
+fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
     if let Some(b) = branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()) {
         return Ok(b);
     }
     check_uid(uid)?;
-    if let (Some(store), Some(p)) = (&app.accounts, who) {
-        let project = store
-            .project(p.account().id, uid)
-            .map_err(internal)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}")))?;
-        return Ok(project.production_branch);
-    }
     let models = read(&app.models);
-    let mut branches: Vec<String> = models.values().filter(|d| d.uid == uid).map(|d| d.branch.clone()).collect();
-    match branches.len() {
-        1 => Ok(branches.remove(0)),
-        0 => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}"))),
-        _ => Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("{uid} has several branches deployed; name one"))),
+    let of_project: Vec<&Arc<Model>> = models.values().filter(|d| d.uid == uid).collect();
+    match of_project.as_slice() {
+        [] => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}"))),
+        [one] => Ok(one.branch.clone()),
+        several => several.iter().find(|d| d.universe().snapshot().branch.uid == d.branch).map(|d| d.branch.clone()).ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "Invalid",
+                format!("{uid} has several branches deployed and its production branch is not one of them; name one"),
+            )
+        }),
     }
 }
 
-/// The explore-class tools cost more than a plan, and the guard charged
-/// this request as a plan: take the explore allowance and a seat too.
-async fn admit_explore(app: &App, who: &Option<Principal>) -> Result<Held, Fail> {
-    if let Some(p) = who {
-        let key_id = match p {
-            Principal::QueryKey { key, .. } => Some(key.id),
-            Principal::User { .. } => None,
-        };
-        let d = app.limits.principal(p.account().id, key_id, Class::Explore);
-        if app.limits.enforced(&d, &format!("{} on explore (mcp)", p.describe())) {
-            return Err(Fail::Http(too_many(&d)));
-        }
-    }
+/// The explore-class tools cost more than a plan, and the guard
+/// admitted this request as a plan: take an explore seat too.
+async fn admit_explore(app: &App) -> Result<Held, Fail> {
     match app.admission.admit(Class::Explore).await {
         Ok(p) => Ok(Held(Arc::new(p))),
         Err(secs) => Err(Fail::Http(busy(secs, Class::Explore))),
@@ -516,7 +455,7 @@ async fn admit_explore(app: &App, who: &Option<Principal>) -> Result<Held, Fail>
 /// refusal then carries the search the client would otherwise make
 /// next, so a spec written from the request's own words costs one
 /// round trip when it is right and still only two when it is not.
-fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, e: ApiError) -> ApiError {
+fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiError {
     let ApiError(status, class, message) = e;
     if class != "FieldNotFound" && class != "FieldAmbiguous" {
         return ApiError(status, class, message);
@@ -526,7 +465,7 @@ fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &st
     if term.is_empty() || term.len() > 200 {
         return ApiError(status, class, message);
     }
-    let found = fields_of(app, who, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
+    let found = fields_of(app, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
     let Ok(found) = found else { return ApiError(status, class, message) };
     let mut lines = Vec::new();
     for f in found["fields"].as_array().into_iter().flatten().take(8) {
@@ -548,32 +487,25 @@ fn with_candidates(app: &Shared, who: &Option<Principal>, uid: &str, branch: &st
     ApiError(status, class, format!("{message}\nFields near '{term}', by uid:\n{}", lines.join("\n")))
 }
 
-async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Value) -> Result<Value, Fail> {
+async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, arguments: Value) -> Result<Value, Fail> {
     if !app.mcp.exposed(name) {
         return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
-    }
-    if !keyed(app, who) {
-        return Err(Fail::Http(needs_key()));
     }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
             let NoArgs {} = args(arguments)?;
-            projects_of(app, who)
+            Ok(projects_of(app))
         }
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
-            let _seat = admit_explore(app, who).await?;
+            let _seat = admit_explore(app).await?;
             let q = a.q.unwrap_or_default();
             if q.trim().is_empty() && !a.hidden {
                 // No search: the whole catalog, as one text, the same
                 // one initialize carries. One call is all the discovery a
                 // question needs, and a client that cut the instructions
                 // short gets it here in full.
-                let text = branch_for(app, who, &a.project, a.branch).and_then(|b| {
-                    let t = gate(app, who, &a.project, &b, Verb::Read)?;
-                    let d = model(app, &t, &a.project, &b)?;
-                    Ok(branch_catalog(&d))
-                });
+                let text = branch_for(app, &a.project, a.branch).and_then(|b| Ok(branch_catalog(&*app.model(&a.project, &b)?)));
                 return Ok(match text {
                     Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalog": text } }),
                     Err(ApiError(status, class, message)) => {
@@ -581,30 +513,21 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
                     }
                 });
             }
-            branch_for(app, who, &a.project, a.branch)
-                .and_then(|b| fields_of(app, who, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
+            branch_for(app, &a.project, a.branch).and_then(|b| fields_of(app, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
-            branch_for(app, who, &a.project, a.branch).and_then(|b| tables_of(app, who, &a.project, &b))
+            branch_for(app, &a.project, a.branch).and_then(|b| tables_of(app, &a.project, &b))
         }
         "values" => {
             let a: ValuesArgs = args(arguments)?;
-            branch_for(app, who, &a.project, a.branch).and_then(|b| values_of(app, who, &a.project, &b, &a.dimension))
+            branch_for(app, &a.project, a.branch).and_then(|b| values_of(app, &a.project, &b, &a.dimension))
         }
         "explore" => {
             let a: QueryArgs = args(arguments)?;
-            let _seat = admit_explore(app, who).await?;
-            branch_for(app, who, &a.project, a.branch)
-                .and_then(|b| {
-                    explore_of(
-                        app,
-                        who,
-                        &a.project,
-                        &b,
-                        ExploreRequest { spec: Some(a.spec), expr: None, context: context_for(who), q: a.q },
-                    )
-                })
+            let _seat = admit_explore(app).await?;
+            branch_for(app, &a.project, a.branch)
+                .and_then(|b| explore_of(app, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context, q: a.q }))
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -612,14 +535,14 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
             if a.q.is_some() {
                 return Err(Fail::Rpc(INVALID_PARAMS, "arguments: q is for explore".into()));
             }
-            let req = SqlRequest { spec: Some(a.spec), expr: None, context: context_for(who) };
-            branch_for(app, who, &a.project, a.branch).and_then(|b| {
+            let req = SqlRequest { spec: Some(a.spec), expr: None, context };
+            branch_for(app, &a.project, a.branch).and_then(|b| {
                 let planned = if name == "sql" {
-                    sql_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    sql_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 } else {
-                    explain_of(app, who, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    explain_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 };
-                planned.map_err(|e| with_candidates(app, who, &a.project, &b, e))
+                planned.map_err(|e| with_candidates(app, &a.project, &b, e))
             })
         }
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),
@@ -640,11 +563,21 @@ async fn call(app: &Shared, who: &Option<Principal>, name: &str, arguments: Valu
 mod tests {
     use super::*;
 
+    fn headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTEXT_HEADER, value.parse().unwrap());
+        h
+    }
+
     #[test]
-    fn the_endpoint_path_and_no_other() {
-        assert!(is_endpoint("/mcp"));
-        assert!(is_endpoint("/mcp/"));
-        assert!(!is_endpoint("/mcp/x"));
-        assert!(!is_endpoint("/projects"));
+    fn the_context_header_is_a_security_context_or_a_refusal() {
+        assert!(context_of(&HeaderMap::new()).unwrap().is_none());
+        assert!(context_of(&headers(" ")).unwrap().is_none());
+        let c = context_of(&headers(r#"{"email":"ann@acme.test","groups":[{"name":"emea"}]}"#)).unwrap().unwrap();
+        assert_eq!(c.email.as_deref(), Some("ann@acme.test"));
+        assert_eq!(c.groups[0].name.as_deref(), Some("emea"));
+        assert!(context_of(&headers("ann@acme.test")).is_err());
+        assert!(context_of(&headers("[]")).is_err());
+        assert!(context_of(&headers(r#"{"emial":"ann@acme.test"}"#)).is_err(), "an unknown member is a typo, not nothing");
     }
 }

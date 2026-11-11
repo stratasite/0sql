@@ -2,180 +2,54 @@
 //! tested, written beside the branch and swapped in whole. And the
 //! removal of a branch, which takes the same lock.
 
-use crate::auth::{user_of, Auth, Held};
-use crate::error::{accounts_error, internal, key_required, not_found, ApiError, Params};
-use crate::tenancy::{check_branch, check_uid, gate, scope_of, Tenant};
-use crate::{blocking, lock, read, write, App, Shared};
+use crate::error::{not_found, ApiError, Params};
+use crate::guard::Held;
+use crate::names::{check_branch, check_uid};
+use crate::{blocking, lock, write, Shared};
 use axum::body::Bytes;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zsql_accounts::{Principal, Verb};
 use zsql_service::{Model, Trust};
 
 pub(crate) async fn deploy(
     State(app): State<Shared>,
-    Auth(who): Auth,
     held: Option<Extension<Held>>,
     Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, who, uid, branch, body, true)
+        deploy_or_validate(app, uid, branch, body, true)
     })
     .await
 }
 
 pub(crate) async fn validate(
     State(app): State<Shared>,
-    Auth(who): Auth,
     held: Option<Extension<Held>>,
     Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, who, uid, branch, body, false)
+        deploy_or_validate(app, uid, branch, body, false)
     })
     .await
 }
 
-/// Refuses a deploy that would put an account over its branch caps.
-///
-/// Checked before the archive is unpacked, so going over costs the
-/// caller nothing and the server nothing. Redeploying a branch that is
-/// already there is not a new branch and is always allowed, which is
-/// what keeps an account at its cap from being locked out of its own
-/// models.
-///
-/// Counted from the models actually in memory rather than from the
-/// project records, because memory is what is being protected: a branch
-/// that is not loaded is not holding anything.
-fn check_caps(app: &App, who: &Option<Principal>, uid: &str, branch: &str) -> Result<(), ApiError> {
-    let models = read(&app.models);
-    caps_allow(app, &models, &scope_of(who), uid, branch)
-}
-
-/// The cap check itself, over a models map the caller already holds.
-/// Taken twice: once before the work, and once more under the write lock
-/// that inserts, because two deploys can pass the first check at the
-/// same moment and only the second one is exact.
-fn caps_allow(app: &App, models: &HashMap<String, Arc<Model>>, scope: &str, uid: &str, branch: &str) -> Result<(), ApiError> {
-    if app.accounts.is_none() {
-        return Ok(());
-    }
-    let (key, project_prefix) = (format!("{scope}{uid}/{branch}"), format!("{scope}{uid}/"));
-    if models.contains_key(&key) {
-        return Ok(());
-    }
-    let (in_project, in_account) = branch_counts(models.keys().map(|k| k.as_str()), scope, &project_prefix);
-    let over = |what: String, n: usize, cap: usize| {
-        ApiError(
-            StatusCode::CONFLICT,
-            "OverLimit",
-            format!(
-                "{what} already has {n} deployed branch{} of the {cap} allowed. Remove one before deploying another: `zsql remove --branch <branch> --yes`, or delete it in the web app under the project.",
-                if n == 1 { "" } else { "es" }
-            ),
-        )
-    };
-    if in_project >= app.caps.per_project {
-        return Err(over(uid.to_string(), in_project, app.caps.per_project));
-    }
-    if in_account >= app.caps.per_account {
-        return Err(over("this account".into(), in_account, app.caps.per_account));
-    }
-    Ok(())
-}
-
-/// Deployed branches in this project, and in the whole account, counted
-/// from the keys of the models map (`[account/]project/branch`).
-///
-/// The trailing slash both prefixes carry is load-bearing: without it
-/// the account `acme` would count `acme-2`'s branches against itself,
-/// and the project `sales` would count `sales-eu`'s.
-fn branch_counts<'a>(keys: impl Iterator<Item = &'a str>, scope: &str, project_prefix: &str) -> (usize, usize) {
-    let (mut in_project, mut in_account) = (0usize, 0usize);
-    for k in keys.filter(|k| k.starts_with(scope)) {
-        in_account += 1;
-        if k.starts_with(project_prefix) {
-            in_project += 1;
-        }
-    }
-    (in_project, in_account)
-}
-
-/// A user deploying to a project the account does not have yet creates
-/// it and owns it; validating needs no project. Query keys cannot deploy.
-fn deploy_gate(
-    app: &App,
-    who: &Option<Principal>,
-    uid: &str,
-    branch: &str,
-    keep: bool,
-    production_branch: &str,
-    name: &str,
-) -> Result<Tenant, ApiError> {
-    check_uid(uid)?;
-    check_branch(branch)?;
-    let scope = scope_of(who);
-    let (store, p) = match (&app.accounts, who) {
-        (None, _) => return Ok(Tenant { scope, project: None }),
-        (Some(_), None) => return Err(key_required()),
-        (Some(store), Some(p)) => (store, p),
-    };
-    match store.project(p.account().id, uid).map_err(internal)? {
-        Some(project) => {
-            store.authorize(p, &project, branch, Verb::Write).map_err(accounts_error)?;
-            Ok(Tenant { scope, project: Some(project) })
-        }
-        None => {
-            let (user, account, _) = user_of(who)?;
-            if !keep {
-                return Ok(Tenant { scope, project: None });
-            }
-            let project = store.create_project(account.id, user, uid, name, production_branch).map_err(accounts_error)?;
-            Ok(Tenant { scope, project: Some(project) })
-        }
-    }
-}
-
-fn deploy_or_validate(
-    app: Shared,
-    who: Option<Principal>,
-    uid: String,
-    branch: String,
-    body: Bytes,
-    keep: bool,
-) -> Result<Json<Value>, ApiError> {
+fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
     }
-    if matches!(who, Some(Principal::QueryKey { .. })) {
-        return Err(ApiError(StatusCode::FORBIDDEN, "Forbidden", "query keys are read only; deploy with your personal key".into()));
-    }
-    // Before the caps are counted under these names, and before the
-    // archive is unpacked: a bad name is answered without doing work.
+    // Before the archive is unpacked: a bad name is answered without
+    // doing work.
     check_uid(&uid)?;
     check_branch(&branch)?;
-    // A validate keeps nothing, so it is not held to the caps.
-    if keep {
-        check_caps(&app, &who, &uid, &branch)?;
-    }
-    // A project that already exists says now whether the caller may
-    // write it, before the archive is unpacked, loaded and tested on
-    // their behalf. A new project is gated once project.yml is read.
-    if let (Some(store), Some(p)) = (&app.accounts, &who) {
-        if let Some(project) = store.project(p.account().id, &uid).map_err(internal)? {
-            store.authorize(p, &project, &branch, Verb::Write).map_err(accounts_error)?;
-        }
-    }
     // Named by a counter, not the clock: two deploys in one process at
     // the same instant must not share a directory, and the second to
     // unpack into a shared one would be refused for files that exist.
@@ -191,7 +65,6 @@ fn deploy_or_validate(
         unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_service::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
-        let t = deploy_gate(&app, &who, &uid, &branch, keep, &loaded.snapshot.branch.uid, &loaded.snapshot.project.name)?;
         let deployed =
             Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
         let mut out = deployed.summary();
@@ -201,19 +74,14 @@ fn deploy_or_validate(
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
             let _writing = lock(&app.deploying);
-            let live = t.dir(&app, &uid, &branch);
+            let live = app.dir(&uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
             deployed.write(&staged).and_then(|()| swap_in(&staged, &live)).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&staged);
                 bad(e.to_string())
             })?;
-            let mut models = write(&app.models);
-            caps_allow(&app, &models, &t.scope, &uid, &branch)?;
-            models.insert(t.key(&uid, &branch), deployed);
-            drop(models);
-            if let (Some(store), Some(p)) = (&app.accounts, &who) {
-                let _ = store.record(p.account().id, &p.describe(), "deploy", &format!("{uid}/{branch}"));
-            }
+            write(&app.models).insert(crate::key(&uid, &branch), deployed);
+            say!("zsqld: deployed {uid}/{branch}");
         }
         Ok(out)
     })();
@@ -254,7 +122,7 @@ impl<R: std::io::Read> std::io::Read for Capped<R> {
 /// directories only, within the size and count limits.
 ///
 /// A symbolic or hard link is refused rather than created. The loader
-/// follows links when it reads, so a link to another account's
+/// follows links when it reads, so a link to another project's
 /// directory, or to anything on the host, would be read as part of the
 /// project and shown back in the model or its errors. The CLI never
 /// writes one.
@@ -301,25 +169,20 @@ fn project_root(work: &std::path::Path) -> Option<PathBuf> {
     entries.into_iter().find(|p| p.join("project.yml").exists())
 }
 
-pub(crate) async fn remove(
-    State(app): State<Shared>,
-    Auth(who): Auth,
-    Params((uid, branch)): Params<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
+pub(crate) async fn remove(State(app): State<Shared>, Params((uid, branch)): Params<(String, String)>) -> Result<Json<Value>, ApiError> {
+    check_uid(&uid)?;
+    check_branch(&branch)?;
     blocking(move || {
         // Under the deploy lock: a deploy of the same branch in flight
         // would otherwise swap its directory in between the removal of
         // the model and of the files.
         let _writing = lock(&app.deploying);
-        let removed = write(&app.models).remove(&t.key(&uid, &branch)).is_some();
+        let removed = write(&app.models).remove(&crate::key(&uid, &branch)).is_some();
         if !removed {
             return Err(not_found(&uid, &branch));
         }
-        let _ = std::fs::remove_dir_all(t.dir(&app, &uid, &branch));
-        if let (Some(store), Some(p)) = (&app.accounts, &who) {
-            let _ = store.record(p.account().id, &p.describe(), "branch_removed", &format!("{uid}/{branch}"));
-        }
+        let _ = std::fs::remove_dir_all(app.dir(&uid, &branch));
+        say!("zsqld: removed {uid}/{branch}");
         Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
     })
     .await
@@ -391,35 +254,5 @@ mod tests {
         let names: Vec<String> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         assert_eq!(names, vec!["main"]);
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The caps are counted by string prefix over the deployment keys,
-    /// and a prefix is an easy thing to get subtly wrong: the account
-    /// `acme` must not be charged for `acme-2`, and the project `sales`
-    /// must not be charged for `sales-eu`. Both of those would show up
-    /// as an account mysteriously unable to deploy.
-    #[test]
-    fn branches_are_counted_against_the_right_project_and_account() {
-        let keys =
-            ["acme/sales/main", "acme/sales/feature-x", "acme/sales-eu/main", "acme/web/main", "acme-2/sales/main", "acme-2/sales/staging"];
-        let it = || keys.iter().copied();
-
-        // Four branches in acme, two of them in acme/sales.
-        assert_eq!(branch_counts(it(), "acme/", "acme/sales/"), (2, 4));
-
-        // `sales-eu` is its own project, with its own count.
-        assert_eq!(branch_counts(it(), "acme/", "acme/sales-eu/"), (1, 4));
-
-        // The other account is counted separately, and is not reached
-        // by a prefix of its name.
-        assert_eq!(branch_counts(it(), "acme-2/", "acme-2/sales/"), (2, 2));
-
-        // A project with nothing deployed yet starts at zero.
-        assert_eq!(branch_counts(it(), "acme/", "acme/new/"), (0, 4));
-
-        // Single-tenant: no scope at all, so everything is in scope and
-        // the account count is simply the total.
-        let flat = ["sales/main", "sales/dev", "web/main"];
-        assert_eq!(branch_counts(flat.iter().copied(), "", "sales/"), (2, 3));
     }
 }

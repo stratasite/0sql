@@ -22,8 +22,8 @@ A statically linked glibc cannot resolve names: it loads its name
 service modules at runtime and dumps core without them, and the CLI
 resolves a server's hostname while the server may be given one to bind.
 That was observed, not assumed. musl resolves names and still links
-statically, so one binary runs on any distribution. SQLite, behind
-accounts, is C, so the x86_64 build installs `musl-gcc` and the arm64
+statically, so one binary runs on any distribution. SQLite, behind the
+SQLite datasource, is C, so the x86_64 build installs `musl-gcc` and the arm64
 build goes through `cross`. `rust-toolchain.toml` pins the toolchain a
 release is built with; rustup reads it on its own.
 

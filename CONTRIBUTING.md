@@ -5,8 +5,8 @@ below are what a change needs to get in.
 
 ## Building and testing
 
-The toolchain `rust-toolchain.toml` names, and a C compiler for the
-SQLite behind accounts.
+The toolchain `rust-toolchain.toml` names, and a C and C++ compiler for
+the SQLite and DuckDB the CLI bundles.
 
 ```sh
 cargo build --release -p zsql-cli                         # target/release/zsql
