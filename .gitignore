@@ -1,2 +1,6 @@
 /target
 **/*.rs.bk
+
+# Research write-ups kept beside the code, not in it.
+/reports/
+/research_notes/
