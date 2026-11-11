@@ -1,10 +1,11 @@
-//! Where the CLI finds the project, the server and the API key.
+//! Where the CLI finds the project, the server and its deploy token.
 //!
 //! - `project.yml` in the project directory: `uid`, `name`, `production_branch`,
 //!   and optionally `server` (a self-hosted server).
 //! - `.zsql` in the project directory (or `.strata`, the strata CLI's file,
-//!   when `.zsql` is absent): `api_key`, `server`, and per-datasource secrets.
-//! - `~/.zsql/config`: the same keys, account-wide.
+//!   when `.zsql` is absent): `api_key` (the server's deploy token, under the
+//!   name it has always had in this file), `server`, and per-datasource secrets.
+//! - `~/.zsql/config`: the same keys, for every project of this user.
 //! - `ZSQL_SERVER` and `ZSQL_API_KEY` in the environment, which win.
 //!
 //! `~/.zsql` is also where the repl history lives. `ZSQL_HOME` moves
@@ -114,7 +115,7 @@ pub fn write_secret(project_dir: &Path, key: &str, value: &str) -> Result<()> {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().filter(|l| !l.trim_start().starts_with(&format!("{key}:"))).map(str::to_string).collect();
     if lines.is_empty() {
-        lines.push("# zsql local configuration: api key, server, datasource secrets. Do not commit.".into());
+        lines.push("# zsql local configuration: deploy token (api_key), server, datasource secrets. Do not commit.".into());
     }
     lines.push(format!("{key}: {value}"));
     std::fs::write(&path, lines.join("\n") + "\n").with_context(|| path.display().to_string())?;

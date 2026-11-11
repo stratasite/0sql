@@ -56,7 +56,7 @@ lifted out of `server/src/main.rs` without behavior change:
   the kind to a status; the CLI prints `class: message`, which is what it
   already prints for a server refusal. The `ContextRequired` rule lives
   here so local planning enforces it. The request shape limits stay in
-  the server as a service policy (`docs/rate-limiting.md`).
+  the server as a service policy (`docs/admission.md`).
 - Every crate gets `publish = false` until the API has had a second
   caller for a while. The path dependencies are the contract for now.
 
@@ -235,7 +235,7 @@ licenses, and Dependabot for crates and actions.
 - Errors are one shape in both modes, text or JSON.
 - The cache is deferred behind measured budgets.
 - Embedding beats downloading: one artifact, one version, one thing to test.
-- Accounts are off by default locally, and an open bind with accounts off is refused.
+- The server has no accounts (2026-11-11); a bind beyond the loopback with no deploy token is refused unless `--open`.
 - Deploy writes are atomic by rename; shutdown is graceful; data directories are locked.
 - Tests never touch the real home directory.
 - Crates are not published to crates.io yet.
@@ -243,6 +243,8 @@ licenses, and Dependabot for crates and actions.
 - Golden fixtures are read, never edited, without an explicit decision.
 
 ## Progress
+
+- 2026-11-11: accounts left the server. It was built to be shared between tenants; it is now a component behind the developer's own service, as a database is, and that service owns sign-in, which projects a user may name, the security context and rate limits. Removed: the accounts crate and `accounts.db` (SQLite is no longer in the server), authentication, the accounts API, mail, the web app, the rate limiter, the branch caps, the account level of the data directory. Kept: admission and deadlines (`admission.rs`), the request bounds, MCP. Added: `ZSQL_DEPLOY_TOKEN`, which deploy, validate, test and remove must present when it is set, and the `Zsql-Context` header, which carries the security context over MCP now that no key is bound to one. `ZSQL_ACCOUNTS=on` refuses to start. Sections above that describe accounts, `--no-accounts`, the limits or the web app are history; `docs/operating.md`, `docs/admission.md` and `docs/mcp.md` are current.
 
 - 2026-10-16: `zsql server status` answered "not running" beside a foreground `zsql serve` that was up, because it only knew the server `server start` recorded. It now also looks at the data directory's lock (`--data-dir`, `ZSQL_DATA_DIR`, else `$ZSQL_HOME/data`) and names the process holding it in the foreground and the URL it is reached at, with the public URL beside it when one was configured (the server writes pid, address and public URL into the lock file once bound; `start` records the public URL too), and says whether it answers; `stop` is still only for servers it started.
 

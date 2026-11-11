@@ -2,11 +2,13 @@
 //! plan specs against it. Deployed models live in memory and under a data
 //! directory so a restart reloads them.
 //!
-//! With `ZSQL_ACCOUNTS=on` the server is multi-tenant: every request
-//! carries a key (`Authorization: Bearer ...`) that names a user or a
-//! query key in an account, deployments are scoped to the account, and
-//! the accounts endpoints manage members, keys and project access. Off
-//! (the default, the self-hosted mode), there is one tenant and no auth.
+//! The server answers whoever can reach it, the way a database on a
+//! private network does. It is meant to sit behind the developer's own
+//! service, which decides who may ask, sends the security context each
+//! plan runs under, and paces its callers. The one credential here is
+//! the optional deploy token: with one set, a deploy, a validate, a test
+//! run and a removal each need `Authorization: Bearer <token>`, so a
+//! server that is read from more widely than it is written to can be.
 //!
 //! ```text
 //! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
@@ -27,14 +29,14 @@
 //!
 //! The crate is one module per concern:
 //!
-//! - `auth`: who is calling, and the guard every request meets
-//! - `tenancy`: the tenant a request lives in and the gate on each branch
+//! - `guard`: the deploy token, the admission cap and the deadline
+//!   every request meets
+//! - `admission`: how much of each kind of work runs at once
+//! - `names`: the project and branch names that become directories
 //! - `deploy`: an archive in, a model out
 //! - `reads`: sql, explain, explore and the catalog
-//! - `accounts_api`: sign-up, sessions, members, keys and grants
 //! - `error`: the one error the API answers with
 //! - `mcp`: the same reads as MCP tools
-//! - `ui`: the embedded web app
 //! - `run`: configuration, the router and the server's life
 
 /// A line to the log. Never a panic: a server whose stderr has gone
@@ -47,28 +49,25 @@ macro_rules! say {
     }};
 }
 
-mod accounts_api;
-mod auth;
+pub mod admission;
 mod deploy;
 mod error;
-pub mod limits;
-pub mod mail;
+mod guard;
 mod mcp;
+mod names;
 mod reads;
 mod run;
-mod tenancy;
-mod ui;
 
+pub use admission::AdmissionCounts;
 pub use mcp::Settings as McpSettings;
-pub use run::{run, run_blocking, serve, Config, MailConfig};
+pub use run::{run, run_blocking, serve, Config};
 
-use crate::error::ApiError;
-use crate::limits::{Admission, Limiter};
+use crate::admission::Admission;
+use crate::error::{not_found, ApiError};
 use axum::http::StatusCode;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use zsql_accounts::Store;
 use zsql_dialect::Dialects;
 use zsql_service::Model;
 
@@ -93,55 +92,47 @@ pub(crate) struct App {
     /// planner can borrow it for as long as its universe.
     dialects: &'static Dialects,
     data_dir: PathBuf,
-    /// Deployments by `[account/]project/branch`.
+    /// Deployments by `project/branch`.
     models: RwLock<HashMap<String, Arc<Model>>>,
-    /// Accounts, users and keys; `None` in the single-tenant mode.
-    accounts: Option<Store>,
-    signup_open: bool,
-    /// Session cookies marked Secure, for a server behind https.
-    secure_cookies: bool,
-    /// What each caller may ask for, and how fast.
-    limits: Limiter,
     /// How much of each kind of work may be in the server at once.
     admission: Admission,
-    /// How many branches an account may keep deployed.
-    caps: Caps,
-    /// How the verification and reset links get out.
-    mailer: mail::Mailer,
     /// What MCP clients are told, and which tools they may call.
     mcp: mcp::Settings,
+    /// What a deploy, a validate, a test run and a removal must present,
+    /// when the server was given one. `None` leaves them as open as the
+    /// reads.
+    deploy_token: Option<String>,
     /// One deploy writes at a time: two for the same branch would race
     /// each other's renames while swapping in.
     deploying: std::sync::Mutex<()>,
 }
 
-/// How many deployed branches are allowed.
-///
-/// This is a memory limit wearing a product's clothes: a deployed model
-/// is held for the life of the process and nothing evicts it, so the
-/// number of them is the number the machine can hold. Both counts are
-/// needed: per project is the one a person feels and reasons about, and
-/// per account is the one that actually bounds the process, since an
-/// account may make as many projects as it likes.
-///
-/// Only with accounts on. A single-tenant server is one operator on
-/// their own machine, who does not need protecting from themselves.
-pub struct Caps {
-    pub per_project: usize,
-    pub per_account: usize,
+/// A deployment's key in the models map.
+pub(crate) fn key(uid: &str, branch: &str) -> String {
+    format!("{uid}/{branch}")
 }
 
-impl Default for Caps {
-    fn default() -> Self {
-        Caps { per_project: 5, per_account: 20 }
+impl App {
+    /// Where a deployed branch lives on disk.
+    pub(crate) fn dir(&self, uid: &str, branch: &str) -> PathBuf {
+        self.data_dir.join(uid).join(branch)
+    }
+
+    /// The deployed model of a branch. The names are checked first, so
+    /// a name that could not have been deployed is told so rather than
+    /// reported as merely missing.
+    pub(crate) fn model(&self, uid: &str, branch: &str) -> Result<Arc<Model>, ApiError> {
+        names::check_uid(uid)?;
+        names::check_branch(branch)?;
+        read(&self.models).get(&key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
     }
 }
 
 pub(crate) type Shared = Arc<App>;
 
 /// Runs work that would hold a runtime thread for seconds on a blocking
-/// thread instead, so a deploy or a password hash never stalls the
-/// planning the rest of the server is doing.
+/// thread instead, so a deploy never stalls the planning the rest of
+/// the server is doing.
 pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
     match tokio::task::spawn_blocking(work).await {
         Ok(result) => result,
@@ -150,7 +141,7 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T,
 }
 
 #[cfg(test)]
-mod isolation_tests;
+mod tests;
 
 #[cfg(test)]
 mod parity_tests;

@@ -2,10 +2,10 @@
 //! and its lock, the deployments reloaded from disk, the router, and the
 //! graceful stop.
 
-use crate::auth::guard;
+use crate::admission::{Admission, AdmissionCounts};
 use crate::deploy::is_swap_leftover;
-use crate::limits::{self, Admission, Limiter};
-use crate::{accounts_api, deploy, mail, mcp, reads, ui, write, App, Caps, Shared};
+use crate::guard::guard;
+use crate::{deploy, mcp, reads, write, App, Shared};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::collections::HashMap;
@@ -13,61 +13,52 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use zsql_accounts::Store;
 use zsql_dialect::Dialects;
 use zsql_service::Model;
 
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
 
+/// What the data directory holds, loaded: `<project>/<branch>/`.
 pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
     let mut n = 0;
     let mut skipped: Vec<String> = Vec::new();
-    // Single-tenant: data/<project>/<branch>; with accounts: data/<account>/<project>/<branch>.
-    let roots: Vec<(String, PathBuf)> = if app.accounts.is_some() {
-        let Ok(accounts) = std::fs::read_dir(&app.data_dir) else { return Ok((0, skipped)) };
-        accounts.flatten().filter(|e| e.path().is_dir()).map(|e| (format!("{}/", e.file_name().to_string_lossy()), e.path())).collect()
-    } else {
-        vec![(String::new(), app.data_dir.clone())]
-    };
-    for (scope, root) in roots {
-        let Ok(projects) = std::fs::read_dir(&root) else { continue };
-        for p in projects.flatten().filter(|e| e.path().is_dir()) {
-            let uid = p.file_name().to_string_lossy().to_string();
-            let Ok(branches) = std::fs::read_dir(p.path()) else { continue };
-            for b in branches.flatten().filter(|e| e.path().is_dir()) {
-                let branch = b.file_name().to_string_lossy().to_string();
-                // A branch name never starts with a dot. A deploy's own
-                // staging or previous copy, left by a crash between two
-                // renames, is swept; any other dot directory is somebody
-                // else's and is left alone, since a data directory can be
-                // pointed anywhere by a typo.
-                if branch.starts_with('.') {
-                    if is_swap_leftover(&branch) {
-                        let _ = std::fs::remove_dir_all(b.path());
-                    }
-                    continue;
+    let Ok(projects) = std::fs::read_dir(&app.data_dir) else { return Ok((0, skipped)) };
+    for p in projects.flatten().filter(|e| e.path().is_dir()) {
+        let uid = p.file_name().to_string_lossy().to_string();
+        let Ok(branches) = std::fs::read_dir(p.path()) else { continue };
+        for b in branches.flatten().filter(|e| e.path().is_dir()) {
+            let branch = b.file_name().to_string_lossy().to_string();
+            // A branch name never starts with a dot. A deploy's own
+            // staging or previous copy, left by a crash between two
+            // renames, is swept; any other dot directory is somebody
+            // else's and is left alone, since a data directory can be
+            // pointed anywhere by a typo.
+            if branch.starts_with('.') {
+                if is_swap_leftover(&branch) {
+                    let _ = std::fs::remove_dir_all(b.path());
                 }
-                if !b.path().join(zsql_service::SNAPSHOT_FILE).exists() {
-                    continue;
+                continue;
+            }
+            if !b.path().join(zsql_service::SNAPSHOT_FILE).exists() {
+                continue;
+            }
+            // One unreadable branch is not a reason to refuse to
+            // start. A model that will not load is almost always a
+            // format this build is too old or too new for, and the
+            // archive it was compiled from lives in someone's
+            // repository, so the fix is a redeploy of that one branch.
+            // Coming up without it, and saying which, beats a restart
+            // loop that systemd gives up on after five tries.
+            let key = crate::key(&uid, &branch);
+            match Model::from_stored(&b.path(), &uid, &branch, app.dialects) {
+                Ok(m) => {
+                    write(&app.models).insert(key, Arc::new(m));
+                    n += 1;
                 }
-                // One unreadable branch is not a reason to refuse to
-                // start. A model that will not load is almost always a
-                // format this build is too old or too new for, and the
-                // archive it was compiled from lives in someone's
-                // repository, so the fix is a redeploy of that one branch.
-                // Coming up without it, and saying which, beats a restart
-                // loop that systemd gives up on after five tries.
-                let key = format!("{scope}{uid}/{branch}");
-                match Model::from_stored(&b.path(), &uid, &branch, app.dialects) {
-                    Ok(m) => {
-                        write(&app.models).insert(key, Arc::new(m));
-                        n += 1;
-                    }
-                    Err(e) => {
-                        say!("zsqld: {key} was not loaded: {e}");
-                        skipped.push(key);
-                    }
+                Err(e) => {
+                    say!("zsqld: {key} was not loaded: {e}");
+                    skipped.push(key);
                 }
             }
         }
@@ -78,8 +69,9 @@ pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
 /// Every route, behind the guard, over the app. Built here so the
 /// tests drive the same router the binary serves.
 pub(crate) fn router(app: Shared) -> Router {
-    let mut router = Router::new()
-        .route("/healthz", get(ui::healthz))
+    Router::new()
+        .route("/", get(root))
+        .route("/healthz", get(healthz))
         .route("/projects", get(reads::projects))
         .route("/projects/{uid}/branches/{branch}", get(reads::branch_summary))
         .route("/projects/{uid}/branches/{branch}/deploy", post(deploy::deploy).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
@@ -96,43 +88,19 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/tables", get(reads::tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(reads::values))
         .route(mcp::PATH, post(mcp::endpoint))
-        .route("/", get(ui::root))
-        .route("/app", get(ui::ui_root))
-        .route("/app/", get(ui::ui_root))
-        .route("/app/{*rest}", get(ui::ui))
-        .route("/signup", post(accounts_api::signup))
-        .route("/login", post(accounts_api::login))
-        .route("/logout", post(accounts_api::logout))
-        .route("/account/password", post(accounts_api::set_password))
-        .route("/password-reset", post(accounts_api::request_reset))
-        .route("/password-reset/accept", post(accounts_api::accept_reset))
-        .route("/verify-email", post(accounts_api::verify_email))
-        .route("/account/verify-email", post(accounts_api::resend_verification))
-        .route("/me", get(accounts_api::me))
-        .route("/account/members", get(accounts_api::members).post(accounts_api::add_member))
-        .route("/account/members/{email}", delete(accounts_api::remove_member))
-        .route("/account/members/{email}/invite", post(accounts_api::invite))
-        .route("/invites/accept", post(accounts_api::accept_invite))
-        .route("/account/keys", get(accounts_api::user_keys).post(accounts_api::create_user_key))
-        .route("/account/keys/{id}", delete(accounts_api::revoke_user_key))
-        .route("/account/query-keys", get(accounts_api::query_keys).post(accounts_api::create_query_key))
-        .route("/account/query-keys/{id}", delete(accounts_api::revoke_query_key))
-        .route("/account/query-keys/{id}/rotate", post(accounts_api::rotate_query_key))
-        .route("/account/query-keys/{id}/grants", post(accounts_api::grant))
-        .route("/account/query-keys/{id}/grants/{project}", delete(accounts_api::revoke_grant))
-        .route("/account/audit", get(accounts_api::audit))
-        .route("/projects/{uid}", axum::routing::patch(accounts_api::update_project).delete(accounts_api::delete_project))
-        .route("/projects/{uid}/access", get(accounts_api::project_access).put(accounts_api::set_access))
-        .route("/projects/{uid}/access/{email}", delete(accounts_api::remove_access));
-    for name in ui::SITE_FILES {
-        router = router.route(&format!("/{name}"), get(ui::site_file));
-    }
-    router
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive
         // routes raise their own limit above.
         .layer(axum::extract::DefaultBodyLimit::max(JSON_LIMIT))
         .with_state(app)
+}
+
+async fn root() -> String {
+    format!("zsqld {}; see /healthz", env!("CARGO_PKG_VERSION"))
+}
+
+async fn healthz() -> &'static str {
+    "ok"
 }
 
 /// Everything the server is told. `zsql serve` fills it from `ZSQL_*`
@@ -144,54 +112,29 @@ pub struct Config {
     /// `host:port`; port 0 takes a free one, and the chosen address is
     /// logged.
     pub bind: String,
-    /// Multi-tenant: every request carries a key, deployments are
-    /// scoped to an account. Off is one tenant and no auth.
-    pub accounts: bool,
-    pub signup_open: bool,
-    /// Where the app is reached from outside, for links and cookies;
-    /// the bind address when `None`. `https://` marks cookies Secure.
+    /// Where the server is reached from outside, when that is not the
+    /// bind address. Nothing here uses it; it is written beside the pid
+    /// so `zsql server status` can say it.
     pub public_url: Option<String>,
-    pub limits: limits::Config,
-    pub admission: limits::AdmissionCounts,
-    pub caps: Caps,
-    pub mail: MailConfig,
+    pub admission: AdmissionCounts,
     pub mcp: mcp::Settings,
-    /// How long an authentication decision may be reused; zero turns
-    /// the cache off.
-    pub auth_cache_ttl: Duration,
-}
-
-/// How mail goes out: a command fed the message on stdin, or nothing,
-/// in which case links are written to the log.
-#[derive(Debug, Clone)]
-pub struct MailConfig {
-    pub command: Option<String>,
-    pub from: String,
-    pub timeout: Duration,
-}
-
-impl Default for MailConfig {
-    fn default() -> Self {
-        MailConfig { command: None, from: String::new(), timeout: Duration::from_secs(20) }
-    }
+    /// With a token, a deploy, a validate, a test run and a removal each
+    /// need `Authorization: Bearer <token>`. Without one they are as
+    /// open as the reads, which is right on a loopback and nowhere else.
+    pub deploy_token: Option<String>,
 }
 
 impl Config {
-    /// A server on its own machine: one tenant, no auth, no limits, the
-    /// compiled-in MCP wording.
+    /// A server on its own machine: no deploy token, the compiled-in
+    /// MCP wording.
     pub fn local(data_dir: PathBuf, bind: String) -> Config {
         Config {
             data_dir,
             bind,
-            accounts: false,
-            signup_open: true,
             public_url: None,
-            limits: limits::Config { mode: limits::Mode::Off, ..limits::Config::default() },
-            admission: limits::AdmissionCounts::default(),
-            caps: Caps::default(),
-            mail: MailConfig::default(),
+            admission: AdmissionCounts::default(),
             mcp: mcp::Settings::builtin(),
-            auth_cache_ttl: zsql_accounts::DEFAULT_AUTH_CACHE_TTL,
+            deploy_token: None,
         }
     }
 }
@@ -209,76 +152,39 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     std::fs::create_dir_all(&config.data_dir)?;
     let mut lock = lock_data_dir(&config.data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
-    let accounts_on = config.accounts;
-    let accounts = if accounts_on { Some(Store::open_with(&config.data_dir.join("accounts.db"), config.auth_cache_ttl)?) } else { None };
     let advertised = config.public_url.clone();
-    let public_url = config.public_url.clone().unwrap_or_else(|| format!("http://{}", config.bind));
-    let secure_cookies = public_url.starts_with("https://");
-    let limits = Limiter::new(config.limits);
-    let admission = Admission::new(&config.admission);
-    let mailer =
-        mail::Mailer::new(config.mail.command, &config.mail.from, config.mail.timeout, &public_url).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let limits_mode = if limits.on() {
-        if limits.cfg.mode == limits::Mode::Shadow {
-            "shadow"
-        } else {
-            "on"
-        }
-    } else {
-        "off"
-    };
-    let mail_state = if mailer.configured() { "on" } else { "off, links to the journal" };
+    let deploy_token = config.deploy_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     let app: Shared = Arc::new(App {
         dialects,
         data_dir: config.data_dir,
         models: RwLock::new(HashMap::new()),
-        accounts,
-        signup_open: config.signup_open,
-        secure_cookies,
-        limits,
-        admission,
-        caps: config.caps,
-        mailer,
+        admission: Admission::new(&config.admission),
         mcp: config.mcp,
+        deploy_token,
         deploying: std::sync::Mutex::new(()),
     });
     let (n, skipped) = reload(&app)?;
     say!(
-        "zsqld: {n} deployment(s) loaded from {}; accounts {}; rate limits {limits_mode}; mail {mail_state}",
+        "zsqld: {n} deployment(s) loaded from {}; deploys {}",
         app.data_dir.display(),
-        if accounts_on {
-            if app.signup_open {
-                "on, sign-up open"
-            } else {
-                "on, sign-up closed"
-            }
-        } else {
-            "off"
-        }
+        if app.deploy_token.is_some() { "need the deploy token" } else { "are open to whoever reaches this address" }
     );
     if !skipped.is_empty() {
         // Said again, together, after the per-branch lines above: the
         // one line someone watching a restart will actually read.
         say!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
     }
-    if accounts_on {
-        let cap = |n: usize| if n == usize::MAX { "off".to_string() } else { n.to_string() };
-        say!("zsqld: branch caps: {} per project, {} per account", cap(app.caps.per_project), cap(app.caps.per_account));
+    // A data directory from a release that had accounts keeps its
+    // deployments one level down, under each account, where nothing
+    // looks now. Said once, so an upgrade that serves nothing says why.
+    if app.data_dir.join("accounts.db").exists() {
+        say!(
+            "zsqld: {} holds accounts.db from a release with accounts. It is not read, and deployments under an account's directory are not served: deploy them again, or move <account>/<project> up one level.",
+            app.data_dir.display()
+        );
     }
 
     let router = router(app.clone());
-
-    // Buckets for callers that have gone quiet, and failure windows that
-    // have passed, are dropped now and then so an idle server does not
-    // hold a row per address it has ever seen.
-    let sweeper = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(300));
-        loop {
-            tick.tick().await;
-            sweeper.limits.sweep();
-        }
-    });
 
     // The handlers are installed before the address is announced, so a
     // signal sent the moment the listening line is read is a graceful
@@ -298,8 +204,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| write!(lock, "{}\n{addr}\n{public}\n", std::process::id()));
     }
     listening(addr);
-    // Connect info: the per-address limits need the peer's address.
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await?;
+    axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
     say!("zsqld: stopped");
     Ok(())
 }
@@ -387,16 +292,15 @@ fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
-    /// The library, and the accounts crate it links, are configured,
-    /// never by the environment: a `zsql serve` flag and a `ZSQL_*`
-    /// variable must mean the same thing, so there is one place that
-    /// reads variables and it is the CLI's serve module.
+    /// The library is configured, never by the environment: a `zsql
+    /// serve` flag and a `ZSQL_*` variable must mean the same thing, so
+    /// there is one place that reads variables and it is the CLI's
+    /// serve module.
     #[test]
     fn the_library_reads_no_environment() {
         let needle = ["env::", "var("].concat();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut sources: Vec<_> = std::fs::read_dir(root.join("server/src")).unwrap().flatten().map(|e| e.path()).collect();
-        sources.push(root.join("accounts/src/lib.rs"));
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources: Vec<_> = std::fs::read_dir(src).unwrap().flatten().map(|e| e.path()).collect();
         for path in sources.iter().filter(|p| p.extension().is_some_and(|x| x == "rs")) {
             let text = std::fs::read_to_string(path).unwrap();
             assert!(!text.contains(&needle), "{} reads the environment", path.display());

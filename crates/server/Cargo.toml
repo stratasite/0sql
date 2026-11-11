@@ -12,7 +12,6 @@ description = "The server: deploy a project, get SQL back; run by `zsql serve`"
 zsql-semantic.workspace = true
 zsql-dialect.workspace = true
 zsql-spec.workspace = true
-zsql-accounts.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde.workspace = true

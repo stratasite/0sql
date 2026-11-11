@@ -2,56 +2,44 @@
 //!
 //! `zsql` plans from a project directory through `zsql_service::Model`;
 //! `zsqld` plans from the same files after a deploy, through the same
-//! type, behind the gate. These tests hold the two to byte-identical
+//! type. These tests hold the two to byte-identical
 //! answers over the fixture projects: the SQL, the explain graph, the
 //! catalog, the field search, and the refusals with their classes.
 //! A difference here is a seam the service crate was meant to close.
 
+use crate::admission::{Admission, AdmissionCounts};
 use crate::error::ApiError;
-use crate::limits;
-use crate::limits::{Admission, Limiter};
-use crate::mail;
 use crate::mcp;
 use crate::run::router;
-use crate::{App, Caps, Shared};
+use crate::{App, Shared};
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::StatusCode;
 use axum::http::{Method, Request};
 use axum::Router;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use tower::ServiceExt;
 use zsql_dialect::Dialects;
 use zsql_service::unlimited;
 use zsql_service::{Model, Trust};
 
-const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40001);
-
 fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects")
 }
 
-/// A single-tenant server over a scratch data directory: no accounts,
-/// no limits, as a developer's own `zsqld` runs.
-fn single_tenant(data_dir: &std::path::Path) -> Shared {
+/// A server over a scratch data directory, as a developer's own
+/// `zsqld` runs.
+fn server_over(data_dir: &std::path::Path) -> Shared {
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     Arc::new(App {
         dialects,
         data_dir: data_dir.to_path_buf(),
         models: RwLock::new(HashMap::new()),
-        accounts: None,
-        signup_open: false,
-        secure_cookies: false,
-        limits: Limiter::new(limits::Config { mode: limits::Mode::Off, ..limits::Config::default() }),
-        admission: Admission::new(&limits::AdmissionCounts::default()),
-        caps: Caps { per_project: usize::MAX, per_account: usize::MAX },
-        mailer: mail::Mailer::new(None, "", Duration::from_secs(20), "http://test").unwrap(),
+        admission: Admission::new(&AdmissionCounts::default()),
         mcp: mcp::Settings::builtin(),
+        deploy_token: None,
         deploying: std::sync::Mutex::new(()),
     })
 }
@@ -90,7 +78,7 @@ fn archive_of_dir(dir: &std::path::Path) -> Vec<u8> {
 }
 
 async fn call(router: &Router, method: Method, path: &str, body: Option<Vec<u8>>, content_type: &str) -> (StatusCode, Value) {
-    let mut req = Request::builder().method(method).uri(path).extension(ConnectInfo(PEER));
+    let mut req = Request::builder().method(method).uri(path);
     if body.is_some() {
         req = req.header("content-type", content_type);
     }
@@ -163,7 +151,7 @@ async fn local_and_server_answer_alike() {
     dirs.sort();
     assert!(!dirs.is_empty(), "no fixture projects under {}", root.display());
     let data_dir = std::env::temp_dir().join(format!("zsqld-parity-{}", std::process::id()));
-    let app = single_tenant(&data_dir);
+    let app = server_over(&data_dir);
     let router = router(app.clone());
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let mut compared = 0;

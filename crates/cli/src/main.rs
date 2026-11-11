@@ -446,13 +446,13 @@ enum Command {
         #[command(flatten)]
         remote: Remote,
     },
-    /// Save the API key, and optionally the server, in .zsql for this project.
+    /// Save the server's deploy token, and optionally the server, in .zsql for this project.
     #[command(display_order = 31)]
     Auth {
-        /// The key the server gave you.
+        /// The deploy token the server was started with (its ZSQL_DEPLOY_TOKEN). A server without one needs none.
         #[arg(long)]
         api_key: String,
-        /// The server the key is for; the default server when unsaid.
+        /// The server the token is for; the default server when unsaid.
         #[arg(long)]
         server: Option<String>,
     },
@@ -477,7 +477,7 @@ enum Command {
         #[command(flatten)]
         remote: Remote,
     },
-    /// Every deployment the key can see on the server.
+    /// Every deployment on the server.
     #[command(display_order = 34, alias = "list")]
     Deployments {
         #[command(flatten)]

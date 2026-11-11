@@ -19,8 +19,7 @@ use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use zsql_server::limits::{Mode, Rate};
-use zsql_server::{Config, MailConfig, McpSettings};
+use zsql_server::{Config, McpSettings};
 
 /// Where the server listens when nothing else is said: the address the
 /// CLI's other commands talk to by default.
@@ -34,19 +33,14 @@ pub struct ServeArgs {
     /// Where deployed models live; $ZSQL_HOME/data when neither this nor the variable says.
     #[arg(long, env = "ZSQL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Multi-tenant: keys, accounts, sign-up. Off, there is one tenant and no auth. ZSQL_ACCOUNTS=on means the same.
-    #[arg(long, overrides_with = "no_accounts")]
-    pub accounts: bool,
-    /// One tenant and no auth, whatever ZSQL_ACCOUNTS says.
-    #[arg(long)]
-    pub no_accounts: bool,
-    /// Allow listening beyond the loopback with accounts off, which lets anyone who can reach the port deploy and plan.
+    /// Allow listening beyond the loopback with no deploy token, which lets anyone who can reach the port deploy and remove.
+    /// With ZSQL_DEPLOY_TOKEN set this is not needed: only the reads are open then.
     #[arg(long)]
     pub open: bool,
     /// Serve only the data directory, even inside a project.
     #[arg(long)]
     pub no_project: bool,
-    /// Where the app is reached from outside, for links and cookies; the bind address otherwise.
+    /// Where the server is reached from outside, for `zsql server status` to report.
     #[arg(long, env = "ZSQL_PUBLIC_URL")]
     pub public_url: Option<String>,
 }
@@ -54,15 +48,6 @@ pub struct ServeArgs {
 impl ServeArgs {
     fn bind(&self) -> String {
         self.bind.clone()
-    }
-
-    /// `--accounts` and `--no-accounts` each win over the variable.
-    fn accounts(&self) -> bool {
-        if self.no_accounts {
-            false
-        } else {
-            self.accounts || on("ZSQL_ACCOUNTS")
-        }
     }
 
     /// Where deployed models live, as an absolute path: the background
@@ -78,77 +63,20 @@ impl ServeArgs {
 
     /// The whole configuration: the environment's settings, with the
     /// flags over them.
+    ///
+    /// The deploy token is a variable and never a flag: a flag is in
+    /// the process list for anyone on the machine to read, and the
+    /// background form would have to pass it on in one.
     fn config(&self) -> Result<Config> {
-        let accounts = self.accounts();
+        retired()?;
         let mut cfg = Config::local(self.data_dir()?, self.bind());
-        cfg.accounts = accounts;
-        cfg.signup_open = !matches!(var("ZSQL_SIGNUP").as_deref(), Some("closed" | "off" | "0"));
         cfg.public_url = self.public_url.clone();
-        // The limits are about sharing one server between tenants, so
-        // they start with the accounts.
-        cfg.limits.mode = if accounts { Mode::On } else { Mode::Off };
-        if let Some(v) = var("ZSQL_LIMITS") {
-            cfg.limits.mode = Mode::parse(&v);
-        }
-        let l = &mut cfg.limits;
-        for (name, slot) in [
-            ("ZSQL_LIMIT_PLAN", &mut l.plan),
-            ("ZSQL_LIMIT_EXPLORE", &mut l.explore),
-            ("ZSQL_LIMIT_HEAVY", &mut l.heavy),
-            ("ZSQL_LIMIT_MANAGE", &mut l.manage),
-            ("ZSQL_LIMIT_KEY_PLAN", &mut l.key_plan),
-            ("ZSQL_LIMIT_KEY_EXPLORE", &mut l.key_explore),
-            ("ZSQL_LIMIT_LOGIN", &mut l.login),
-            ("ZSQL_LIMIT_SIGNUP", &mut l.signup),
-            ("ZSQL_LIMIT_INVITE", &mut l.invite),
-            ("ZSQL_LIMIT_RESET", &mut l.reset),
-            ("ZSQL_LIMIT_BAD_KEY", &mut l.bad_key),
-            ("ZSQL_LIMIT_HANDSHAKE", &mut l.handshake),
-        ] {
-            rate(name, slot)?;
-        }
-        if let Some(v) = var("ZSQL_LIMIT_EMAIL_FAILURES") {
-            l.email_failures = if v.eq_ignore_ascii_case("off") {
-                0
-            } else {
-                v.parse().with_context(|| format!("ZSQL_LIMIT_EMAIL_FAILURES: {v:?} is not a number"))?
-            };
-        }
-        if let Some(v) = var("ZSQL_LIMIT_EMAIL_WINDOW") {
-            l.email_window = Duration::from_secs(number(&v, "ZSQL_LIMIT_EMAIL_WINDOW")? as u64);
-        }
-        l.trusted_proxy = on("ZSQL_TRUSTED_PROXY");
-
+        cfg.deploy_token = var("ZSQL_DEPLOY_TOKEN");
         let a = &mut cfg.admission;
-        for (name, slot) in [
-            ("ZSQL_ADMIT_PLAN", &mut a.plan),
-            ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
-            ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
-            ("ZSQL_ADMIT_MANAGE", &mut a.manage),
-            ("ZSQL_ADMIT_PASSWORD", &mut a.password),
-        ] {
+        for (name, slot) in [("ZSQL_ADMIT_PLAN", &mut a.plan), ("ZSQL_ADMIT_EXPLORE", &mut a.explore), ("ZSQL_ADMIT_HEAVY", &mut a.heavy)] {
             if let Some(v) = var(name) {
                 *slot = number(&v, name)?;
             }
-        }
-        for (name, slot) in
-            [("ZSQL_MAX_BRANCHES_PER_PROJECT", &mut cfg.caps.per_project), ("ZSQL_MAX_BRANCHES_PER_ACCOUNT", &mut cfg.caps.per_account)]
-        {
-            match var(name) {
-                Some(v) if v.eq_ignore_ascii_case("off") => *slot = usize::MAX,
-                Some(v) => *slot = number(&v, name)?,
-                None => {}
-            }
-        }
-
-        cfg.mail =
-            MailConfig { command: var("ZSQL_MAIL_COMMAND"), from: var("ZSQL_MAIL_FROM").unwrap_or_default(), ..MailConfig::default() };
-        if let Some(v) = var("ZSQL_MAIL_TIMEOUT") {
-            cfg.mail.timeout = Duration::from_secs(number(&v, "ZSQL_MAIL_TIMEOUT")? as u64);
-        }
-
-        if let Some(v) = var("ZSQL_AUTH_CACHE_TTL") {
-            cfg.auth_cache_ttl = Duration::from_secs(number(&v, "ZSQL_AUTH_CACHE_TTL")? as u64);
         }
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
@@ -162,12 +90,6 @@ impl ServeArgs {
     fn to_argv(&self, project: Option<&Path>) -> Result<Vec<OsString>> {
         let mut argv: Vec<OsString> = vec!["serve".into(), "--bind".into(), self.bind.clone().into()];
         argv.extend(["--data-dir".into(), self.data_dir()?.into()]);
-        if self.accounts {
-            argv.push("--accounts".into());
-        }
-        if self.no_accounts {
-            argv.push("--no-accounts".into());
-        }
         if self.open {
             argv.push("--open".into());
         }
@@ -234,9 +156,17 @@ fn number(v: &str, name: &str) -> Result<usize> {
     v.parse().with_context(|| format!("{name}: {v:?} is not a number"))
 }
 
-fn rate(name: &str, slot: &mut Rate) -> Result<()> {
-    if let Some(v) = var(name) {
-        *slot = Rate::parse(&v).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+/// A server told to keep accounts must not come up as one with none.
+/// Accounts, keys and sign-up are no longer part of the server; an
+/// environment file that still asks for them describes a server every
+/// request authenticated to, and starting without saying so would
+/// serve the same address to anyone.
+fn retired() -> Result<()> {
+    if on("ZSQL_ACCOUNTS") {
+        bail!(
+            "ZSQL_ACCOUNTS is on, but this server has no accounts: it answers whoever can reach it, and belongs behind your own service. \
+             Remove the variable; set ZSQL_DEPLOY_TOKEN to keep deploys to whoever holds it. See docs/operating.md."
+        );
     }
     Ok(())
 }
@@ -257,13 +187,14 @@ fn loopback(bind: &str) -> bool {
     bind.parse::<SocketAddr>().map(|a| a.ip().is_loopback()).unwrap_or(false) || bind.starts_with("localhost:")
 }
 
-/// Runs the server here until it is stopped. Inside a project, and with
-/// accounts off, the project is deployed to it and redeployed as its
-/// files change.
+/// Runs the server here until it is stopped. Inside a project, the
+/// project is deployed to it and redeployed as its files change.
 pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
-    let (bind, accounts) = (args.bind(), args.accounts());
-    if !accounts && !args.open && !loopback(&bind) {
-        bail!("{bind} is not a loopback address, and with accounts off anyone who reaches it may deploy and plan; add --accounts, or --open to mean it");
+    let bind = args.bind();
+    let cfg = args.config()?;
+    let token = cfg.deploy_token.clone();
+    if token.is_none() && !args.open && !loopback(&bind) {
+        bail!("{bind} is not a loopback address, and with no deploy token anyone who reaches it may deploy and remove; set ZSQL_DEPLOY_TOKEN, or add --open to mean it");
     }
     // A project named explicitly must be there; one looked for is optional.
     let project = match (args.no_project, at.project.is_some()) {
@@ -271,7 +202,6 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         (false, true) => Some(at.project_dir()?),
         (false, false) => at.project_dir().ok(),
     };
-    let cfg = args.config()?;
 
     let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
     let server = std::thread::Builder::new()
@@ -292,44 +222,36 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         }
     };
 
-    match (project, accounts) {
-        (Some(p), false) => {
-            // An unspecified address is listened on, not connected to.
-            let reach = match addr.ip() {
-                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-                ip => ip,
-            };
-            let client = remote::Client::new(&format!("http://{}", SocketAddr::new(reach, addr.port())), None);
-            let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
-            eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
-            let deploy = || -> Result<()> {
-                let archive = project::archive(&p.dir)?;
-                let v = client.post_bytes(&format!("{}/deploy", remote::branch_path(&p.uid, &branch)), "application/gzip", &archive)?;
-                show::print_deploy(&v);
-                Ok(())
-            };
-            if let Err(e) = deploy() {
-                eprintln!("error: {e}");
-            }
-            project::watch(
-                &p.dir,
-                || server.is_finished(),
-                || {
-                    println!();
-                    if let Err(e) = deploy() {
-                        eprintln!("error: {e}");
-                    }
-                },
-            );
+    if let Some(p) = project {
+        // An unspecified address is listened on, not connected to.
+        let reach = match addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        // The server's own token: it is this process that set it.
+        let client = remote::Client::new(&format!("http://{}", SocketAddr::new(reach, addr.port())), token);
+        let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
+        eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
+        let deploy = || -> Result<()> {
+            let archive = project::archive(&p.dir)?;
+            let v = client.post_bytes(&format!("{}/deploy", remote::branch_path(&p.uid, &branch)), "application/gzip", &archive)?;
+            show::print_deploy(&v);
+            Ok(())
+        };
+        if let Err(e) = deploy() {
+            eprintln!("error: {e}");
         }
-        (Some(p), true) => {
-            eprintln!(
-                "zsql: accounts are on, so {} is not deployed by itself; sign up, make a key, and `zsql deploy --server http://{addr}`",
-                p.dir.display()
-            );
-        }
-        (None, _) => {}
+        project::watch(
+            &p.dir,
+            || server.is_finished(),
+            || {
+                println!();
+                if let Err(e) = deploy() {
+                    eprintln!("error: {e}");
+                }
+            },
+        );
     }
     finish(server)
 }

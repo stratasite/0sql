@@ -1,24 +1,22 @@
 //! The reads: sql, explain, explore, the catalog, the values of a
 //! dimension, the tests, a branch's summary and the listing. Each
 //! handler is a thin wrapper over a plain function so the MCP tools run
-//! the same code behind the same gate.
+//! the same code.
 
-use crate::auth::{Auth, Held};
-use crate::error::{internal, key_required, ApiError, Input, Params, Search};
-use crate::tenancy::{effective_context, gate, in_scope, model, scope_of};
+use crate::error::{ApiError, Input, Params, Search};
+use crate::guard::Held;
 use crate::{blocking, read, Shared};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use zsql_accounts::{Level, Principal, Role, Verb};
 use zsql_service::{ExplainResponse, ExploreRequest, ExploreResponse, ServiceError, SqlRequest, SqlResponse};
 
 /// What one request may ask for. A spec is JSON the caller wrote and
 /// the cost of planning grows with it, so its shape is bounded before
 /// any work starts: generous beside any real query, a wall in front of
-/// a generated one. See `docs/rate-limiting.md`.
+/// a generated one. See `docs/admission.md`.
 pub(crate) mod shape {
     pub const EXPR: usize = 8 * 1024;
     pub const PROJECTIONS: usize = 100;
@@ -125,73 +123,49 @@ fn shape_check(v: &Value) -> Result<(), ServiceError> {
 }
 
 // The read handlers are each a thin wrapper over a plain function, so
-// the MCP tools in mcp.rs run exactly the same code with the same
-// principal, and there is one place per read where access is decided.
-// The work itself is the service's: the server adds who may read the
-// branch, the context a key is bound to, and the bounds on a request.
+// the MCP tools in mcp.rs run exactly the same code. The work itself is
+// the service's: the server adds the bounds on a request. The security
+// context a plan runs under is whatever the request carries: the caller
+// is the developer's own service, and it says who it is asking for.
 
 pub(crate) async fn sql(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
-    Ok(Json(sql_of(&app, &who, &uid, &branch, req)?))
+    Ok(Json(sql_of(&app, &uid, &branch, req)?))
 }
 
-pub(crate) fn sql_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, mut req: SqlRequest) -> Result<SqlResponse, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
-    req.context = effective_context(&t, who, req.context)?;
+pub(crate) fn sql_of(app: &Shared, uid: &str, branch: &str, req: SqlRequest) -> Result<SqlResponse, ApiError> {
+    let d = app.model(uid, branch)?;
     check_expr(req.expr.as_deref())?;
     Ok(d.sql(req, &shape_check)?)
 }
 
 pub(crate) async fn explain(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<SqlRequest>,
 ) -> Result<Json<ExplainResponse>, ApiError> {
-    Ok(Json(explain_of(&app, &who, &uid, &branch, req)?))
+    Ok(Json(explain_of(&app, &uid, &branch, req)?))
 }
 
-pub(crate) fn explain_of(
-    app: &Shared,
-    who: &Option<Principal>,
-    uid: &str,
-    branch: &str,
-    mut req: SqlRequest,
-) -> Result<ExplainResponse, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
-    req.context = effective_context(&t, who, req.context)?;
+pub(crate) fn explain_of(app: &Shared, uid: &str, branch: &str, req: SqlRequest) -> Result<ExplainResponse, ApiError> {
+    let d = app.model(uid, branch)?;
     check_expr(req.expr.as_deref())?;
     Ok(d.explain(req, &shape_check)?)
 }
 
 pub(crate) async fn explore(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<ExploreRequest>,
 ) -> Result<Json<ExploreResponse>, ApiError> {
-    Ok(Json(explore_of(&app, &who, &uid, &branch, req)?))
+    Ok(Json(explore_of(&app, &uid, &branch, req)?))
 }
 
-/// Exploring resolves universes only, so no policy applies yet; the
-/// context is still held to the bound-context rule, so a key behaves
-/// the same on every read.
-pub(crate) fn explore_of(
-    app: &Shared,
-    who: &Option<Principal>,
-    uid: &str,
-    branch: &str,
-    mut req: ExploreRequest,
-) -> Result<ExploreResponse, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
-    req.context = effective_context(&t, who, req.context)?;
+pub(crate) fn explore_of(app: &Shared, uid: &str, branch: &str, req: ExploreRequest) -> Result<ExploreResponse, ApiError> {
+    let d = app.model(uid, branch)?;
     check_expr(req.expr.as_deref())?;
     if let Some(term) = &req.q {
         check_term(term)?;
@@ -212,56 +186,43 @@ pub(crate) struct FieldsQuery {
 /// `score` (1 for a containing match).
 pub(crate) async fn fields(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<FieldsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(fields_of(&app, &who, &uid, &branch, q)?))
+    Ok(Json(fields_of(&app, &uid, &branch, q)?))
 }
 
-pub(crate) fn fields_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, q: FieldsQuery) -> Result<Value, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
+pub(crate) fn fields_of(app: &Shared, uid: &str, branch: &str, q: FieldsQuery) -> Result<Value, ApiError> {
+    let d = app.model(uid, branch)?;
     check_term(&q.q)?;
     Ok(d.fields(&q.q, q.hidden))
 }
 
-pub(crate) async fn tables(
-    State(app): State<Shared>,
-    Auth(who): Auth,
-    Params((uid, branch)): Params<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(tables_of(&app, &who, &uid, &branch)?))
+pub(crate) async fn tables(State(app): State<Shared>, Params((uid, branch)): Params<(String, String)>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(tables_of(&app, &uid, &branch)?))
 }
 
-pub(crate) fn tables_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str) -> Result<Value, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
-    Ok(d.tables())
+pub(crate) fn tables_of(app: &Shared, uid: &str, branch: &str) -> Result<Value, ApiError> {
+    Ok(app.model(uid, branch)?.tables())
 }
 
 pub(crate) async fn values(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch, dim)): Params<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(values_of(&app, &who, &uid, &branch, &dim)?))
+    Ok(Json(values_of(&app, &uid, &branch, &dim)?))
 }
 
-pub(crate) fn values_of(app: &Shared, who: &Option<Principal>, uid: &str, branch: &str, dim: &str) -> Result<Value, ApiError> {
-    let t = gate(app, who, uid, branch, Verb::Read)?;
-    let d = model(app, &t, uid, branch)?;
-    Ok(d.values_of(dim)?)
+pub(crate) fn values_of(app: &Shared, uid: &str, branch: &str, dim: &str) -> Result<Value, ApiError> {
+    Ok(app.model(uid, branch)?.values_of(dim)?)
 }
 
 pub(crate) async fn test(
     State(app): State<Shared>,
-    Auth(who): Auth,
     held: Option<Extension<Held>>,
     Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Write)?;
-    let d = model(&app, &t, &uid, &branch)?;
+    let d = app.model(&uid, &branch)?;
     blocking(move || {
         let _held = held;
         Ok(Json(d.run_tests()?))
@@ -271,45 +232,18 @@ pub(crate) async fn test(
 
 pub(crate) async fn branch_summary(
     State(app): State<Shared>,
-    Auth(who): Auth,
     Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let t = gate(&app, &who, &uid, &branch, Verb::Read)?;
-    let d = model(&app, &t, &uid, &branch)?;
-    Ok(Json(d.summary()))
+    Ok(Json(app.model(&uid, &branch)?.summary()))
 }
 
-/// Every deployment the caller may read; with accounts on, also the
-/// account's projects and the caller's level on each.
-pub(crate) async fn projects(State(app): State<Shared>, Auth(who): Auth) -> Result<Json<Value>, ApiError> {
-    Ok(Json(projects_of(&app, &who)?))
+/// Every deployed branch.
+pub(crate) async fn projects(State(app): State<Shared>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(projects_of(&app)))
 }
 
-pub(crate) fn projects_of(app: &Shared, who: &Option<Principal>) -> Result<Value, ApiError> {
-    if app.accounts.is_some() && who.is_none() {
-        return Err(key_required());
-    }
-    let mut out = Vec::new();
-    for d in in_scope(&read(&app.models), &scope_of(who)) {
-        if gate(app, who, &d.uid, &d.branch, Verb::Read).is_ok() {
-            out.push(d.summary());
-        }
-    }
+pub(crate) fn projects_of(app: &Shared) -> Value {
+    let mut out: Vec<Value> = read(&app.models).values().map(|d| d.summary()).collect();
     out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
-    let mut answer = json!({ "deployments": out });
-    if let (Some(store), Some(p)) = (&app.accounts, who) {
-        let mut projects = Vec::new();
-        for project in store.projects(p.account().id).map_err(internal)? {
-            let level = match p {
-                Principal::User { role: Role::Admin, .. } => Some(Level::Owner),
-                Principal::User { user, .. } => store.level_for(&project, user.id).map_err(internal)?,
-                Principal::QueryKey { grants, .. } => grants.iter().any(|g| g.project_id == project.id).then_some(Level::Read),
-            };
-            if level.is_some() {
-                projects.push(json!({ "uid": project.uid, "name": project.name, "production_branch": project.production_branch, "visibility": project.visibility, "protected_production": project.protected_production, "level": level }));
-            }
-        }
-        answer["projects"] = json!(projects);
-    }
-    Ok(answer)
+    json!({ "deployments": out })
 }

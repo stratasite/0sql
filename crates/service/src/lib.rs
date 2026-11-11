@@ -6,9 +6,8 @@
 //! functions here, so what a caller gets back, the SQL, the explain
 //! graph, the field catalog, a refusal and its class, is the same
 //! whichever binary produced it. The server adds only what is about
-//! the server: who may read which branch, rate limits, and the bounds
-//! it puts on a request's shape; those arrive here as a [`ShapeCheck`]
-//! the caller supplies.
+//! the server: admission, and the bounds it puts on a request's shape;
+//! the bounds arrive here as a [`ShapeCheck`] the caller supplies.
 //!
 //! The planner is "the engine" throughout this repository; this crate
 //! is the layer between a caller and the engine, not the engine.
@@ -566,7 +565,7 @@ impl Model {
 // ---------------------------------------------------------------- requests
 
 /// A bound a caller puts on a spec before any work starts. The server
-/// refuses one built to be expensive (`docs/rate-limiting.md`); a local
+/// refuses one built to be expensive (`docs/admission.md`); a local
 /// caller passes [`unlimited`].
 pub type ShapeCheck<'a> = &'a dyn Fn(&Value) -> Result<()>;
 

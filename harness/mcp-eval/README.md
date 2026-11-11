@@ -12,7 +12,7 @@ For every case in `cases.jsonl`, Claude Code is started headless as a real
 MCP client (`claude -p`, the zsql server as its only tool source, every
 built-in tool denied, an empty working directory) with the question wrapped
 in `task.md`. The agent finishes by printing the spec it settled on; the
-runner plans that spec through the server's REST route with the same key,
+runner plans that spec through the server's REST route under the same context,
 runs the SQL on the demo warehouse, and compares the rows with the rows the
 case's reference spec produces. Same rows, in order when the case says
 `ordered`, is a pass. Column names are ignored, column order is ignored,
@@ -29,8 +29,8 @@ the agent chose; the train split's full transcripts go to `traces/`.
 
 ## Running it
 
-Needs the local server up with the demo model deployed and a query key for
-it bound to `{"system_admin": true}` in `.key` (gitignored), the demo repo at
+Needs the local server up with the demo model deployed (every plan runs
+under `{"system_admin": true}`, or `ZSQL_EVAL_CONTEXT`), the demo repo at
 `~/Projects/demo/0sql-dashboard-demo` with its DuckDB warehouse built, and
 `claude` on the path with a login.
 
