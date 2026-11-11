@@ -30,10 +30,12 @@ impl Source for Sqlite {
         // checked against the clock rather than counted, so a slow step and
         // a fast one are charged alike.
         let deadline = std::time::Instant::now() + self.timeout;
-        self.db.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline));
+        // A handler that could not be installed is a query with no
+        // deadline, so that is a refusal and not something to run past.
+        self.db.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline)).map_err(fail)?;
         let result = (|| {
             let mut stmt = self.db.prepare(sql).map_err(fail)?;
-            let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
             let width = columns.len();
             let mut out = Vec::new();
             let mut rows = stmt.query([]).map_err(fail)?;
@@ -55,8 +57,12 @@ impl Source for Sqlite {
             }
             Ok(Rows { columns, rows: out })
         })();
-        self.db.progress_handler(0, None::<fn() -> bool>);
-        result
+        // Cleared whatever the query did. A handler left behind would
+        // call off the next statement against this one's spent deadline,
+        // so failing to clear it is reported when the query itself was
+        // fine, and the query's own error wins when it was not.
+        let cleared = self.db.progress_handler(0, None::<fn() -> bool>).map_err(fail);
+        result.and_then(|rows| cleared.map(|()| rows))
     }
 
     fn adapter(&self) -> &str {
