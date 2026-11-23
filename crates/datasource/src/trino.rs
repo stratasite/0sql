@@ -4,7 +4,7 @@
 //! `information_schema.tables` and mean this catalog's. Athena has its
 //! own transport; it is not reached this way.
 
-use crate::{http, read_only, Connection, Result, Rows, Secret, Source, SourceError};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Source};
 use base64::Engine;
 use serde_json::Value;
 
@@ -59,12 +59,11 @@ impl Trino {
     }
 
     fn page(&self, body: String) -> Result<Value> {
-        let v: Value =
-            serde_json::from_str(&body).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
+        let v: Value = serde_json::from_str(&body).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("query failed");
             let name = err.get("errorName").and_then(Value::as_str).unwrap_or("");
-            return Err(SourceError::Query(self.conn.uid.clone(), format!("{name} {msg}").trim().to_string()));
+            return Err(Error::Query(self.conn.uid.clone(), format!("{name} {msg}").trim().to_string()));
         }
         Ok(v)
     }
@@ -73,7 +72,7 @@ impl Trino {
 impl Source for Trino {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        let fail = |e: ureq::Error| SourceError::Query(self.conn.uid.clone(), crate::chain(&e));
+        let fail = |e: ureq::Error| Error::Query(self.conn.uid.clone(), crate::chain(&e));
         let first = self.headers(self.agent.post(&format!("{}/v1/statement", self.base))).send(sql.as_bytes()).map_err(fail)?;
         let mut v = self.page(http::text(&self.conn, first)?)?;
         let mut columns: Vec<String> = Vec::new();
@@ -91,7 +90,7 @@ impl Source for Trino {
                         if let Some(next) = v.get("nextUri").and_then(Value::as_str) {
                             let _ = self.headers(self.agent.delete(next)).call();
                         }
-                        return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+                        return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
                     }
                     rows.push(r.as_array().map(|cells| cells.iter().cloned().map(http::cell).collect()).unwrap_or_default());
                 }

@@ -12,7 +12,7 @@
 //! in `datasources.yml`, by `GOOGLE_APPLICATION_CREDENTIALS`, or found
 //! where gcloud leaves it.
 
-use crate::{http, jwt, read_only, Connection, Result, Rows, Secrets, Source, SourceError};
+use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secrets, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -90,7 +90,7 @@ impl BigQuery {
             }
         };
         if !missing.is_empty() {
-            return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
+            return Err(Error::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
         let base = conn.url.clone().unwrap_or_else(|| DEFAULT_BASE.into());
         let note = http::plain(conn, &base, "bigquery")?;
@@ -125,7 +125,7 @@ impl BigQuery {
                     "exp": now + 3600,
                 });
                 let assertion = signer.rs256(&claims).map_err(|e| match e {
-                    SourceError::PrivateKey(_, why) => SourceError::PrivateKey(self.conn.uid.clone(), why),
+                    Error::PrivateKey(_, why) => Error::PrivateKey(self.conn.uid.clone(), why),
                     other => other,
                 })?;
                 (token_uri.clone(), http::form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &assertion)]))
@@ -156,12 +156,12 @@ impl BigQuery {
         http::call(&self.conn, &self.agent, method, url, &headers, body.as_deref().map(str::as_bytes))
     }
 
-    fn refused(&self, status: u16, text: &str) -> SourceError {
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
+    fn refused(&self, status: u16, text: &str) -> Error {
+        Error::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn parse(&self, text: &str) -> Result<Answer> {
-        serde_json::from_str(text).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
+        serde_json::from_str(text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
     }
 
     fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
@@ -185,10 +185,7 @@ impl BigQuery {
         let mut answer = self.parse(&text)?;
         let job = answer.job_reference.clone().unwrap_or_default();
         if job.job_id.is_empty() && !answer.job_complete {
-            return Err(SourceError::Query(
-                self.conn.uid.clone(),
-                "the job is not complete and the answer names no job to wait for".into(),
-            ));
+            return Err(Error::Query(self.conn.uid.clone(), "the job is not complete and the answer names no job to wait for".into()));
         }
         let base = self.base.clone();
         let project = http::urlencode(&self.project);
@@ -215,7 +212,7 @@ impl BigQuery {
                     job.location.as_deref().map(|l| format!("?location={}", http::urlencode(l))).unwrap_or_default()
                 );
                 let _ = self.request(http::Method::Post, &cancel, Some("{}".into()));
-                return Err(SourceError::Query(
+                return Err(Error::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
                 ));
@@ -231,21 +228,21 @@ impl BigQuery {
         if let Some(e) = answer.errors.first() {
             let message = e.message.clone().unwrap_or_else(|| "query failed".into());
             if answer.schema.is_none() {
-                return Err(SourceError::Query(self.conn.uid.clone(), message));
+                return Err(Error::Query(self.conn.uid.clone(), message));
             }
             self.warnings.push(format!("{}: the job reported: {message}", self.conn.uid));
         }
         // The total is known from the first page, so a result over the cap
         // is refused before any other page is fetched.
         if answer.total_rows.as_deref().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n > max_rows as i64) {
-            return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let columns: Vec<String> = answer.schema.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         loop {
             rows.extend(answer.rows.into_iter().map(|r| r.f.into_iter().map(|c| http::cell(c.v)).collect::<Vec<_>>()));
             if rows.len() > max_rows {
-                return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+                return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
             }
             let Some(token) = answer.page_token.take() else { break };
             let (status, text) = self.request(http::Method::Get, &results_url(Some(&token)), None)?;
@@ -260,7 +257,7 @@ impl BigQuery {
 
 /// The credentials file, by its `type`.
 fn credential(uid: &str, path: &std::path::Path) -> Result<Credential> {
-    let fail = |why: String| SourceError::NoCredentials(uid.to_string(), format!("{}: {why}", path.display()));
+    let fail = |why: String| Error::NoCredentials(uid.to_string(), format!("{}: {why}", path.display()));
     let text = std::fs::read_to_string(path).map_err(|e| fail(e.to_string()))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| fail(format!("not JSON: {e}")))?;
     let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);

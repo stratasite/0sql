@@ -11,7 +11,7 @@
 //! platform's roots and `ca_file`, name included — HTTPS has no rung
 //! between those two.
 
-use crate::{Connection, Result, SourceError, SslMode};
+use crate::{Connection, Error, Result, SslMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,7 @@ fn certificates(uid: &str, ca_file: Option<&std::path::Path>) -> Result<Option<V
 /// The certificates in a PEM file, as ureq takes them.
 fn pem(uid: &str, path: &std::path::Path) -> Result<Vec<ureq::tls::Certificate<'static>>> {
     use rustls::pki_types::pem::PemObject;
-    let fail = |e: String| SourceError::CaFile(format!("{uid}: {}", path.display()), e);
+    let fail = |e: String| Error::CaFile(format!("{uid}: {}", path.display()), e);
     let text = std::fs::read(path).map_err(|e| fail(e.to_string()))?;
     let mut out = Vec::new();
     for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&text) {
@@ -86,7 +86,7 @@ pub(crate) fn base_url(conn: &Connection, default_port: u16, what: &'static str)
     let url = match &conn.url {
         Some(u) => u.clone(),
         None => {
-            let host = conn.host.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "host or url"))?;
+            let host = conn.host.clone().ok_or_else(|| Error::Missing(conn.uid.clone(), "host or url"))?;
             let scheme = if conn.sslmode.insists() { "https" } else { "http" };
             format!("{scheme}://{host}:{}", conn.port.unwrap_or(default_port))
         }
@@ -99,13 +99,12 @@ pub(crate) fn base_url(conn: &Connection, default_port: u16, what: &'static str)
 /// when the warehouse refused: a refusal's body is where it says why.
 pub(crate) fn text(conn: &Connection, r: ureq::http::Response<ureq::Body>) -> Result<String> {
     let status = r.status();
-    let body =
-        r.into_body().with_config().limit(MAX_BODY).read_to_string().map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
+    let body = r.into_body().with_config().limit(MAX_BODY).read_to_string().map_err(|e| Error::Query(conn.uid.clone(), e.to_string()))?;
     if status.is_success() {
         Ok(body)
     } else {
         let why: String = body.trim().chars().take(400).collect();
-        Err(SourceError::Query(conn.uid.clone(), format!("{status}: {why}")))
+        Err(Error::Query(conn.uid.clone(), format!("{status}: {why}")))
     }
 }
 
@@ -127,7 +126,7 @@ pub(crate) fn call(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<(u16, String)> {
-    let fail = |e: ureq::Error| SourceError::Query(conn.uid.clone(), crate::chain(&e));
+    let fail = |e: ureq::Error| Error::Query(conn.uid.clone(), crate::chain(&e));
     let response = match method {
         Method::Post => {
             let mut req = agent.post(url);
@@ -145,12 +144,8 @@ pub(crate) fn call(
         }
     };
     let status = response.status().as_u16();
-    let text = response
-        .into_body()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_string()
-        .map_err(|e| SourceError::Query(conn.uid.clone(), e.to_string()))?;
+    let text =
+        response.into_body().with_config().limit(MAX_BODY).read_to_string().map_err(|e| Error::Query(conn.uid.clone(), e.to_string()))?;
     Ok((status, text))
 }
 
@@ -186,14 +181,14 @@ pub(crate) fn token(
     }
     let (status, text) = call(conn, agent, Method::Post, url, &headers, Some(form_body.as_bytes()))?;
     if status != 200 {
-        return Err(SourceError::Connect(conn.uid.clone(), format!("token: {status}: {}", reason(&text))));
+        return Err(Error::Connect(conn.uid.clone(), format!("token: {status}: {}", reason(&text))));
     }
     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     let token = v
         .get("access_token")
         .and_then(|t| t.as_str())
         .map(str::to_string)
-        .ok_or_else(|| SourceError::Connect(conn.uid.clone(), "token: the answer carried no access_token".into()))?;
+        .ok_or_else(|| Error::Connect(conn.uid.clone(), "token: the answer carried no access_token".into()))?;
     let secs = v.get("expires_in").and_then(|e| e.as_u64()).filter(|s| (1..=86_400).contains(s)).unwrap_or(3600);
     Ok((token, Instant::now() + Duration::from_secs(secs)))
 }
@@ -203,7 +198,7 @@ pub(crate) fn token(
 pub(crate) fn plain(conn: &Connection, url: &str, what: &'static str) -> Result<Option<String>> {
     let plain = url.to_lowercase().starts_with("http://");
     if plain && conn.sslmode.insists() {
-        return Err(SourceError::PlainUrl(conn.uid.clone(), what));
+        return Err(Error::PlainUrl(conn.uid.clone(), what));
     }
     Ok((plain && conn.sslmode == SslMode::Prefer)
         .then(|| format!("{}: sslmode is prefer and the url is plain http, so nothing is encrypted", conn.uid)))

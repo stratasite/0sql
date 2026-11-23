@@ -12,7 +12,7 @@
 //! that mode permits: under 1 the server already bans writes and the cap
 //! is checked here; under 2 the caps go up; under 0 so does `readonly=2`.
 
-use crate::{http, read_only, Connection, Result, Rows, Secret, Source, SourceError};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Source};
 
 pub struct ClickHouse {
     agent: ureq::Agent,
@@ -65,14 +65,14 @@ impl ClickHouse {
         if let Some(p) = &self.password {
             req = req.header("X-ClickHouse-Key", p.expose());
         }
-        let response = req.send(sql.as_bytes()).map_err(|e| SourceError::Query(self.conn.uid.clone(), crate::chain(&e)))?;
+        let response = req.send(sql.as_bytes()).map_err(|e| Error::Query(self.conn.uid.clone(), crate::chain(&e)))?;
         let body = http::text(&self.conn, response)?;
         let compact: Compact =
-            serde_json::from_str(&body).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
+            serde_json::from_str(&body).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
         // Under readonly=1 the server was sent no cap, so this is the cap;
         // otherwise the server threw first and this is belt and braces.
         if compact.data.len() > max_rows {
-            return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let columns = compact.meta.into_iter().map(|m| m.name).collect();
         let rows = compact.data.into_iter().map(|row| row.into_iter().map(http::cell).collect()).collect();

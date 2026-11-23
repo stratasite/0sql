@@ -21,7 +21,7 @@
 //! when one of them misbehaves.
 
 use crate::batch::{self, Batches};
-use crate::{read_only, Connection, Result, Rows, Secrets, Source, SourceError};
+use crate::{read_only, Connection, Error, Result, Rows, Secrets, Source};
 use adbc_core::error::Status;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
 use adbc_core::{Connection as _, Database as _, Driver as _, Statement as _};
@@ -53,7 +53,7 @@ pub fn load(name: &str) -> Result<Option<ManagedDriver>> {
     match ManagedDriver::load_from_name(name, None, AdbcVersion::V110, flags, None) {
         Ok(d) => Ok(Some(d)),
         Err(e) if e.status == Status::NotFound => Ok(None),
-        Err(e) => Err(SourceError::Connect(format!("the ADBC driver {name}"), e.message)),
+        Err(e) => Err(Error::Connect(format!("the ADBC driver {name}"), e.message)),
     }
 }
 
@@ -68,7 +68,7 @@ pub struct Adbc {
 
 impl Adbc {
     pub fn open(mut driver: ManagedDriver, plan: &Plan, uid: &str, timeout: Duration) -> Result<Adbc> {
-        let fail = |e: adbc_core::error::Error| SourceError::Connect(uid.to_string(), e.message);
+        let fail = |e: adbc_core::error::Error| Error::Connect(uid.to_string(), e.message);
         let options = plan.options.iter().map(|(k, v)| (OptionDatabase::from(k.as_str()), OptionValue::String(v.clone())));
         let database = driver.new_database_with_opts(options).map_err(fail)?;
         let connection = database.new_connection().map_err(fail)?;
@@ -87,7 +87,7 @@ impl Adbc {
     pub fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
         read_only(sql)?;
         let uid = self.uid.clone();
-        let fail = |e: adbc_core::error::Error| SourceError::Query(uid.clone(), e.message);
+        let fail = |e: adbc_core::error::Error| Error::Query(uid.clone(), e.message);
         let mut statement = self.connection.new_statement().map_err(fail)?;
         statement.set_sql_query(sql).map_err(fail)?;
         let cancel = statement.get_cancel_handle();
@@ -95,7 +95,7 @@ impl Adbc {
         let worker_uid = uid.clone();
         std::thread::spawn(move || {
             let outcome = (|| {
-                let reader = statement.execute().map_err(|e| SourceError::Query(worker_uid.clone(), e.message))?;
+                let reader = statement.execute().map_err(|e| Error::Query(worker_uid.clone(), e.message))?;
                 let schema = reader.schema();
                 batch::collect(&worker_uid, schema, reader, max_rows)
             })();
@@ -104,9 +104,7 @@ impl Adbc {
         });
         match done_rx.recv_timeout(self.timeout) {
             Ok(outcome) => outcome,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(SourceError::Query(uid, "the driver stopped without an answer".into()))
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::Query(uid, "the driver stopped without an answer".into())),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let secs = self.timeout.as_secs();
                 let why = match cancel.try_cancel() {
@@ -120,7 +118,7 @@ impl Adbc {
                         if e.message.trim().is_empty() { format!("{:?}", e.status) } else { e.message }
                     ),
                 };
-                Err(SourceError::Query(uid, why))
+                Err(Error::Query(uid, why))
             }
         }
     }
@@ -200,7 +198,7 @@ impl Source for WithAdbc {
                 // The statement ran and only its result could not be
                 // fetched, so REST is asked instead, for this statement
                 // and every later one on the connection.
-                Err(SourceError::Query(_, why)) if why.contains(NO_READ_SESSION) => {
+                Err(Error::Query(_, why)) if why.contains(NO_READ_SESSION) => {
                     tracing::warn!(
                         datasource = %self.uid,
                         driver = self.plan.driver,
@@ -475,9 +473,9 @@ mod tests {
             got.to_text().unwrap().rows,
             vec![vec![Some("1".into()), Some("a".into()), Some("2.5".into())], vec![Some("2".into()), None, Some("0.5".into())]]
         );
-        assert!(matches!(db.batches("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).unwrap_err(), SourceError::TooManyRows(_, 2)));
-        assert!(matches!(db.batches("DELETE FROM t", 2).unwrap_err(), SourceError::NotARead(_)));
-        assert!(matches!(db.batches("SELECT * FROM no_such_table", 2).unwrap_err(), SourceError::Query(_, _)));
+        assert!(matches!(db.batches("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).unwrap_err(), Error::TooManyRows(_, 2)));
+        assert!(matches!(db.batches("DELETE FROM t", 2).unwrap_err(), Error::NotARead(_)));
+        assert!(matches!(db.batches("SELECT * FROM no_such_table", 2).unwrap_err(), Error::Query(_, _)));
     }
 
     /// The SQLite driver cannot cancel, which makes it the case worth
@@ -504,7 +502,7 @@ mod tests {
     fn the_warehouse_drivers_know_every_option_they_are_sent() {
         // "failed to auth for unknown reason" is a login failing, which
         // is the expected end; only a complaint about an option counts.
-        let unknown = |e: &SourceError| {
+        let unknown = |e: &Error| {
             let m = e.to_string().to_lowercase();
             m.contains("not implemented")
                 || (m.contains("option") && ["unknown", "unrecognized", "invalid", "unsupported"].iter().any(|w| m.contains(w)))
@@ -690,7 +688,7 @@ mod tests {
 
         // The cap refuses.
         let err = adbc.batches("SELECT x FROM UNNEST(GENERATE_ARRAY(1, 100)) AS x", 10).unwrap_err();
-        assert!(matches!(err, SourceError::TooManyRows(_, 10)), "{err}");
+        assert!(matches!(err, Error::TooManyRows(_, 10)), "{err}");
 
         // The timeout: a statement that scans nothing and takes minutes.
         let mut hasty = open(Duration::from_secs(3));

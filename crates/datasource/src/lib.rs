@@ -42,7 +42,7 @@ pub use batch::Batches;
 pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Listing, Names, Scope, Table};
 
 #[derive(Debug, thiserror::Error)]
-pub enum SourceError {
+pub enum Error {
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error("{0}: {1}")]
@@ -79,7 +79,7 @@ pub enum SourceError {
     PrivateKey(String, String),
 }
 
-pub type Result<T> = std::result::Result<T, SourceError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// An error and everything underneath it, joined: a driver's outer
 /// message is often "error performing TLS handshake" while the reason —
@@ -135,7 +135,7 @@ impl SslMode {
             "require" | "required" | "on" | "true" => SslMode::Require,
             "verify-ca" => SslMode::VerifyCa,
             "verify-full" | "verify-identity" => SslMode::VerifyFull,
-            _ => return Err(SourceError::SslMode(s.trim().to_string())),
+            _ => return Err(Error::SslMode(s.trim().to_string())),
         })
     }
 
@@ -230,8 +230,8 @@ impl Connection {
     /// Every datasource in a project's `datasources.yml`, in file order.
     pub fn read_all(project_dir: &Path) -> Result<Vec<Connection>> {
         let path = project_dir.join("datasources.yml");
-        let text = std::fs::read_to_string(&path).map_err(|e| SourceError::Io(path.display().to_string(), e))?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| SourceError::Yaml(path.display().to_string(), e))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| Error::Yaml(path.display().to_string(), e))?;
         let Some(map) = doc.as_mapping() else { return Ok(vec![]) };
         let mut out = Vec::new();
         for (key, d) in map {
@@ -295,11 +295,11 @@ impl Connection {
             "postgres" | "redshift" | "sqlserver" | "snowflake" | "trino" => self.database = catalog,
             "databricks" | "athena" => self.catalog = catalog,
             "bigquery" => self.project = catalog,
-            "mysql" => return Err(SourceError::NoCatalogs("MySQL")),
-            "clickhouse" => return Err(SourceError::NoCatalogs("ClickHouse")),
-            "sqlite" => return Err(SourceError::NoCatalogs("SQLite")),
-            "duckdb" => return Err(SourceError::NoCatalogs("DuckDB")),
-            other => return Err(SourceError::Unsupported(other.to_string())),
+            "mysql" => return Err(Error::NoCatalogs("MySQL")),
+            "clickhouse" => return Err(Error::NoCatalogs("ClickHouse")),
+            "sqlite" => return Err(Error::NoCatalogs("SQLite")),
+            "duckdb" => return Err(Error::NoCatalogs("DuckDB")),
+            other => return Err(Error::Unsupported(other.to_string())),
         }
         Ok(())
     }
@@ -307,11 +307,11 @@ impl Connection {
     /// One datasource by its key, as `datasources.yml` spells it.
     pub fn read(project_dir: &Path, uid: &str) -> Result<Connection> {
         let want = uid.trim().to_lowercase();
-        Connection::read_all(project_dir)?.into_iter().find(|c| c.uid == want).ok_or_else(|| SourceError::NoDatasource(uid.to_string()))
+        Connection::read_all(project_dir)?.into_iter().find(|c| c.uid == want).ok_or_else(|| Error::NoDatasource(uid.to_string()))
     }
 
     fn need(&self, value: &Option<String>, what: &'static str) -> Result<String> {
-        value.clone().ok_or_else(|| SourceError::Missing(self.uid.clone(), what))
+        value.clone().ok_or_else(|| Error::Missing(self.uid.clone(), what))
     }
 
     /// The statement timeout, from `query_timeout` or a default that is
@@ -597,7 +597,7 @@ pub trait Source {
 /// protection that matters is a credential with no write grant, which the
 /// documentation asks for.
 pub fn read_only(sql: &str) -> Result<()> {
-    let refuse = || SourceError::NotARead(sql.chars().take(80).collect());
+    let refuse = || Error::NotARead(sql.chars().take(80).collect());
     let text = skeleton(sql);
     let trimmed = text.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() || trimmed.contains(';') {
@@ -733,7 +733,7 @@ fn open_adapter(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> 
         }
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         "duckdb" => Ok(Box::new(duckdb::DuckDb::open(conn)?)),
-        other => Err(SourceError::Unsupported(other.to_string())),
+        other => Err(Error::Unsupported(other.to_string())),
     }
 }
 

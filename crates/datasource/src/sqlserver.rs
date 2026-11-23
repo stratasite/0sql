@@ -12,7 +12,7 @@
 //! later with it. tiberius's rustls brings aws-lc in beside ring, which
 //! costs 2.7 MB of binary and is why `ring` is installed as the process
 //! default once, in `tls`.
-use crate::{read_only, tls, Connection, Result, Rows, Secret, Source, SourceError, SslMode};
+use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Source, SslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type Client = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -44,7 +44,7 @@ impl SqlServer {
                 let user = conn.need(&conn.username, "username")?;
                 let password = secret
                     .clone()
-                    .ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+                    .ok_or_else(|| Error::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
                 tiberius::AuthMethod::sql_server(&user, password.expose())
             }
         };
@@ -83,7 +83,7 @@ impl SqlServer {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         let mut warnings = Vec::new();
         let mut last = String::new();
         let mut client = None;
@@ -108,7 +108,7 @@ impl SqlServer {
                 Err(e) => last = e,
             }
         }
-        let client = client.ok_or_else(|| SourceError::Connect(conn.uid.clone(), last))?;
+        let client = client.ok_or_else(|| Error::Connect(conn.uid.clone(), last))?;
         Ok(SqlServer {
             runtime,
             client: Some(client),
@@ -155,12 +155,12 @@ impl Source for SqlServer {
                 if e == timed_out {
                     self.client = None;
                 }
-                return Err(SourceError::Query(uid, e));
+                return Err(Error::Query(uid, e));
             }
         };
         let rows_in = sets.into_iter().next().unwrap_or_default();
         if rows_in.len() > max_rows {
-            return Err(SourceError::TooManyRows(uid, max_rows));
+            return Err(Error::TooManyRows(uid, max_rows));
         }
         let columns: Vec<String> = rows_in.first().map(|r| r.columns().iter().map(|c| c.name().to_string()).collect()).unwrap_or_default();
         let rows = rows_in.into_iter().map(|r| r.cells().map(|(_, d)| cell(d)).collect()).collect();

@@ -10,7 +10,7 @@
 //! until someone needs them. The region follows the same order, ending
 //! in the shared config file.
 
-use crate::{http, read_only, sigv4, Connection, Result, Rows, Secret, Secrets, Source, SourceError};
+use crate::{http, read_only, sigv4, Connection, Error, Result, Rows, Secret, Secrets, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -66,7 +66,7 @@ impl Athena {
             ));
         }
         if !missing.is_empty() {
-            return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
+            return Err(Error::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
         let region = region.expect("checked");
         let base = conn.url.clone().unwrap_or_else(|| format!("https://athena.{region}.amazonaws.com"));
@@ -103,10 +103,7 @@ impl Athena {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         if status != 200 {
             let kind = v.get("__type").and_then(|t| t.as_str()).unwrap_or("");
-            return Err(SourceError::Query(
-                self.conn.uid.clone(),
-                format!("{status}: {kind} {}", http::reason(&text)).replace(":  ", ": "),
-            ));
+            return Err(Error::Query(self.conn.uid.clone(), format!("{status}: {kind} {}", http::reason(&text)).replace(":  ", ": ")));
         }
         Ok(v)
     }
@@ -130,7 +127,7 @@ impl Athena {
             .get("QueryExecutionId")
             .and_then(|i| i.as_str())
             .map(str::to_string)
-            .ok_or_else(|| SourceError::Query(self.conn.uid.clone(), "no QueryExecutionId in the answer".into()))?;
+            .ok_or_else(|| Error::Query(self.conn.uid.clone(), "no QueryExecutionId in the answer".into()))?;
 
         // Queued, running, then settled; past the statement timeout the
         // query is stopped so it stops costing.
@@ -143,12 +140,12 @@ impl Athena {
                 "SUCCEEDED" => break,
                 "FAILED" | "CANCELLED" => {
                     let why = v.pointer("/QueryExecution/Status/StateChangeReason").and_then(|s| s.as_str()).unwrap_or("");
-                    return Err(SourceError::Query(self.conn.uid.clone(), format!("{}: {why}", state.to_lowercase()).trim().to_string()));
+                    return Err(Error::Query(self.conn.uid.clone(), format!("{}: {why}", state.to_lowercase()).trim().to_string()));
                 }
                 _ => {
                     if Instant::now() >= deadline {
                         let _ = self.action("StopQueryExecution", serde_json::json!({ "QueryExecutionId": id }));
-                        return Err(SourceError::Query(
+                        return Err(Error::Query(
                             self.conn.uid.clone(),
                             format!("still running after {}s; stopped (query_timeout)", self.conn.timeout().as_secs()),
                         ));
@@ -193,7 +190,7 @@ impl Athena {
                 }
                 rows.push(cells);
                 if rows.len() > max_rows {
-                    return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+                    return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
                 }
             }
             first = false;

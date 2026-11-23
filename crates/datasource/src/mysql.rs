@@ -9,7 +9,7 @@
 //! the bundle the crate carries plus `ca_file`, not the platform's
 //! store, because the crate takes certificate files and not a store.
 
-use crate::{read_only, Connection, Result, Rows, Secret, Source, SourceError, SslMode};
+use crate::{read_only, Connection, Error, Result, Rows, Secret, Source, SslMode};
 use mysql_async::prelude::Queryable;
 
 pub struct MySql {
@@ -24,7 +24,7 @@ impl MySql {
         let host = conn.need(&conn.host, "host")?;
         let user = conn.need(&conn.username, "username")?;
         let password =
-            secret.ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+            secret.ok_or_else(|| Error::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
         crate::tls::install_ring();
 
         let ssl = |mode: SslMode| -> Option<mysql_async::SslOpts> {
@@ -53,7 +53,7 @@ impl MySql {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         let mut warnings = Vec::new();
         let mut last = String::new();
         let mut c = None;
@@ -69,12 +69,12 @@ impl MySql {
                 Err(e) => last = crate::chain(&e),
             }
         }
-        let mut c = c.ok_or_else(|| SourceError::Connect(conn.uid.clone(), last))?;
+        let mut c = c.ok_or_else(|| Error::Connect(conn.uid.clone(), last))?;
         // The statement timeout, enforced by the server; a SET is not user
         // SQL, so it does not pass through the guard.
         runtime
             .block_on(c.query_drop(format!("SET SESSION max_execution_time = {}", conn.timeout().as_millis())))
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         Ok(MySql { runtime, conn: c, uid: conn.uid.clone(), warnings })
     }
 }
@@ -83,7 +83,7 @@ impl Source for MySql {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
         let uid = self.uid.clone();
-        let fail = |e: mysql_async::Error| SourceError::Query(uid.clone(), crate::chain(&e));
+        let fail = |e: mysql_async::Error| Error::Query(uid.clone(), crate::chain(&e));
         let conn = &mut self.conn;
         self.runtime.block_on(async {
             let mut result = conn.query_iter(sql).await.map_err(fail)?;
@@ -96,7 +96,7 @@ impl Source for MySql {
                 .unwrap_or_default();
             let rows: Vec<mysql_async::Row> = result.collect().await.map_err(fail)?;
             if rows.len() > max_rows {
-                return Err(SourceError::TooManyRows(uid.clone(), max_rows));
+                return Err(Error::TooManyRows(uid.clone(), max_rows));
             }
             Ok(Rows {
                 columns,

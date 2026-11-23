@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use zsql_datasource::{Catalog, Connection, Filter, Secrets, SourceError, CONNECTION_KEYS, SECRET_FIELDS};
+use zsql_datasource::{Catalog, Connection, Filter, Secrets, CONNECTION_KEYS, SECRET_FIELDS};
 
 /// The most tables one page holds, and how many it holds when the
 /// request does not say. A warehouse can have tens of thousands, so a
@@ -118,19 +118,20 @@ fn named(v: Option<String>) -> Result<Option<String>, ApiError> {
 /// fix (400); a warehouse that would not answer is upstream (502). The
 /// datasource crate words some of these for a project directory, so the
 /// ones that name a file are said again for a request.
-fn refused(e: SourceError) -> ApiError {
+fn refused(e: zsql_datasource::Error) -> ApiError {
     let (status, message) = match &e {
-        SourceError::Connect(..) | SourceError::Query(..) | SourceError::TooManyRows(..) | SourceError::Io(..) => {
-            (StatusCode::BAD_GATEWAY, e.to_string())
-        }
-        SourceError::Missing(uid, what) => {
+        zsql_datasource::Error::Connect(..)
+        | zsql_datasource::Error::Query(..)
+        | zsql_datasource::Error::TooManyRows(..)
+        | zsql_datasource::Error::Io(..) => (StatusCode::BAD_GATEWAY, e.to_string()),
+        zsql_datasource::Error::Missing(uid, what) => {
             (StatusCode::BAD_REQUEST, format!("datasource {uid} has no {what}; deploy it in datasources.yml or send it in the connection"))
         }
-        SourceError::NoSecret { uid, .. } => (
+        zsql_datasource::Error::NoSecret { uid, .. } => (
             StatusCode::BAD_REQUEST,
             format!("datasource {uid} needs a password; deploy it in datasources.yml or send it in the connection"),
         ),
-        SourceError::NoSchemas(engine) => (StatusCode::BAD_REQUEST, format!("{engine} has no schemas; ask without one")),
+        zsql_datasource::Error::NoSchemas(engine) => (StatusCode::BAD_REQUEST, format!("{engine} has no schemas; ask without one")),
         _ => (StatusCode::BAD_REQUEST, e.to_string()),
     };
     ApiError(status, "DatasourceError", message)

@@ -7,7 +7,7 @@
 //! being async. The crate stays free to grow an async twin if the server
 //! ever needs one.
 
-use crate::{read_only, tls, Connection, Result, Rows, Secret, Source, SourceError, SslMode};
+use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Source, SslMode};
 
 pub struct Postgres {
     runtime: tokio::runtime::Runtime,
@@ -24,7 +24,7 @@ impl Postgres {
         let user = conn.need(&conn.username, "username")?;
         let database = conn.need(&conn.database, "database")?;
         let password =
-            secret.ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+            secret.ok_or_else(|| Error::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
 
         // The statement timeout is the warehouse's to enforce, so it is set
         // on the session rather than trusted from this side alone. Redshift
@@ -63,11 +63,10 @@ impl Postgres {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
 
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls::client_config(&conn.uid, conn.sslmode, conn.ca_file.as_deref())?);
-        let (client, connection) =
-            runtime.block_on(config.connect(tls)).map_err(|e| SourceError::Connect(conn.uid.clone(), crate::chain(&e)))?;
+        let (client, connection) = runtime.block_on(config.connect(tls)).map_err(|e| Error::Connect(conn.uid.clone(), crate::chain(&e)))?;
         // The connection drives the socket and must be polled for the
         // client to work; it ends when the client is dropped.
         runtime.spawn(async move {
@@ -81,7 +80,7 @@ impl Postgres {
             if let Some(schema) = &conn.schema {
                 session.push_str(&format!("; SET search_path TO {schema}"));
             }
-            pg.runtime.block_on(pg.client.simple_query(&session)).map_err(|e| SourceError::Connect(conn.uid.clone(), crate::chain(&e)))?;
+            pg.runtime.block_on(pg.client.simple_query(&session)).map_err(|e| Error::Connect(conn.uid.clone(), crate::chain(&e)))?;
         }
         // `prefer` may have ended plaintext, and the server knows which —
         // Postgres through pg_stat_ssl; Redshift has no such view, so there
@@ -114,8 +113,8 @@ impl Source for Postgres {
         let messages = self
             .runtime
             .block_on(async { tokio::time::timeout(self.timeout, self.client.simple_query(sql)).await })
-            .map_err(|_| SourceError::Query(uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
-            .map_err(|e| SourceError::Query(uid.clone(), crate::chain(&e)))?;
+            .map_err(|_| Error::Query(uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
+            .map_err(|e| Error::Query(uid.clone(), crate::chain(&e)))?;
         let mut columns: Vec<String> = Vec::new();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         for m in messages {
@@ -126,7 +125,7 @@ impl Source for Postgres {
                 tokio_postgres::SimpleQueryMessage::Row(row) => {
                     if rows.len() == max_rows {
                         // Past the cap: refuse rather than trim.
-                        return Err(SourceError::TooManyRows(uid, max_rows));
+                        return Err(Error::TooManyRows(uid, max_rows));
                     }
                     if columns.is_empty() {
                         columns = row.columns().iter().map(|c| c.name().to_string()).collect();

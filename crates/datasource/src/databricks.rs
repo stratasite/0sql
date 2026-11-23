@@ -13,7 +13,7 @@
 //! over it costs the warehouse one extra row and this side one request:
 //! the manifest says the total and whether it was cut.
 
-use crate::{http, read_only, Connection, Result, Rows, Secret, Secrets, Source, SourceError};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Secrets, Source};
 use base64::Engine;
 use std::time::{Duration, Instant};
 
@@ -78,7 +78,7 @@ impl Databricks {
             }
         };
         if !missing.is_empty() {
-            return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
+            return Err(Error::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
         let note = http::plain(conn, &base, "databricks")?;
         Ok(Databricks {
@@ -124,12 +124,12 @@ impl Databricks {
         http::call(&self.conn, &self.agent, method, url, &headers, body.as_deref().map(str::as_bytes))
     }
 
-    fn refused(&self, status: u16, text: &str) -> SourceError {
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
+    fn refused(&self, status: u16, text: &str) -> Error {
+        Error::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn parse(&self, text: &str) -> Result<Answer> {
-        serde_json::from_str(text).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
+        serde_json::from_str(text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
     }
 
     fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
@@ -163,10 +163,7 @@ impl Databricks {
         }
         if answer.status.state != "SUCCEEDED" {
             let why = answer.status.error.and_then(|e| e.message).unwrap_or_default();
-            return Err(SourceError::Query(
-                self.conn.uid.clone(),
-                format!("{}: {why}", answer.status.state.to_lowercase()).trim().to_string(),
-            ));
+            return Err(Error::Query(self.conn.uid.clone(), format!("{}: {why}", answer.status.state.to_lowercase()).trim().to_string()));
         }
         self.collect(answer, max_rows)
     }
@@ -180,7 +177,7 @@ impl Databricks {
         loop {
             if Instant::now() >= deadline {
                 let _ = self.request(http::Method::Post, &format!("{url}/cancel"), None);
-                return Err(SourceError::Query(
+                return Err(Error::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
                 ));
@@ -204,7 +201,7 @@ impl Databricks {
     fn collect(&mut self, answer: Answer, max_rows: usize) -> Result<Rows> {
         let manifest = answer.manifest.unwrap_or_default();
         if manifest.truncated || manifest.total_row_count.is_some_and(|n| n > max_rows as i64) {
-            return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let mut columns: Vec<(i64, String)> = manifest.schema.columns.into_iter().map(|c| (c.position.unwrap_or(0), c.name)).collect();
         columns.sort_by_key(|(p, _)| *p);
@@ -214,7 +211,7 @@ impl Databricks {
         while let Some(r) = result.take() {
             rows.extend(r.data_array.into_iter().map(|row| row.into_iter().map(http::cell).collect::<Vec<_>>()));
             if rows.len() > max_rows {
-                return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+                return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
             }
             let Some(next) = r.next_chunk_index else { break };
             let url = format!("{}{STATEMENTS}/{}/result/chunks/{next}", self.base, answer.statement_id);
@@ -222,8 +219,7 @@ impl Databricks {
             if status != 200 {
                 return Err(self.refused(status, &text));
             }
-            result =
-                Some(serde_json::from_str(&text).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected chunk: {e}")))?);
+            result = Some(serde_json::from_str(&text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected chunk: {e}")))?);
         }
         Ok(Rows { columns, rows })
     }

@@ -9,7 +9,7 @@
 //! `READ_ONLY` mode, so a write fails inside the engine. A statement
 //! past the timeout is interrupted through the engine's own handle.
 
-use crate::{read_only, Batches, Connection, Result, Rows, Source, SourceError};
+use crate::{read_only, Batches, Connection, Error, Result, Rows, Source};
 use std::path::PathBuf;
 
 // Why this crate names a symbol it never calls.
@@ -57,14 +57,14 @@ pub struct DuckDb {
 
 impl DuckDb {
     pub fn open(conn: &Connection) -> Result<DuckDb> {
-        let file: PathBuf = conn.file.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "file"))?;
+        let file: PathBuf = conn.file.clone().ok_or_else(|| Error::Missing(conn.uid.clone(), "file"))?;
         if !file.exists() {
-            return Err(SourceError::Connect(conn.uid.clone(), format!("{} does not exist", file.display())));
+            return Err(Error::Connect(conn.uid.clone(), format!("{} does not exist", file.display())));
         }
         let config = duckdb::Config::default()
             .access_mode(duckdb::AccessMode::ReadOnly)
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
-        let db = duckdb::Connection::open_with_flags(&file, config).map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
+        let db = duckdb::Connection::open_with_flags(&file, config).map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         Ok(DuckDb { conn: db, uid: conn.uid.clone(), timeout: conn.timeout() })
     }
 }
@@ -75,7 +75,7 @@ impl DuckDb {
     fn run(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
         read_only(sql)?;
         let uid = self.uid.clone();
-        let fail = |e: duckdb::Error| SourceError::Query(uid.clone(), e.to_string());
+        let fail = |e: duckdb::Error| Error::Query(uid.clone(), e.to_string());
         // The timeout: a watcher interrupts the engine, which then answers
         // the statement with an error naming the interrupt.
         let handle = self.conn.interrupt_handle();
@@ -97,8 +97,8 @@ impl DuckDb {
         let _ = stop_tx.send(());
         let _ = watcher.join();
         match outcome {
-            Err(SourceError::Query(u, why)) if why.to_lowercase().contains("interrupt") => {
-                Err(SourceError::Query(u, format!("no answer within {}s; interrupted", timeout.as_secs())))
+            Err(Error::Query(u, why)) if why.to_lowercase().contains("interrupt") => {
+                Err(Error::Query(u, format!("no answer within {}s; interrupted", timeout.as_secs())))
             }
             other => other,
         }

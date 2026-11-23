@@ -2,7 +2,7 @@
 //! file's: the database is opened with the read-only flag, so a write is
 //! refused by SQLite itself before the guard in [`read_only`] is reached.
 
-use crate::{read_only, Connection, Result, Rows, Source, SourceError};
+use crate::{read_only, Connection, Error, Result, Rows, Source};
 
 pub struct Sqlite {
     db: rusqlite::Connection,
@@ -12,11 +12,11 @@ pub struct Sqlite {
 
 impl Sqlite {
     pub fn open(conn: &Connection) -> Result<Sqlite> {
-        let file = conn.file.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "file"))?;
+        let file = conn.file.clone().ok_or_else(|| Error::Missing(conn.uid.clone(), "file"))?;
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let db = rusqlite::Connection::open_with_flags(&file, flags)
-            .map_err(|e| SourceError::Connect(conn.uid.clone(), format!("{}: {e}", file.display())))?;
-        db.busy_timeout(conn.timeout()).map_err(|e| SourceError::Connect(conn.uid.clone(), e.to_string()))?;
+            .map_err(|e| Error::Connect(conn.uid.clone(), format!("{}: {e}", file.display())))?;
+        db.busy_timeout(conn.timeout()).map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         Ok(Sqlite { db, uid: conn.uid.clone(), timeout: conn.timeout() })
     }
 }
@@ -24,7 +24,7 @@ impl Sqlite {
 impl Source for Sqlite {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        let fail = |e: rusqlite::Error| SourceError::Query(self.uid.clone(), e.to_string());
+        let fail = |e: rusqlite::Error| Error::Query(self.uid.clone(), e.to_string());
         // SQLite has no statement timeout; a progress handler fires every so
         // many VM steps and can call the statement off. The budget is
         // checked against the clock rather than counted, so a slow step and
@@ -41,7 +41,7 @@ impl Source for Sqlite {
             let mut rows = stmt.query([]).map_err(fail)?;
             while let Some(row) = rows.next().map_err(fail)? {
                 if out.len() == max_rows {
-                    return Err(SourceError::TooManyRows(self.uid.clone(), max_rows));
+                    return Err(Error::TooManyRows(self.uid.clone(), max_rows));
                 }
                 let mut cells = Vec::with_capacity(width);
                 for i in 0..width {

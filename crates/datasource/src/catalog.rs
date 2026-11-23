@@ -121,7 +121,7 @@ impl Catalog {
 
 // ---------------------------------------------------------------------- read
 
-use crate::{Result, Rows, Source, SourceError};
+use crate::{Error, Result, Rows, Source};
 
 /// Caps on a catalog read. A warehouse with more tables or columns than
 /// this is refused rather than half-read, so a generated model is never
@@ -162,7 +162,7 @@ impl Catalog {
             "bigquery" => bigquery(src, f)?,
             "sqlite" => sqlite(src, f)?,
             "duckdb" => duckdb(src, f)?,
-            other => return Err(SourceError::Unsupported(other.to_string())),
+            other => return Err(Error::Unsupported(other.to_string())),
         };
         let read_at = now();
         let (scopes, added) = match &f.name {
@@ -207,7 +207,7 @@ impl Catalog {
             "bigquery" => bigquery(src, &f)?,
             "sqlite" => sqlite(src, &f)?,
             "duckdb" => duckdb(src, &f)?,
-            other => return Err(SourceError::Unsupported(other.to_string())),
+            other => return Err(Error::Unsupported(other.to_string())),
         };
         let more = tables.len() > limit;
         tables.truncate(limit);
@@ -1016,8 +1016,8 @@ fn standard_keys_sql(prefix: &str, upper: bool) -> String {
 /// for a column; a parameterized `STRING(n)` carries its width in the
 /// type's spelling.
 fn bigquery(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
-    let conn = src.connection().ok_or_else(|| SourceError::Missing("bigquery".into(), "project"))?;
-    let project = conn.project.clone().ok_or_else(|| SourceError::Missing(conn.uid.clone(), "project"))?;
+    let conn = src.connection().ok_or_else(|| Error::Missing("bigquery".into(), "project"))?;
+    let project = conn.project.clone().ok_or_else(|| Error::Missing(conn.uid.clone(), "project"))?;
     let (qualifier, rows_join, rows_expr) = match f.schema.as_deref() {
         Some(dataset) => (
             format!("`{project}`.`{dataset}`"),
@@ -1028,7 +1028,7 @@ fn bigquery(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
             let location = conn
                 .location
                 .clone()
-                .ok_or_else(|| SourceError::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalog"))?;
+                .ok_or_else(|| Error::Missing(conn.uid.clone(), "dataset, or location to read a whole region's catalog"))?;
             (format!("`{project}`.`region-{location}`"), String::new(), "CAST(NULL AS STRING)")
         }
     };
@@ -1136,7 +1136,7 @@ fn duckdb(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
 /// the columns. No schema, no comments, no row estimate: SQLite keeps none.
 fn sqlite(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     if f.schema.is_some() {
-        return Err(SourceError::NoSchemas("SQLite"));
+        return Err(Error::NoSchemas("SQLite"));
     }
     let t = src.query(
         "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",

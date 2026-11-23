@@ -16,7 +16,7 @@
 //! the value is written in double quotes, in which case it is sent as
 //! written.
 
-use crate::{http, jwt, read_only, Connection, Result, Rows, Secret, Secrets, Source, SourceError};
+use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secret, Secrets, Source};
 use std::time::{Duration, Instant};
 
 const STATEMENTS: &str = "/api/v2/statements";
@@ -91,7 +91,7 @@ impl Snowflake {
             }
         };
         if !missing.is_empty() {
-            return Err(SourceError::NoCredentials(conn.uid.clone(), missing.join("; ")));
+            return Err(Error::NoCredentials(conn.uid.clone(), missing.join("; ")));
         }
         let note = http::plain(conn, &base, "snowflake")?;
         Ok(Snowflake {
@@ -128,7 +128,7 @@ impl Snowflake {
                             "exp": now + JWT_LIFETIME.as_secs(),
                         });
                         let t = signer.rs256(&claims).map_err(|e| match e {
-                            SourceError::PrivateKey(_, why) => SourceError::PrivateKey(self.conn.uid.clone(), why),
+                            Error::PrivateKey(_, why) => Error::PrivateKey(self.conn.uid.clone(), why),
                             other => other,
                         })?;
                         self.jwt = Some((t.clone(), Instant::now()));
@@ -155,8 +155,8 @@ impl Snowflake {
 
     /// A refusal, as the server put it: the `message` of its JSON when
     /// there is one, the body otherwise.
-    fn refused(&self, status: u16, text: &str) -> SourceError {
-        SourceError::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
+    fn refused(&self, status: u16, text: &str) -> Error {
+        Error::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
     fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
@@ -207,7 +207,7 @@ impl Snowflake {
         loop {
             if Instant::now() >= deadline {
                 let _ = self.request(http::Method::Post, &format!("{url}/cancel"), None);
-                return Err(SourceError::Query(
+                return Err(Error::Query(
                     self.conn.uid.clone(),
                     format!("still running after {}s; cancelled (query_timeout)", self.conn.timeout().as_secs()),
                 ));
@@ -224,7 +224,7 @@ impl Snowflake {
     }
 
     fn parse(&self, text: &str) -> Result<Answer> {
-        serde_json::from_str(text).map_err(|e| SourceError::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
+        serde_json::from_str(text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
     }
 
     /// The rows of a finished statement, across its partitions. The total
@@ -233,7 +233,7 @@ impl Snowflake {
     fn collect(&mut self, answer: Answer, max_rows: usize) -> Result<Rows> {
         let meta = answer.meta.unwrap_or_default();
         if meta.num_rows.is_some_and(|n| n > max_rows as i64) {
-            return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         let columns: Vec<String> = meta.row_type.into_iter().map(|c| c.name).collect();
         let mut rows: Vec<Vec<Option<String>>> =
@@ -248,12 +248,12 @@ impl Snowflake {
                 let part = self.parse(&text)?;
                 rows.extend(part.data.into_iter().flatten().map(|r| r.into_iter().map(http::cell).collect::<Vec<_>>()));
                 if rows.len() > max_rows {
-                    return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+                    return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
                 }
             }
         }
         if rows.len() > max_rows {
-            return Err(SourceError::TooManyRows(self.conn.uid.clone(), max_rows));
+            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
         }
         Ok(Rows { columns, rows })
     }

@@ -45,7 +45,7 @@ pub enum ExecError {
     #[error("planning: {0}")]
     Plan(String),
     #[error("{0}")]
-    Source(#[from] zsql_datasource::SourceError),
+    Source(#[from] zsql_datasource::Error),
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error("{0}")]

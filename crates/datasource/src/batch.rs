@@ -12,7 +12,7 @@
 //! transport has always used. A typed column and its text agree by
 //! construction, since the second is made from the first.
 
-use crate::{Result, Rows, SourceError};
+use crate::{Error, Result, Rows};
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StringArray};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -56,7 +56,7 @@ impl Batches {
 
     /// Every cell as the text it prints as; a null stays a null.
     pub fn to_text(&self) -> Result<Rows> {
-        let fail = |e: arrow_schema::ArrowError| SourceError::Query("result".into(), format!("rendering a value: {e}"));
+        let fail = |e: arrow_schema::ArrowError| Error::Query("result".into(), format!("rendering a value: {e}"));
         let options = FormatOptions::default();
         let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(self.num_rows());
         for batch in &self.batches {
@@ -126,10 +126,10 @@ pub fn collect<E: std::fmt::Display>(
     let mut out = Batches { schema, batches: Vec::new() };
     let mut rows = 0usize;
     for batch in stream {
-        let batch = batch.map_err(|e| SourceError::Query(uid.to_string(), e.to_string()))?;
+        let batch = batch.map_err(|e| Error::Query(uid.to_string(), e.to_string()))?;
         rows += batch.num_rows();
         if rows > max_rows {
-            return Err(SourceError::TooManyRows(uid.to_string(), max_rows));
+            return Err(Error::TooManyRows(uid.to_string(), max_rows));
         }
         if batch.num_rows() > 0 {
             out.batches.push(batch);
@@ -194,6 +194,6 @@ mod tests {
         let one = Batches::from_text(&text());
         let stream = || vec![Ok::<_, String>(one.batches[0].clone()), Ok(one.batches[0].clone())].into_iter();
         assert_eq!(collect("wh", one.schema.clone(), stream(), 6).unwrap().num_rows(), 6);
-        assert!(matches!(collect("wh", one.schema.clone(), stream(), 5).unwrap_err(), SourceError::TooManyRows(_, 5)));
+        assert!(matches!(collect("wh", one.schema.clone(), stream(), 5).unwrap_err(), Error::TooManyRows(_, 5)));
     }
 }

@@ -4,7 +4,7 @@
 //! with other claims. One signer serves both, on the `ring` already in
 //! the tree for TLS.
 
-use crate::{Result, SourceError};
+use crate::{Error, Result};
 use base64::Engine;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
@@ -21,7 +21,7 @@ impl Signer {
     /// nowhere to ask for one.
     pub fn from_pem(uid: &str, pem: &[u8]) -> Result<Signer> {
         use rustls::pki_types::{pem::PemObject, PrivateKeyDer};
-        let fail = |what: String| SourceError::PrivateKey(uid.to_string(), what);
+        let fail = |what: String| Error::PrivateKey(uid.to_string(), what);
         if String::from_utf8_lossy(pem).contains("ENCRYPTED PRIVATE KEY") {
             return Err(fail(
                 "the key is encrypted; write it out without the passphrase with `openssl pkcs8 -in <key> -out <key>.plain.p8 -nocrypt` and use that".into(),
@@ -59,7 +59,7 @@ impl Signer {
         let mut sig = vec![0; self.key.public().modulus_len()];
         self.key
             .sign(&RSA_PKCS1_SHA256, &self.rng, signing.as_bytes(), &mut sig)
-            .map_err(|e| SourceError::PrivateKey(String::new(), e.to_string()))?;
+            .map_err(|e| Error::PrivateKey(String::new(), e.to_string()))?;
         Ok(format!("{signing}.{}", b64(&sig)))
     }
 }

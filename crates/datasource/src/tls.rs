@@ -9,7 +9,7 @@
 //! provider, aws-lc, in beside it, and with two compiled in a bare
 //! `ClientConfig::builder()` would otherwise pick one unspecified.
 
-use crate::{Result, SourceError, SslMode};
+use crate::{Error, Result, SslMode};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
@@ -40,7 +40,7 @@ pub fn roots(uid: &str, ca_file: Option<&Path>) -> Result<RootCertStore> {
     }
     if let Some(path) = ca_file {
         use rustls::pki_types::pem::PemObject;
-        let fail = |e: String| SourceError::CaFile(format!("{uid}: {}", path.display()), e);
+        let fail = |e: String| Error::CaFile(format!("{uid}: {}", path.display()), e);
         let mut added = 0;
         for cert in CertificateDer::pem_file_iter(path).map_err(|e| fail(e.to_string()))? {
             let cert = cert.map_err(|e| fail(e.to_string()))?;
@@ -67,7 +67,7 @@ pub fn client_config(uid: &str, mode: SslMode, ca_file: Option<&Path>) -> Result
         SslMode::VerifyCa => {
             let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots(uid, ca_file)?), provider)
                 .build()
-                .map_err(|e| SourceError::CaFile(uid.to_string(), e.to_string()))?;
+                .map_err(|e| Error::CaFile(uid.to_string(), e.to_string()))?;
             builder.dangerous().with_custom_certificate_verifier(Arc::new(ChainOnly(inner))).with_no_client_auth()
         }
         SslMode::VerifyFull => builder.with_root_certificates(roots(uid, ca_file)?).with_no_client_auth(),
