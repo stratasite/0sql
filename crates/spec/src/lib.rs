@@ -40,7 +40,9 @@ pub struct Group {
 
 pub mod expr;
 pub mod fuzzy;
-pub mod model;
+pub mod query;
 pub mod spec;
-pub use model::*;
+pub use query::{
+    Decorator, DecoratorKind, Filter, Link, LinkMode, LinkTarget, OrderBy, PairDedupe, Projection, ProjectionKind, Query, Segment, Tree,
+};
 pub use spec::{lower, resolve_field, Error, Spec};

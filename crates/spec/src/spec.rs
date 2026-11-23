@@ -15,7 +15,7 @@
 //! fields resolve freely: hiding is a discovery concern, not a planning one.
 
 use crate::expr::ParsedExpression;
-use crate::model::*;
+use crate::query::*;
 use crate::Attrs;
 use regex::Regex;
 use serde::{Deserialize, Serialize};

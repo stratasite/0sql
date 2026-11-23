@@ -11,4 +11,8 @@ pub mod model;
 pub mod snapshot;
 
 pub use model::{BuildError, SemanticModel};
-pub use snapshot::*;
+pub use snapshot::{
+    default_sample_size, BranchRef, Cardinality, DataType, Datasource, Exclusion, ExclusionScope, ExclusionType, Expression, Field,
+    FieldKind, FilterMode, Id, Inclusion, JoinDef, JoinType, LoadError, Partition, Path, PermissionSource, PermissionValueFrom, PolicyMode,
+    Predicate, ProjectRef, SecurityPolicy, Snapshot, SnapshotKind, Table, Tier, Unresolved, DATASOURCE_FIELDS, FORMAT, MAX_SAMPLE_SIZE,
+};
