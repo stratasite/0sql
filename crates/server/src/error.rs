@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use zsql_core::{Kind, ServiceError};
+use zsql_core::Kind;
 
 /// An error as the API reports it: a status, a class the goldens would
 /// name, and a message.
@@ -20,8 +20,8 @@ impl IntoResponse for ApiError {
 }
 
 /// A refusal from the service, as the API reports it.
-impl From<ServiceError> for ApiError {
-    fn from(e: ServiceError) -> Self {
+impl From<zsql_core::Error> for ApiError {
+    fn from(e: zsql_core::Error) -> Self {
         let status = match e.kind {
             Kind::Invalid => StatusCode::BAD_REQUEST,
             Kind::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,

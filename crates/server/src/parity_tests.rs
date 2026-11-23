@@ -99,7 +99,7 @@ async fn get(router: &Router, path: &str) -> (StatusCode, Value) {
 }
 
 /// What the service says, as the server would report it.
-fn as_server(r: Result<Value, zsql_core::ServiceError>) -> (StatusCode, Value) {
+fn as_server(r: Result<Value, zsql_core::Error>) -> (StatusCode, Value) {
     match r {
         Ok(v) => (StatusCode::OK, v),
         Err(e) => {

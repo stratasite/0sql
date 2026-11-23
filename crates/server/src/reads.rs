@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use zsql_core::{ExplainResponse, ExploreRequest, ExploreResponse, ServiceError, SqlRequest, SqlResponse};
+use zsql_core::{ExplainResponse, ExploreRequest, ExploreResponse, SqlRequest, SqlResponse};
 
 /// What one request may ask for. A spec is JSON the caller wrote and
 /// the cost of planning grows with it, so its shape is bounded before
@@ -118,8 +118,8 @@ fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
 }
 
 /// The shape bound, as the service takes it.
-fn shape_check(v: &Value) -> Result<(), ServiceError> {
-    check_shape(v).map_err(|ApiError(_, class, message)| ServiceError::invalid(class, message))
+fn shape_check(v: &Value) -> Result<(), zsql_core::Error> {
+    check_shape(v).map_err(|ApiError(_, class, message)| zsql_core::Error::invalid(class, message))
 }
 
 // The read handlers are each a thin wrapper over a plain function, so

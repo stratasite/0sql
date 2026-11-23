@@ -43,15 +43,15 @@ pub enum Kind {
 /// A refusal, with the class the goldens and the API name it by.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{class}: {message}")]
-pub struct ServiceError {
+pub struct Error {
     pub kind: Kind,
     pub class: &'static str,
     pub message: String,
 }
 
-impl ServiceError {
+impl Error {
     pub fn new(kind: Kind, class: &'static str, message: impl Into<String>) -> Self {
-        ServiceError { kind, class, message: message.into() }
+        Error { kind, class, message: message.into() }
     }
     pub fn invalid(class: &'static str, message: impl Into<String>) -> Self {
         Self::new(Kind::Invalid, class, message)
@@ -67,25 +67,25 @@ impl ServiceError {
     }
 }
 
-impl From<zsql_spec::Error> for ServiceError {
+impl From<zsql_spec::Error> for Error {
     fn from(e: zsql_spec::Error) -> Self {
         Self::unprocessable(e.error_class(), e.to_string())
     }
 }
 
-impl From<zsql_planner::Error> for ServiceError {
+impl From<zsql_planner::Error> for Error {
     fn from(e: zsql_planner::Error) -> Self {
         Self::unprocessable(e.error_class(), e.to_string())
     }
 }
 
-impl From<zsql_dialect::Error> for ServiceError {
+impl From<zsql_dialect::Error> for Error {
     fn from(e: zsql_dialect::Error) -> Self {
         Self::internal("Dialect", e.to_string())
     }
 }
 
-pub type Result<T> = std::result::Result<T, ServiceError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Why a project directory did not become a model.
 #[derive(Debug, thiserror::Error)]
@@ -377,7 +377,7 @@ impl Model {
     /// phase timings and the node graph.
     pub fn plan_request(&self, req: SqlRequest, explain: bool, check: ShapeCheck) -> Result<Planned> {
         if req.context.is_none() && !self.semantic().policies().is_empty() {
-            return Err(ServiceError::invalid("ContextRequired", "this branch has security policies; a context is required to plan"));
+            return Err(Error::invalid("ContextRequired", "this branch has security policies; a context is required to plan"));
         }
         let base = self.dialects.base()?;
         let (spec_value, made_spec, items) = spec_of(req.spec, req.expr.as_deref(), check)?;
@@ -615,10 +615,10 @@ impl Model {
                     .collect();
                 match hits.as_slice() {
                     [one] => *one,
-                    [] => return Err(ServiceError::not_found(format!("no dimension matches '{dim}'"))),
+                    [] => return Err(Error::not_found(format!("no dimension matches '{dim}'"))),
                     many => {
                         let uids: Vec<&str> = many.iter().map(|f| f.uid.as_str()).collect();
-                        return Err(ServiceError::invalid("Ambiguous", format!("'{dim}' matches several dimensions: {}", uids.join(", "))));
+                        return Err(Error::invalid("Ambiguous", format!("'{dim}' matches several dimensions: {}", uids.join(", "))));
                     }
                 }
             }
@@ -635,7 +635,7 @@ impl Model {
                 out["values"] = serde_json::to_value(&e.values).expect("sampled values serialize");
                 Ok(out)
             }
-            None => Err(ServiceError::not_found(format!("no sampled values for {}", field.uid))),
+            None => Err(Error::not_found(format!("no sampled values for {}", field.uid))),
         }
     }
 }
@@ -679,12 +679,12 @@ pub fn spec_of(spec: Option<Value>, expr: Option<&str>, check: ShapeCheck) -> Re
             Ok((s, None, vec![]))
         }
         (None, Some(line)) => {
-            let (spec, items) = zsql_shorthand::parse_line(line).map_err(|m| ServiceError::invalid("Shorthand", m))?;
+            let (spec, items) = zsql_shorthand::parse_line(line).map_err(|m| Error::invalid("Shorthand", m))?;
             check(&spec)?;
             let described = zsql_shorthand::describe(&items);
             Ok((spec.clone(), Some(spec), described))
         }
-        (None, None) => Err(ServiceError::invalid("Invalid", "give a spec or an expr")),
+        (None, None) => Err(Error::invalid("Invalid", "give a spec or an expr")),
     }
 }
 
