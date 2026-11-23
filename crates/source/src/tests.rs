@@ -344,6 +344,8 @@ fn a_real_postgres_catalog_reads_pg_catalog() {
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
     let mut src = open(&conn, Secrets::password(Some(Secret(password)))).expect("connects");
     let cat = Catalog::read(src.as_mut(), "test", Some("pg_catalog")).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some("pg_catalog"), 40);
+    a_search_means_its_underscores(src.as_mut(), Some("pg_catalog"), "G_CLA", "pg_class", "p__class");
 
     let class = cat.table(Some("pg_catalog"), "pg_class").expect("pg_class is in every server");
     assert_eq!(class.kind, "table");
@@ -377,6 +379,12 @@ fn a_real_clickhouse_catalog_reads_a_database() {
     // real. Either way the read works and the scope holds.
     let scope = std::env::var("ZSQL_TEST_CLICKHOUSE_DB").unwrap_or_else(|_| "blogs".into());
     let cat = Catalog::read(src.as_mut(), "ch", Some(&scope)).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some(&scope), 2);
+    // `system` is never empty, so the paging clause is proven even when
+    // the scope above holds nothing.
+    let system = Catalog::list(src.as_mut(), &Filter::schema(Some("system")), 3, 1).expect("a page of system");
+    assert!(system.tables.len() == 3 && system.more, "{:?}", system.tables.len());
+    a_search_means_its_underscores(src.as_mut(), Some("system"), "A_TYPE_F", "data_type_families", "dat__type_families");
     assert_eq!(cat.adapter, "clickhouse");
     assert!(cat.tables.iter().all(|t| t.schema.as_deref() == Some(scope.as_str())), "the scope held");
     if let Some(countries) = cat.table(Some("blogs"), "countries") {
@@ -431,6 +439,8 @@ fn a_real_mysql_answers_and_its_catalog_reads() {
     assert!(p.warnings().is_empty(), "TLS was on offer, so nothing to warn about: {:?}", p.warnings());
     // The catalog of mysql's own schema: always there, never written to.
     let cat = Catalog::read(src.as_mut(), "my", Some("mysql")).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some("mysql"), 15);
+    a_search_means_its_underscores(src.as_mut(), Some("mysql"), "E_ZONE_N", "time_zone_name", "tim__zone_name");
     let user = cat.table(Some("mysql"), "user").expect("mysql.user is in every server");
     assert!(user.columns.iter().any(|c| c.name == "Host"), "typed columns");
     assert!(user.columns.windows(2).all(|w| w[0].position < w[1].position));
@@ -492,6 +502,8 @@ fn a_real_sqlserver_answers_and_its_catalog_reads() {
     // are not in it, which is right for a model. master.dbo always holds
     // the spt_ tables setup leaves behind, and spt_values is a view.
     let cat = Catalog::read(src.as_mut(), "ms", Some("dbo")).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some("dbo"), 2);
+    a_search_means_its_underscores(src.as_mut(), Some("dbo"), "T_MON", "spt_monitor", "sp__monitor");
     let monitor = cat.table(Some("dbo"), "spt_monitor").expect("master.dbo.spt_monitor is on every server");
     assert_eq!(monitor.kind, "table");
     assert_eq!(monitor.physical_name(), "dbo.spt_monitor");
@@ -527,6 +539,10 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalog_reads() {
     assert!(src.query("CREATE TABLE memory.default.zsql_no (a INT)", 1).is_err());
     // The catalog is a header, so information_schema alone means tpch's.
     let cat = Catalog::read(src.as_mut(), "tr", Some("tiny")).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some("tiny"), 3);
+    // tpch has no underscore in a table name, so the hit is plain and
+    // the miss is what proves `_` is not read as any character.
+    a_search_means_its_underscores(src.as_mut(), Some("tiny"), "ATIO", "nation", "n_tion");
     let nation = cat.table(Some("tiny"), "nation").expect("tpch.tiny.nation");
     assert_eq!(nation.kind, "table");
     let name = nation.columns.iter().find(|c| c.name == "name").expect("name");
@@ -2155,4 +2171,156 @@ fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
             assert!(head.contains("x-snowflake-authorization-token-type: oauth"), "{head}");
         }
     }
+}
+// ------------------------------------------------------------------ listing
+
+/// A listing walked page by page names exactly the tables a whole read
+/// of the same scope finds, in the same order, and reads nothing below
+/// a table. Called from each adapter's own catalog test, so the paging
+/// clause is proven on every engine that has one here.
+fn pages_agree(src: &mut dyn Source, cat: &Catalog, schema: Option<&str>, size: usize) {
+    let f = Filter::schema(schema);
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = Catalog::list(src, &f, size, offset).expect("a page");
+        assert!(page.tables.len() <= size, "a page holds at most what was asked for");
+        assert!(page.tables.iter().all(|t| t.columns.is_empty() && t.primary_key.is_empty() && t.foreign_keys.is_empty()));
+        assert!(!page.more || page.tables.len() == size, "a short page is the last one");
+        offset += page.tables.len();
+        seen.extend(page.tables.into_iter().map(|t| (t.schema, t.name)));
+        if !page.more {
+            break;
+        }
+        assert!(offset <= cat.tables.len(), "the pages never end");
+    }
+    let whole: Vec<(Option<String>, String)> = cat.tables.iter().map(|t| (t.schema.clone(), t.name.clone())).collect();
+    assert_eq!(seen, whole);
+}
+
+#[test]
+fn a_listing_pages_through_a_file_and_narrows_by_name() {
+    let path = duckdb_file("duckdb-listing");
+    let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let cat = Catalog::read(&mut *src, "local", None).unwrap();
+    for size in [1, 2, 3, 100] {
+        pages_agree(&mut *src, &cat, None, size);
+    }
+    let first = Catalog::list(&mut *src, &Filter::schema(None), 2, 0).unwrap();
+    assert!(first.more, "three tables, two asked for");
+    assert_eq!(first.tables[0].comment.as_deref(), Some("Who buys"), "what the tables statement reads is kept");
+    let hit = Catalog::list(&mut *src, &Filter::like(None, "ORD"), 100, 0).unwrap();
+    assert_eq!(hit.tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["orders"]);
+    assert!(!hit.more);
+    assert!(Catalog::list(&mut *src, &Filter::schema(None), 100, 3).unwrap().tables.is_empty(), "past the end is empty, not an error");
+
+    // SQLite has no statement to page, so the page is counted in the read.
+    let dir = temp("listing-sqlite");
+    let file = dir.join("c.db");
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch("CREATE TABLE a (x); CREATE TABLE b (x); CREATE TABLE ab (x); CREATE VIEW v AS SELECT x FROM a;")
+        .unwrap();
+    let conn = Connection { uid: "lite".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let cat = Catalog::read(&mut *src, "lite", None).unwrap();
+    for size in [1, 3, 4, 100] {
+        pages_agree(&mut *src, &cat, None, size);
+    }
+    let hit = Catalog::list(&mut *src, &Filter::like(None, "a"), 1, 1).unwrap();
+    assert_eq!(hit.tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["ab"], "the second of a and ab");
+    assert!(!hit.more);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_page_is_cut_in_each_engines_own_words() {
+    let sql = "SELECT 1 ORDER BY 1, 2";
+    let list = |adapter: &str| catalog::paged_for_test(adapter, sql, 101, 200);
+    assert_eq!(list("postgres"), "SELECT 1 ORDER BY 1, 2 LIMIT 101 OFFSET 200");
+    assert_eq!(list("trino"), "SELECT 1 ORDER BY 1, 2 OFFSET 200 LIMIT 101");
+    assert_eq!(list("athena"), list("trino"));
+    assert_eq!(list("sqlserver"), "SELECT 1 ORDER BY 1, 2 OFFSET 200 ROWS FETCH NEXT 101 ROWS ONLY");
+}
+
+#[test]
+fn a_connection_sent_whole_is_read_as_the_file_is_and_a_catalog_lands_where_the_engine_keeps_one() {
+    let sent: serde_yaml::Value = serde_yaml::from_str(
+        "host: db.internal\nport: 5432\ndatabase: analytics\nusername: analyst\npassword: ' hunter2 '\nsslmode: require\nsession_token: ''\n",
+    )
+    .unwrap();
+    let mut conn = Connection::from_value("Warehouse", &sent).unwrap();
+    conn.adapter = "postgres".into();
+    assert_eq!((conn.uid.as_str(), conn.host.as_deref(), conn.port), ("warehouse", Some("db.internal"), Some(5432)));
+    assert_eq!(conn.sslmode, SslMode::Require);
+    let secrets = Secrets::from_value(&sent);
+    assert_eq!(secrets.password.as_ref().map(Secret::expose), Some("hunter2"));
+    assert!(secrets.session_token.is_none(), "an empty secret is no secret");
+    assert!(!format!("{secrets:?}").contains("hunter2"), "a secret never prints");
+    for key in sent.as_mapping().unwrap().keys().filter_map(|k| k.as_str()) {
+        assert!(CONNECTION_KEYS.contains(&key) || SECRET_FIELDS.contains(&key), "{key} is a key a caller may send");
+    }
+
+    conn.in_catalog("other").unwrap();
+    assert_eq!(conn.database.as_deref(), Some("other"), "Postgres's catalog is its database");
+    for (adapter, at) in
+        [("databricks", "catalog"), ("athena", "catalog"), ("bigquery", "project"), ("trino", "database"), ("snowflake", "database")]
+    {
+        let mut c = Connection { adapter: adapter.into(), ..Default::default() };
+        c.in_catalog("x").unwrap();
+        let got = match at {
+            "catalog" => &c.catalog,
+            "project" => &c.project,
+            _ => &c.database,
+        };
+        assert_eq!(got.as_deref(), Some("x"), "{adapter}");
+    }
+    for adapter in ["mysql", "clickhouse", "sqlite", "duckdb"] {
+        let err = Connection { adapter: adapter.into(), ..Default::default() }.in_catalog("x").unwrap_err().to_string();
+        assert!(err.contains("has no catalogs"), "{adapter}: {err}");
+    }
+}
+
+/// A search means its characters: `hit` finds `expect`, and `miss`,
+/// which would match it only if a `_` stood for any character, finds
+/// nothing by that name. Called from each engine's own test, since
+/// every one spells a literal underscore its own way.
+fn a_search_means_its_underscores(src: &mut dyn Source, schema: Option<&str>, hit: &str, expect: &str, miss: &str) {
+    let named = |src: &mut dyn Source, pattern: &str| -> Vec<String> {
+        Catalog::list(src, &Filter::like(schema, pattern), 100, 0).expect("a search").tables.into_iter().map(|t| t.name).collect()
+    };
+    let found = named(src, hit);
+    assert!(found.iter().any(|n| n.eq_ignore_ascii_case(expect)), "{hit:?} should find {expect}: {found:?}");
+    let found = named(src, miss);
+    assert!(!found.iter().any(|n| n.eq_ignore_ascii_case(expect)), "{miss:?} should not find {expect}: {found:?}");
+    // The whole read takes the same filter.
+    let read = Catalog::read_filtered(src, "x", &Filter::like(schema, hit)).expect("a filtered read");
+    assert!(read.tables.iter().any(|t| t.name.eq_ignore_ascii_case(expect) && !t.columns.is_empty()), "{hit:?} read whole");
+}
+
+#[test]
+fn a_search_is_spelled_for_the_engine_it_runs_on() {
+    let like = |adapter: &str, pattern: &str| catalog::holding_for_test(adapter, pattern);
+    assert_eq!(like("postgres", "CS_Contact"), "LOWER(t) LIKE '%cs!_contact%' ESCAPE '!'");
+    assert_eq!(like("duckdb", "50%_o'k!"), "LOWER(t) LIKE '%50!%!_o''k!!%' ESCAPE '!'");
+    assert_eq!(like("sqlserver", "a[b]_c"), "LOWER(t) LIKE '%a![b]!_c%' ESCAPE '!'");
+    assert_eq!(like("clickhouse", r"cs_con\tact%"), r"LOWER(t) LIKE '%cs\_contact\%%'");
+    assert_eq!(like("bigquery", "cs_contact"), r"LOWER(t) LIKE '%cs\\_contact%'");
+    for adapter in ["redshift", "mysql", "trino", "athena", "snowflake", "databricks"] {
+        assert_eq!(like(adapter, "a_b"), like("postgres", "a_b"), "{adapter}");
+    }
+
+    let path = duckdb_file("duckdb-search");
+    ::duckdb::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE cs_contact_f (id INTEGER); CREATE TABLE csxcontact (id INTEGER);")
+        .unwrap();
+    let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path), ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    a_search_means_its_underscores(&mut *src, None, "CS_CONTACT", "cs_contact_f", "cs__ontact_f");
+    let both = Catalog::list(&mut *src, &Filter::like(None, "contact"), 100, 0).unwrap();
+    assert_eq!(both.tables.len(), 2);
+    let one = Catalog::list(&mut *src, &Filter::like(None, "cs_contact"), 100, 0).unwrap();
+    assert_eq!(one.tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["cs_contact_f"], "csxcontact is not cs_contact");
 }

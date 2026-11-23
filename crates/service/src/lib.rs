@@ -166,6 +166,34 @@ pub struct Model {
 
 /// What the files on disk are called under a model's directory.
 pub const SNAPSHOT_FILE: &str = "snapshot.json.gz";
+
+/// Whether a datasource setting is a secret by its name: the fields a
+/// connection takes as one, and anything spelled like one. Generous on
+/// purpose, since what it decides is whether a value is served.
+pub fn is_secret(key: &str) -> bool {
+    let key = key.to_lowercase();
+    key == "oauth_client_id"
+        || ["password", "passwd", "secret", "token", "private_key", "access_key", "api_key", "credential"]
+            .iter()
+            .any(|word| key.contains(word) && !key.ends_with("_file") && !key.ends_with("_path"))
+}
+
+/// A datasource's deployed settings as they may be served: every secret
+/// left out at any depth, and named in `secrets` by its path.
+fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut Vec<String>) -> Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in settings {
+        let path = if under.is_empty() { key.clone() } else { format!("{under}.{key}") };
+        if is_secret(key) {
+            secrets.push(path);
+        } else if let Value::Object(inner) = value {
+            out.insert(key.clone(), shown(inner, &path, secrets));
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
 pub const TESTS_FILE: &str = "tests.json";
 
 impl Model {
@@ -513,11 +541,49 @@ impl Model {
         json!({ "fields": out })
     }
 
-    pub fn tables(&self) -> Value {
+    /// The model's datasources: the key each is known by, its name,
+    /// adapter and tier, and every other setting its entry was deployed
+    /// with. A secret among those is never served: `connection` leaves
+    /// it out and `secrets` names it, so a caller can tell which the
+    /// server already holds. With `q`, the ones whose uid, name or
+    /// adapter holds it.
+    pub fn datasources(&self, q: &str) -> Value {
+        let wanted = holds(q);
+        let out: Vec<Value> = self
+            .universe()
+            .snapshot()
+            .datasources
+            .iter()
+            .filter(|d| wanted(&d.uid) || wanted(&d.name) || wanted(&d.adapter))
+            .map(|d| {
+                let mut secrets = Vec::new();
+                let connection = shown(&d.connection, "", &mut secrets);
+                json!({
+                    "uid": d.uid, "name": d.name, "adapter": d.adapter, "tier": d.tier, "description": d.description,
+                    "query_timeout": d.query_timeout, "extra_query_params": d.extra_query_params,
+                    "connection": connection, "secrets": secrets,
+                })
+            })
+            .collect();
+        json!({ "datasources": out })
+    }
+
+    /// One datasource as it was deployed, by its uid in any case: for a
+    /// reader that connects, so its secrets are in it. Not for serving.
+    pub fn datasource(&self, datasource: &str) -> Option<&zsql_semantic::Datasource> {
+        let want = datasource.trim().to_lowercase();
+        self.universe().snapshot().datasources.iter().find(|d| d.uid.to_lowercase() == want)
+    }
+
+    /// The model's tables. With `q`, the ones whose uid, name or
+    /// physical name holds it.
+    pub fn tables(&self, q: &str) -> Value {
         let u = self.universe();
+        let wanted = holds(q);
         let out: Vec<Value> = u
             .tables()
             .iter()
+            .filter(|t| wanted(&t.uid) || wanted(&t.name) || wanted(&t.physical_name))
             .map(|t| {
                 json!({
                     "uid": t.uid, "name": t.name, "physical_name": t.physical_name, "cost": t.cost,
@@ -532,8 +598,10 @@ impl Model {
     /// A dimension's sampled values, by uid or by name, else by a unique
     /// substring of a dimension's uid, name or synonyms (hidden ones
     /// included). Several substring matches are an `Ambiguous` refusal
-    /// naming them; a near miss is never taken for the user.
-    pub fn values_of(&self, dim: &str) -> Result<Value> {
+    /// naming them; a near miss is never taken for the user. With `q`,
+    /// only the sampled values that hold it; the counts beside them
+    /// still describe the whole sample.
+    pub fn values_of(&self, dim: &str, q: &str) -> Result<Value> {
         let u = self.universe();
         let field = match u.field_by_uid(dim, Some(FieldKind::Dimension)).or_else(|| u.field_by_name(dim, FieldKind::Dimension)) {
             Some(f) => f,
@@ -556,10 +624,27 @@ impl Model {
             }
         };
         match self.values.as_ref().and_then(|v| v.get(&field.uid)) {
-            Some(e) => Ok(serde_json::to_value(e).expect("sampled values serialize")),
+            Some(e) if q.trim().is_empty() => Ok(serde_json::to_value(e).expect("sampled values serialize")),
+            Some(e) => {
+                let wanted = holds(q);
+                let mut e = e.clone();
+                e.values.retain(|v| wanted(&v.v));
+                let mut out = serde_json::to_value(&e).expect("sampled values serialize");
+                // An entry with no values leaves the key out; a search
+                // that found none says so with an empty list.
+                out["values"] = serde_json::to_value(&e.values).expect("sampled values serialize");
+                Ok(out)
+            }
             None => Err(ServiceError::not_found(format!("no sampled values for {}", field.uid))),
         }
     }
+}
+
+/// What a list's `q` keeps: text that holds it, in any case. An empty
+/// `q` keeps everything, so a caller that sends none filters nothing.
+pub fn holds(q: &str) -> impl Fn(&str) -> bool {
+    let needle = q.trim().to_lowercase();
+    move |text: &str| needle.is_empty() || text.to_lowercase().contains(&needle)
 }
 
 // ---------------------------------------------------------------- requests
@@ -831,9 +916,61 @@ mod tests {
         model.write(&dir).expect("write");
         let back = Model::from_stored(&dir, "p", "b", d).expect("read back");
         assert_eq!(back.summary()["fields"], model.summary()["fields"]);
-        assert_eq!(back.tables(), model.tables());
+        assert_eq!(back.tables(""), model.tables(""));
         assert_eq!(back.fields("", true), model.fields("", true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each list keeps what holds its `q`, in any case, and is whole
+    /// without one.
+    #[test]
+    fn a_list_keeps_what_holds_its_q() {
+        use zsql_project::values::{DimensionValues, ValueCount};
+        let fx = Fixtures::open(Fixtures::default_root());
+        let hash = fx.snapshot_hashes().expect("hashes").into_iter().next().expect("a universe");
+        let mut model = Model::build("p", "b", fx.snapshot(&hash).expect("snapshot"), dialects()).expect("universe");
+        let names = |v: &Value, list: &str, key: &str| -> Vec<String> {
+            v[list].as_array().expect("a list").iter().map(|x| x[key].as_str().unwrap_or_default().to_string()).collect()
+        };
+
+        let all = names(&model.tables(""), "tables", "name");
+        assert_eq!(names(&model.tables("   "), "tables", "name"), all, "a blank q filters nothing");
+        let asked = format!("  {}  ", all[0].to_uppercase());
+        let hit = model.tables(&asked);
+        assert!(names(&hit, "tables", "name").contains(&all[0]), "found in any case, untrimmed");
+        for t in hit["tables"].as_array().unwrap() {
+            let holds = |k: &str| t[k].as_str().unwrap_or_default().to_lowercase().contains(&all[0].to_lowercase());
+            assert!(holds("uid") || holds("name") || holds("physical_name"), "{t}");
+        }
+        assert!(names(&model.tables("no table is called this"), "tables", "name").is_empty());
+
+        let sources = model.datasources("");
+        let first = &sources["datasources"][0];
+        let (uid, adapter) = (first["uid"].as_str().unwrap(), first["adapter"].as_str().unwrap());
+        assert_eq!(model.datasource(&uid.to_uppercase()).map(|d| d.adapter.as_str()), Some(adapter));
+        assert!(model.datasource("no-such-datasource").is_none());
+        assert!(names(&model.datasources(adapter), "datasources", "uid").contains(&uid.to_string()));
+        assert!(names(&model.datasources("no datasource is called this"), "datasources", "uid").is_empty());
+
+        let dim = model.universe().fields().iter().find(|f| f.is_dimension()).expect("a dimension").uid.clone();
+        let count = |v: &str, n: i64| ValueCount { v: v.into(), n };
+        model.values = Some(ValueCatalog {
+            dimensions: vec![DimensionValues {
+                uid: dim.clone(),
+                name: "d".into(),
+                table: "t".into(),
+                sampled_at: "2026-01-01T00:00:00Z".into(),
+                sample_size: None,
+                distinct: Some(3),
+                values: vec![count("Northeast", 5), count("North", 3), count("South", 1)],
+                range: None,
+            }],
+        });
+        assert_eq!(names(&model.values_of(&dim, "").unwrap(), "values", "v"), ["Northeast", "North", "South"]);
+        let north = model.values_of(&dim, "NORTH").unwrap();
+        assert_eq!(names(&north, "values", "v"), ["Northeast", "North"], "most frequent first, still");
+        assert_eq!(north["distinct"], 3, "the counts describe the sample, not the filter");
+        assert_eq!(model.values_of(&dim, "nowhere").unwrap()["values"], json!([]), "no match is an empty list, not a refusal");
     }
 
     /// A refusal names its class and kind the way the API always has.
@@ -855,7 +992,7 @@ mod tests {
         let secured = Model::build("p", "b", guarded.expect("a universe with policies"), d).expect("universe");
         let e = secured.sql(SqlRequest { spec: None, expr: Some("anything".into()), context: None }, &unlimited).unwrap_err();
         assert_eq!((e.kind, e.class), (Kind::Invalid, "ContextRequired"));
-        let e = model.values_of("no-such-dimension").unwrap_err();
+        let e = model.values_of("no-such-dimension", "").unwrap_err();
         assert_eq!(e.kind, Kind::NotFound);
         let e = model.sql(SqlRequest { spec: None, expr: Some("no such field at all".into()), context: None }, &unlimited).unwrap_err();
         assert_eq!(e.kind, Kind::Unprocessable, "{e}");

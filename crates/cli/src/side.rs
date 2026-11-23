@@ -252,7 +252,7 @@ impl Side for Session {
     }
 
     fn tables(&mut self) -> Result<Value> {
-        Ok(self.model.tables())
+        Ok(self.model.tables(""))
     }
 
     fn fields(&mut self, q: &str, hidden: bool) -> Result<Value> {
@@ -260,7 +260,7 @@ impl Side for Session {
     }
 
     fn values(&mut self, dim: &str) -> Result<Value> {
-        Ok(self.model.values_of(dim).map_err(Refusal::from)?)
+        Ok(self.model.values_of(dim, "").map_err(Refusal::from)?)
     }
 
     fn explore(&mut self, query: &Query, context: Option<&Value>, term: Option<&str>) -> Result<Value> {

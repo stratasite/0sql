@@ -5,7 +5,7 @@
 use crate::admission::{Admission, AdmissionCounts};
 use crate::deploy::is_swap_leftover;
 use crate::guard::guard;
-use crate::{deploy, mcp, reads, write, App, Shared};
+use crate::{deploy, mcp, probe, reads, write, App, Shared};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::collections::HashMap;
@@ -87,6 +87,9 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/fields", get(reads::fields))
         .route("/projects/{uid}/branches/{branch}/tables", get(reads::tables))
         .route("/projects/{uid}/branches/{branch}/values/{dim}", get(reads::values))
+        .route("/projects/{uid}/branches/{branch}/datasources", get(probe::datasources))
+        .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables", post(probe::tables))
+        .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
         .route(mcp::PATH, post(mcp::endpoint))
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive

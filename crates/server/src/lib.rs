@@ -5,8 +5,13 @@
 //! The server answers whoever can reach it, the way a database on a
 //! private network does. It is meant to sit behind the developer's own
 //! service, which decides who may ask, sends the security context each
-//! plan runs under, and paces its callers. The one credential here is
-//! the optional deploy token: with one set, a deploy, a validate, a test
+//! plan runs under, and paces its callers. It keeps of a
+//! datasource what its entry was deployed with, every key, and a probe
+//! connects with that and whatever the request sends over it; what a
+//! request sends is dropped with the answer. `zsql deploy` strips
+//! secrets from the entry, so a secret is kept only when a deployer
+//! put one there on purpose, and it is never served. The server's own
+//! credential is the optional deploy token: with one set, a deploy, a validate, a test
 //! run and a removal each need `Authorization: Bearer <token>`, so a
 //! server that is read from more widely than it is written to can be.
 //!
@@ -19,10 +24,13 @@
 //! POST /projects/{uid}/branches/{branch}/test          run the deployed tests/*.yml again
 //! GET  /projects/{uid}/branches/{branch}               summary and warnings
 //! GET  /projects/{uid}/branches/{branch}/fields        ?q=text&hidden=true
-//! GET  /projects/{uid}/branches/{branch}/tables
-//! GET  /projects/{uid}/branches/{branch}/values/{dim}
+//! GET  /projects/{uid}/branches/{branch}/tables        ?q=text
+//! GET  /projects/{uid}/branches/{branch}/values/{dim}  ?q=text
+//! GET  /projects/{uid}/branches/{branch}/datasources   ?q=text
+//! POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables          {"connection": {...}}  ?q=&schema=&catalog=&limit=&offset=
+//! POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables/{table}  {"connection": {...}}  ?schema=&catalog=
 //! DELETE /projects/{uid}/branches/{branch}
-//! GET  /projects                                       every deployed branch
+//! GET  /projects                                       every deployed branch, ?q=text
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! GET  /healthz
 //! ```
@@ -35,6 +43,8 @@
 //! - `names`: the project and branch names that become directories
 //! - `deploy`: an archive in, a model out
 //! - `reads`: sql, explain, explore and the catalog
+//! - `probe`: a datasource's own tables, read from the warehouse with
+//!   the connection the request sends
 //! - `error`: the one error the API answers with
 //! - `mcp`: the same reads as MCP tools
 //! - `run`: configuration, the router and the server's life
@@ -45,6 +55,7 @@ mod error;
 mod guard;
 mod mcp;
 mod names;
+mod probe;
 mod reads;
 mod run;
 

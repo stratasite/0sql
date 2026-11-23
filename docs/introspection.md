@@ -13,6 +13,15 @@ replaces it is narrower and still worth saying: **0sql connects to
 read, from the machine you run it on; the hosted service holds no
 warehouse credentials.** That stays true through everything below.
 
+(2026-11-23: the server now reads a warehouse's catalog too, for a
+caller with no project directory. A deploy now keeps every key of a
+datasource's entry, not only name, adapter and tier, and a probe
+connects with that and whatever the request sends over it. `zsql
+deploy` still strips secrets, so the server holds one only when a
+deployer's own archive carried it; otherwise the service in front sends
+it with each request and the server drops it with the answer.
+`docs/operating.md`, "Probing a datasource".)
+
 ## What this is not
 
 Deliberately out of scope so the phases stay small: running planned
