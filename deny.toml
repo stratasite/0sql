@@ -18,6 +18,12 @@ ignore = [
   # fxhash is unmaintained, not vulnerable: a hash function behind the
   # picker's filtering in inquire. It goes when inquire moves off it.
   { id = "RUSTSEC-2025-0057", reason = "fxhash under inquire, a hash for the picker's filter; unmaintained, not a vulnerability" },
+  # chrono is unmaintained, not vulnerable, and has no fixed version.
+  # arrow brings it in under the bundled DuckDB, which this tree cannot
+  # change; the planner's own use (sql/dates.rs, visitors/temporal.rs)
+  # could move to jiff or time, but that alone would not clear this.
+  # Revisit when arrow drops it or a real advisory lands against it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono under arrow (via duckdb) and in the planner's date arithmetic; unmaintained, not a vulnerability" },
 ]
 
 [licenses]
