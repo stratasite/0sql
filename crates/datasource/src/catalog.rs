@@ -863,7 +863,7 @@ fn trino(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
 /// unquoted alias comes back upper-cased, and the scope is folded the
 /// way Snowflake folds an unquoted name.
 fn snowflake(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
-    let scope = f.schema.as_deref().map(crate::snowflake::ident);
+    let scope = f.schema.as_deref().map(crate::adapters::snowflake::ident);
     let f = &Filter { schema: scope.clone(), ..f.clone() };
     let tables = format!(
         "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", \

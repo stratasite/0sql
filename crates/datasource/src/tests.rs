@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::catalog::{self, Column, ForeignKey, Table};
+use std::path::{Path, PathBuf};
 
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zsql-datasource-{name}-{}", std::process::id()));

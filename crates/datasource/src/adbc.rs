@@ -268,7 +268,7 @@ pub fn snowflake(conn: &Connection, secrets: &Secrets) -> Plan {
     }
     for (key, value) in [("db", &conn.database), ("schema", &conn.schema), ("warehouse", &conn.warehouse), ("role", &conn.role)] {
         if let Some(v) = value {
-            set(format!("{SF}{key}"), &crate::snowflake::ident(v));
+            set(format!("{SF}{key}"), &crate::adapters::snowflake::ident(v));
         }
     }
     if let Some(user) = conn.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
@@ -619,7 +619,7 @@ mod tests {
     #[ignore = "needs a BigQuery project: ZSQL_TEST_BQ_*"]
     fn live_bigquery_answers_over_rest() {
         let conn = live_bigquery();
-        let mut rest = crate::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap();
+        let mut rest = crate::adapters::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap();
         let got = rest.batches(EVERY_TYPE, 10).unwrap();
         assert_eq!(got.num_rows(), 1);
         assert_eq!(rest.transport(), "rest");
@@ -640,15 +640,15 @@ mod tests {
     #[ignore = "needs a BigQuery project: ZSQL_TEST_BQ_*"]
     fn live_bigquery_takes_a_token_obtained_elsewhere() {
         let conn = live_bigquery();
-        let token = crate::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap().bearer().unwrap();
+        let token = crate::adapters::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap().bearer().unwrap();
         let bare = Connection { key_file: None, ..conn };
         let secrets = Secrets { oauth_token: secret(&token), ..Default::default() };
         assert_eq!(bigquery(&bare, &secrets, &|_| None), None, "a token from upstream is REST's");
-        let mut src = crate::bigquery::BigQuery::open_with(&bare, secrets, &|_| None, None).unwrap();
+        let mut src = crate::adapters::bigquery::BigQuery::open_with(&bare, secrets, &|_| None, None).unwrap();
         let rows = src.query("SELECT SESSION_USER() AS who", 1).unwrap();
         eprintln!("oauth: answered as {:?}", rows.rows[0][0]);
         let wrong = Secrets { oauth_token: secret("not-a-token"), ..Default::default() };
-        let err = crate::bigquery::BigQuery::open_with(&bare, wrong, &|_| None, None).unwrap().query("SELECT 1", 1).unwrap_err();
+        let err = crate::adapters::bigquery::BigQuery::open_with(&bare, wrong, &|_| None, None).unwrap().query("SELECT 1", 1).unwrap_err();
         eprintln!("oauth: a bad token is refused: {err}");
     }
 
@@ -668,7 +668,7 @@ mod tests {
         show("adbc", &got);
 
         // The same statement over REST, to see the two spellings side by side.
-        let mut rest = crate::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap();
+        let mut rest = crate::adapters::bigquery::BigQuery::open(&conn, Secrets::default()).unwrap();
         show("rest", &rest.batches(EVERY_TYPE, 10).unwrap());
 
         // A table of the dataset, whatever is first: its real column types.
