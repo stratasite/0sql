@@ -54,7 +54,7 @@ pub enum Error {
     #[error("{0:?} is not a log format: plain or json")]
     Format(String),
     #[error(
-        "{0:?} is not a log filter: a level (off, error, warn, info, debug, trace), or levels by crate as in `warn,zsql_source=debug`"
+        "{0:?} is not a log filter: a level (off, error, warn, info, debug, trace), or levels by crate as in `warn,zsql_datasource=debug`"
     )]
     Filter(String),
     #[error("a log is already installed in this process")]
@@ -67,7 +67,7 @@ pub struct Config {
     /// What a plain line starts with: `zsqld` for the server, `zsql`
     /// for a command.
     pub name: &'static str,
-    /// A level, or levels by crate: `info`, `warn,zsql_source=debug`.
+    /// A level, or levels by crate: `info`, `warn,zsql_datasource=debug`.
     /// A name matches by prefix, so `zsql=debug` is every crate here.
     pub filter: String,
     pub format: Format,
@@ -277,8 +277,8 @@ mod tests {
 
     #[test]
     fn finer_lines_name_where_they_came_from() {
-        let lines = logged("debug", Format::Plain, || tracing::debug!(target: "zsql_source", "opened"));
-        assert_eq!(lines, ["zsqld: debug: zsql_source: opened"]);
+        let lines = logged("debug", Format::Plain, || tracing::debug!(target: "zsql_datasource", "opened"));
+        assert_eq!(lines, ["zsqld: debug: zsql_datasource: opened"]);
     }
 
     #[test]
@@ -290,14 +290,14 @@ mod tests {
     #[test]
     fn the_filter_decides_by_level_and_by_crate() {
         let emit = || {
-            tracing::info!(target: "zsql_source", "ours, routine");
-            tracing::debug!(target: "zsql_source::adbc", "ours, fine");
+            tracing::info!(target: "zsql_datasource", "ours, routine");
+            tracing::debug!(target: "zsql_datasource::adbc", "ours, fine");
             tracing::debug!(target: "hyper", "theirs, fine");
             tracing::warn!(target: "hyper", "theirs, a warning");
         };
         assert_eq!(logged("off", Format::Plain, emit).len(), 0);
         assert_eq!(logged("warn", Format::Plain, emit).len(), 1);
-        assert_eq!(logged("warn,zsql_source=debug", Format::Plain, emit).len(), 3);
+        assert_eq!(logged("warn,zsql_datasource=debug", Format::Plain, emit).len(), 3);
         // `-v` and `-vv`: every crate here, by the prefix they share.
         assert_eq!(logged(&filter_for(1, "off"), Format::Plain, emit).len(), 1);
         assert_eq!(logged(&filter_for(2, "off"), Format::Plain, emit).len(), 2);
@@ -308,13 +308,13 @@ mod tests {
     #[test]
     fn json_is_an_object_a_line_with_typed_fields() {
         let lines = logged("info", Format::Json, || {
-            tracing::warn!(target: "zsql_source", datasource = "bq", rows = 3, cached = false, level = "mine", "given up\non");
+            tracing::warn!(target: "zsql_datasource", datasource = "bq", rows = 3, cached = false, level = "mine", "given up\non");
         });
         assert_eq!(lines.len(), 1);
         assert!(!lines[0].contains('\n'));
         let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(v["level"], "warn");
-        assert_eq!(v["target"], "zsql_source");
+        assert_eq!(v["target"], "zsql_datasource");
         assert_eq!(v["message"], "given up\non");
         assert_eq!(v["datasource"], "bq");
         assert_eq!(v["rows"], 3);
@@ -326,9 +326,9 @@ mod tests {
     #[test]
     fn what_cannot_be_read_is_refused_by_name() {
         assert!(matches!(parse_filter("loud"), Err(Error::Filter(_))));
-        assert!(matches!(parse_filter("warn,zsql_source"), Err(Error::Filter(_))));
-        assert!(matches!(parse_filter("zsql_source=loud"), Err(Error::Filter(_))));
-        assert!(parse_filter(" warn , zsql_source=debug ").is_ok());
+        assert!(matches!(parse_filter("warn,zsql_datasource"), Err(Error::Filter(_))));
+        assert!(matches!(parse_filter("zsql_datasource=loud"), Err(Error::Filter(_))));
+        assert!(parse_filter(" warn , zsql_datasource=debug ").is_ok());
         assert!(matches!("yaml".parse::<Format>(), Err(Error::Format(_))));
         assert_eq!("JSON".parse::<Format>().unwrap(), Format::Json);
     }

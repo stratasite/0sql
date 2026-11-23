@@ -13,7 +13,7 @@ use crate::{config, tty};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::time::Instant;
-use zsql_source::{Catalog, Connection, Drift, Filter, Source};
+use zsql_datasource::{Catalog, Connection, Drift, Filter, Source};
 
 /// Where a datasource's catalog is written: one file per datasource,
 /// so re-reading one never rewrites another, and committed rather than
@@ -51,8 +51,8 @@ pub fn choose(project_dir: &Path, datasource: Option<&str>) -> Result<Connection
 }
 
 fn open(project_dir: &Path, conn: &Connection) -> Result<Box<dyn Source>> {
-    let secrets = zsql_source::secrets(Some(project_dir), &conn.uid);
-    let src = zsql_source::open(conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
+    let secrets = zsql_datasource::secrets(Some(project_dir), &conn.uid);
+    let src = zsql_datasource::open(conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
     for w in src.warnings() {
         eprintln!("warning: {w}");
     }
@@ -516,7 +516,7 @@ pub fn search(project_dir: Option<&Path>, datasource: Option<&str>, pattern: &st
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let want = pattern.trim().to_lowercase();
     // (datasource, table, in the file already)
-    let mut hits: Vec<(String, zsql_source::Table, bool)> = Vec::new();
+    let mut hits: Vec<(String, zsql_datasource::Table, bool)> = Vec::new();
     let where_ = if live {
         let conn = choose(&project.dir, datasource)?;
         let held = load(&project.dir, &conn.uid)?;
@@ -593,7 +593,7 @@ fn files_of(project_dir: &Path, datasource: Option<&str>) -> Result<Vec<Connecti
 pub fn show(project_dir: Option<&Path>, datasource: Option<&str>, table: &str, json: bool) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let (schema, name) = split(table.trim());
-    let mut found: Vec<(String, zsql_source::Table)> = Vec::new();
+    let mut found: Vec<(String, zsql_datasource::Table)> = Vec::new();
     let mut any_file = false;
     for conn in files_of(&project.dir, datasource)? {
         let Some(cat) = load(&project.dir, &conn.uid)? else { continue };

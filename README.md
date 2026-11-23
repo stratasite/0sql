@@ -183,6 +183,9 @@ crates/planner    resolution, the node graph, the visitors, SQL
 crates/project    a project directory loaded into a snapshot
 crates/shorthand  the comma-separated line, for people at a prompt
 crates/core       a loaded model and every read over it, shared by the CLI and the server
+crates/datasource reaching a warehouse: the connection, its secret, one read-only statement
+crates/exec       running a planned query and keeping its rows: the result store and the cache
+crates/log        where the log goes: level, format and destination, in one place
 crates/server     the server: deploy, plan, MCP
 crates/cli        zsql
 crates/devtool    zsql-dev: the goldens, benches and formation checks, for developers of the engine

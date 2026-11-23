@@ -8,7 +8,7 @@ use crate::{config, tty};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::path::Path;
-use zsql_source::{Catalog, Connection, Filter};
+use zsql_datasource::{Catalog, Connection, Filter};
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
@@ -222,7 +222,7 @@ fn where_of(c: &Connection) -> String {
 
 /// Whether the secret this adapter needs is at hand.
 fn secret_state(dir: &Path, c: &Connection) -> &'static str {
-    let secrets = zsql_source::secrets(Some(dir), &c.uid);
+    let secrets = zsql_datasource::secrets(Some(dir), &c.uid);
     let has = secrets.password.is_some()
         || secrets.personal_access_token.is_some()
         || secrets.private_key.is_some()
@@ -266,8 +266,8 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
             if conn.adapter == "bigquery" { "its key file is named by key_file in datasources.yml" } else { "it opens a file" }
         ),
     };
-    if !zsql_source::SECRET_FIELDS.contains(&field.as_str()) {
-        bail!("{field} is not a secret field; one of {}", zsql_source::SECRET_FIELDS.join(", "));
+    if !zsql_datasource::SECRET_FIELDS.contains(&field.as_str()) {
+        bail!("{field} is not a secret field; one of {}", zsql_datasource::SECRET_FIELDS.join(", "));
     }
     let value = if secret_stdin {
         let mut s = String::new();
@@ -291,9 +291,9 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
 
 fn test(dir: &Path, datasource: Option<&str>) -> Result<()> {
     let conn = crate::catalog::choose(dir, datasource)?;
-    let secrets = zsql_source::secrets(Some(dir), &conn.uid);
+    let secrets = zsql_datasource::secrets(Some(dir), &conn.uid);
     let t0 = std::time::Instant::now();
-    let mut src = zsql_source::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
+    let mut src = zsql_datasource::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
     for w in src.warnings() {
         eprintln!("warning: {w}");
     }
@@ -421,7 +421,7 @@ fn add(
         config::write_secret(dir, &format!("{key}_{field}"), &value)?;
         println!("saved   {field} for {key} in .zsql");
     } else if let Some(field) = secret_field {
-        println!("note    no {field} yet: put it in .zsql under {key}, or in {}", zsql_source::secret_env_var(&key, field));
+        println!("note    no {field} yet: put it in .zsql under {key}, or in {}", zsql_datasource::secret_env_var(&key, field));
     }
     eprintln!("next: zsql datasource test -d {key}, then zsql catalog read -d {key} --schema <name>");
     Ok(())

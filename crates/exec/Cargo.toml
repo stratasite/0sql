@@ -11,7 +11,7 @@ description = "Running a planned query and keeping its rows: the result store an
 [dependencies]
 tracing.workspace = true
 zsql-core.workspace = true
-zsql-source.workspace = true
+zsql-datasource.workspace = true
 zsql-semantic.workspace = true
 zsql-spec.workspace = true
 serde.workspace = true

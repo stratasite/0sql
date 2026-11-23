@@ -219,7 +219,7 @@ Everything 0sql reports goes to stderr through one logger
 
 | variable | flag | what |
 |---|---|---|
-| `ZSQL_LOG` | `--log` | a level (`off`, `error`, `warn`, `info`, `debug`, `trace`), or levels by crate: `warn,zsql_source=debug`. A name matches by prefix, so `zsql=debug` is every crate of 0sql and no library's. `zsql serve` logs at `info` unless told otherwise |
+| `ZSQL_LOG` | `--log` | a level (`off`, `error`, `warn`, `info`, `debug`, `trace`), or levels by crate: `warn,zsql_datasource=debug`. A name matches by prefix, so `zsql=debug` is every crate of 0sql and no library's. `zsql serve` logs at `info` unless told otherwise |
 | `ZSQL_LOG_FORMAT` | `--log-format` | `plain`, the default, or `json`: an object a line with `ts`, `level`, `target`, `message` and each field under its own name |
 | | `-v`, `-vv`, `-vvv` | shorthand: what 0sql did, how, and every library too |
 

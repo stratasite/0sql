@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use zsql_source::{Catalog, Connection, Filter, Secrets, SourceError, CONNECTION_KEYS, SECRET_FIELDS};
+use zsql_datasource::{Catalog, Connection, Filter, Secrets, SourceError, CONNECTION_KEYS, SECRET_FIELDS};
 
 /// The most tables one page holds, and how many it holds when the
 /// request does not say. A warehouse can have tens of thousands, so a
@@ -116,7 +116,7 @@ fn named(v: Option<String>) -> Result<Option<String>, ApiError> {
 /// What the warehouse or the connection said, as the API reports it. A
 /// connection that cannot be made from what was sent is the caller's to
 /// fix (400); a warehouse that would not answer is upstream (502). The
-/// source crate words some of these for a project directory, so the
+/// datasource crate words some of these for a project directory, so the
 /// ones that name a file are said again for a request.
 fn refused(e: SourceError) -> ApiError {
     let (status, message) = match &e {
@@ -269,7 +269,7 @@ pub(crate) async fn tables(
     let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
     blocking(move || {
         let _held = held;
-        let mut src = zsql_source::open(&conn, secrets).map_err(refused)?;
+        let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
         let filter = if q.is_empty() { Filter::schema(schema.as_deref()) } else { Filter::like(schema.as_deref(), &q) };
         let page = Catalog::list(&mut *src, &filter, limit, offset).map_err(refused)?;
         let tables: Vec<Value> = page
@@ -337,7 +337,7 @@ pub(crate) async fn table(
     let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
     blocking(move || {
         let _held = held;
-        let mut src = zsql_source::open(&conn, secrets).map_err(refused)?;
+        let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
         let mut cat = Catalog::read_filtered(&mut *src, &conn.uid, &Filter::table(schema.as_deref(), &name)).map_err(refused)?;
         let within = schema.as_deref().map(|s| format!(" in schema {s}")).unwrap_or_default();
         if cat.tables.len() > 1 {

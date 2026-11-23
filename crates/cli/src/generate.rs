@@ -7,7 +7,7 @@ use crate::{catalog, config, templates, tty};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use zsql_source::{Catalog, Column, Connection, Table};
+use zsql_datasource::{Catalog, Column, Connection, Table};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,

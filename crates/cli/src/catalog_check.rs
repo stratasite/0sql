@@ -13,7 +13,7 @@ use crate::generate::{map_type, Mapped};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use zsql_core::Model;
-use zsql_source::{Catalog, Table};
+use zsql_datasource::{Catalog, Table};
 
 /// Findings per datasource that has a catalog; a datasource without one
 /// is listed as unchecked. `fails` is true when a table or column the
@@ -67,7 +67,7 @@ pub fn findings(model: &Model) -> Value {
                 }
             };
             checked += 1;
-            let by_column: BTreeMap<String, &zsql_source::Column> = found.columns.iter().map(|c| (c.name.to_lowercase(), c)).collect();
+            let by_column: BTreeMap<String, &zsql_datasource::Column> = found.columns.iter().map(|c| (c.name.to_lowercase(), c)).collect();
             for e in s.expressions.iter().filter(|e| e.table_id == table.id) {
                 let field = s.fields.iter().find(|f| f.id == e.field_id);
                 for col in &e.column_refs {
@@ -214,11 +214,11 @@ fn resolve<'a>(cat: &'a Catalog, physical: &str, quotes: &(String, String)) -> (
 }
 
 fn column<'a>(
-    by_lower: &BTreeMap<String, &'a zsql_source::Column>,
+    by_lower: &BTreeMap<String, &'a zsql_datasource::Column>,
     table: &'a Table,
     name: &str,
     quotes: &(String, String),
-) -> Option<&'a zsql_source::Column> {
+) -> Option<&'a zsql_datasource::Column> {
     let (n, exact) = unquote(name, quotes);
     if exact {
         table.columns.iter().find(|c| c.name == n)

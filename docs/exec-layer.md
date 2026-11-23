@@ -76,12 +76,12 @@ driver and another way without.
 
 ## Phases
 
-- [x] **Phase 0 — the result contract.** `zsql_source::Batches`: a
+- [x] **Phase 0 — the result contract.** `zsql_datasource::Batches`: a
   schema and Arrow record batches. `Source::batches` beside
   `Source::query`, defaulting to the text read as `Utf8` columns, so
   every adapter answers it. `Source::transport` says `native`, `rest`
   or `adbc`. DuckDB hands over its own batches.
-- [ ] **Phase 1 — ADBC for Snowflake and BigQuery.** `crates/source/src/adbc.rs`:
+- [ ] **Phase 1 — ADBC for Snowflake and BigQuery.** `crates/datasource/src/adbc.rs`:
   the driver loaded on first use, the REST transport's credentials
   mapped to driver options, the row cap and the statement timeout kept.
   The statement runs on its own thread; at the timeout the caller is
@@ -116,7 +116,7 @@ driver and another way without.
 
 ## Running the driver tests
 
-Three tests in `crates/source/src/adbc.rs` load real drivers and are
+Three tests in `crates/datasource/src/adbc.rs` load real drivers and are
 ignored by default. They need no account: two run statements through
 the SQLite driver, and one opens the Snowflake and BigQuery drivers
 with fake values to check that every option sent is one the driver
@@ -124,7 +124,7 @@ knows.
 
 ```
 dbc install sqlite snowflake bigquery
-cargo test -p zsql-source adbc::tests -- --ignored --nocapture
+cargo test -p zsql-datasource adbc::tests -- --ignored --nocapture
 ```
 
 Neither `bin/ci` nor the workflow runs them: the Sources step skips

@@ -66,7 +66,7 @@ struct Cli {
     /// Log what zsql does, to stderr: -v for what happened, -vv for how, -vvv for every library too.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     verbose: u8,
-    /// What to log, in place of -v: a level, or levels by crate as in `warn,zsql_source=debug`. `zsql serve` logs at info unless told otherwise; every other command logs nothing.
+    /// What to log, in place of -v: a level, or levels by crate as in `warn,zsql_datasource=debug`. `zsql serve` logs at info unless told otherwise; every other command logs nothing.
     #[arg(long, global = true, env = "ZSQL_LOG", value_name = "FILTER")]
     log: Option<String>,
     /// How a log line is written: plain or json.

@@ -19,7 +19,7 @@ Four decisions belong to the product owner and are marked **[OWNER]**.
 ## What exists, and what this adds
 
 Today the planner turns an expression line or a spec into SQL for one
-of thirteen dialects and names the datasource; `zsql-source` opens ten
+of thirteen dialects and names the datasource; `zsql-datasource` opens ten
 of those warehouses read-only and runs one statement under a row cap
 that refuses rather than trims; `zsql sample` is the one command that
 runs planned SQL, and it keeps only sampled values. There is no command
@@ -77,7 +77,7 @@ footer carries the honest caveat that a truncated `GROUP BY` without an
 `ORDER BY` is an arbitrary subset. **[OWNER B]** truncate-and-flag
 (recommended) or refuse as `sample` does.
 
-**Open and execute.** `Connection::read` and `zsql_source::secrets`
+**Open and execute.** `Connection::read` and `zsql_datasource::secrets`
 exactly as `sample_one` does. The connect timeout is the transport's
 ten seconds. The statement timeout follows strata's precedence, which
 is the right one for a command that may run a long query: `--timeout`
@@ -449,16 +449,16 @@ types are decided in phase 1 and phase 5 is presentation.
 ## Where the work goes
 
 A new crate `crates/exec` (`zsql-exec`), depending on `zsql-core`
-for `Model`, `Planned` and `SqlRequest`, on `zsql-source`, on
+for `Model`, `Planned` and `SqlRequest`, on `zsql-datasource`, on
 `zsql-semantic` for `DataType`, and on `serde_json`, `flate2` and
-`sha2`, all in the lock already. Not inside `zsql-source`: that crate
+`sha2`, all in the lock already. Not inside `zsql-datasource`: that crate
 is a transport and must not know about policies, projects or disks. Not
 inside the CLI: a server endpoint would reimplement it. The crate takes
 a `Connector`, so the CLI supplies `datasources.yml` and `.zsql` and a
 server could supply its own registry without the crate changing.
 
 ```rust
-pub trait Connector { fn open(&self, datasource_uid: &str) -> zsql_source::Result<Box<dyn Source>>; }
+pub trait Connector { fn open(&self, datasource_uid: &str) -> zsql_datasource::Result<Box<dyn Source>>; }
 pub struct Cancel(pub Arc<AtomicBool>);
 pub enum Limit { Rows(u64), All }
 pub struct RunRequest { pub query: SqlRequest, pub limit: Limit, pub fresh: bool, pub timeout: Option<Duration> }
@@ -482,7 +482,7 @@ pub trait Progress { fn phase(&mut self, what: &str); }     // "planning", "conn
 
 The CLI adds `run.rs`, `results.rs` and `table.rs`, and `Command::Run`
 and `Command::Results` in `main.rs`. `zsql_core::Planned` gains
-`projections`. `zsql_source::Source` gains `cancel_handle` and
+`projections`. `zsql_datasource::Source` gains `cancel_handle` and
 `query_into`, each with a default so no adapter breaks.
 
 ## What strata does that is taken, and what is left
@@ -505,7 +505,7 @@ does not have.
 
 Each phase ships on its own and is proven without a cloud account: the
 SQLite fixture in the ordinary suite, the Postgres container on CI, and
-the fakes in `crates/source/src/tests.rs`.
+the fakes in `crates/datasource/src/tests.rs`.
 
 1. **`zsql run` and the store.** *Landed 2026-10-22: `crates/exec`, `zsql
    run`, the store under `~/.zsql/results/<project>`, the key, the

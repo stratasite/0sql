@@ -7,7 +7,7 @@ use super::*;
 use crate::catalog::{self, Column, ForeignKey, Table};
 
 fn temp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zsql-source-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zsql-datasource-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -184,7 +184,7 @@ fn only_a_read_is_allowed_through() {
 
 /// The transport against a real server. Ignored, because it needs one:
 /// `ZSQL_TEST_PG=host=… user=… password=… dbname=…` style settings as
-/// separate variables, then `cargo test -p zsql-source -- --ignored`.
+/// separate variables, then `cargo test -p zsql-datasource -- --ignored`.
 /// Phase B2 replaces this with a container CI runs for itself.
 #[test]
 #[ignore]

@@ -12,8 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zsql_core::{Model, SqlRequest};
+use zsql_datasource::{Connection, Source};
 use zsql_exec::{CacheStatus, Connector, Engine, Limit, Manifest, RunRequest, Store};
-use zsql_source::{Connection, Source};
 
 /// Where a project's results live: `ZSQL_RESULTS_DIR`, else
 /// `<home>/results/<project uid>`; `None` when `ZSQL_RESULTS=off`.
@@ -34,12 +34,12 @@ struct Local_ {
 }
 
 impl Connector for Local_ {
-    fn open(&self, uid: &str) -> zsql_source::Result<Box<dyn Source>> {
+    fn open(&self, uid: &str) -> zsql_datasource::Result<Box<dyn Source>> {
         let mut conn = Connection::read(&self.dir, uid)?;
         // --timeout for this run, else the datasource's, else the project's, else ten minutes.
         conn.query_timeout = self.timeout.map(|t| t as i64).or(conn.query_timeout).or_else(|| project_timeout(&self.dir)).or(Some(600));
-        let secrets = zsql_source::secrets(Some(&self.dir), &conn.uid);
-        zsql_source::open(&conn, secrets)
+        let secrets = zsql_datasource::secrets(Some(&self.dir), &conn.uid);
+        zsql_datasource::open(&conn, secrets)
     }
 
     /// What the cache key uses to tell one connection from another, and

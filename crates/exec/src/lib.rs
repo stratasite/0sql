@@ -1,6 +1,6 @@
 //! Running a planned query and keeping its rows.
 //!
-//! The planner says what to run and where; `zsql-source` runs it; this
+//! The planner says what to run and where; `zsql-datasource` runs it; this
 //! crate decides whether to run it at all, keeps what came back, and
 //! finds it again. A result is customer data: it lives where the caller
 //! says (the command line puts it under the user's home, outside any
@@ -26,7 +26,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zsql_core::{Model, SqlRequest};
-use zsql_source::{Batches, Rows, Source};
+use zsql_datasource::{Batches, Rows, Source};
 
 pub const MANIFEST_FORMAT: u32 = 2;
 /// What this build writes.
@@ -45,7 +45,7 @@ pub enum ExecError {
     #[error("planning: {0}")]
     Plan(String),
     #[error("{0}")]
-    Source(#[from] zsql_source::SourceError),
+    Source(#[from] zsql_datasource::SourceError),
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error("{0}")]
@@ -338,7 +338,7 @@ impl Stored {
 /// Opens the datasource the planner named. The command line reads
 /// `datasources.yml` and `.zsql`; a server would bring its own.
 pub trait Connector {
-    fn open(&self, datasource_uid: &str) -> zsql_source::Result<Box<dyn Source>>;
+    fn open(&self, datasource_uid: &str) -> zsql_datasource::Result<Box<dyn Source>>;
     /// Who the connection is, for the key: never a secret.
     fn identity(&self, datasource_uid: &str) -> Option<String>;
     /// How long a result from this datasource answers, when it says.

@@ -43,7 +43,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The transports in zsql-source against real servers, one container per
+  # The transports in zsql-datasource against real servers, one container per
   # warehouse that can run without a cloud account. Its own job so a slow
   # image never holds up the planner's tests; the ignored tests are the
   # ones that need a server, and here they get one.
@@ -82,7 +82,7 @@ jobs:
         run: |
           # adbc::tests load ADBC drivers this job does not install; they
           # are run by hand, see docs/exec-layer.md.
-          cargo test --locked -p zsql-source -- --ignored --skip adbc::tests
+          cargo test --locked -p zsql-datasource -- --ignored --skip adbc::tests
           cargo test --locked -p zsql-cli --test generate -- --ignored
           cargo test --locked -p zsql-cli --test sample -- --ignored
       # When a container never comes up, say which and why before it is

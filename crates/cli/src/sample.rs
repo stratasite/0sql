@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use zsql_core::{Model, Trust};
+use zsql_datasource::{Catalog, Connection};
 use zsql_project::values::{DimensionValues, ValueCatalog, ValueCount};
 use zsql_semantic::{Field, FieldKind, Snapshot, Table};
-use zsql_source::{Catalog, Connection};
 
 pub struct Options<'a> {
     pub datasource: Option<&'a str>,
@@ -216,7 +216,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         })
         .collect();
     // Connections by the datasource the planner chose, opened on first use.
-    let mut sources: BTreeMap<String, Box<dyn zsql_source::Source>> = BTreeMap::new();
+    let mut sources: BTreeMap<String, Box<dyn zsql_datasource::Source>> = BTreeMap::new();
     let mut sampled = 0;
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for j in &jobs {
@@ -267,7 +267,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
             uid: j.field.uid.clone(),
             name: j.field.name.clone(),
             table: via.clone(),
-            sampled_at: zsql_source::catalog::now(),
+            sampled_at: zsql_datasource::catalog::now(),
             sample_size: (!own).then_some(size),
             distinct,
             values,
@@ -306,15 +306,15 @@ fn sample_one(
     s: &Snapshot,
     j: &Job<'_>,
     context: Option<&zsql_spec::SecurityContext>,
-    sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>,
+    sources: &mut BTreeMap<String, Box<dyn zsql_datasource::Source>>,
     catalogs: &BTreeMap<String, Catalog>,
 ) -> Result<(Vec<ValueCount>, Option<i64>, String)> {
     let size = j.field.sample_size;
-    let open = |uid: &str, sources: &mut BTreeMap<String, Box<dyn zsql_source::Source>>| -> Result<()> {
+    let open = |uid: &str, sources: &mut BTreeMap<String, Box<dyn zsql_datasource::Source>>| -> Result<()> {
         if !sources.contains_key(uid) {
             let conn = Connection::read(project_dir, uid).context("reading datasources.yml")?;
-            let secrets = zsql_source::secrets(Some(project_dir), &conn.uid);
-            let src = zsql_source::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
+            let secrets = zsql_datasource::secrets(Some(project_dir), &conn.uid);
+            let src = zsql_datasource::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;
             for w in src.warnings() {
                 eprintln!("warning: {w}");
             }
@@ -422,7 +422,7 @@ fn sample_one(
 
 /// Rows as values with their counts, given which column holds the value
 /// and which the count. A missing count is one; a null value is no value.
-fn values_of(rows: &zsql_source::Rows, value: usize, count: usize) -> Vec<ValueCount> {
+fn values_of(rows: &zsql_datasource::Rows, value: usize, count: usize) -> Vec<ValueCount> {
     rows.rows
         .iter()
         .filter_map(|r| {
@@ -452,7 +452,7 @@ fn why_not(s: &Snapshot, f: &Field) -> Option<String> {
 
 /// The catalog's column behind a bare-column expression, if the
 /// catalog has the table.
-fn declared<'a>(cat: &'a Catalog, physical: &str, expr: &str) -> Option<&'a zsql_source::Column> {
+fn declared<'a>(cat: &'a Catalog, physical: &str, expr: &str) -> Option<&'a zsql_datasource::Column> {
     let name = expr.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
     let (schema, table) = match physical.rsplit_once('.') {
         Some((s, t)) => (Some(s), t),

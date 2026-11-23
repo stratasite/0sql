@@ -3857,6 +3857,7 @@ dependencies = [
  "tracing",
  "ureq",
  "zsql-core",
+ "zsql-datasource",
  "zsql-dialect",
  "zsql-exec",
  "zsql-log",
@@ -3864,7 +3865,6 @@ dependencies = [
  "zsql-semantic",
  "zsql-server",
  "zsql-shorthand",
- "zsql-source",
  "zsql-spec",
 ]
 
@@ -3885,6 +3885,37 @@ dependencies = [
  "zsql-semantic",
  "zsql-shorthand",
  "zsql-spec",
+]
+
+[[package]]
+name = "zsql-datasource"
+version = "0.6.10"
+dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "base64 0.22.1",
+ "duckdb",
+ "mysql_async",
+ "ring",
+ "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tiberius",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-util",
+ "tracing",
+ "ureq",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3928,8 +3959,8 @@ dependencies = [
  "thiserror",
  "tracing",
  "zsql-core",
+ "zsql-datasource",
  "zsql-semantic",
- "zsql-source",
  "zsql-spec",
 ]
 
@@ -4026,10 +4057,10 @@ dependencies = [
  "tower",
  "tracing",
  "zsql-core",
+ "zsql-datasource",
  "zsql-dialect",
  "zsql-semantic",
  "zsql-shorthand",
- "zsql-source",
  "zsql-spec",
 ]
 
@@ -4038,37 +4069,6 @@ name = "zsql-shorthand"
 version = "0.6.10"
 dependencies = [
  "serde_json",
-]
-
-[[package]]
-name = "zsql-source"
-version = "0.6.10"
-dependencies = [
- "adbc_core",
- "adbc_driver_manager",
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
- "base64 0.22.1",
- "duckdb",
- "mysql_async",
- "ring",
- "rusqlite",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror",
- "tiberius",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-util",
- "tracing",
- "ureq",
- "webpki-roots",
 ]
 
 [[package]]
