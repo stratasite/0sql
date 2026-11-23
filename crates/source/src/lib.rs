@@ -18,7 +18,10 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_env = "musl"))]
+pub mod adbc;
 pub mod athena;
+pub mod batch;
 pub mod bigquery;
 pub mod catalog;
 pub mod clickhouse;
@@ -35,6 +38,7 @@ pub mod sqlserver;
 pub mod tls;
 pub mod trino;
 
+pub use batch::Batches;
 pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Names, Scope, Table};
 
 #[derive(Debug, thiserror::Error)]
@@ -291,6 +295,12 @@ impl Connection {
 pub struct Secret(String);
 
 impl Secret {
+    /// A secret handed over by whoever holds it: a server's upstream, a
+    /// test. The command line resolves its own with [`secret`].
+    pub fn new(value: impl Into<String>) -> Secret {
+        Secret(value.into())
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -378,11 +388,16 @@ pub struct Secrets {
     pub access_key_id: Option<Secret>,
     pub secret_access_key: Option<Secret>,
     pub session_token: Option<Secret>,
+    /// An OAuth access token somebody else obtained: the end user's, for
+    /// a warehouse that takes one. Whoever hands it over keeps it fresh;
+    /// nothing here refreshes it, and a connection lives no longer than
+    /// the token it was opened with. See [`takes_oauth_token`].
+    pub oauth_token: Option<Secret>,
 }
 
 /// The field names [`secrets`] resolves, as `.zsql` and the environment
 /// spell them.
-pub const SECRET_FIELDS: [&str; 8] = [
+pub const SECRET_FIELDS: [&str; 9] = [
     "password",
     "personal_access_token",
     "private_key",
@@ -391,6 +406,7 @@ pub const SECRET_FIELDS: [&str; 8] = [
     "access_key_id",
     "secret_access_key",
     "session_token",
+    "oauth_token",
 ];
 
 impl Secrets {
@@ -413,6 +429,7 @@ pub fn secrets(project_dir: Option<&Path>, uid: &str) -> Secrets {
         access_key_id: get("access_key_id"),
         secret_access_key: get("secret_access_key"),
         session_token: get("session_token"),
+        oauth_token: get("oauth_token"),
     }
 }
 
@@ -446,8 +463,23 @@ pub trait Source {
     /// answer. Implementations call [`read_only`] first.
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows>;
 
+    /// The same read with its types kept: what a result that is stored
+    /// or handed on is made of. A transport that only has text answers
+    /// with `Utf8` columns, which is what this default does.
+    fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
+        Ok(Batches::from_text(&self.query(sql, max_rows)?))
+    }
+
     /// The adapter's name, for an error that says where it happened.
     fn adapter(&self) -> &str;
+
+    /// How the last read travelled: `native` for a wire protocol or an
+    /// engine in this process, `rest` for a warehouse's HTTP API, `adbc`
+    /// for its driver. Kept with a stored result, because the same
+    /// datasource can answer through two of them.
+    fn transport(&self) -> &str {
+        "native"
+    }
 
     /// What a caller should be told about this connection that is not an
     /// error: that `prefer` ended plaintext, for one.
@@ -551,20 +583,59 @@ fn skeleton(sql: &str) -> String {
     out
 }
 
+/// Whether this adapter can be opened with [`Secrets::oauth_token`]: an
+/// access token obtained elsewhere and sent as the credential. The ones
+/// that cannot have no bearer login on the protocol spoken here.
+pub fn takes_oauth_token(adapter: &str) -> bool {
+    matches!(adapter, "snowflake" | "bigquery" | "databricks" | "trino" | "sqlserver")
+}
+
 /// Opens the adapter this connection names, with whichever of the
 /// secrets it takes.
 pub fn open(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> {
+    let started = std::time::Instant::now();
+    let opened = open_adapter(conn, secrets);
+    match &opened {
+        Ok(src) => tracing::debug!(
+            datasource = %conn.uid,
+            adapter = %conn.adapter,
+            transport = src.transport(),
+            ms = started.elapsed().as_millis() as u64,
+            "a datasource was opened"
+        ),
+        // The caller reports the failure; this is where and how long.
+        Err(e) => {
+            tracing::debug!(datasource = %conn.uid, adapter = %conn.adapter, ms = started.elapsed().as_millis() as u64, "a datasource did not open: {e}")
+        }
+    }
+    opened
+}
+
+fn open_adapter(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> {
     let secret = secrets.password.clone();
     match conn.adapter.as_str() {
         "postgres" | "redshift" => Ok(Box::new(postgres::Postgres::open(conn, secret)?)),
         "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
         "mysql" => Ok(Box::new(mysql::MySql::open(conn, secret)?)),
-        "trino" => Ok(Box::new(trino::Trino::open(conn, secret)?)),
+        "trino" => Ok(Box::new(trino::Trino::open(conn, secret, secrets.oauth_token)?)),
         "athena" => Ok(Box::new(athena::Athena::open(conn, secrets)?)),
-        "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret)?)),
-        "snowflake" => Ok(Box::new(snowflake::Snowflake::open(conn, secrets)?)),
+        "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret, secrets.oauth_token)?)),
+        "snowflake" => {
+            let rest = Box::new(snowflake::Snowflake::open(conn, secrets.clone())?);
+            #[cfg(not(target_env = "musl"))]
+            return Ok(Box::new(adbc::WithAdbc::new(rest, adbc::snowflake(conn, &secrets), conn)));
+            #[cfg(target_env = "musl")]
+            Ok(rest)
+        }
         "databricks" => Ok(Box::new(databricks::Databricks::open(conn, secrets)?)),
-        "bigquery" => Ok(Box::new(bigquery::BigQuery::open(conn, secrets)?)),
+        "bigquery" => {
+            let rest = Box::new(bigquery::BigQuery::open(conn, secrets.clone())?);
+            #[cfg(not(target_env = "musl"))]
+            if let Some(plan) = adbc::bigquery(conn, &secrets, &|k| std::env::var(k).ok()) {
+                return Ok(Box::new(adbc::WithAdbc::new(rest, plan, conn)));
+            }
+            Ok(rest)
+        }
         "sqlite" => Ok(Box::new(sqlite::Sqlite::open(conn)?)),
         "duckdb" => Ok(Box::new(duckdb::DuckDb::open(conn)?)),
         other => Err(SourceError::Unsupported(other.to_string())),

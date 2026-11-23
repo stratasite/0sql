@@ -21,6 +21,7 @@ flate2.workspace = true
 tar = "0.4"
 libc = "0.2"
 zsql-service.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 zsql-shorthand.workspace = true

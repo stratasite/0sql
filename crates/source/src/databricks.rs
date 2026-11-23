@@ -54,7 +54,9 @@ impl Databricks {
             missing.push("warehouse (the SQL warehouse id, from the workspace's SQL Warehouses page)".into());
         }
         let env = |field: &str| crate::secret_env_var(&conn.uid, field);
-        let auth = if let Some(t) = secrets.personal_access_token {
+        // An OAuth access token from upstream and a personal access token
+        // are the same thing on the wire: a bearer.
+        let auth = if let Some(t) = secrets.oauth_token.or(secrets.personal_access_token) {
             Some(Auth::Token(t))
         } else {
             let client_id = conn.client_id.clone().or_else(|| secrets.oauth_client_id.map(|s| s.expose().to_string()));
@@ -285,6 +287,10 @@ impl Source for Databricks {
 
     fn adapter(&self) -> &str {
         "databricks"
+    }
+
+    fn transport(&self) -> &str {
+        "rest"
     }
 
     fn warnings(&self) -> &[String] {

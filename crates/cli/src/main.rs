@@ -63,6 +63,15 @@ struct Cli {
     /// For a program driving zsql: JSON wherever a command has a JSON shape, and never a prompt.
     #[arg(long, global = true)]
     agent: bool,
+    /// Log what zsql does, to stderr: -v for what happened, -vv for how, -vvv for every library too.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// What to log, in place of -v: a level, or levels by crate as in `warn,zsql_source=debug`. `zsql serve` logs at info unless told otherwise; every other command logs nothing.
+    #[arg(long, global = true, env = "ZSQL_LOG", value_name = "FILTER")]
+    log: Option<String>,
+    /// How a log line is written: plain or json.
+    #[arg(long, global = true, env = "ZSQL_LOG_FORMAT", value_name = "FORMAT", default_value = "plain")]
+    log_format: String,
 }
 
 /// The flags that name a server's copy of the model, on the commands that
@@ -676,7 +685,7 @@ impl Command {
 }
 
 fn main() {
-    let Cli { command, project, no_input, agent } = Cli::parse();
+    let Cli { command, project, no_input, agent, verbose, log, log_format } = Cli::parse();
     tty::set_no_input(no_input);
     tty::set_agent(agent);
     let command = match command {
@@ -700,6 +709,21 @@ fn main() {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
+    }
+    // The log, before anything that might report to it. A server says
+    // what it is doing unless told not to; a command says nothing
+    // unless asked, so what it prints stays what it always printed.
+    let serves = command.serves();
+    let installed = log_format.parse::<zsql_log::Format>().and_then(|format| {
+        zsql_log::init(&zsql_log::Config {
+            name: if serves { "zsqld" } else { "zsql" },
+            filter: log.unwrap_or_else(|| zsql_log::filter_for(verbose, if serves { "info" } else { "off" })),
+            format,
+        })
+    });
+    if let Err(e) = installed {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
     let json = command.wants_json();
     if let Err(e) = run(command, project) {

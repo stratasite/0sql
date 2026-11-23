@@ -33,8 +33,20 @@ pub struct BigQuery {
 
 /// What the credentials file held.
 enum Credential {
-    ServiceAccount { email: String, signer: Box<jwt::Signer>, token_uri: String },
-    AuthorizedUser { client_id: String, client_secret: String, refresh_token: String, token_uri: String },
+    /// An access token obtained elsewhere, sent as it is: nothing here
+    /// can refresh it, so the connection is good for as long as it is.
+    AccessToken(crate::Secret),
+    ServiceAccount {
+        email: String,
+        signer: Box<jwt::Signer>,
+        token_uri: String,
+    },
+    AuthorizedUser {
+        client_id: String,
+        client_secret: String,
+        refresh_token: String,
+        token_uri: String,
+    },
 }
 
 impl BigQuery {
@@ -46,7 +58,7 @@ impl BigQuery {
     /// test can hand in its own.
     pub fn open_with(
         conn: &Connection,
-        _secrets: Secrets,
+        secrets: Secrets,
         env: &dyn Fn(&str) -> Option<String>,
         default_file: Option<PathBuf>,
     ) -> Result<BigQuery> {
@@ -59,15 +71,18 @@ impl BigQuery {
             .clone()
             .or_else(|| env("GOOGLE_APPLICATION_CREDENTIALS").map(PathBuf::from))
             .or_else(|| default_file.filter(|p| p.exists()));
-        let credential = match file {
-            Some(path) => match credential(&conn.uid, &path) {
+        let credential = match (secrets.oauth_token, file) {
+            // A token from upstream is the end user's; a file on this
+            // machine is somebody else, and is not consulted.
+            (Some(token), _) => Some(Credential::AccessToken(token)),
+            (None, Some(path)) => match credential(&conn.uid, &path) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     missing.push(e.to_string());
                     None
                 }
             },
-            None => {
+            (None, None) => {
                 missing.push(
                     "credentials: key_file in datasources.yml naming a service account's JSON key, or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`".into(),
                 );
@@ -92,13 +107,14 @@ impl BigQuery {
 
     /// An access token, minted or refreshed when the one held is within
     /// a minute of expiring.
-    fn bearer(&mut self) -> Result<String> {
+    pub(crate) fn bearer(&mut self) -> Result<String> {
         if let Some((t, until)) = &self.token {
             if Instant::now() + Duration::from_secs(60) < *until {
                 return Ok(t.clone());
             }
         }
         let (token_uri, body) = match &self.credential {
+            Credential::AccessToken(t) => return Ok(t.expose().to_string()),
             Credential::ServiceAccount { email, signer, token_uri } => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                 let claims = serde_json::json!({
@@ -339,6 +355,10 @@ impl Source for BigQuery {
 
     fn adapter(&self) -> &str {
         "bigquery"
+    }
+
+    fn transport(&self) -> &str {
+        "rest"
     }
 
     fn warnings(&self) -> &[String] {

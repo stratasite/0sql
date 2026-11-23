@@ -126,6 +126,7 @@ same thing. The ones an operator sets:
 | `ZSQL_BIND` | the address; `127.0.0.1:3699` by default, and a proxy in front is the usual arrangement |
 | `ZSQL_DATA_DIR` | the data directory |
 | `ZSQL_DEPLOY_TOKEN` | what a deploy, a validate, a test and a removal must present; a variable only, never a flag |
+| `ZSQL_LOG`, `ZSQL_LOG_FORMAT` | what is logged and how; the log, below |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY` | how much of each kind of work runs at once; `docs/admission.md` |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
@@ -134,6 +135,32 @@ same thing. The ones an operator sets:
 state directory systemd owns, no capabilities, a read-only filesystem
 apart from that directory, a private temp directory and a system call
 filter. The `ZSQL_*` variables go in its `EnvironmentFile`, mode 0600.
+
+## The log
+
+Everything 0sql reports goes to stderr through one logger
+(`crates/log`), which a systemd unit's journal collects and stamps.
+
+| variable | flag | what |
+|---|---|---|
+| `ZSQL_LOG` | `--log` | a level (`off`, `error`, `warn`, `info`, `debug`, `trace`), or levels by crate: `warn,zsql_source=debug`. A name matches by prefix, so `zsql=debug` is every crate of 0sql and no library's. `zsql serve` logs at `info` unless told otherwise |
+| `ZSQL_LOG_FORMAT` | `--log-format` | `plain`, the default, or `json`: an object a line with `ts`, `level`, `target`, `message` and each field under its own name |
+| | `-v`, `-vv`, `-vvv` | shorthand: what 0sql did, how, and every library too |
+
+A plain line is the program's name and the message, then any fields as
+`key=value`. A warning or an error says so (`zsqld: warning: ...`), and
+anything finer than `info` names the crate it came from. A value that
+is a credential is never written: it prints as `Secret(…)`.
+
+Every other command of `zsql` logs nothing unless asked with the same
+flags and variables. What a command prints for whoever ran it, a
+result, a `warning:` line, an error, is its output and not its log,
+and does not change with the level.
+
+`zsql server start` finds where the server listens from the line below
+or, when the log is quieter than `info` or is JSON, from the lock file.
+The background server takes `ZSQL_LOG` and `ZSQL_LOG_FORMAT` from the
+environment it is started in.
 
 ## The first lines it logs
 
@@ -167,10 +194,10 @@ directory back, fixing ownership and starting it.
 Releases before 0.6.10 could run with `ZSQL_ACCOUNTS=on`: users, keys,
 sign-up, a web app, rate limits, all in the server. That is gone.
 
-- `zsql serve` refuses to start while `ZSQL_ACCOUNTS` is on, so a
-  server that authenticated every request does not come back up
-  answering anyone. Remove it from the environment file, with
-  `ZSQL_SIGNUP`, `ZSQL_LIMITS`, `ZSQL_LIMIT_*`, `ZSQL_MAIL_*`,
+- `ZSQL_ACCOUNTS` is no longer read, and nothing stops a server that
+  still sets it: one that authenticated every request comes back up
+  answering anyone who reaches it. Remove it from the environment
+  file, with `ZSQL_SIGNUP`, `ZSQL_LIMITS`, `ZSQL_LIMIT_*`, `ZSQL_MAIL_*`,
   `ZSQL_TRUSTED_PROXY`, `ZSQL_AUTH_CACHE_TTL`, `ZSQL_MAX_BRANCHES_*`,
   `ZSQL_ADMIT_MANAGE` and `ZSQL_ADMIT_PASSWORD`, which are no longer
   read. Set `ZSQL_DEPLOY_TOKEN`.
@@ -178,9 +205,8 @@ sign-up, a web app, rate limits, all in the server. That is gone.
   looked for at `<project>/<branch>/`. Deploy each again, or move each
   `<account>/<project>` directory up one level; two accounts with a
   project of the same uid cannot both be kept.
-- `accounts.db` is not read. The server says so at startup while the
-  file is there. Keep a copy if the users and audit log in it matter to
-  you, then delete it.
+- `accounts.db` is not read, and nothing says so. Keep a copy if the
+  users and audit log in it matter to you, then delete it.
 - User keys and query keys stop working: nothing checks them. An
   application that sent a query key keeps working, and so does anyone
   else. A context that was bound to a query key's grant must now be

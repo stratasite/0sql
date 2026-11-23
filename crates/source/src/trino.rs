@@ -13,6 +13,8 @@ pub struct Trino {
     base: String,
     user: String,
     password: Option<Secret>,
+    /// An OAuth access token, sent as a bearer in place of the password.
+    token: Option<Secret>,
     catalog: Option<String>,
     schema: Option<String>,
     conn: Connection,
@@ -20,13 +22,14 @@ pub struct Trino {
 }
 
 impl Trino {
-    pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Trino> {
+    pub fn open(conn: &Connection, secret: Option<Secret>, token: Option<Secret>) -> Result<Trino> {
         let (base, note) = http::base_url(conn, 8080, "trino")?;
         Ok(Trino {
             agent: http::agent(conn)?,
             base,
             user: conn.username.clone().unwrap_or_else(|| "zsql".into()),
             password: secret,
+            token,
             catalog: conn.database.clone(),
             schema: conn.schema.clone(),
             conn: conn.clone(),
@@ -44,7 +47,10 @@ impl Trino {
         if let Some(s) = &self.schema {
             req = req.header("X-Trino-Schema", s);
         }
-        if let Some(p) = &self.password {
+        if let Some(t) = &self.token {
+            // The coordinator's JWT or OAuth 2 authenticator reads this.
+            req = req.header("Authorization", &format!("Bearer {}", t.expose()));
+        } else if let Some(p) = &self.password {
             // Basic over HTTPS; Trino refuses it over plain HTTP, which is right.
             let token = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", self.user, p.expose()));
             req = req.header("Authorization", &format!("Basic {token}"));
@@ -109,6 +115,10 @@ impl Source for Trino {
 
     fn adapter(&self) -> &str {
         "trino"
+    }
+
+    fn transport(&self) -> &str {
+        "rest"
     }
 
     fn warnings(&self) -> &[String] {

@@ -57,7 +57,7 @@ pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
                     n += 1;
                 }
                 Err(e) => {
-                    say!("zsqld: {key} was not loaded: {e}");
+                    tracing::warn!("{key} was not loaded: {e}");
                     skipped.push(key);
                 }
             }
@@ -164,24 +164,15 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         deploying: std::sync::Mutex::new(()),
     });
     let (n, skipped) = reload(&app)?;
-    say!(
-        "zsqld: {n} deployment(s) loaded from {}; deploys {}",
+    tracing::info!(
+        "{n} deployment(s) loaded from {}; deploys {}",
         app.data_dir.display(),
         if app.deploy_token.is_some() { "need the deploy token" } else { "are open to whoever reaches this address" }
     );
     if !skipped.is_empty() {
         // Said again, together, after the per-branch lines above: the
         // one line someone watching a restart will actually read.
-        say!("zsqld: {} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
-    }
-    // A data directory from a release that had accounts keeps its
-    // deployments one level down, under each account, where nothing
-    // looks now. Said once, so an upgrade that serves nothing says why.
-    if app.data_dir.join("accounts.db").exists() {
-        say!(
-            "zsqld: {} holds accounts.db from a release with accounts. It is not read, and deployments under an account's directory are not served: deploy them again, or move <account>/<project> up one level.",
-            app.data_dir.display()
-        );
+        tracing::warn!("{} deployment(s) could not be loaded and are not being served: {}", skipped.len(), skipped.join(", "));
     }
 
     let router = router(app.clone());
@@ -194,7 +185,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // The address actually bound, so a port of 0 is answered with the
     // port it got.
     let addr = listener.local_addr()?;
-    say!("zsqld: listening on http://{addr}");
+    tracing::info!("listening on http://{addr}");
     // The address, and the public URL when there is one, join the pid
     // in the lock file, so `zsql server status` can say where a server
     // it did not start is reached.
@@ -205,7 +196,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     }
     listening(addr);
     axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
-    say!("zsqld: stopped");
+    tracing::info!("stopped");
     Ok(())
 }
 
@@ -252,7 +243,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        say!("zsqld: stopping");
+        tracing::info!("stopping");
     }
 }
 

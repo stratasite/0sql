@@ -9,6 +9,7 @@ publish = false
 description = "Running a planned query and keeping its rows: the result store and the cache over it"
 
 [dependencies]
+tracing.workspace = true
 zsql-service.workspace = true
 zsql-source.workspace = true
 zsql-semantic.workspace = true
@@ -18,6 +19,11 @@ serde_json.workspace = true
 flate2.workspace = true
 thiserror.workspace = true
 sha2 = "0.10"
+# A stored result is an Arrow IPC file. LZ4 because its implementation
+# here is Rust, where zstd's would bring a C library into the build.
+arrow-ipc = { version = "60", features = ["lz4"] }
+arrow-array = "60"
+arrow-schema = "60"
 
 [lints]
 workspace = true

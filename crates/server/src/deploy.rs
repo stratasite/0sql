@@ -81,7 +81,7 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
                 bad(e.to_string())
             })?;
             write(&app.models).insert(crate::key(&uid, &branch), deployed);
-            say!("zsqld: deployed {uid}/{branch}");
+            tracing::info!("deployed {uid}/{branch}");
         }
         Ok(out)
     })();
@@ -182,7 +182,7 @@ pub(crate) async fn remove(State(app): State<Shared>, Params((uid, branch)): Par
             return Err(not_found(&uid, &branch));
         }
         let _ = std::fs::remove_dir_all(app.dir(&uid, &branch));
-        say!("zsqld: removed {uid}/{branch}");
+        tracing::info!("removed {uid}/{branch}");
         Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
     })
     .await

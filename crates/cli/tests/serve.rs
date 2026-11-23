@@ -271,22 +271,6 @@ fn a_bind_beyond_the_loopback_needs_a_deploy_token_or_to_be_meant() {
     assert!(err.contains("--open") && err.contains("ZSQL_DEPLOY_TOKEN"), "{err}");
 }
 
-/// A server told to keep accounts does not come up as one with none.
-#[test]
-fn a_server_asked_for_accounts_refuses_to_start_without_them() {
-    let root = Scratch::new("retired");
-    let out = zsql()
-        .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
-        .env("ZSQL_HOME", root.path("home"))
-        .env("ZSQL_ACCOUNTS", "on")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("ZSQL_ACCOUNTS") && err.contains("ZSQL_DEPLOY_TOKEN"), "{err}");
-    assert!(!root.path("data/lock").exists(), "it stopped before it took the data directory");
-}
-
 /// With a deploy token the server may listen beyond the loopback, it
 /// deploys its own project with its own token, reads stay open, and
 /// `zsql deploy` and `zsql remove` work for whoever holds the token

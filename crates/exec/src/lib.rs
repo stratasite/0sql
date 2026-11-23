@@ -8,21 +8,33 @@
 //! See `docs/run.md`.
 //!
 //! The store is a layout, not a database: a result is a directory named
-//! by its cache key holding `rows.jsonl.gz` and `manifest.json`, the
+//! by its cache key holding `rows.arrow` and `manifest.json`, the
 //! manifest written last as the commit marker. Nothing is updated in
 //! place, so a copy of the directory is a copy of the store.
+//!
+//! The rows are an Arrow IPC file: the batches the transport returned,
+//! with the types it knew, LZ4-compressed. Anything that reads Arrow
+//! reads a stored result without this crate, and a result read back is
+//! the result that was written, not text parsed into a guess at it.
+//! Results written before 0.7 are `rows.jsonl.gz`, every cell a string;
+//! they are still read, as `Utf8` columns, and never written.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zsql_service::{Model, SqlRequest};
-use zsql_source::Source;
+use zsql_source::{Batches, Rows, Source};
 
-pub const MANIFEST_FORMAT: u32 = 1;
-pub const ROWS_FORMAT: &str = "jsonl.gz";
+pub const MANIFEST_FORMAT: u32 = 2;
+/// What this build writes.
+pub const ROWS_FORMAT: &str = "arrow";
+/// What builds before 0.7 wrote, still read.
+pub const ROWS_FORMAT_TEXT: &str = "jsonl.gz";
+const ROWS_FILE: &str = "rows.arrow";
+const ROWS_FILE_TEXT: &str = "rows.jsonl.gz";
 /// Rows a run keeps when the question did not bound itself.
 pub const DEFAULT_CAP: u64 = 10_000;
 /// How long a result answers for a datasource that says nothing.
@@ -42,6 +54,10 @@ pub enum ExecError {
     NotFound(String),
     #[error("{0} matches more than one result; give more of the id")]
     Ambiguous(String),
+    #[error("{0}: {1}")]
+    Arrow(String, arrow_schema::ArrowError),
+    #[error("{0}: rows in a format this build does not read: {1}")]
+    RowsFormat(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, ExecError>;
@@ -61,6 +77,11 @@ pub struct Manifest {
     pub branch: String,
     pub datasource_uid: String,
     pub adapter: String,
+    /// How the rows travelled: `native`, `rest` or `adbc`. One datasource
+    /// can answer through two of them, typed through one and as text
+    /// through the other, and a result should say which it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     /// Which database answered, never a secret: every name, location and
     /// timestamp that decides what a query sees, as a JSON object. Two
     /// connections that differ here are two databases, and a result from
@@ -97,8 +118,13 @@ pub struct Column {
     /// The model's data type when the column is a field of the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_type: Option<String>,
-    /// `model` or `unknown`; `warehouse` once the transports say theirs.
+    /// `model` or `unknown`: where `data_type` came from.
     pub source: String,
+    /// The type the rows are stored in, as Arrow names it: what the
+    /// transport said the warehouse returned, or `Utf8` when it only
+    /// had text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrow_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_uid: Option<String>,
 }
@@ -220,21 +246,25 @@ impl Store {
     /// Writes a result: the rows first, into a directory beside the
     /// final one, then the manifest, then one rename. A reader that
     /// finds no manifest finds no result.
-    fn write(&self, manifest: &Manifest, rows: &[Vec<Option<String>>]) -> Result<Stored> {
+    fn write(&self, manifest: &Manifest, rows: &Batches) -> Result<Stored> {
         let dir = self.dir_of(&manifest.key);
         let tmp = dir.with_extension("tmp");
         let io = |p: &Path, e: std::io::Error| ExecError::Io(p.display().to_string(), e);
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).map_err(|e| io(&tmp, e))?;
-        let rows_path = tmp.join("rows.jsonl.gz");
+        let rows_path = tmp.join(ROWS_FILE);
         {
+            let arrow = |e: arrow_schema::ArrowError| ExecError::Arrow(rows_path.display().to_string(), e);
             let file = std::fs::File::create(&rows_path).map_err(|e| io(&rows_path, e))?;
-            let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            for r in rows {
-                enc.write_all(serde_json::to_string(r)?.as_bytes()).map_err(|e| io(&rows_path, e))?;
-                enc.write_all(b"\n").map_err(|e| io(&rows_path, e))?;
+            let options = arrow_ipc::writer::IpcWriteOptions::default()
+                .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))
+                .map_err(arrow)?;
+            let mut writer =
+                arrow_ipc::writer::FileWriter::try_new_with_options(std::io::BufWriter::new(file), &rows.schema, options).map_err(arrow)?;
+            for batch in &rows.batches {
+                writer.write(batch).map_err(arrow)?;
             }
-            enc.finish().map_err(|e| io(&rows_path, e))?;
+            writer.finish().map_err(arrow)?;
         }
         let manifest_path = tmp.join("manifest.json");
         let mut text = serde_json::to_string_pretty(manifest)?;
@@ -256,11 +286,39 @@ impl Stored {
         &self.dir
     }
 
-    /// The rows, read back as they were written.
-    pub fn rows(&self) -> Result<RowReader> {
-        let path = self.dir.join("rows.jsonl.gz");
-        let file = std::fs::File::open(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
-        Ok(RowReader { lines: std::io::BufReader::new(flate2::read::GzDecoder::new(file)).lines(), path })
+    /// The rows, read back as they were written: the batches and their
+    /// types. A result from before 0.7 comes back as `Utf8` columns.
+    pub fn batches(&self) -> Result<Batches> {
+        match self.manifest.rows_format.as_str() {
+            ROWS_FORMAT => {
+                let path = self.dir.join(ROWS_FILE);
+                let arrow = |e: arrow_schema::ArrowError| ExecError::Arrow(path.display().to_string(), e);
+                let file = std::fs::File::open(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None).map_err(arrow)?;
+                let schema = reader.schema();
+                let batches = reader.collect::<std::result::Result<Vec<_>, _>>().map_err(arrow)?;
+                Ok(Batches { schema, batches })
+            }
+            ROWS_FORMAT_TEXT => {
+                let path = self.dir.join(ROWS_FILE_TEXT);
+                let file = std::fs::File::open(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+                for line in std::io::BufReader::new(flate2::read::GzDecoder::new(file)).lines() {
+                    let line = line.map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                    if !line.trim().is_empty() {
+                        rows.push(serde_json::from_str(&line)?);
+                    }
+                }
+                let columns = self.manifest.columns.iter().map(|c| c.name.clone()).collect();
+                Ok(Batches::from_text(&Rows { columns, rows }))
+            }
+            other => Err(ExecError::RowsFormat(self.dir.display().to_string(), other.to_string())),
+        }
+    }
+
+    /// The rows as the text they print as.
+    pub fn rows(&self) -> Result<Rows> {
+        Ok(self.batches()?.to_text()?)
     }
 
     /// Seconds since this result was written, by its own timestamp.
@@ -272,23 +330,6 @@ impl Stored {
 
     pub fn expired(&self) -> bool {
         self.age() > Duration::from_secs(self.manifest.cache_ttl_secs)
-    }
-}
-
-pub struct RowReader {
-    lines: std::io::Lines<std::io::BufReader<flate2::read::GzDecoder<std::fs::File>>>,
-    path: PathBuf,
-}
-
-impl Iterator for RowReader {
-    type Item = Result<Vec<Option<String>>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        let line = self.lines.next()?;
-        Some(match line {
-            Ok(l) if l.trim().is_empty() => return self.next(),
-            Ok(l) => serde_json::from_str(&l).map_err(ExecError::Json),
-            Err(e) => Err(ExecError::Io(self.path.display().to_string(), e)),
-        })
     }
 }
 
@@ -334,7 +375,7 @@ pub enum CacheStatus {
 /// was asked.
 pub struct Outcome {
     pub manifest: Manifest,
-    pub rows: Vec<Vec<Option<String>>>,
+    pub batches: Batches,
     pub cache: CacheStatus,
     /// Where it was written, when it was.
     pub stored: Option<PathBuf>,
@@ -387,12 +428,13 @@ impl Engine {
             if ttl.as_secs() > 0 {
                 if let Some(stored) = store.lookup(&key)? {
                     if !stored.expired() {
-                        let rows: Vec<Vec<Option<String>>> = stored.rows()?.collect::<Result<_>>()?;
+                        tracing::debug!(datasource = %datasource_uid, age_secs = stored.age().as_secs(), "answered from a stored result");
+                        let batches = stored.batches()?;
                         return Ok(Outcome {
                             cache: CacheStatus::Hit { age: stored.age() },
                             stored: Some(stored.dir.clone()),
                             manifest: stored.manifest,
-                            rows,
+                            batches,
                         });
                     }
                 }
@@ -402,17 +444,25 @@ impl Engine {
         let t1 = Instant::now();
         let mut src = connector.open(&datasource_uid)?;
         let connect_ms = t1.elapsed().as_millis();
-        let mut warnings: Vec<String> = src.warnings().to_vec();
         let t2 = Instant::now();
-        let got = src.query(&sql, max_rows)?;
+        let mut batches = src.batches(&sql, max_rows)?;
         let run_ms = t2.elapsed().as_millis();
-        let mut rows = got.rows;
+        // Read after the statement: a source warns about what running it
+        // found too, a transport it had to give up on among them, and
+        // the manifest is where that is kept.
+        let mut warnings: Vec<String> = src.warnings().to_vec();
+        let transport = src.transport().to_string();
+        tracing::debug!(
+            datasource = %datasource_uid,
+            transport = %transport,
+            rows = batches.num_rows() as u64,
+            connect_ms = connect_ms as u64,
+            run_ms = run_ms as u64,
+            "a statement ran"
+        );
         let complete = match cap {
-            Some(cap) if rows.len() as u64 > cap => {
-                rows.truncate(cap as usize);
-                false
-            }
-            _ => true,
+            Some(cap) => !batches.truncate(cap as usize),
+            None => true,
         };
         if !complete {
             warnings.push(format!(
@@ -422,17 +472,23 @@ impl Engine {
         }
 
         let s = model.universe().snapshot();
-        let columns: Vec<Column> = got
-            .columns
+        let columns: Vec<Column> = batches
+            .schema
+            .fields()
             .iter()
-            .map(|name| match s.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name) || f.uid.eq_ignore_ascii_case(name)) {
-                Some(f) => Column {
-                    name: name.clone(),
-                    data_type: f.data_type.and_then(|d| serde_json::to_value(d).ok()).and_then(|v| v.as_str().map(str::to_string)),
-                    source: "model".into(),
-                    field_uid: Some(f.uid.clone()),
-                },
-                None => Column { name: name.clone(), data_type: None, source: "unknown".into(), field_uid: None },
+            .map(|column| {
+                let name = column.name();
+                let arrow_type = Some(column.data_type().to_string());
+                match s.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name) || f.uid.eq_ignore_ascii_case(name)) {
+                    Some(f) => Column {
+                        name: name.clone(),
+                        data_type: f.data_type.and_then(|d| serde_json::to_value(d).ok()).and_then(|v| v.as_str().map(str::to_string)),
+                        source: "model".into(),
+                        arrow_type,
+                        field_uid: Some(f.uid.clone()),
+                    },
+                    None => Column { name: name.clone(), data_type: None, source: "unknown".into(), arrow_type, field_uid: None },
+                }
             })
             .collect();
         let sql_lower = sql.to_lowercase();
@@ -453,6 +509,7 @@ impl Engine {
             branch: model.branch.clone(),
             datasource_uid,
             adapter,
+            transport: Some(transport),
             connection_identity: identity,
             expr,
             spec,
@@ -460,7 +517,7 @@ impl Engine {
             sql,
             user_limit: planned.limit,
             cap,
-            rows: rows.len() as u64,
+            rows: batches.num_rows() as u64,
             complete,
             columns: columns.clone(),
             rows_format: ROWS_FORMAT.into(),
@@ -482,10 +539,10 @@ impl Engine {
             CacheStatus::Miss
         };
         let stored = match (&self.store, req.store) {
-            (Some(store), true) => Some(store.write(&manifest, &rows)?.dir),
+            (Some(store), true) => Some(store.write(&manifest, &batches)?.dir),
             _ => None,
         };
-        Ok(Outcome { manifest, rows, cache, stored })
+        Ok(Outcome { manifest, batches, cache, stored })
     }
 }
 
@@ -584,6 +641,7 @@ mod tests {
             branch: "working-tree".into(),
             datasource_uid: "wh".into(),
             adapter: "sqlite".into(),
+            transport: Some("native".into()),
             connection_identity: None,
             expr: Some("status, calc(count(*), integer) as n".into()),
             spec: None,
@@ -597,6 +655,7 @@ mod tests {
                 name: "status".into(),
                 data_type: Some("string".into()),
                 source: "model".into(),
+                arrow_type: Some("Utf8".into()),
                 field_uid: Some("status".into()),
             }],
             rows_format: ROWS_FORMAT.into(),
@@ -605,17 +664,61 @@ mod tests {
             lineage: Lineage::default(),
             warnings: vec![],
         };
+        // A typed column beside a text one: what is read back is what was
+        // written, type included, not a string to be parsed again.
+        let schema: arrow_schema::SchemaRef = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("status", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("n", arrow_schema::DataType::Int64, true),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(arrow_array::StringArray::from(vec![Some("paid"), None])),
+                std::sync::Arc::new(arrow_array::Int64Array::from(vec![Some(3), Some(1)])),
+            ],
+        )
+        .unwrap();
+        let written = Batches { schema, batches: vec![batch] };
         let rows = vec![vec![Some("paid".to_string()), Some("3".to_string())], vec![None, Some("1".to_string())]];
-        let stored = store.write(&manifest, &rows).unwrap();
+        let stored = store.write(&manifest, &written).unwrap();
+        assert!(stored.dir().join("rows.arrow").exists());
         assert!(stored.dir().join("manifest.json").exists());
         assert!(!stored.dir().with_extension("tmp").exists(), "the temporary directory was renamed away");
-        let back: Vec<_> = store.lookup(&key).unwrap().unwrap().rows().unwrap().collect::<Result<_>>().unwrap();
-        assert_eq!(back, rows);
+        let back = store.lookup(&key).unwrap().unwrap().batches().unwrap();
+        assert_eq!(back.schema, written.schema, "the types survive the disk");
+        assert_eq!(back.batches, written.batches);
+        assert_eq!(back.to_text().unwrap().rows, rows);
         assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(store.get(&manifest.id[..6]).unwrap().manifest.key, key, "a prefix of the id");
         assert_eq!(store.get(&key[..10]).unwrap().manifest.key, key, "a prefix of the key");
         assert!(matches!(store.get("r-1999").unwrap_err(), ExecError::NotFound(_)));
         assert!(!store.lookup(&key).unwrap().unwrap().expired());
+
+        // What a build before 0.7 left behind: gzipped JSON lines and a
+        // manifest that says so. Read as text columns, never rewritten.
+        let old_key = cache_key("wh", "sqlite", None, "SELECT status FROM orders", None);
+        let old_dir = store.dir_of(&old_key);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(
+                std::fs::File::create(old_dir.join("rows.jsonl.gz")).unwrap(),
+                flate2::Compression::default(),
+            );
+            enc.write_all(b"[\"paid\",\"3\"]\n[null,\"1\"]\n").unwrap();
+            enc.finish().unwrap();
+        }
+        let mut old =
+            Manifest { format: 1, key: old_key.clone(), rows_format: ROWS_FORMAT_TEXT.into(), transport: None, ..manifest.clone() };
+        old.columns.push(Column { name: "n".into(), data_type: None, source: "unknown".into(), arrow_type: None, field_uid: None });
+        std::fs::write(old_dir.join("manifest.json"), serde_json::to_string(&old).unwrap()).unwrap();
+        let read = store.lookup(&old_key).unwrap().unwrap();
+        assert_eq!(read.rows().unwrap().rows, rows, "an old result still answers");
+        assert!(read.batches().unwrap().schema.fields().iter().all(|f| f.data_type() == &arrow_schema::DataType::Utf8));
+        let unknown = Stored { manifest: Manifest { rows_format: "parquet".into(), ..manifest.clone() }, dir: old_dir.clone() };
+        assert!(matches!(unknown.batches().unwrap_err(), ExecError::RowsFormat(_, f) if f == "parquet"));
+        store.remove(&old_key).unwrap();
+
         store.remove(&key).unwrap();
         assert!(store.lookup(&key).unwrap().is_none());
         assert_eq!(store.purge().unwrap(), 0);

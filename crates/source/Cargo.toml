@@ -9,6 +9,7 @@ publish = false
 description = "Reaching a datasource to read from it: the connection, its secret, and one read-only statement"
 
 [dependencies]
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -28,6 +29,17 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 duckdb = { version = "1.20000.0", features = ["bundled"] }
+# The result contract: record batches. The same Arrow DuckDB already
+# brings, named here so the crate does not reach it through a driver.
+arrow-array = "60"
+arrow-schema = "60"
+arrow-cast = "60"
+
+# ADBC drivers are shared libraries loaded at run time, which a static
+# musl binary cannot do; there the REST transports are the only path.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+adbc_core = "0.25"
+adbc_driver_manager = "0.25"
 
 [lints]
 workspace = true

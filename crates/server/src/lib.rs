@@ -39,16 +39,6 @@
 //! - `mcp`: the same reads as MCP tools
 //! - `run`: configuration, the router and the server's life
 
-/// A line to the log. Never a panic: a server whose stderr has gone
-/// away (a pipe its reader closed) keeps serving, which `eprintln!`
-/// would not allow.
-macro_rules! say {
-    ($($t:tt)*) => {{
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), $($t)*);
-    }};
-}
-
 pub mod admission;
 mod deploy;
 mod error;

@@ -278,6 +278,10 @@ impl Source for Athena {
         "athena"
     }
 
+    fn transport(&self) -> &str {
+        "rest"
+    }
+
     fn warnings(&self) -> &[String] {
         &self.warnings
     }

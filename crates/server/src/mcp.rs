@@ -192,7 +192,7 @@ async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, 
             )
             .trim()
             .to_string();
-            say!("zsqld: mcp: connected: {client}");
+            tracing::info!("mcp: connected: {client}");
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },

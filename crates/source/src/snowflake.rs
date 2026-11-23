@@ -37,8 +37,14 @@ pub struct Snowflake {
 }
 
 enum Auth {
+    /// An OAuth access token obtained elsewhere.
+    Delegated(Secret),
     Token(Secret),
-    KeyPair { signer: Box<jwt::Signer>, account: String, user: String },
+    KeyPair {
+        signer: Box<jwt::Signer>,
+        account: String,
+        user: String,
+    },
 }
 
 /// The session the statement runs in, already folded.
@@ -107,6 +113,7 @@ impl Snowflake {
     /// The bearer and the header that says what kind it is.
     fn bearer(&mut self) -> Result<(String, &'static str)> {
         match &self.auth {
+            Auth::Delegated(t) => Ok((t.expose().to_string(), "OAUTH")),
             Auth::Token(t) => Ok((t.expose().to_string(), "PROGRAMMATIC_ACCESS_TOKEN")),
             Auth::KeyPair { signer, account, user } => {
                 let fresh = self.jwt.as_ref().filter(|(_, at)| at.elapsed() < JWT_RENEW_AFTER).map(|(t, _)| t.clone());
@@ -255,6 +262,9 @@ impl Snowflake {
 /// Which credential the connection carries, or what it would take.
 fn credentials(conn: &Connection, secrets: Secrets) -> std::result::Result<Auth, String> {
     let env = |field: &str| crate::secret_env_var(&conn.uid, field);
+    if let Some(t) = secrets.oauth_token {
+        return Ok(Auth::Delegated(t));
+    }
     if let Some(t) = secrets.personal_access_token {
         return Ok(Auth::Token(t));
     }
@@ -342,6 +352,10 @@ impl Source for Snowflake {
 
     fn adapter(&self) -> &str {
         "snowflake"
+    }
+
+    fn transport(&self) -> &str {
+        "rest"
     }
 
     fn warnings(&self) -> &[String] {

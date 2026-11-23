@@ -2110,3 +2110,49 @@ fn a_duckdb_catalog_reads_tables_views_columns_comments_and_keys() {
     assert_eq!(scoped.tables.len(), 3);
     assert!(Catalog::read(&mut *src, "local", Some("nowhere")).unwrap().tables.is_empty());
 }
+
+// ------------------------------------------------------------ oauth token
+
+/// A token obtained upstream is the credential, sent as it was given, by
+/// every adapter that says it takes one. Nothing here mints or refreshes
+/// anything: no token endpoint is called and no file is read.
+#[test]
+fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
+    for adapter in ["snowflake", "bigquery", "databricks", "trino", "sqlserver"] {
+        assert!(takes_oauth_token(adapter), "{adapter}");
+    }
+    for adapter in ["postgres", "redshift", "mysql", "clickhouse", "athena", "sqlite", "duckdb"] {
+        assert!(!takes_oauth_token(adapter), "{adapter}");
+    }
+    assert!(SECRET_FIELDS.contains(&"oauth_token"));
+
+    let server = fake(|method, path, _body| match (method, path) {
+        ("POST", "/api/v2/statements") => (200, sf_result("h0", &["ONE"], serde_json::json!([["1"]]), 1, 1)),
+        ("POST", "/bigquery/v2/projects/p/queries") => (200, bq_result("j0", true, &["one"], serde_json::json!([["1"]]), 1, None)),
+        ("POST", "/api/2.0/sql/statements") => (200, dbx_result("s0", "SUCCEEDED", &["one"], serde_json::json!([["1"]]), 1, None, false)),
+        ("POST", "/v1/statement") => (200, serde_json::json!({"columns": [{"name": "one"}], "data": [["1"]]}).to_string()),
+        _ => (404, format!("{{\"message\":\"no route {method} {path}\"}}")),
+    });
+    let token = || Secrets { oauth_token: Some(Secret("user-token".into())), ..Default::default() };
+    let base = Connection { url: Some(server.url.clone()), sslmode: SslMode::Disable, query_timeout: Some(5), ..Default::default() };
+    let cases = [
+        Connection { uid: "snow".into(), adapter: "snowflake".into(), database: Some("db".into()), ..base.clone() },
+        // No key file and no application-default credentials: the token is enough.
+        Connection { uid: "bq".into(), adapter: "bigquery".into(), project: Some("p".into()), ..base.clone() },
+        Connection { uid: "dbx".into(), adapter: "databricks".into(), warehouse: Some("w1".into()), ..base.clone() },
+        Connection { uid: "trino".into(), adapter: "trino".into(), username: Some("ada".into()), ..base.clone() },
+    ];
+    for conn in cases {
+        let before = server.seen.lock().unwrap().len();
+        let mut src = open(&conn, token()).unwrap_or_else(|e| panic!("{}: {e}", conn.adapter));
+        let rows = src.query("SELECT 1 AS one", 10).unwrap_or_else(|e| panic!("{}: {e}", conn.adapter));
+        assert_eq!(rows.rows, vec![vec![Some("1".to_string())]], "{}", conn.adapter);
+        let seen = server.seen.lock().unwrap();
+        assert_eq!(seen.len(), before + 1, "{}: one request, and none of them for a token", conn.adapter);
+        let head = seen[before].2.to_lowercase();
+        assert!(head.contains("authorization: bearer user-token"), "{}: {head}", conn.adapter);
+        if conn.adapter == "snowflake" {
+            assert!(head.contains("x-snowflake-authorization-token-type: oauth"), "{head}");
+        }
+    }
+}

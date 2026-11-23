@@ -80,7 +80,9 @@ jobs:
           ZSQL_TEST_TRINO_URL: http://localhost:8080
           ZSQL_TEST_TRINO_DB: tpch
         run: |
-          cargo test --locked -p zsql-source -- --ignored
+          # adbc::tests load ADBC drivers this job does not install; they
+          # are run by hand, see docs/exec-layer.md.
+          cargo test --locked -p zsql-source -- --ignored --skip adbc::tests
           cargo test --locked -p zsql-cli --test generate -- --ignored
           cargo test --locked -p zsql-cli --test sample -- --ignored
       # When a container never comes up, say which and why before it is

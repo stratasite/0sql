@@ -183,6 +183,9 @@ pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Val
     let connector = Local_ { dir: project.dir.clone(), timeout: opts.timeout };
     let outcome = engine.run(model, &connector, RunRequest { query: req, limit, fresh: opts.fresh, store: root.is_some() })?;
 
+    // Printed as text, whatever the types: one rendering for the four
+    // formats, the same one a transport without types has always given.
+    let rows = outcome.batches.to_text()?.rows;
     let format = match (opts.format, opts.out) {
         (Some(f), _) => Format::parse(f)?,
         (None, Some(p)) => {
@@ -195,7 +198,7 @@ pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Val
     match opts.out {
         Some(path) => {
             let mut file = std::fs::File::create(path).with_context(|| path.display().to_string())?;
-            emit(&mut file, format, &outcome.manifest, &outcome.rows, head, &outcome.cache)?;
+            emit(&mut file, format, &outcome.manifest, &rows, head, &outcome.cache)?;
             if !opts.quiet {
                 eprintln!("{} -> {}", footer(&outcome.manifest, &outcome.cache, head), path.display());
             }
@@ -203,7 +206,7 @@ pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Val
         None => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            emit(&mut lock, format, &outcome.manifest, &outcome.rows, head, &outcome.cache)?;
+            emit(&mut lock, format, &outcome.manifest, &rows, head, &outcome.cache)?;
             if !opts.quiet && format == Format::Table {
                 eprintln!("{}", footer(&outcome.manifest, &outcome.cache, head));
             }
@@ -411,7 +414,9 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
         }
         ResultsCommand::Show { id, format, head, offset } => {
             let s = store.get(id)?;
-            let rows: Vec<Vec<Option<String>>> = s.rows()?.skip(offset).collect::<zsql_exec::Result<_>>()?;
+            let mut batches = s.batches()?;
+            batches.skip(offset);
+            let rows = batches.to_text()?.rows;
             let format = format.map(Format::parse).transpose()?.unwrap_or(Format::Table);
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
@@ -422,7 +427,7 @@ pub fn results(project: &Project, cmd: ResultsCommand<'_>) -> Result<()> {
         }
         ResultsCommand::Export { id, out } => {
             let s = store.get(id)?;
-            let rows: Vec<Vec<Option<String>>> = s.rows()?.collect::<zsql_exec::Result<_>>()?;
+            let rows = s.rows()?.rows;
             let format = Format::of_path(out)
                 .ok_or_else(|| anyhow::anyhow!("{}: say the format by the extension (json, jsonl, csv)", out.display()))?;
             let mut file = std::fs::File::create(out).with_context(|| out.display().to_string())?;

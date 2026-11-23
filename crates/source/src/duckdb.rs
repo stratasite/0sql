@@ -9,8 +9,7 @@
 //! `READ_ONLY` mode, so a write fails inside the engine. A statement
 //! past the timeout is interrupted through the engine's own handle.
 
-use crate::{read_only, Connection, Result, Rows, Source, SourceError};
-use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
+use crate::{read_only, Batches, Connection, Result, Rows, Source, SourceError};
 use std::path::PathBuf;
 
 // Why this crate names a symbol it never calls.
@@ -70,8 +69,10 @@ impl DuckDb {
     }
 }
 
-impl Source for DuckDb {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+impl DuckDb {
+    /// The statement's batches as the engine made them, under the row
+    /// cap and the timeout.
+    fn run(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
         read_only(sql)?;
         let uid = self.uid.clone();
         let fail = |e: duckdb::Error| SourceError::Query(uid.clone(), e.to_string());
@@ -88,33 +89,10 @@ impl Source for DuckDb {
         let outcome = (|| {
             let mut stmt = self.conn.prepare(sql).map_err(fail)?;
             let batches = stmt.query_arrow([]).map_err(fail)?;
-            // The names come from the executed statement's schema: before
+            // The schema comes from the executed statement: before
             // execution the statement has none to give.
-            let columns: Vec<String> = batches.get_schema().fields().iter().map(|f| f.name().clone()).collect();
-            let options = FormatOptions::default();
-            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-            for batch in batches {
-                let formatters: Vec<ArrayFormatter> = batch
-                    .columns()
-                    .iter()
-                    .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(|e| SourceError::Query(uid.clone(), e.to_string()))?;
-                for i in 0..batch.num_rows() {
-                    if rows.len() == max_rows {
-                        return Err(SourceError::TooManyRows(uid.clone(), max_rows));
-                    }
-                    rows.push(
-                        batch
-                            .columns()
-                            .iter()
-                            .zip(&formatters)
-                            .map(|(c, f)| if c.is_null(i) { None } else { Some(f.value(i).to_string()) })
-                            .collect(),
-                    );
-                }
-            }
-            Ok(Rows { columns, rows })
+            let schema = batches.get_schema();
+            crate::batch::collect(&uid, schema, batches.map(Ok::<_, duckdb::Error>), max_rows)
         })();
         let _ = stop_tx.send(());
         let _ = watcher.join();
@@ -124,6 +102,18 @@ impl Source for DuckDb {
             }
             other => other,
         }
+    }
+}
+
+impl Source for DuckDb {
+    /// Every cell rendered to text by Arrow's own formatter, so a date,
+    /// a decimal or a struct prints as DuckDB would print it.
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        self.run(sql, max_rows)?.to_text()
+    }
+
+    fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
+        self.run(sql, max_rows)
     }
 
     fn adapter(&self) -> &str {

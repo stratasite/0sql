@@ -103,6 +103,10 @@ impl Source for ClickHouse {
         "clickhouse"
     }
 
+    fn transport(&self) -> &str {
+        "rest"
+    }
+
     fn warnings(&self) -> &[String] {
         &self.warnings
     }

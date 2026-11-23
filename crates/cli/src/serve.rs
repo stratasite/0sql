@@ -68,7 +68,6 @@ impl ServeArgs {
     /// the process list for anyone on the machine to read, and the
     /// background form would have to pass it on in one.
     fn config(&self) -> Result<Config> {
-        retired()?;
         let mut cfg = Config::local(self.data_dir()?, self.bind());
         cfg.public_url = self.public_url.clone();
         cfg.deploy_token = var("ZSQL_DEPLOY_TOKEN");
@@ -148,27 +147,18 @@ fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn on(name: &str) -> bool {
-    matches!(var(name).as_deref(), Some("on" | "1" | "true"))
-}
-
 fn number(v: &str, name: &str) -> Result<usize> {
     v.parse().with_context(|| format!("{name}: {v:?} is not a number"))
 }
 
-/// A server told to keep accounts must not come up as one with none.
-/// Accounts, keys and sign-up are no longer part of the server; an
-/// environment file that still asks for them describes a server every
-/// request authenticated to, and starting without saying so would
-/// serve the same address to anyone.
-fn retired() -> Result<()> {
-    if on("ZSQL_ACCOUNTS") {
-        bail!(
-            "ZSQL_ACCOUNTS is on, but this server has no accounts: it answers whoever can reach it, and belongs behind your own service. \
-             Remove the variable; set ZSQL_DEPLOY_TOKEN to keep deploys to whoever holds it. See docs/operating.md."
-        );
-    }
-    Ok(())
+/// The address in a data directory's lock, when the process that wrote
+/// it is `pid`: a running server puts its pid there, then where it
+/// listens once it does.
+fn locked_address(data_dir: &Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join("lock")).ok()?;
+    let mut lines = text.lines();
+    (lines.next()?.trim() == pid.to_string()).then_some(())?;
+    lines.next().map(str::trim).filter(|a| !a.is_empty()).map(str::to_string)
 }
 
 /// A file named by a variable, read whole, or nothing.
@@ -176,7 +166,7 @@ fn file(name: &str) -> Result<Option<String>> {
     match var(name) {
         Some(path) => {
             let text = std::fs::read_to_string(&path).with_context(|| format!("{name}: cannot read {path}"))?;
-            eprintln!("zsqld: mcp: {name} read from {path}");
+            tracing::info!("mcp: {name} read from {path}");
             Ok(Some(text))
         }
         None => Ok(None),
@@ -436,9 +426,13 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
         }
         let text = std::fs::read_to_string(&log_path).unwrap_or_default();
         let since = text.get(log_len as usize..).unwrap_or("");
-        if let Some(addr) = since.lines().find_map(|l| l.trim().strip_prefix("zsqld: listening on http://")) {
+        // Where it listens: the line it logs, or, when the log was
+        // told to be quieter or to be JSON, the lock it writes its pid
+        // and address into.
+        let said = since.lines().find_map(|l| l.trim().strip_prefix("zsqld: listening on http://")).map(str::to_string);
+        if let Some(addr) = said.or_else(|| locked_address(&started.data_dir, started.pid)) {
             // The address actually bound, which a bind of port 0 does not say.
-            started.bind = addr.to_string();
+            started.bind = addr;
             std::fs::write(pid_file()?, serde_json::to_string(&started)?)?;
             break;
         }

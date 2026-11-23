@@ -26,24 +26,34 @@ pub struct SqlServer {
     client: Option<Client>,
     conn: Connection,
     secret: Option<Secret>,
+    token: Option<Secret>,
     uid: String,
     timeout: std::time::Duration,
     warnings: Vec<String>,
 }
 
 impl SqlServer {
-    pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<SqlServer> {
+    /// With an OAuth token, a Microsoft Entra access token for the
+    /// database, the login is the token and names no user; otherwise it
+    /// is a SQL login, a username and its password.
+    pub fn open(conn: &Connection, secret: Option<Secret>, token: Option<Secret>) -> Result<SqlServer> {
         let host = conn.need(&conn.host, "host")?;
-        let user = conn.need(&conn.username, "username")?;
-        let password = secret
-            .clone()
-            .ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+        let login = match &token {
+            Some(t) => tiberius::AuthMethod::aad_token(t.expose()),
+            None => {
+                let user = conn.need(&conn.username, "username")?;
+                let password = secret
+                    .clone()
+                    .ok_or_else(|| SourceError::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
+                tiberius::AuthMethod::sql_server(&user, password.expose())
+            }
+        };
         tls::install_ring();
         let configure = |encryption: tiberius::EncryptionLevel, trust: Trust| {
             let mut config = tiberius::Config::new();
             config.host(&host);
             config.port(conn.port.unwrap_or(1433));
-            config.authentication(tiberius::AuthMethod::sql_server(&user, password.expose()));
+            config.authentication(login.clone());
             if let Some(db) = &conn.database {
                 config.database(db);
             }
@@ -104,6 +114,7 @@ impl SqlServer {
             client: Some(client),
             conn: conn.clone(),
             secret,
+            token,
             uid: conn.uid.clone(),
             timeout: conn.timeout(),
             warnings,
@@ -125,7 +136,7 @@ impl Source for SqlServer {
         let uid = self.uid.clone();
         let timeout = self.timeout;
         if self.client.is_none() {
-            let fresh = SqlServer::open(&self.conn, self.secret.clone())?;
+            let fresh = SqlServer::open(&self.conn, self.secret.clone(), self.token.clone())?;
             self.client = fresh.client;
         }
         let client = self.client.as_mut().expect("reopened");
