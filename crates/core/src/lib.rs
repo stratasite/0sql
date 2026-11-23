@@ -79,8 +79,8 @@ impl From<zsql_planner::PlanError> for ServiceError {
     }
 }
 
-impl From<zsql_dialect::DialectError> for ServiceError {
-    fn from(e: zsql_dialect::DialectError) -> Self {
+impl From<zsql_dialect::Error> for ServiceError {
+    fn from(e: zsql_dialect::Error) -> Self {
         Self::internal("Dialect", e.to_string())
     }
 }

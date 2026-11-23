@@ -133,7 +133,7 @@ pub enum PlanError {
     #[error("{0}")]
     SegmentDatasource(String),
     #[error("{0}")]
-    Dialect(#[from] zsql_dialect::DialectError),
+    Dialect(#[from] zsql_dialect::Error),
 }
 
 impl PlanError {

@@ -337,7 +337,7 @@ impl<'a> Node<'a> {
 
     /// The node's statement with any strategy-imposed limit, rendered the
     /// way this dialect takes one.
-    pub fn final_sql(&self, dialect: &zsql_dialect::Dialect) -> Result<String, zsql_dialect::DialectError> {
+    pub fn final_sql(&self, dialect: &zsql_dialect::Dialect) -> Result<String, zsql_dialect::Error> {
         let s = self.sql.borrow().clone().unwrap_or_default();
         match self.limit.borrow().as_ref() {
             Some(n) => dialect.apply_limit(&s, 0, n),

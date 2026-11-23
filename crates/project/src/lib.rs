@@ -39,7 +39,7 @@ pub enum ProjectError {
     #[error("{file}: {message}")]
     Invalid { file: String, message: String },
     #[error("{0}")]
-    Dialect(#[from] zsql_dialect::DialectError),
+    Dialect(#[from] zsql_dialect::Error),
     #[error("{0}")]
     SemanticModel(#[from] BuildError),
 }
