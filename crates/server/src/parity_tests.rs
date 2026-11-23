@@ -1,11 +1,11 @@
 //! Local and server answer alike.
 //!
-//! `zsql` plans from a project directory through `zsql_service::Model`;
+//! `zsql` plans from a project directory through `zsql_core::Model`;
 //! `zsqld` plans from the same files after a deploy, through the same
 //! type. These tests hold the two to byte-identical
 //! answers over the fixture projects: the SQL, the explain graph, the
 //! catalog, the field search, and the refusals with their classes.
-//! A difference here is a seam the service crate was meant to close.
+//! A difference here is a seam the core crate was meant to close.
 
 use crate::admission::{Admission, AdmissionCounts};
 use crate::error::ApiError;
@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
+use zsql_core::unlimited;
+use zsql_core::{Model, Trust};
 use zsql_dialect::Dialects;
-use zsql_service::unlimited;
-use zsql_service::{Model, Trust};
 
 fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects")
@@ -99,7 +99,7 @@ async fn get(router: &Router, path: &str) -> (StatusCode, Value) {
 }
 
 /// What the service says, as the server would report it.
-fn as_server(r: Result<Value, zsql_service::ServiceError>) -> (StatusCode, Value) {
+fn as_server(r: Result<Value, zsql_core::ServiceError>) -> (StatusCode, Value) {
     match r {
         Ok(v) => (StatusCode::OK, v),
         Err(e) => {
@@ -165,7 +165,7 @@ async fn local_and_server_answer_alike() {
         assert_eq!(body["fields"], local.summary()["fields"], "{uid}: field count");
 
         for spec in specs_over(&local) {
-            let req = || zsql_service::SqlRequest { spec: Some(spec.clone()), expr: None, context: None };
+            let req = || zsql_core::SqlRequest { spec: Some(spec.clone()), expr: None, context: None };
             let server = post_json(&router, &format!("{base}/sql"), &json!({ "spec": spec })).await;
             let here = as_server(local.sql(req(), &unlimited).map(|r| serde_json::to_value(r).unwrap()));
             assert_eq!(server, here, "{uid} sql over {spec}");
@@ -185,7 +185,7 @@ async fn local_and_server_answer_alike() {
             let (hs, hv) = as_server(
                 local
                     .explore(
-                        zsql_service::ExploreRequest { spec: Some(spec.clone()), expr: None, context: None, q: Some("a".into()) },
+                        zsql_core::ExploreRequest { spec: Some(spec.clone()), expr: None, context: None, q: Some("a".into()) },
                         &unlimited,
                     )
                     .map(|r| serde_json::to_value(r).unwrap()),
@@ -207,7 +207,7 @@ async fn local_and_server_answer_alike() {
             let server = post_json(&router, &format!("{base}/sql"), &json!({ "expr": line })).await;
             let here = as_server(
                 local
-                    .sql(zsql_service::SqlRequest { spec: None, expr: Some(line.into()), context: None }, &unlimited)
+                    .sql(zsql_core::SqlRequest { spec: None, expr: Some(line.into()), context: None }, &unlimited)
                     .map(|r| serde_json::to_value(r).unwrap()),
             );
             assert_eq!(server, here, "{uid} expr {line}");

@@ -11,8 +11,8 @@ use crate::side::Query;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
+use zsql_core::{unlimited, ExploreRequest, Model, SqlRequest, Trust};
 use zsql_dialect::Dialects;
-use zsql_service::{unlimited, ExploreRequest, Model, SqlRequest, Trust};
 use zsql_spec::SecurityContext;
 
 /// What a local model is called where a server would say the branch:

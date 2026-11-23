@@ -10,7 +10,7 @@ use crate::{remote, Target};
 use anyhow::Result;
 use serde_json::Value;
 use std::time::Instant;
-use zsql_service::Model;
+use zsql_core::Model;
 
 /// A query as it travels: a spec, or the expression line for whoever
 /// plans it to read, so the item descriptions come from one place.

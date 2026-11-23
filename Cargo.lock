@@ -3856,15 +3856,34 @@ dependencies = [
  "tar",
  "tracing",
  "ureq",
+ "zsql-core",
  "zsql-dialect",
  "zsql-exec",
  "zsql-log",
  "zsql-project",
  "zsql-semantic",
  "zsql-server",
- "zsql-service",
  "zsql-shorthand",
  "zsql-source",
+ "zsql-spec",
+]
+
+[[package]]
+name = "zsql-core"
+version = "0.6.10"
+dependencies = [
+ "flate2",
+ "regex",
+ "self_cell",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zsql-dialect",
+ "zsql-golden",
+ "zsql-planner",
+ "zsql-project",
+ "zsql-semantic",
+ "zsql-shorthand",
  "zsql-spec",
 ]
 
@@ -3908,8 +3927,8 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tracing",
+ "zsql-core",
  "zsql-semantic",
- "zsql-service",
  "zsql-source",
  "zsql-spec",
 ]
@@ -4006,30 +4025,11 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "zsql-core",
  "zsql-dialect",
  "zsql-semantic",
- "zsql-service",
  "zsql-shorthand",
  "zsql-source",
- "zsql-spec",
-]
-
-[[package]]
-name = "zsql-service"
-version = "0.6.10"
-dependencies = [
- "flate2",
- "regex",
- "self_cell",
- "serde",
- "serde_json",
- "thiserror",
- "zsql-dialect",
- "zsql-golden",
- "zsql-planner",
- "zsql-project",
- "zsql-semantic",
- "zsql-shorthand",
  "zsql-spec",
 ]
 

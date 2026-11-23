@@ -1,4 +1,4 @@
-//! The service layer: a loaded model, and every read over it.
+//! The core: a loaded model, and every read over it.
 //!
 //! The server keeps one [`Model`] per deployed branch and answers each
 //! route from it; the CLI builds one from the project directory at hand
@@ -911,7 +911,7 @@ mod tests {
         let d = dialects();
         let hash = fx.snapshot_hashes().expect("hashes").into_iter().next().expect("a universe");
         let model = Model::build("p", "b", fx.snapshot(&hash).expect("snapshot"), d).expect("universe");
-        let dir = std::env::temp_dir().join(format!("zsql-service-stored-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zsql-core-stored-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         model.write(&dir).expect("write");
         let back = Model::from_stored(&dir, "p", "b", d).expect("read back");

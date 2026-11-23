@@ -182,7 +182,7 @@ crates/spec       the query spec, its lowering, the formula parser, the security
 crates/planner    resolution, the node graph, the visitors, SQL
 crates/project    a project directory loaded into a snapshot
 crates/shorthand  the comma-separated line, for people at a prompt
-crates/service    a loaded model and every read over it, shared by the CLI and the server
+crates/core       a loaded model and every read over it, shared by the CLI and the server
 crates/server     the server: deploy, plan, MCP
 crates/cli        zsql
 crates/devtool    zsql-dev: the goldens, benches and formation checks, for developers of the engine

@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use zsql_service::{Kind, ServiceError};
+use zsql_core::{Kind, ServiceError};
 
 /// An error as the API reports it: a status, a class the goldens would
 /// name, and a message.

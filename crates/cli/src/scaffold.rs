@@ -121,7 +121,7 @@ pub fn empty_table(
 pub fn new_test(project_dir: Option<&Path>, name: &str, json: bool) -> Result<()> {
     let p = project_of(project_dir.map(Path::to_path_buf))?;
     let file = zsql_project::parameterize(name).replace('-', "_");
-    let fields = zsql_service::Model::from_dir(&p.dir, zsql_service::Trust::Owned, crate::local::dialects()).ok().map(|m| {
+    let fields = zsql_core::Model::from_dir(&p.dir, zsql_core::Trust::Owned, crate::local::dialects()).ok().map(|m| {
         let s = m.semantic().snapshot();
         let first = |kind: zsql_semantic::FieldKind| s.fields.iter().find(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone());
         (first(zsql_semantic::FieldKind::Dimension), first(zsql_semantic::FieldKind::Measure))

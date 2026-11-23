@@ -25,7 +25,7 @@ use sha2::Digest;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use zsql_service::{Model, SqlRequest};
+use zsql_core::{Model, SqlRequest};
 use zsql_source::{Batches, Rows, Source};
 
 pub const MANIFEST_FORMAT: u32 = 2;
@@ -401,7 +401,7 @@ impl Engine {
         let expr = req.query.expr.clone();
         let spec = req.query.spec.clone();
         let context_digest = req.query.context.as_ref().map(|c| sha256(&serde_json::to_string(c).unwrap_or_default()));
-        let planned = model.plan_request(req.query, false, &zsql_service::unlimited).map_err(|e| ExecError::Plan(e.to_string()))?;
+        let planned = model.plan_request(req.query, false, &zsql_core::unlimited).map_err(|e| ExecError::Plan(e.to_string()))?;
         let plan_us = t0.elapsed().as_micros();
         let dialect = model.dialects.get(&planned.plan.adapter).map_err(|e| ExecError::Plan(e.to_string()))?;
 

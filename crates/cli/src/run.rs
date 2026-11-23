@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use zsql_core::{Model, SqlRequest};
 use zsql_exec::{CacheStatus, Connector, Engine, Limit, Manifest, RunRequest, Store};
-use zsql_service::{Model, SqlRequest};
 use zsql_source::{Connection, Source};
 
 /// Where a project's results live: `ZSQL_RESULTS_DIR`, else

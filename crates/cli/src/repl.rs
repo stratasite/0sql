@@ -134,7 +134,7 @@ pub fn run<S: Side>(side: S, context: Option<Value>) -> Result<()> {
                         println!("error: {e}");
                     }
                 }
-                "spec" => match zsql_service::spec_of(None, Some(rest), &zsql_service::unlimited).map_err(Refusal::from) {
+                "spec" => match zsql_core::spec_of(None, Some(rest), &zsql_core::unlimited).map_err(Refusal::from) {
                     Ok((spec, _, items)) => {
                         for d in items {
                             println!("{}", dim(&d));

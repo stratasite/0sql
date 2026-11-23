@@ -11,7 +11,7 @@ members = [
   "crates/log",
   "crates/source",
   "crates/exec",
-  "crates/service",
+  "crates/core",
   "crates/server",
   "crates/golden",
   "crates/devtool",
@@ -55,7 +55,7 @@ zsql-shorthand = { path = "crates/shorthand" }
 zsql-log = { path = "crates/log" }
 zsql-source = { path = "crates/source" }
 zsql-exec = { path = "crates/exec" }
-zsql-service = { path = "crates/service" }
+zsql-core = { path = "crates/core" }
 zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }
 

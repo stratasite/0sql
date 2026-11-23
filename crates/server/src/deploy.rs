@@ -13,7 +13,7 @@ use axum::response::Json;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use zsql_service::{Model, Trust};
+use zsql_core::{Model, Trust};
 
 pub(crate) async fn deploy(
     State(app): State<Shared>,
@@ -64,7 +64,7 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
     let result = (|| -> Result<Value, ApiError> {
         unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
-        let loaded = zsql_service::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
+        let loaded = zsql_core::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let deployed =
             Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
         let mut out = deployed.summary();

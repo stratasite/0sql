@@ -12,7 +12,7 @@
 use crate::generate::{map_type, Mapped};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use zsql_service::Model;
+use zsql_core::Model;
 use zsql_source::{Catalog, Table};
 
 /// Findings per datasource that has a catalog; a datasource without one

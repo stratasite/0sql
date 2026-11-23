@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use zsql_core::Model;
 use zsql_dialect::Dialects;
-use zsql_service::Model;
 
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
@@ -40,7 +40,7 @@ pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
                 }
                 continue;
             }
-            if !b.path().join(zsql_service::SNAPSHOT_FILE).exists() {
+            if !b.path().join(zsql_core::SNAPSHOT_FILE).exists() {
                 continue;
             }
             // One unreadable branch is not a reason to refuse to

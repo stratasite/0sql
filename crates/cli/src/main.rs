@@ -742,7 +742,7 @@ fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
     match command {
         Command::Spec { line } => {
             let (spec, _, items) =
-                zsql_service::spec_of(None, Some(&line.join(" ")), &zsql_service::unlimited).map_err(failure::Refusal::from)?;
+                zsql_core::spec_of(None, Some(&line.join(" ")), &zsql_core::unlimited).map_err(failure::Refusal::from)?;
             for d in items {
                 eprintln!("{d}");
             }

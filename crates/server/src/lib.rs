@@ -69,8 +69,8 @@ use axum::http::StatusCode;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use zsql_core::Model;
 use zsql_dialect::Dialects;
-use zsql_service::Model;
 
 // A lock is never poisoned here on purpose: a panic in one request
 // must not take the lock, and with it every later request, down with

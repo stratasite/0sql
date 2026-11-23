@@ -9,9 +9,9 @@ use crate::{config, local, tty};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
+use zsql_core::{Model, Trust};
 use zsql_project::values::{DimensionValues, ValueCatalog, ValueCount};
 use zsql_semantic::{Field, FieldKind, Snapshot, Table};
-use zsql_service::{Model, Trust};
 use zsql_source::{Catalog, Connection};
 
 pub struct Options<'a> {
@@ -351,8 +351,8 @@ fn sample_one(
     let dim = format!("\"{}\"", j.field.name.replace('"', "\"\""));
     let hints = if j.lookups.is_empty() { String::new() } else { format!(", hints ({})", j.lookups.join(", ")) };
     let line = format!("{dim}, calc(count(*), integer) as n desc, limit {size}{hints}");
-    let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
-    let planned = model.plan_request(req, false, &zsql_service::unlimited).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let req = zsql_core::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
+    let planned = model.plan_request(req, false, &zsql_core::unlimited).map_err(|e| anyhow::anyhow!("{e}"))?;
     let dialect = model.dialects.get(&planned.plan.adapter)?;
     let sql = planned.plan.sql_with_limit(planned.limit, &dialect).map_err(|e| anyhow::anyhow!("{e}"))?;
     let via = planned.plan.datasource_uid.clone();
@@ -373,8 +373,8 @@ fn sample_one(
     // limit, counted as a derived table. Any common table expressions stay
     // in front, which is what the plan's root offset is for.
     let line = format!("{dim}, calc(count(*), integer) as n{hints}");
-    let req = zsql_service::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
-    let distinct = match model.plan_request(req, false, &zsql_service::unlimited) {
+    let req = zsql_core::SqlRequest { spec: None, expr: Some(line), context: context.cloned() };
+    let distinct = match model.plan_request(req, false, &zsql_core::unlimited) {
         Ok(p) => {
             let (prefix, root) = p.plan.sql.split_at(p.plan.root_at);
             let count = format!("{prefix}SELECT COUNT(*) AS d FROM (\n{root}\n) AS zsql_distinct");

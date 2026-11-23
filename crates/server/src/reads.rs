@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use zsql_service::{ExplainResponse, ExploreRequest, ExploreResponse, ServiceError, SqlRequest, SqlResponse};
+use zsql_core::{ExplainResponse, ExploreRequest, ExploreResponse, ServiceError, SqlRequest, SqlResponse};
 
 /// What one request may ask for. A spec is JSON the caller wrote and
 /// the cost of planning grows with it, so its shape is bounded before
@@ -262,7 +262,7 @@ pub(crate) async fn projects(State(app): State<Shared>, Search(q): Search<ListQu
 
 pub(crate) fn projects_of(app: &Shared, q: &str) -> Result<Value, ApiError> {
     check_term(q)?;
-    let wanted = zsql_service::holds(q);
+    let wanted = zsql_core::holds(q);
     let mut out: Vec<Value> = read(&app.models).values().filter(|d| wanted(&d.uid) || wanted(&d.branch)).map(|d| d.summary()).collect();
     out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
     Ok(json!({ "deployments": out }))

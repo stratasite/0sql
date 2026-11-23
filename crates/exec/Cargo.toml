@@ -10,7 +10,7 @@ description = "Running a planned query and keeping its rows: the result store an
 
 [dependencies]
 tracing.workspace = true
-zsql-service.workspace = true
+zsql-core.workspace = true
 zsql-source.workspace = true
 zsql-semantic.workspace = true
 zsql-spec.workspace = true

@@ -448,7 +448,7 @@ types are decided in phase 1 and phase 5 is presentation.
 
 ## Where the work goes
 
-A new crate `crates/exec` (`zsql-exec`), depending on `zsql-service`
+A new crate `crates/exec` (`zsql-exec`), depending on `zsql-core`
 for `Model`, `Planned` and `SqlRequest`, on `zsql-source`, on
 `zsql-semantic` for `DataType`, and on `serde_json`, `flate2` and
 `sha2`, all in the lock already. Not inside `zsql-source`: that crate
@@ -481,7 +481,7 @@ pub trait Progress { fn phase(&mut self, what: &str); }     // "planning", "conn
 ```
 
 The CLI adds `run.rs`, `results.rs` and `table.rs`, and `Command::Run`
-and `Command::Results` in `main.rs`. `zsql_service::Planned` gains
+and `Command::Results` in `main.rs`. `zsql_core::Planned` gains
 `projections`. `zsql_source::Source` gains `cancel_handle` and
 `query_into`, each with a default so no adapter breaks.
 

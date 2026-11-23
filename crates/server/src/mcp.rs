@@ -47,8 +47,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use zsql_core::{ExploreRequest, Model, SqlRequest};
 use zsql_semantic::FieldKind;
-use zsql_service::{ExploreRequest, Model, SqlRequest};
 use zsql_spec::SecurityContext;
 
 pub const PATH: &str = "/mcp";
