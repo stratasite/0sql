@@ -3,7 +3,7 @@
 //!
 //! The pipeline: resolve a universe, build the DAG, run the visitors in
 //! order, then assemble the final statement. A shape the planner does not
-//! plan is refused with [`PlanError::Unimplemented`] rather than planned
+//! plan is refused with [`Error::Unimplemented`] rather than planned
 //! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
@@ -122,7 +122,7 @@ impl Plan {
 /// goldens hold the Rails names they were captured under, which
 /// `zsql_golden` translates when it compares.
 #[derive(Debug, thiserror::Error)]
-pub enum PlanError {
+pub enum Error {
     #[error("not implemented: {0}")]
     Unimplemented(&'static str),
     #[error("{0}")]
@@ -136,21 +136,21 @@ pub enum PlanError {
     Dialect(#[from] zsql_dialect::Error),
 }
 
-impl PlanError {
+impl Error {
     /// The Rails exception class this error corresponds to.
     /// The `class` an API error carries; see `zsql_spec::Error::error_class`.
     pub fn error_class(&self) -> &'static str {
         match self {
-            PlanError::Resolution(_) => "Unresolvable",
-            PlanError::SegmentDatasource(_) => "SegmentDatasource",
-            PlanError::SecurityPolicy(_) => "SecurityPolicy",
-            PlanError::Unimplemented(_) => "Unimplemented",
-            PlanError::Dialect(_) => "Dialect",
+            Error::Resolution(_) => "Unresolvable",
+            Error::SegmentDatasource(_) => "SegmentDatasource",
+            Error::SecurityPolicy(_) => "SecurityPolicy",
+            Error::Unimplemented(_) => "Unimplemented",
+            Error::Dialect(_) => "Dialect",
         }
     }
 }
 
-pub type Result<T> = std::result::Result<T, PlanError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Plans a typed query, as spec lowering or a stored model produces it.
 pub fn plan_query_with<'a>(
@@ -258,7 +258,7 @@ impl<'a> Planner<'a> {
         model::check_supported(&rquery, self.semantic, principal)?;
         match run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, vec![], explain) {
             // A segment keyed in another datasource: resolve again with every key required.
-            Err(PlanError::SegmentDatasource(_)) => {
+            Err(Error::SegmentDatasource(_)) => {
                 let required = visitors::segmentation::all_key_dimensions(&rquery);
                 run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, required, explain)
             }

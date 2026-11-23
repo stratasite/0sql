@@ -4,7 +4,7 @@
 use crate::dag::{Filtered, Graph, NodeId, NodeKind, Projected};
 use crate::model::RQuery;
 use crate::visitors::grain::*;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use zsql_semantic::{ExclusionType, Field, FilterMode, SemanticModel};
 
 pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
@@ -153,7 +153,7 @@ fn allowed_components<'a>(
                 }
             }
         }
-        None => return Err(PlanError::Resolution("Unhandled measure exclusion type.".into())),
+        None => return Err(Error::Resolution("Unhandled measure exclusion type.".into())),
     }
     Ok((projections, filters))
 }

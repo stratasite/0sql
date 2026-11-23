@@ -10,7 +10,7 @@ use crate::resolver::set_subtrees;
 use crate::universe::{Base, Universes};
 use crate::visitors::grain::{create_agg_node, create_merge_node, dimensionally_equivalent};
 use crate::visitors::segmentation::{component_links, keys_for, node_signature, signature, Signature};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use std::sync::Arc;
 use zsql_semantic::{Field, SemanticModel};
@@ -116,9 +116,9 @@ fn referenced_measure_fields<'a>(calc: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> 
     Ok(out)
 }
 
-fn conflict<'a>(calc: &Rc<RProjection<'a>>, name: &str, q: &RQuery<'a>) -> PlanError {
+fn conflict<'a>(calc: &Rc<RProjection<'a>>, name: &str, q: &RQuery<'a>) -> Error {
     let segments: Vec<String> = component_links(calc).iter().filter_map(|(s, _)| q.segment(*s)).map(|s| s.name()).collect();
-    PlanError::Resolution(format!(
+    Error::Resolution(format!(
         "Segment {} cannot be applied to calculation {}: it references {}, which aggregates outside the calculation's segment. Apply the same segment to it, or remove the reference.",
         segments.join(", "),
         calc.alias(),
@@ -324,9 +324,9 @@ fn universe_for<'a>(
             keys.iter().map(|k| k.name.clone()).collect::<Vec<_>>().join(", ")
         );
         if universes.bases.iter().any(|u| covers(u)) {
-            return Err(PlanError::SegmentDatasource(message));
+            return Err(Error::SegmentDatasource(message));
         }
-        return Err(PlanError::Resolution(message));
+        return Err(Error::Resolution(message));
     }
     let dims: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
     let dim_filters: Vec<Rc<RFilter<'a>>> = node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.filter.clone()).collect();

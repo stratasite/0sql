@@ -7,7 +7,7 @@ use crate::model::{RFilter, RProjection, RQuery};
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
 use crate::visitors::grain::{create_agg_node, create_merge_node, dimensionally_equivalent};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Field, SemanticModel};
 use zsql_spec::{Decorator, DecoratorKind};
@@ -36,7 +36,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a
         } else {
             let agg =
                 graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid) && n.purpose.is_none()).map(|n| n.id);
-            let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
+            let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
             process_table(graph, semantic, q, &mp, agg)?;
         }
     }
@@ -167,7 +167,7 @@ fn total_calculation<'a>(
     c: &Decorator,
 ) -> Result<Rc<RProjection<'a>>> {
     let agg = graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_field(measure.id)).map(|n| n.id);
-    let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", measure.name)))?;
+    let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", measure.name)))?;
     let total_node = find_or_create_total_node(graph, semantic, q, measure, c, agg)?;
     let alias = digest(&measure.name, "total_");
     if let Some(existing) = graph.nodes[total_node].projections.iter().find(|p| p.is_calculation() && p.proj.match_alias(&alias)) {

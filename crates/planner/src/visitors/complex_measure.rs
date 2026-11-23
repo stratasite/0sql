@@ -6,7 +6,7 @@ use crate::dag::{Entity, Graph, MultiExpr, Node, NodeId, NodeKind, RefKey, Refer
 use crate::model::{FilledTree, RFilter, RProjection, RQuery};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_dialect::Dialects;
 use zsql_semantic::{Field, SemanticModel};
@@ -76,7 +76,7 @@ fn register_reference_signatures<'a>(
     Ok(())
 }
 
-fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> PlanError {
+fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Error {
     let links = match component {
         Component::Proj(p) => component_links(p),
         Component::Filter(_) => vec![],
@@ -87,7 +87,7 @@ fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Pla
     } else {
         format!("Segment {} cannot be applied to", segments.join(", "))
     };
-    PlanError::Resolution(format!(
+    Error::Resolution(format!(
         "{} {}: it references {}, which aggregates under a different segment. Apply the same segment to every use of {}, or remove the reference.",
         subject,
         component.field().name,
@@ -339,11 +339,11 @@ fn create_segmented_component_graph<'a>(
     let opts = Options { auto_level_dims: true, datasource: Some(graph.datasource), required_dims: required.clone(), ..Default::default() };
     let mut sub_graph = match resolver::resolve_with(semantic, universes, dialects, &sub, &opts) {
         Ok(g) => g,
-        Err(PlanError::Resolution(m)) => {
+        Err(Error::Resolution(m)) => {
             let unpinned = Options { auto_level_dims: true, datasource: None, required_dims: required, ..Default::default() };
             return match resolver::resolve_with(semantic, universes, dialects, &sub, &unpinned) {
-                Ok(_) => Err(PlanError::SegmentDatasource(m)),
-                Err(_) => Err(PlanError::Resolution(m)),
+                Ok(_) => Err(Error::SegmentDatasource(m)),
+                Err(_) => Err(Error::Resolution(m)),
             };
         }
         Err(e) => return Err(e),

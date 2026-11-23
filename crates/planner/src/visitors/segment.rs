@@ -7,7 +7,7 @@ use crate::model::{FilledTree, RQuery, RSegment};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::visitors::segmentation::component_links;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 use zsql_dialect::Dialects;
@@ -97,7 +97,7 @@ fn build_segment_node<'a>(
     let opts = Options { datasource: Some(graph.datasource), ..Default::default() };
     let mut sub = match resolver::resolve_with(semantic, universes, dialects, &sq, &opts) {
         Ok(g) => g,
-        Err(PlanError::Resolution(m)) => return Err(PlanError::Resolution(format!("Could not resolve segment {}: {}", segment.name(), m))),
+        Err(Error::Resolution(m)) => return Err(Error::Resolution(format!("Could not resolve segment {}: {}", segment.name(), m))),
         Err(e) => return Err(e),
     };
     sub.dialect = graph.dialect.clone();
@@ -164,7 +164,7 @@ fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId
     for proj in carried {
         let (parent_pid, _) = proj.carried_from.expect("carried");
         let Some(seg_proj) = graph.nodes[seg_node].projected(parent_pid).map(|p| p.proj.clone()) else {
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "Segment {} does not expand {} — remove the carried column or add the dimension to the segment's expanding zone.",
                 segment.name(),
                 proj.field.map(|f| f.name.clone()).unwrap_or_default()
@@ -183,7 +183,7 @@ fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -
     for p in node.projections.iter().filter(|p| p.proj.is_carried()) {
         if !node.field_refs.contains_key(&RefKey::Proj(p.proj.pid)) {
             let kind = if q.def.population { "segment" } else { "query" };
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "{} reads from an expanding segment that does not apply here — expanding segments cannot combine with top-n rankings or snapshot resolution, and the segment must be linked to this {}.",
                 p.alias, kind
             )));
@@ -201,7 +201,7 @@ fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<RSegment<'a>
     }
     let measures: Vec<String> = node.projections.iter().filter(|p| p.is_measure()).map(|p| p.alias.clone()).collect();
     let desc = if measures.is_empty() { q.def.name.clone().unwrap_or_default() } else { format!("measure {}", measures.join(", ")) };
-    Err(PlanError::Resolution(format!(
+    Err(Error::Resolution(format!(
         "Segment {} cannot be applied to {}: key dimension {} is not reachable from {}.",
         segment.name(),
         desc,

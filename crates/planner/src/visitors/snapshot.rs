@@ -5,7 +5,7 @@
 use crate::dag::{Graph, NodeId, NodeKind, Projected, Strategy, StrategyKind};
 use crate::model::{RProjection, RQuery};
 use crate::visitors::grain::{create_agg_node, create_merge_node};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Field, SemanticModel, SnapshotKind, Table};
 use zsql_spec::DecoratorKind;
@@ -141,14 +141,14 @@ fn create_snap_nodes<'a>(
 
 fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
     let first_measure =
-        graph.nodes[snap].measures().into_iter().next().ok_or_else(|| PlanError::Resolution("snapshot node without measure".into()))?;
+        graph.nodes[snap].measures().into_iter().next().ok_or_else(|| Error::Resolution("snapshot node without measure".into()))?;
     let snap_point = first_measure.snapshot;
     let exp = graph.nodes[snap].expression(semantic, first_measure)?;
     let snap_table: &'a Table = semantic.table(exp.table_id).expect("snapshot table");
     let snap_date_dim = snap_table
         .snapshot_date_id
         .and_then(|d| semantic.field(d))
-        .ok_or_else(|| PlanError::Resolution(format!("{} is not a snapshot table", snap_table.name)))?;
+        .ok_or_else(|| Error::Resolution(format!("{} is not a snapshot table", snap_table.name)))?;
 
     let snap_date_proj = snapshot_date_projection(&graph.nodes[snap], snap_date_dim, semantic);
     let snap_date_filter = snapshot_date_filter(&graph.nodes[snap], snap_date_dim, snap_date_proj.as_ref(), semantic);

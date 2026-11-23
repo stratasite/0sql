@@ -6,7 +6,7 @@
 use crate::dag::{Entity, Graph, NodeId, NodeKind, RefKey, Reference};
 use crate::universe::Subtree;
 use crate::visitors::grain::{exclusion_dimension_ids, inclusion_dimension_ids};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use zsql_semantic::{
     ExclusionType, Field, FieldKind, FilterMode, PermissionSource, PermissionValueFrom, PolicyMode, SecurityPolicy, SemanticModel,
     Unresolved,
@@ -119,7 +119,7 @@ fn ensure_context_dim_ref<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a S
         return Ok(());
     }
     let unreachable = || {
-        PlanError::SecurityPolicy(format!(
+        Error::SecurityPolicy(format!(
             "Security policy context dimension '{}' is not reachable in the universe for this query. Cannot safely enforce security policy.",
             ctx.name
         ))
@@ -142,7 +142,7 @@ fn ensure_context_dim_ref<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a S
     }
     .ok_or_else(unreachable)?;
     if !exp.dimension_ref_ids.is_empty() || !exp.measure_ref_ids.is_empty() {
-        return Err(PlanError::SecurityPolicy(format!(
+        return Err(Error::SecurityPolicy(format!(
             "Security policy context dimension '{}' has a composite expression and cannot be used as a security context dimension.",
             ctx.name
         )));

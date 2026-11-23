@@ -6,7 +6,7 @@ use crate::model::{FilledTree, RFilter, RProjection, RQuery};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::visitors::grain::create_agg_node;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_dialect::Dialects;
 use zsql_semantic::{FieldKind, Predicate, SemanticModel};
@@ -127,7 +127,7 @@ fn build_count_node<'a>(
     let mut calc = (*q.static_calc(semantic, "row_count_measure", "count(*)")).clone_shallow();
     calc.def.order_by = Some(OrderBy::Desc);
     calc.def.ordinal = Some(1);
-    let base = graph.nodes[id].universe.clone().ok_or_else(|| PlanError::Resolution("top-n on a node without a universe".into()))?;
+    let base = graph.nodes[id].universe.clone().ok_or_else(|| Error::Resolution("top-n on a node without a universe".into()))?;
     let projections = vec![Rc::new(RProjection::for_field(dimension)), Rc::new(calc)];
     let top = create_agg_node(graph, semantic, q, base, projections, filters)?;
     graph.nodes[top].purpose = Some("strategy");

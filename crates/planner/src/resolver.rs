@@ -5,7 +5,7 @@ use crate::dag::{Graph, Node, NodeKind};
 use crate::model::{RProjection, RQuery};
 use crate::pruner::{prune_to_minimum, sort_for_max_hints_and_dims, sort_paths_for_max_hints_and_dims};
 use crate::universe::{Base, Model, Universes};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use std::sync::Arc;
 use zsql_dialect::Dialects;
@@ -87,7 +87,7 @@ pub fn resolve_with<'a>(
 ) -> Result<Graph<'a>> {
     let segment_keys = if opts.segment_keys { q.query_level_key_dimensions() } else { vec![] };
     match resolve_inner(semantic, universes, dialects, q, opts, &segment_keys) {
-        Err(PlanError::Resolution(msg)) if !segment_keys.is_empty() => {
+        Err(Error::Resolution(msg)) if !segment_keys.is_empty() => {
             // Re-resolve without the keys: when that works, the segments are to blame.
             let without = Options { segment_keys: false, ..opts.clone() };
             match resolve_inner(semantic, universes, dialects, q, &without, &[]) {
@@ -95,14 +95,14 @@ pub fn resolve_with<'a>(
                     let names: Vec<String> =
                         q.query_level_links().iter().filter_map(|(sid, _)| q.segment(*sid)).map(|s| s.name()).collect();
                     let keys: Vec<String> = segment_keys.iter().map(|k| k.name.clone()).collect();
-                    Err(PlanError::Resolution(format!(
+                    Err(Error::Resolution(format!(
                         "Segment {} cannot be applied to the query \"{}\": key dimension {} is not reachable together with the query's fields. Apply the segment to specific measures instead, or re-key it on a dimension every field can reach.",
                         names.join(", "),
                         q.def.name.clone().unwrap_or_default(),
                         keys.join(", ")
                     )))
                 }
-                Err(_) => Err(PlanError::Resolution(msg)),
+                Err(_) => Err(Error::Resolution(msg)),
             }
         }
         other => other,
@@ -118,10 +118,10 @@ fn resolve_inner<'a>(
     segment_keys: &[&'a Field],
 ) -> Result<Graph<'a>> {
     if q.projections.is_empty() {
-        return Err(PlanError::Resolution("At least one projection required".into()));
+        return Err(Error::Resolution("At least one projection required".into()));
     }
     if q.is_segment() && q.projections.iter().all(|p| !(p.is_dimension() && !p.is_calculation() && !p.def.is_expansion())) {
-        return Err(PlanError::Resolution("Query is not valid: a segment needs key dimensions".into()));
+        return Err(Error::Resolution("Query is not valid: a segment needs key dimensions".into()));
     }
     let measures = measures(semantic, q);
     let mut dimensions = dimensions(semantic, q);
@@ -135,7 +135,7 @@ fn resolve_inner<'a>(
     let ds_ids = universes.datasources_with_all_measures(semantic, &measures);
     if ds_ids.is_empty() {
         let names: Vec<&str> = measures.iter().map(|m| m.name.as_str()).collect();
-        return Err(PlanError::Resolution(format!(
+        return Err(Error::Resolution(format!(
             "the measures are not all in one datasource, and a query plans against one: {}",
             names.join(", ")
         )));
@@ -162,7 +162,7 @@ fn resolve_inner<'a>(
         .collect();
     if candidates.is_empty() {
         if let Some(d) = opts.datasource {
-            return Err(PlanError::Resolution(format!("No universe can resolve the query within datasource {}.", d.name)));
+            return Err(Error::Resolution(format!("No universe can resolve the query within datasource {}.", d.name)));
         }
     }
 
@@ -257,7 +257,7 @@ fn resolve_inner<'a>(
         }
 
         if let Some(c) = pushdown.iter().find(|c| !pushed.contains(&c.pid)) {
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "Calculation \"{}\" references dimensions that no single universe resolves together, so it cannot be computed.",
                 c.alias()
             )));

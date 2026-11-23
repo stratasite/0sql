@@ -393,12 +393,12 @@ impl<'a> Node<'a> {
     /// Rails `Dag::Query#expression`: the field's expression on the cheapest
     /// path of the subtree holding it, adding the path when none does.
     pub fn expression(&mut self, universe: &'a zsql_semantic::SemanticModel, field: &'a Field) -> crate::Result<&'a Expression> {
-        let base = self.universe.clone().ok_or_else(|| crate::PlanError::Resolution("node has no universe".into()))?;
+        let base = self.universe.clone().ok_or_else(|| crate::Error::Resolution("node has no universe".into()))?;
         let path = match self.subtrees.iter().find(|t| t.paths.iter().any(|p| p.field_id == field.id)) {
             Some(t) => t.path_for(field.id).expect("subtree holds field"),
             None => {
                 let path = base.path_for(field.id).ok_or_else(|| {
-                    crate::PlanError::Resolution(format!("Could not find table or path for {} with id: {}.", field_to_s(field), field.id))
+                    crate::Error::Resolution(format!("Could not find table or path for {} with id: {}.", field_to_s(field), field.id))
                 })?;
                 match self.subtrees.iter_mut().find(|t| t.join_path == path.joins) {
                     Some(t) => t.push(path),
@@ -408,7 +408,7 @@ impl<'a> Node<'a> {
             }
         };
         universe.expression_for(path.target_table_id, field.id).ok_or_else(|| {
-            crate::PlanError::Resolution(format!(
+            crate::Error::Resolution(format!(
                 "Could not find expression for {} in the the target table {}.",
                 field_to_s(field),
                 path.target_table_id

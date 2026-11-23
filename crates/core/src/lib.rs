@@ -73,8 +73,8 @@ impl From<zsql_spec::Error> for ServiceError {
     }
 }
 
-impl From<zsql_planner::PlanError> for ServiceError {
-    fn from(e: zsql_planner::PlanError) -> Self {
+impl From<zsql_planner::Error> for ServiceError {
+    fn from(e: zsql_planner::Error) -> Self {
         Self::unprocessable(e.error_class(), e.to_string())
     }
 }

@@ -5,7 +5,7 @@
 use crate::dag::{Entity, Graph, MultiExpr, NodeId, NodeKind, RefKey, Reference};
 use crate::model::{RProjection, RQuery};
 use crate::universe::Subtree;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Expression, Field, SemanticModel};
 
@@ -93,7 +93,7 @@ fn create_reference_within<'a>(
     if visiting.contains(&field.id) {
         let mut chain: Vec<String> = visiting.iter().filter_map(|i| semantic.field(*i)).map(|f| f.name.clone()).collect();
         chain.push(field.name.clone());
-        return Err(PlanError::Resolution(format!(
+        return Err(Error::Resolution(format!(
             "The expression for {} references itself: {}. Fix the model; this field cannot be planned.",
             crate::model::field_to_s(field),
             chain.join(" -> ")
@@ -106,7 +106,7 @@ fn create_reference_within<'a>(
             None => {
                 let base = node.universe.clone().expect("query node universe");
                 let path = base.path_for(field.id).ok_or_else(|| {
-                    PlanError::Resolution(format!("Could not find path for {} with id: {}.", crate::model::field_to_s(field), field.id))
+                    Error::Resolution(format!("Could not find path for {} with id: {}.", crate::model::field_to_s(field), field.id))
                 })?;
                 let node = &mut graph.nodes[id];
                 match node.subtrees.iter_mut().find(|t| t.join_path == path.joins) {
@@ -123,7 +123,7 @@ fn create_reference_within<'a>(
         semantic.expression_for(path.target_table_id, field.id)
     };
     let exp = exp.ok_or_else(|| {
-        PlanError::Resolution(format!(
+        Error::Resolution(format!(
             "Could not find expression for {} in the the target table {}.",
             crate::model::field_to_s(field),
             path.target_table_id
@@ -160,7 +160,7 @@ fn append_projection_references<'a>(
             }
         }
         let Some((pj, input)) = found else {
-            return Err(PlanError::Resolution(format!("Could not find projection with alias: {alias}.")));
+            return Err(Error::Resolution(format!("Could not find projection with alias: {alias}.")));
         };
         sources.push(Reference::Node { entity: Entity::Proj(pj), node: input });
     }
@@ -224,7 +224,7 @@ fn create_local_multi_reference<'a>(
     }
     visiting.push(field.id);
     for rid in exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()) {
-        let rf = semantic.field(*rid).ok_or_else(|| PlanError::Resolution(format!("referenced field {rid} not found")))?;
+        let rf = semantic.field(*rid).ok_or_else(|| Error::Resolution(format!("referenced field {rid} not found")))?;
         let r = create_reference_within(graph, id, semantic, rf, visiting);
         match r {
             Ok(r) => sources.push(r),
@@ -328,7 +328,7 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a Semanti
                 if graph.nodes[id].get_ref(p.pid, field_id).is_some() {
                     continue;
                 }
-                return Err(PlanError::Resolution(format!("No input materializes {}", p.to_s())));
+                return Err(Error::Resolution(format!("No input materializes {}", p.to_s())));
             };
             let r = Reference::Node { entity: Entity::Proj(p.clone()), node: source };
             let node = &mut graph.nodes[id];
@@ -349,7 +349,7 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a Semanti
             .copied()
             .find(|i| graph.nodes[*i].projections.iter().any(|p| p.field().map(|x| x.id == f.field.id).unwrap_or(false)));
         let Some(source) = source else {
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "The filter on {} cannot be applied at the final pass: no input outputs that column. Filter a projected copy of the field, or remove the filter.",
                 f.field.name
             )));

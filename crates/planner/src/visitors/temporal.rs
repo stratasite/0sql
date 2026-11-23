@@ -9,7 +9,7 @@ use crate::sql::dates::parse_value;
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
 use crate::visitors::grain::{create_agg_node, create_merge_node, grain_key};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -88,7 +88,7 @@ fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQu
     let t = temporalizer(mp);
     let field = mp.field().expect("measure field");
     let agg = graph.live().find(|n| n.purpose.is_none() && n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid)).map(|n| n.id);
-    let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
+    let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
     let calc = transformed_calculation(graph, semantic, q, field, &t, Some(agg), Some(mp))?;
     let sql = if t.bool("percent_change", false) {
         format!(
@@ -198,7 +198,7 @@ fn transformed_formula<'a>(
             out = entity_gsub(&out, &pj.proj.alias(), &format!("[{}]", tf.alias()));
         } else if pj.is_calculation() {
             if seen.contains(&pj.proj.pid) {
-                return Err(PlanError::Resolution(format!("Calculation {} references itself through {}", calc.alias(), pj.proj.alias())));
+                return Err(Error::Resolution(format!("Calculation {} references itself through {}", calc.alias(), pj.proj.alias())));
             }
             seen.push(pj.proj.pid);
             let inner = transformed_formula(graph, semantic, q, &pj.proj, merge, t, seen)?;
@@ -255,7 +255,7 @@ fn transformed_calculation<'a>(
             .live()
             .find(|n| n.purpose.is_none() && n.kind == NodeKind::Aggregation && n.has_field(measure.id))
             .map(|n| n.id)
-            .ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", measure.name)))?,
+            .ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", measure.name)))?,
     };
     let transformed = find_or_create_transformed_node(graph, semantic, q, measure, t, agg)?;
     let alias = digest(&measure.name, t);
@@ -388,11 +388,11 @@ fn transform_date_filters<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, 
     let format = graph.dialect.date_format().to_string();
     for f in graph.nodes[id].filters.iter_mut().filter(|f| f.is_date()) {
         let value = f.filter_value.clone().unwrap_or_default();
-        let start = parse_value(&value, false).ok_or_else(|| PlanError::Resolution(format!("cannot parse date {value}")))?;
+        let start = parse_value(&value, false).ok_or_else(|| Error::Resolution(format!("cannot parse date {value}")))?;
         let mut fv = shift_back(start, &u);
         let mut fve = if f.predicate == Predicate::Between {
             let end = f.filter_value_end.clone().unwrap_or_default();
-            shift_back(parse_value(&end, true).ok_or_else(|| PlanError::Resolution(format!("cannot parse date {end}")))?, &u)
+            shift_back(parse_value(&end, true).ok_or_else(|| Error::Resolution(format!("cannot parse date {end}")))?, &u)
         } else {
             f.predicate = Predicate::Between;
             start - Duration::days(1)

@@ -3,7 +3,7 @@
 
 use crate::model::RFilter;
 use crate::universe::{Base, Model, Subtree};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
     if measures.is_empty() {
         let first = models.first().cloned().ok_or_else(|| {
             let names: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
-            PlanError::Resolution(format!("no table reaches every dimension of the query together: {}", names.join(", ")))
+            Error::Resolution(format!("no table reaches every dimension of the query together: {}", names.join(", ")))
         })?;
         pruned.push(first);
     } else {
@@ -54,7 +54,7 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
                 .cloned()
                 .ok_or_else(|| {
                     let dims: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
-                    PlanError::Resolution(format!(
+                    Error::Resolution(format!(
                         "no table holding the measure {} reaches every dimension of the query ({}); it may need a join path, or the dimensions may belong to different tables",
                         m.name,
                         dims.join(", ")
@@ -67,7 +67,7 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
                 .iter()
                 .find(|u| u.has_field(d.id))
                 .cloned()
-                .ok_or_else(|| PlanError::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id)))?;
+                .ok_or_else(|| Error::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id)))?;
             pruned.push(u);
         }
     }

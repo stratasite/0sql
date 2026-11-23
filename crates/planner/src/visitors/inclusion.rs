@@ -4,7 +4,7 @@
 use crate::dag::{Entity, Filtered, Graph, NodeId, NodeKind, Projected, RefKey, Reference};
 use crate::model::{RProjection, RQuery};
 use crate::visitors::grain::*;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Field, FilterMode, SemanticModel};
 
@@ -44,8 +44,7 @@ fn process<'a>(
     if let Some(target) = find_equivalent_agg(graph, &dims, &filters, measure, &signature) {
         let root = graph.root();
         let (projs, _) = move_measure_components(graph, id, target, measure);
-        let out =
-            graph.nodes[target].outputs.first().copied().ok_or_else(|| PlanError::Resolution("inclusion target has no output".into()))?;
+        let out = graph.nodes[target].outputs.first().copied().ok_or_else(|| Error::Resolution("inclusion target has no output".into()))?;
         for p in projs {
             create_calculation(graph, &p, target, out, root, semantic);
         }
@@ -66,7 +65,7 @@ fn process<'a>(
     let all_local = projections.iter().all(|p| p.field.map(|f| base.has_field(f.id)).unwrap_or(true))
         && filters.iter().all(|f| base.has_field(f.field().id));
     if !all_local {
-        return Err(PlanError::Unimplemented("inclusion sub-plan outside the node's universe"));
+        return Err(Error::Unimplemented("inclusion sub-plan outside the node's universe"));
     }
     let extended = create_agg_node(graph, semantic, q, base, projections, filters.iter().map(|f| f.filter.clone()).collect())?;
     visited.push(extended);

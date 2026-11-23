@@ -2,7 +2,7 @@
 //! its semantic field. Components are shared by `Rc` so a node's wrapper and
 //! the query's own list refer to the same record, as Rails' object identity does.
 
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -299,7 +299,7 @@ fn resolve_hints<'a>(semantic: &'a SemanticModel, hints: &[String], whose: &dyn 
             [] => unknown.push(format!("{h}{}", did_you_mean(semantic, h))),
             several => {
                 let names: Vec<&str> = several.iter().map(|t| t.uid.as_str()).collect();
-                return Err(PlanError::Resolution(format!(
+                return Err(Error::Resolution(format!(
                     "{} hint {h} names {} tables; say which by uid: {}",
                     whose(),
                     several.len(),
@@ -309,7 +309,7 @@ fn resolve_hints<'a>(semantic: &'a SemanticModel, hints: &[String], whose: &dyn 
         }
     }
     if !unknown.is_empty() {
-        return Err(PlanError::Resolution(format!("{} hints name no table: {}", whose(), unknown.join("; "))));
+        return Err(Error::Resolution(format!("{} hints name no table: {}", whose(), unknown.join("; "))));
     }
     Ok(out)
 }
@@ -447,9 +447,7 @@ impl<'a> RQuery<'a> {
         for p in &def.projections {
             let field = match (&p.field_uid, p.is_calculation()) {
                 (Some(uid), false) => Some(semantic.field_by_uid(uid, p.field_kind).ok_or_else(|| {
-                    PlanError::Resolution(format!(
-                        "Query is not valid: [\"Projections Field {uid} is no longer available in this branch\"]"
-                    ))
+                    Error::Resolution(format!("Query is not valid: [\"Projections Field {uid} is no longer available in this branch\"]"))
                 })?),
                 _ => None,
             };
@@ -457,7 +455,7 @@ impl<'a> RQuery<'a> {
                 if d.kind == DecoratorKind::Truncate {
                     let Some(f) = field else { continue };
                     if !f.is_date() {
-                        return Err(PlanError::Resolution("Query is not valid: only date/datetime types can be date truncated".into()));
+                        return Err(Error::Resolution("Query is not valid: only date/datetime types can be date truncated".into()));
                     }
                     let grains: Vec<&str> = if f.grains.is_empty() {
                         vec!["day", "month", "week", "quarter", "year"]
@@ -466,7 +464,7 @@ impl<'a> RQuery<'a> {
                     };
                     if let Some(g) = d.grain() {
                         if !grains.contains(&g) {
-                            return Err(PlanError::Resolution(format!(
+                            return Err(Error::Resolution(format!(
                                 "Query is not valid: Decorators has errors ({g} is not an enabled date grain for {})",
                                 f.name
                             )));
@@ -502,10 +500,7 @@ impl<'a> RQuery<'a> {
         let mut by_ref = std::collections::HashMap::new();
         for (i, f) in def.filters.iter().enumerate() {
             let field = semantic.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
-                PlanError::Resolution(format!(
-                    "Query is not valid: [\"Filters Field {} is no longer available in this branch\"]",
-                    f.field_uid
-                ))
+                Error::Resolution(format!("Query is not valid: [\"Filters Field {} is no longer available in this branch\"]", f.field_uid))
             })?;
             by_ref.insert(f.reference.as_str(), i);
             filters.push(Rc::new(RFilter { fid: i, def: f.clone(), field }));
@@ -557,7 +552,7 @@ impl<'a> RQuery<'a> {
             }
             for f in &s.filters {
                 let field = semantic.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
-                    PlanError::Resolution(format!("Query is not valid: [\"Segment filter field {} is no longer available\"]", f.field_uid))
+                    Error::Resolution(format!("Query is not valid: [\"Segment filter field {} is no longer available\"]", f.field_uid))
                 })?;
                 sby_ref.insert(f.reference.as_str(), fid);
                 sfilters.push(Rc::new(RFilter { fid, def: f.clone(), field }));
@@ -725,7 +720,7 @@ pub fn check_supported(q: &RQuery, semantic: &SemanticModel, principal: Option<&
         }
         for f in &p.field_refs {
             if f.exclusion_type.is_some() || f.inclusions.is_some() {
-                return Err(PlanError::Unimplemented("calculations over rule-bearing measures"));
+                return Err(Error::Unimplemented("calculations over rule-bearing measures"));
             }
         }
     }
