@@ -1,4 +1,4 @@
-//! The query bound to a universe: every projection and filter resolved to
+//! The query bound to a semantic model: every projection and filter resolved to
 //! its semantic field. Components are shared by `Rc` so a node's wrapper and
 //! the query's own list refer to the same record, as Rails' object identity does.
 
@@ -22,7 +22,7 @@ fn next_pid() -> usize {
 }
 
 #[derive(Debug)]
-pub struct RProjection<'a> {
+pub struct ResolvedProjection<'a> {
     /// Identity: two wrappers of the same projection share a pid.
     pub pid: usize,
     pub def: Projection,
@@ -32,7 +32,7 @@ pub struct RProjection<'a> {
     /// Engine-created projections carry no ordinal and never render for the user.
     pub is_static: bool,
     /// The persisted projection an engine calculation descends from.
-    pub source: RefCell<Option<Rc<RProjection<'a>>>>,
+    pub source: RefCell<Option<Rc<ResolvedProjection<'a>>>>,
     /// Whether the projection is a saved record (engine-built ones are not).
     pub persisted: bool,
     /// Measure-level segment links on this projection: (segment sid, mode).
@@ -41,7 +41,7 @@ pub struct RProjection<'a> {
     pub carried_from: Option<(usize, usize)>,
 }
 
-impl<'a> RProjection<'a> {
+impl<'a> ResolvedProjection<'a> {
     pub fn for_field(field: &'a Field) -> Self {
         let def = Projection {
             reference: String::new(),
@@ -65,7 +65,7 @@ impl<'a> RProjection<'a> {
             is_static: false,
             source_ref: None,
         };
-        RProjection {
+        ResolvedProjection {
             pid: next_pid(),
             def,
             field: Some(field),
@@ -127,7 +127,7 @@ impl<'a> RProjection<'a> {
         def.projection_refs = vec![];
         let mut field_refs = dimension_refs;
         field_refs.extend(measure_refs);
-        RProjection {
+        ResolvedProjection {
             pid: next_pid(),
             def,
             field: None,
@@ -140,18 +140,18 @@ impl<'a> RProjection<'a> {
         }
     }
 
-    pub fn source(&self) -> Option<Rc<RProjection<'a>>> {
+    pub fn source(&self) -> Option<Rc<ResolvedProjection<'a>>> {
         self.source.borrow().clone()
     }
 
-    pub fn set_source(&self, s: Option<Rc<RProjection<'a>>>) {
+    pub fn set_source(&self, s: Option<Rc<ResolvedProjection<'a>>>) {
         *self.source.borrow_mut() = s;
     }
 
     /// A copy sharing the pid, so the seat and identity of a static stay
     /// while provenance or decorators are set on it.
     pub fn clone_shallow(&self) -> Self {
-        RProjection {
+        ResolvedProjection {
             pid: self.pid,
             def: self.def.clone(),
             field: self.field,
@@ -215,11 +215,11 @@ impl<'a> RProjection<'a> {
     }
 
     /// Rails `Projection#to_s` / `Calculation#to_s`; part of node identity.
-    pub fn to_s(&self) -> String {
+    pub fn identity(&self) -> String {
         if self.is_calculation() {
             format!("<calc:{}:{}>", self.alias(), self.def.sql.clone().unwrap_or_default())
         } else {
-            format!("<proj:{}>", self.field.map(field_to_s).unwrap_or_default())
+            format!("<proj:{}>", self.field.map(field_identity).unwrap_or_default())
         }
     }
 
@@ -239,7 +239,7 @@ impl<'a> RProjection<'a> {
 
     /// Rails `Calculation#measure_dependent?`: stands on a measure by
     /// classification, by @m reference, or through a projected measure's alias.
-    pub fn measure_dependent(&self, projections: &[Rc<RProjection<'a>>]) -> bool {
+    pub fn measure_dependent(&self, projections: &[Rc<ResolvedProjection<'a>>]) -> bool {
         self.is_measure()
             || !self.def.measure_refs.is_empty()
             || self.def.projection_refs.iter().any(|a| projections.iter().any(|p| p.match_alias(a) && p.is_measure()))
@@ -253,7 +253,7 @@ pub fn sorted_decorators(decs: &[Decorator]) -> Vec<&Decorator> {
 }
 
 /// Rails `Semantic::Field#to_s`: `[Name]@D` / `[Name]@M`.
-pub fn field_to_s(f: &Field) -> String {
+pub fn field_identity(f: &Field) -> String {
     let k = match f.kind {
         FieldKind::Dimension => "D",
         FieldKind::Measure => "M",
@@ -262,19 +262,19 @@ pub fn field_to_s(f: &Field) -> String {
 }
 
 /// Rails `Semantic::Table#to_s`: `[datasource_uid:table_uid]`.
-pub fn table_to_s(semantic: &SemanticModel, t: &Table) -> String {
+pub fn table_identity(semantic: &SemanticModel, t: &Table) -> String {
     let ds = semantic.datasource(t.datasource_id).map(|d| d.uid.as_str()).unwrap_or("");
     format!("[{}:{}]", ds, t.uid)
 }
 
 #[derive(Debug)]
-pub struct RFilter<'a> {
+pub struct ResolvedFilter<'a> {
     pub fid: usize,
     pub def: Filter,
     pub field: &'a Field,
 }
 
-impl<'a> RFilter<'a> {
+impl<'a> ResolvedFilter<'a> {
     pub fn is_measure(&self) -> bool {
         self.field.is_measure()
     }
@@ -343,28 +343,28 @@ fn did_you_mean(semantic: &SemanticModel, term: &str) -> String {
 }
 
 #[derive(Debug)]
-pub struct RQuery<'a> {
+pub struct ResolvedQuery<'a> {
     pub def: Query,
-    pub projections: Vec<Rc<RProjection<'a>>>,
-    pub filters: Vec<Rc<RFilter<'a>>>,
+    pub projections: Vec<Rc<ResolvedProjection<'a>>>,
+    pub filters: Vec<Rc<ResolvedFilter<'a>>>,
     pub hints: Vec<&'a Table>,
     /// The tree over filter fids, defaulting to a flat AND of every filter.
     pub tree: FilledTree,
     /// Static calculations visitors append to the query while planning
     /// (Rails pushes them onto the association target).
-    pub extras: std::cell::RefCell<Vec<Rc<RProjection<'a>>>>,
+    pub extras: std::cell::RefCell<Vec<Rc<ResolvedProjection<'a>>>>,
     /// Segments the queryable can see, in creation order (sid = index).
-    pub segments: Vec<Rc<RSegment<'a>>>,
+    pub segments: Vec<Rc<ResolvedSegment<'a>>>,
 }
 
 /// A segment bound to the universe: its own projections, filters and tree,
 /// and where it is applied.
 #[derive(Debug)]
-pub struct RSegment<'a> {
+pub struct ResolvedSegment<'a> {
     pub sid: usize,
     pub def: zsql_spec::Segment,
-    pub projections: Vec<Rc<RProjection<'a>>>,
-    pub filters: Vec<Rc<RFilter<'a>>>,
+    pub projections: Vec<Rc<ResolvedProjection<'a>>>,
+    pub filters: Vec<Rc<ResolvedFilter<'a>>>,
     pub tree: FilledTree,
     /// Whether the raw tree is anything but a flat AND (node identity).
     pub custom_tree: bool,
@@ -373,7 +373,7 @@ pub struct RSegment<'a> {
     pub hints: Vec<&'a Table>,
 }
 
-impl<'a> RSegment<'a> {
+impl<'a> ResolvedSegment<'a> {
     pub fn name(&self) -> String {
         self.def.name.clone().unwrap_or_default()
     }
@@ -389,8 +389,8 @@ impl<'a> RSegment<'a> {
     }
 
     /// The query this segment plans as, for its population.
-    pub fn as_query(&self) -> RQuery<'a> {
-        RQuery {
+    pub fn as_query(&self) -> ResolvedQuery<'a> {
+        ResolvedQuery {
             def: zsql_spec::Query {
                 population: true,
                 name: self.def.name.clone(),
@@ -441,9 +441,9 @@ impl FilledTree {
     }
 }
 
-impl<'a> RQuery<'a> {
+impl<'a> ResolvedQuery<'a> {
     pub fn resolve(semantic: &'a SemanticModel, def: Query) -> Result<Self> {
-        let mut projections: Vec<RProjection<'a>> = Vec::new();
+        let mut projections: Vec<ResolvedProjection<'a>> = Vec::new();
         for p in &def.projections {
             let field = match (&p.field_uid, p.is_calculation()) {
                 (Some(uid), false) => Some(semantic.field_by_uid(uid, p.field_kind).ok_or_else(|| {
@@ -484,7 +484,7 @@ impl<'a> RQuery<'a> {
                 }
             }
             let is_static = p.is_static;
-            projections.push(RProjection {
+            projections.push(ResolvedProjection {
                 pid: next_pid(),
                 def: p.clone(),
                 field,
@@ -503,7 +503,7 @@ impl<'a> RQuery<'a> {
                 Error::Resolution(format!("Query is not valid: [\"Filters Field {} is no longer available in this branch\"]", f.field_uid))
             })?;
             by_ref.insert(f.reference.as_str(), i);
-            filters.push(Rc::new(RFilter { fid: i, def: f.clone(), field }));
+            filters.push(Rc::new(ResolvedFilter { fid: i, def: f.clone(), field }));
         }
         let tree = match &def.filter_tree {
             Some(t) => FilledTree::from_tree(t, &by_ref).unwrap_or(FilledTree::Group("and".into(), vec![])),
@@ -514,7 +514,7 @@ impl<'a> RQuery<'a> {
         // Segments: their own components, then links resolved onto the
         // query's projections and carried columns onto their definitions.
         let mut fid = filters.len();
-        let mut segments: Vec<RSegment<'a>> = Vec::new();
+        let mut segments: Vec<ResolvedSegment<'a>> = Vec::new();
         for (sid, s) in def.segments.iter().enumerate() {
             let mut sprojs = Vec::new();
             for p in &s.projections {
@@ -533,7 +533,7 @@ impl<'a> RQuery<'a> {
                         field_refs.push(f);
                     }
                 }
-                sprojs.push(Rc::new(RProjection {
+                sprojs.push(Rc::new(ResolvedProjection {
                     pid: next_pid(),
                     def: p.clone(),
                     field,
@@ -545,7 +545,7 @@ impl<'a> RQuery<'a> {
                     carried_from: None,
                 }));
             }
-            let mut sfilters: Vec<Rc<RFilter<'a>>> = Vec::new();
+            let mut sfilters: Vec<Rc<ResolvedFilter<'a>>> = Vec::new();
             let mut sby_ref = std::collections::HashMap::new();
             for (q_ref, &q_fid) in &by_ref {
                 sby_ref.insert(*q_ref, q_fid);
@@ -555,7 +555,7 @@ impl<'a> RQuery<'a> {
                     Error::Resolution(format!("Query is not valid: [\"Segment filter field {} is no longer available\"]", f.field_uid))
                 })?;
                 sby_ref.insert(f.reference.as_str(), fid);
-                sfilters.push(Rc::new(RFilter { fid, def: f.clone(), field }));
+                sfilters.push(Rc::new(ResolvedFilter { fid, def: f.clone(), field }));
                 fid += 1;
             }
             let (stree, custom) = match &s.filter_tree {
@@ -583,7 +583,7 @@ impl<'a> RQuery<'a> {
                 Some(name) => format!("segment '{name}'"),
                 None => "the segment's".to_string(),
             })?;
-            segments.push(RSegment {
+            segments.push(ResolvedSegment {
                 sid,
                 def: s.clone(),
                 projections: sprojs,
@@ -611,9 +611,9 @@ impl<'a> RQuery<'a> {
                 }
             }
         }
-        let projections: Vec<Rc<RProjection<'a>>> = projections.into_iter().map(Rc::new).collect();
+        let projections: Vec<Rc<ResolvedProjection<'a>>> = projections.into_iter().map(Rc::new).collect();
         let segments = segments.into_iter().map(Rc::new).collect();
-        Ok(RQuery { def, projections, filters, hints, tree, extras: Default::default(), segments })
+        Ok(ResolvedQuery { def, projections, filters, hints, tree, extras: Default::default(), segments })
     }
 
     /// Whether this is a segment planned for its own population.
@@ -621,7 +621,7 @@ impl<'a> RQuery<'a> {
         self.def.population
     }
 
-    pub fn segment(&self, sid: usize) -> Option<&Rc<RSegment<'a>>> {
+    pub fn segment(&self, sid: usize) -> Option<&Rc<ResolvedSegment<'a>>> {
         self.segments.iter().find(|s| s.sid == sid)
     }
 
@@ -657,24 +657,24 @@ impl<'a> RQuery<'a> {
 
     /// The query's projections as Rails sees them mid-plan: its own plus
     /// the statics appended so far.
-    pub fn all_projections(&self) -> Vec<Rc<RProjection<'a>>> {
+    pub fn all_projections(&self) -> Vec<Rc<ResolvedProjection<'a>>> {
         let mut v = self.projections.clone();
         v.extend(self.extras.borrow().iter().cloned());
         v
     }
 
-    pub fn push_static(&self, calc: Rc<RProjection<'a>>) {
+    pub fn push_static(&self, calc: Rc<ResolvedProjection<'a>>) {
         self.extras.borrow_mut().push(calc);
     }
 
     /// Rails `Query.static_calc`: a measure calculation over the formula,
     /// with its `[Name]@m`, `[Name]@d` and `[Alias]` references resolved,
     /// seated after the query's projections and appended to them.
-    pub fn static_calc(&self, semantic: &'a SemanticModel, alias: &str, sql: &str) -> Rc<RProjection<'a>> {
+    pub fn static_calc(&self, semantic: &'a SemanticModel, alias: &str, sql: &str) -> Rc<ResolvedProjection<'a>> {
         let (measures, dims, projs) = crate::sql::expr::parse_refs(sql);
         let measure_refs: Vec<&Field> = measures.iter().filter_map(|n| semantic.field_by_name(n, FieldKind::Measure)).collect();
         let dimension_refs: Vec<&Field> = dims.iter().filter_map(|n| semantic.field_by_name(n, FieldKind::Dimension)).collect();
-        let mut rp = RProjection::for_calc_typed(
+        let mut rp = ResolvedProjection::for_calc_typed(
             sql.to_string(),
             alias.to_string(),
             Some(self.next_ordinal()),
@@ -710,7 +710,7 @@ impl<'a> RQuery<'a> {
 }
 
 /// Refuses, as unimplemented, queries that need visitors not yet ported.
-pub fn check_supported(q: &RQuery, semantic: &SemanticModel, principal: Option<&SecurityContext>) -> Result<()> {
+pub fn check_supported(q: &ResolvedQuery, semantic: &SemanticModel, principal: Option<&SecurityContext>) -> Result<()> {
     for p in &q.projections {
         for d in &p.def.decorators {
             match d.kind {

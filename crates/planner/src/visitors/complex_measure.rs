@@ -3,7 +3,7 @@
 //! arrive as plain columns from sub-graphs planned for them.
 
 use crate::dag::{Entity, Graph, MultiExpr, Node, NodeId, NodeKind, RefKey, Reference};
-use crate::model::{FilledTree, RFilter, RProjection, RQuery};
+use crate::resolved::{FilledTree, ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::{Error, Result};
@@ -13,8 +13,8 @@ use zsql_semantic::{Field, SemanticModel};
 
 /// A compound component of a node and the measures it needs from elsewhere.
 enum Component<'a> {
-    Proj(Rc<RProjection<'a>>),
-    Filter(Rc<RFilter<'a>>),
+    Proj(Rc<ResolvedProjection<'a>>),
+    Filter(Rc<ResolvedFilter<'a>>),
 }
 
 impl<'a> Component<'a> {
@@ -31,7 +31,7 @@ pub fn run<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<()> {
     let mut registry: HashMap<i64, Signature> = HashMap::new();
     for id in graph.post_order() {
@@ -48,7 +48,7 @@ fn register_reference_signatures<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     component: &Component<'a>,
     registry: &mut HashMap<i64, Signature>,
 ) -> Result<()> {
@@ -76,7 +76,7 @@ fn register_reference_signatures<'a>(
     Ok(())
 }
 
-fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Error {
+fn conflict<'a>(component: &Component<'a>, field: &Field, q: &ResolvedQuery<'a>) -> Error {
     let links = match component {
         Component::Proj(p) => component_links(p),
         Component::Filter(_) => vec![],
@@ -102,7 +102,7 @@ fn visit<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     registry: &mut HashMap<i64, Signature>,
 ) -> Result<()> {
     if graph.nodes[id].removed || graph.nodes[id].kind == NodeKind::Merge {
@@ -173,7 +173,7 @@ fn setup_merge_node<'a>(
     id: NodeId,
     semantic: &'a SemanticModel,
     component: &Component<'a>,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<NodeId> {
     let root = graph.root();
     let merge = if graph.nodes[root].is_merge() {
@@ -216,7 +216,7 @@ fn project_local_reference<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a 
     for mid in &exp.measure_ref_ids {
         if !has_clean_projected_measure(&graph.nodes[id], *mid) && base.has_measure(*mid) {
             let m = semantic.field(*mid).expect("measure");
-            let mut rp = RProjection::for_field(m);
+            let mut rp = ResolvedProjection::for_field(m);
             rp.def.ordinal = Some(graph.nodes[id].projections.len() as i64);
             graph.nodes[id].add_projection(Rc::new(rp));
         }
@@ -236,7 +236,7 @@ fn create_non_local_measure_graph<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     component: &Component<'a>,
     measures: Vec<&'a Field>,
 ) -> Result<()> {
@@ -255,13 +255,13 @@ fn create_non_local_measure_graph<'a>(
     // The sub-query: the main query's dimensions (same records) plus the
     // missing measures, with the main query's dimension filters and any
     // filter on the component's own field lent to it.
-    let mut projections: Vec<Rc<RProjection<'a>>> = q.all_projections().into_iter().filter(|p| p.is_dimension()).collect();
+    let mut projections: Vec<Rc<ResolvedProjection<'a>>> = q.all_projections().into_iter().filter(|p| p.is_dimension()).collect();
     for m in stack {
-        let mut rp = RProjection::for_field(m);
+        let mut rp = ResolvedProjection::for_field(m);
         rp.def.ordinal = Some(projections.len() as i64);
         projections.push(Rc::new(rp));
     }
-    let filters: Vec<Rc<RFilter<'a>>> = q
+    let filters: Vec<Rc<ResolvedFilter<'a>>> = q
         .filters
         .iter()
         .filter(|f| f.is_dimension())
@@ -269,7 +269,7 @@ fn create_non_local_measure_graph<'a>(
         .cloned()
         .collect();
     let name = format!("{}-subgraph", q.def.name.clone().unwrap_or_default());
-    let sub = RQuery {
+    let sub = ResolvedQuery {
         def: zsql_spec::Query::planner_sub(name),
         projections,
         filters: filters.clone(),
@@ -298,26 +298,26 @@ fn create_segmented_component_graph<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
-    component: &Rc<RProjection<'a>>,
+    q: &ResolvedQuery<'a>,
+    component: &Rc<ResolvedProjection<'a>>,
 ) -> Result<()> {
     let exp = graph.nodes[id].expression(semantic, component.field.expect("measure"))?;
     let measures: Vec<&Field> = exp.measure_ref_ids.iter().filter_map(|m| semantic.field(*m)).collect();
-    let mut projections: Vec<Rc<RProjection<'a>>> = q.all_projections().into_iter().filter(|p| p.is_dimension()).collect();
+    let mut projections: Vec<Rc<ResolvedProjection<'a>>> = q.all_projections().into_iter().filter(|p| p.is_dimension()).collect();
     for m in &measures {
-        let mut rp = RProjection::for_field(m);
+        let mut rp = ResolvedProjection::for_field(m);
         rp.def.ordinal = Some(projections.len() as i64);
         rp.set_source(Some(component.clone()));
         projections.push(Rc::new(rp));
     }
-    let filters: Vec<Rc<RFilter<'a>>> = q
+    let filters: Vec<Rc<ResolvedFilter<'a>>> = q
         .filters
         .iter()
         .filter(|f| f.is_dimension())
         .chain(q.filters.iter().filter(|f| f.field.id == component.field.expect("measure").id))
         .cloned()
         .collect();
-    let sub = RQuery {
+    let sub = ResolvedQuery {
         def: zsql_spec::Query::planner_sub(format!("{}-subgraph", q.def.name.clone().unwrap_or_default())),
         projections,
         filters: filters.clone(),
@@ -373,7 +373,7 @@ fn build_from_existing_agg<'a>(graph: &mut Graph<'a>, measure: &'a Field) -> Opt
     if node.is_agg()
         && !node.projections.iter().any(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false) && p.decorators().is_empty())
     {
-        let mut rp = RProjection::for_field(measure);
+        let mut rp = ResolvedProjection::for_field(measure);
         rp.def.ordinal = Some(node.projections.len() as i64);
         node.add_projection(Rc::new(rp));
     }

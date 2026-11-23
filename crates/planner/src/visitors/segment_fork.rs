@@ -4,8 +4,8 @@
 //! later visitors derive is born already forked.
 
 use crate::dag::{Filtered, Graph, NodeId, NodeKind, Projected};
-use crate::model::{RFilter, RProjection, RQuery};
 use crate::pruner::sort_for_max_hints_and_dims;
+use crate::resolved::{ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::resolver::set_subtrees;
 use crate::universe::{Base, Universes};
 use crate::visitors::grain::{create_agg_node, create_merge_node, dimensionally_equivalent};
@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use zsql_semantic::{Field, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, universes: &Universes<'a>, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, universes: &Universes<'a>, q: &ResolvedQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         if graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
             continue;
@@ -25,7 +25,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, universes: &U
         let mut order: Vec<usize> = (0..buckets.len()).collect();
         order.sort_by_cached_key(|i| {
             let (sig, uni, _) = &buckets[*i];
-            (if sig.is_empty() { 0 } else { 1 }, sig_to_s(sig), uni.to_s().to_string())
+            (if sig.is_empty() { 0 } else { 1 }, sig_identity(sig), uni.identity().to_string())
         });
         let home = order[0];
         for i in order.iter().skip(1) {
@@ -45,12 +45,18 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, universes: &U
 }
 
 /// Ruby `Array#to_s` of a signature, as Rails sorts buckets by it.
-fn sig_to_s(sig: &Signature) -> String {
+fn sig_identity(sig: &Signature) -> String {
     let parts: Vec<String> = sig.iter().map(|(s, m)| format!("[{}, \"{}\"]", s, m.name())).collect();
     format!("[{}]", parts.join(", "))
 }
 
-fn rebind_universe<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>, base: Arc<Base<'a>>) -> Result<()> {
+fn rebind_universe<'a>(
+    graph: &mut Graph<'a>,
+    id: NodeId,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    base: Arc<Base<'a>>,
+) -> Result<()> {
     graph.nodes[id].projections.retain(|p| p.proj.persisted || p.field().map(|f| base.has_field(f.id)).unwrap_or(true));
     graph.nodes[id].universe = Some(base);
     set_subtrees(graph, id, semantic, q)
@@ -63,18 +69,18 @@ fn materialize_filter_columns<'a>(graph: &mut Graph<'a>, id: NodeId) {
         let clean =
             graph.nodes[id].projections.iter().any(|p| p.field().map(|x| x.id == f.id).unwrap_or(false) && p.decorators().is_empty());
         if !clean {
-            graph.nodes[id].add_projection(Rc::new(RProjection::for_field(f)));
+            graph.nodes[id].add_projection(Rc::new(ResolvedProjection::for_field(f)));
         }
     }
 }
 
 /// Measure-level links on a calculation cascade to the aggregations it reads.
-fn adopt_calculation_links<'a>(graph: &mut Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Result<()> {
-    let linked: Vec<Rc<RProjection<'a>>> =
+fn adopt_calculation_links<'a>(graph: &mut Graph<'a>, id: NodeId, q: &ResolvedQuery<'a>) -> Result<()> {
+    let linked: Vec<Rc<ResolvedProjection<'a>>> =
         q.projections.iter().filter(|p| p.is_calculation() && p.persisted && !p.links.is_empty()).cloned().collect();
     for calc in linked {
         for field in referenced_measure_fields(&calc, q)? {
-            let projs: Vec<Rc<RProjection<'a>>> = graph.nodes[id]
+            let projs: Vec<Rc<ResolvedProjection<'a>>> = graph.nodes[id]
                 .projections
                 .iter()
                 .filter(|p| !p.is_calculation() && p.field().map(|f| f.id == field.id).unwrap_or(false))
@@ -94,7 +100,7 @@ fn adopt_calculation_links<'a>(graph: &mut Graph<'a>, id: NodeId, q: &RQuery<'a>
     Ok(())
 }
 
-fn referenced_measure_fields<'a>(calc: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> Result<Vec<&'a Field>> {
+fn referenced_measure_fields<'a>(calc: &Rc<ResolvedProjection<'a>>, q: &ResolvedQuery<'a>) -> Result<Vec<&'a Field>> {
     let mut out: Vec<&Field> = calc.field_refs.iter().copied().filter(|f| f.is_measure()).collect();
     for a in &calc.def.projection_refs {
         let Some(p) = q.projections.iter().find(|p| p.match_alias(a)) else { continue };
@@ -116,7 +122,7 @@ fn referenced_measure_fields<'a>(calc: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> 
     Ok(out)
 }
 
-fn conflict<'a>(calc: &Rc<RProjection<'a>>, name: &str, q: &RQuery<'a>) -> Error {
+fn conflict<'a>(calc: &Rc<ResolvedProjection<'a>>, name: &str, q: &ResolvedQuery<'a>) -> Error {
     let segments: Vec<String> = component_links(calc).iter().filter_map(|(s, _)| q.segment(*s)).map(|s| s.name()).collect();
     Error::Resolution(format!(
         "Segment {} cannot be applied to calculation {}: it references {}, which aggregates outside the calculation's segment. Apply the same segment to it, or remove the reference.",
@@ -126,7 +132,7 @@ fn conflict<'a>(calc: &Rc<RProjection<'a>>, name: &str, q: &RQuery<'a>) -> Error
     ))
 }
 
-type Bucket<'a> = (Signature, Arc<Base<'a>>, Vec<Rc<RProjection<'a>>>);
+type Bucket<'a> = (Signature, Arc<Base<'a>>, Vec<Rc<ResolvedProjection<'a>>>);
 
 /// Measures grouped by (signature, universe); None when nothing is segmented.
 fn bucket_measures<'a>(
@@ -134,16 +140,16 @@ fn bucket_measures<'a>(
     id: NodeId,
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<Option<Vec<Bucket<'a>>>> {
-    let members: Vec<Rc<RProjection<'a>>> =
+    let members: Vec<Rc<ResolvedProjection<'a>>> =
         graph.nodes[id].projections.iter().filter(|p| p.is_measure() && !p.is_calculation()).map(|p| p.proj.clone()).collect();
     if members.iter().all(|p| signature(p).is_empty()) {
         return Ok(None);
     }
     let node_universe = graph.nodes[id].universe.clone().expect("agg universe");
     let mut buckets: Vec<Bucket<'a>> = Vec::new();
-    let push = |sig: Signature, uni: Arc<Base<'a>>, p: Option<Rc<RProjection<'a>>>, buckets: &mut Vec<Bucket<'a>>| match buckets
+    let push = |sig: Signature, uni: Arc<Base<'a>>, p: Option<Rc<ResolvedProjection<'a>>>, buckets: &mut Vec<Bucket<'a>>| match buckets
         .iter_mut()
         .find(|(s, u, _)| *s == sig && u.root.id == uni.root.id)
     {
@@ -155,7 +161,7 @@ fn bucket_measures<'a>(
         None => buckets.push((sig, uni, p.into_iter().collect())),
     };
     // Rails groups by signature first (insertion order), then buckets per group.
-    let mut groups: Vec<(Signature, Vec<Rc<RProjection<'a>>>)> = Vec::new();
+    let mut groups: Vec<(Signature, Vec<Rc<ResolvedProjection<'a>>>)> = Vec::new();
     for p in &members {
         let sig = signature(p);
         match groups.iter_mut().find(|(s, _)| *s == sig) {
@@ -183,7 +189,7 @@ fn bucket_measures<'a>(
 }
 
 /// The persisted projection a measure filter belongs to.
-fn owner_projection<'a>(node: &crate::dag::Node<'a>, f: &Filtered<'a>) -> Option<Rc<RProjection<'a>>> {
+fn owner_projection<'a>(node: &crate::dag::Node<'a>, f: &Filtered<'a>) -> Option<Rc<ResolvedProjection<'a>>> {
     node.projections
         .iter()
         .find(|p| {
@@ -201,8 +207,8 @@ fn fork_measures<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
-    projs: &[Rc<RProjection<'a>>],
+    q: &ResolvedQuery<'a>,
+    projs: &[Rc<ResolvedProjection<'a>>],
     sig: &Signature,
     uni: Arc<Base<'a>>,
 ) -> Result<()> {
@@ -214,7 +220,7 @@ fn fork_measures<'a>(
             .cloned()
             .collect()
     };
-    let followers: Vec<Rc<RProjection<'a>>> = graph.nodes[id]
+    let followers: Vec<Rc<ResolvedProjection<'a>>> = graph.nodes[id]
         .projections
         .iter()
         .filter(|p| {
@@ -225,14 +231,14 @@ fn fork_measures<'a>(
         })
         .map(|p| p.proj.clone())
         .collect();
-    let mut built: Vec<Rc<RProjection<'a>>> = Vec::new();
+    let mut built: Vec<Rc<ResolvedProjection<'a>>> = Vec::new();
     for f in &moved_filters {
         let projected = projs.iter().chain(followers.iter()).any(|p| p.field_id() == Some(f.field().id) && p.def.decorators.is_empty());
         if !projected {
-            built.push(Rc::new(RProjection::for_field(f.field())));
+            built.push(Rc::new(ResolvedProjection::for_field(f.field())));
         }
     }
-    let moved: Vec<Rc<RProjection<'a>>> = projs.iter().cloned().chain(followers.iter().cloned()).collect();
+    let moved: Vec<Rc<ResolvedProjection<'a>>> = projs.iter().cloned().chain(followers.iter().cloned()).collect();
     let dims: Vec<Projected<'a>> = graph.nodes[id].projections.iter().filter(|p| p.is_dimension()).cloned().collect();
     let mut filters: Vec<Filtered<'a>> = graph.nodes[id].filters.iter().filter(|f| f.is_dimension()).cloned().collect();
     filters.extend(moved_filters.iter().cloned());
@@ -270,14 +276,14 @@ fn fork_measures<'a>(
             } else {
                 graph.root()
             };
-            let mut projections: Vec<Rc<RProjection<'a>>> = graph.nodes[id]
+            let mut projections: Vec<Rc<ResolvedProjection<'a>>> = graph.nodes[id]
                 .projections
                 .iter()
                 .filter(|p| p.is_dimension() || moved.iter().any(|m| m.pid == p.proj.pid))
                 .map(|p| p.proj.clone())
                 .collect();
             projections.extend(built.iter().cloned());
-            let rfilters: Vec<Rc<RFilter<'a>>> = filters.iter().map(|f| f.filter.clone()).collect();
+            let rfilters: Vec<Rc<ResolvedFilter<'a>>> = filters.iter().map(|f| f.filter.clone()).collect();
             let t = create_agg_node(graph, semantic, q, uni, projections, rfilters)?;
             graph.add_edge(t, merge);
         }
@@ -297,8 +303,8 @@ fn universe_for<'a>(
     id: NodeId,
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
-    q: &RQuery<'a>,
-    p: &Rc<RProjection<'a>>,
+    q: &ResolvedQuery<'a>,
+    p: &Rc<ResolvedProjection<'a>>,
 ) -> Result<Arc<Base<'a>>> {
     let node = &graph.nodes[id];
     let keys = keys_for(p, q);
@@ -329,7 +335,7 @@ fn universe_for<'a>(
         return Err(Error::Resolution(message));
     }
     let dims: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
-    let dim_filters: Vec<Rc<RFilter<'a>>> = node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.filter.clone()).collect();
+    let dim_filters: Vec<Rc<ResolvedFilter<'a>>> = node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.filter.clone()).collect();
     let sorted = sort_for_max_hints_and_dims(candidates, &[field], &dims, &q.hints, &dim_filters, semantic);
     Ok(sorted[0].clone())
 }

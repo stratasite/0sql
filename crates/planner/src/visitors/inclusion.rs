@@ -2,13 +2,13 @@
 //! a lower grain first, then a merge rolls it up with the rule's aggregation.
 
 use crate::dag::{Entity, Filtered, Graph, NodeId, NodeKind, Projected, RefKey, Reference};
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::visitors::grain::*;
 use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Field, FilterMode, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let mut visited: Vec<NodeId> = Vec::new();
     for id in graph.post_order() {
         if visited.contains(&id) || graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
@@ -32,7 +32,7 @@ fn process<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     visited: &mut Vec<NodeId>,
 ) -> Result<()> {
@@ -57,7 +57,7 @@ fn process<'a>(
     let mut root = graph.root();
     let measure_projections: Vec<Projected<'a>> =
         graph.nodes[id].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
-    let mut projections: Vec<Rc<RProjection<'a>>> = dims.iter().map(|d| d.proj.clone()).collect();
+    let mut projections: Vec<Rc<ResolvedProjection<'a>>> = dims.iter().map(|d| d.proj.clone()).collect();
     projections.extend(measure_projections.iter().map(|p| p.proj.clone()));
 
     // The node at the extended dimensionality.
@@ -131,7 +131,7 @@ fn create_calculation<'a>(
     let name = format!("[{}]@m", field.name);
     let sql =
         if rule.aggregation.contains("@exp") { rule.aggregation.replace("@exp", &name) } else { format!("{}({})", rule.aggregation, name) };
-    let calc = Rc::new(RProjection::for_calc(sql, proj.proj.alias(), proj.proj.def.ordinal, vec![field], vec![]));
+    let calc = Rc::new(ResolvedProjection::for_calc(sql, proj.proj.alias(), proj.proj.def.ordinal, vec![field], vec![]));
     graph.nodes[calc_node].add_projection(calc.clone());
     if root != calc_node && !graph.nodes[root].removed {
         graph.nodes[root].field_refs.insert(RefKey::Proj(proj.proj.pid), Reference::Node { entity: Entity::Proj(calc), node: calc_node });
@@ -144,7 +144,7 @@ fn allowed_components<'a>(
     graph: &Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
 ) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
     let node = &graph.nodes[id];
@@ -167,7 +167,7 @@ fn allowed_components<'a>(
     for did in rule_ids {
         if let Some(d) = semantic.field(did) {
             // Built against the query, so it seats after the query's projections.
-            let mut rp = RProjection::for_field(d);
+            let mut rp = ResolvedProjection::for_field(d);
             rp.def.ordinal = Some(q.next_ordinal());
             projections.push(Projected::new(Rc::new(rp)));
         }

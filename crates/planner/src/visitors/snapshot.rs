@@ -3,14 +3,14 @@
 //! per grain and joins back onto the snapshot table.
 
 use crate::dag::{Graph, NodeId, NodeKind, Projected, Strategy, StrategyKind};
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::visitors::grain::{create_agg_node, create_merge_node};
 use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Field, SemanticModel, SnapshotKind, Table};
 use zsql_spec::DecoratorKind;
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         if graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
             continue;
@@ -33,7 +33,7 @@ fn materialize_filtered_snapshots<'a>(graph: &mut Graph<'a>, id: NodeId) {
     for f in fields {
         let projected = graph.nodes[id].projections.iter().any(|p| p.field().map(|x| x.id == f.id).unwrap_or(false));
         if !projected {
-            graph.nodes[id].add_projection(Rc::new(RProjection::for_field(f)));
+            graph.nodes[id].add_projection(Rc::new(ResolvedProjection::for_field(f)));
         }
     }
 }
@@ -81,23 +81,23 @@ fn create_snap_nodes<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     sets: Vec<(String, Vec<&'a Field>)>,
 ) -> Result<()> {
     let mut root = graph.root();
     let mut snap_nodes = Vec::new();
     for (_, measures) in sets {
-        let mut projections: Vec<Rc<RProjection<'a>>> =
+        let mut projections: Vec<Rc<ResolvedProjection<'a>>> =
             graph.nodes[id].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
         for m in &measures {
-            let existing: Vec<Rc<RProjection<'a>>> = graph.nodes[id]
+            let existing: Vec<Rc<ResolvedProjection<'a>>> = graph.nodes[id]
                 .projections
                 .iter()
                 .filter(|p| p.field().map(|f| f.id == m.id).unwrap_or(false))
                 .map(|p| p.proj.clone())
                 .collect();
             if existing.is_empty() {
-                projections.push(Rc::new(RProjection::for_field(m)));
+                projections.push(Rc::new(ResolvedProjection::for_field(m)));
             } else {
                 projections.extend(existing);
             }
@@ -139,7 +139,7 @@ fn create_snap_nodes<'a>(
     Ok(())
 }
 
-fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let first_measure =
         graph.nodes[snap].measures().into_iter().next().ok_or_else(|| Error::Resolution("snapshot node without measure".into()))?;
     let snap_point = first_measure.snapshot;
@@ -158,7 +158,7 @@ fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, semantic: &'a 
 
     let agg = if snap_point == Some(SnapshotKind::Beginning) { "MIN" } else { "MAX" };
     let sql = format!("{agg}([{}]@d)", snap_date_dim.name);
-    let calc = Rc::new(RProjection::for_calc_typed(
+    let calc = Rc::new(ResolvedProjection::for_calc_typed(
         sql,
         "SnapshotJoinDate".into(),
         Some(q.next_ordinal()),
@@ -169,7 +169,7 @@ fn create_snapshot_query<'a>(graph: &mut Graph<'a>, snap: NodeId, semantic: &'a 
     ));
     q.push_static(calc.clone());
 
-    let mut projections: Vec<Rc<RProjection<'a>>> = Vec::new();
+    let mut projections: Vec<Rc<ResolvedProjection<'a>>> = Vec::new();
     if let Some(p) = &snap_date_proj {
         projections.push(p.proj.clone());
     }

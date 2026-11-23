@@ -3,7 +3,7 @@
 //! names a measure rule lists into dimension ids.
 
 use crate::dag::{Filtered, Graph, Node, NodeId, NodeKind, Projected};
-use crate::model::{RFilter, RProjection, RQuery};
+use crate::resolved::{ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::resolver::set_subtrees;
 use crate::universe::Base;
 use crate::Result;
@@ -62,10 +62,10 @@ pub fn measure_signature(node: &Node, measure: &Field) -> crate::visitors::segme
 pub fn create_agg_node<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     base: Arc<Base<'a>>,
-    projections: Vec<Rc<RProjection<'a>>>,
-    filters: Vec<Rc<RFilter<'a>>>,
+    projections: Vec<Rc<ResolvedProjection<'a>>>,
+    filters: Vec<Rc<ResolvedFilter<'a>>>,
 ) -> Result<NodeId> {
     let node = Node::with_universe(NodeKind::Aggregation, base, projections, filters);
     let id = graph.add_node(node);
@@ -74,7 +74,7 @@ pub fn create_agg_node<'a>(
 }
 
 /// Rails `Dag.create_merge_node`.
-pub fn create_merge_node<'a>(graph: &mut Graph<'a>, q: &RQuery<'a>) -> NodeId {
+pub fn create_merge_node<'a>(graph: &mut Graph<'a>, q: &ResolvedQuery<'a>) -> NodeId {
     let filters = q.filters.iter().filter(|f| f.is_measure() && graph.dialect.final_measure_filter()).cloned().collect();
     let merge = Node::merge(q.all_projections(), filters, graph.dialect.final_pass_measure_join_type().to_string());
     graph.add_node(merge)
@@ -168,7 +168,7 @@ pub fn covered_elsewhere(graph: &Graph, id: NodeId) -> bool {
 }
 
 /// Dimension ids a calculation stands on, directly or through aliases.
-pub fn calc_dimension_ids(calc: &RProjection, q: &RQuery) -> Vec<Id> {
+pub fn calc_dimension_ids(calc: &ResolvedProjection, q: &ResolvedQuery) -> Vec<Id> {
     let mut ids: Vec<Id> = calc.field_refs.iter().filter(|f| f.is_dimension()).map(|f| f.id).collect();
     for a in &calc.def.projection_refs {
         if let Some(p) = q.projections.iter().find(|p| p.match_alias(a)) {

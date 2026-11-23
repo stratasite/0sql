@@ -2,12 +2,12 @@
 //! grain without the excluded dimensions, in its own node.
 
 use crate::dag::{Filtered, Graph, NodeId, NodeKind, Projected};
-use crate::model::RQuery;
+use crate::resolved::ResolvedQuery;
 use crate::visitors::grain::*;
 use crate::{Error, Result};
 use zsql_semantic::{ExclusionType, Field, FilterMode, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         if graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
             continue;
@@ -25,7 +25,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a
     Ok(())
 }
 
-fn process<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>, measure: &'a Field) -> Result<()> {
+fn process<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, measure: &'a Field) -> Result<()> {
     let (dims, filters) = allowed_components(graph, id, semantic, q, measure)?;
     if dimensionally_equivalent(&graph.nodes[id], &dims, &filters) {
         return Ok(());
@@ -75,7 +75,7 @@ fn allowed_components<'a>(
     graph: &Graph<'a>,
     id: NodeId,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
 ) -> Result<(Vec<Projected<'a>>, Vec<Filtered<'a>>)> {
     let node = &graph.nodes[id];

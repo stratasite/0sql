@@ -1,7 +1,7 @@
 //! Rails `SqlVisitor`: renders every node to SQL text, inputs first.
 
 use crate::dag::{AliasKey, Entity, Filtered, Graph, Node, NodeId, Projected, RefKey, Reference};
-use crate::model::{FilledTree, RQuery};
+use crate::resolved::{FilledTree, ResolvedQuery};
 use crate::sql::dates::date_lit;
 use crate::sql::expr::{entity_gsub, qualify, ungroupable};
 use crate::sql::Builder;
@@ -9,7 +9,7 @@ use crate::{Error, Result};
 use zsql_semantic::{DataType, Expression, Field, Predicate, SemanticModel};
 use zsql_spec::DecoratorKind;
 
-pub fn run<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         let sql = node_to_sql(graph, semantic, q, id)?;
         *graph.nodes[id].sql.borrow_mut() = Some(sql);
@@ -20,10 +20,10 @@ pub fn run<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -
 struct Ctx<'g, 'a> {
     graph: &'g Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &'g RQuery<'a>,
+    q: &'g ResolvedQuery<'a>,
 }
 
-fn node_to_sql<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>, id: NodeId) -> Result<String> {
+fn node_to_sql<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, id: NodeId) -> Result<String> {
     let cx = Ctx { graph, semantic, q };
     let node = &graph.nodes[id];
     let mut sql = Builder::new();
@@ -414,7 +414,11 @@ fn resolve_expression<'a>(
                 None => paths.into_iter().next(),
             }
             .ok_or_else(|| {
-                Error::Resolution(format!("Could not find table or path for {} with id: {}.", crate::model::field_to_s(field), field.id))
+                Error::Resolution(format!(
+                    "Could not find table or path for {} with id: {}.",
+                    crate::resolved::field_identity(field),
+                    field.id
+                ))
             })?;
             append_path_joins(cx, sql, parent, path);
             path
@@ -425,12 +429,12 @@ fn resolve_expression<'a>(
                 Some(tb) => paths.into_iter().find(|p| p.table_nodes.contains(&tb.id)),
                 None => paths.into_iter().next(),
             }
-            .ok_or_else(|| Error::Resolution(format!("Could not find path for {}", crate::model::field_to_s(field))))?
+            .ok_or_else(|| Error::Resolution(format!("Could not find path for {}", crate::resolved::field_identity(field))))?
         }
     };
     cx.semantic
         .expression_for(path.target_table_id, field.id)
-        .ok_or_else(|| Error::Resolution(format!("Could not find expression for {}", crate::model::field_to_s(field))))
+        .ok_or_else(|| Error::Resolution(format!("Could not find expression for {}", crate::resolved::field_identity(field))))
 }
 
 fn aliased_expression_sql<'a>(cx: &Ctx<'_, 'a>, parent: &Node<'a>, expression: &Expression) -> String {
@@ -473,7 +477,7 @@ fn projection_to_select_sql<'a>(cx: &Ctx<'_, 'a>, p: &Projected<'a>, node: &Node
 fn projection_to_sql<'a>(cx: &Ctx<'_, 'a>, p: &Projected<'a>, node: &Node<'a>) -> Result<String> {
     let r = node
         .get_ref(p.proj.pid, p.proj.field_id())
-        .ok_or_else(|| Error::Resolution(format!("No field reference found for projection: {}", p.to_s())))?;
+        .ok_or_else(|| Error::Resolution(format!("No field reference found for projection: {}", p.identity())))?;
     let base = {
         let _t = crate::profile::span(match r {
             Reference::Table { .. } => "sql.select.table_ref",

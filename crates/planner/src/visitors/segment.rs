@@ -3,7 +3,7 @@
 //! final SQL carries exactly one CTE per segment.
 
 use crate::dag::{Entity, Graph, NodeId, NodeKind, Owner, RefKey, Reference, Strategy, StrategyKind};
-use crate::model::{FilledTree, RQuery, RSegment};
+use crate::resolved::{FilledTree, ResolvedQuery, ResolvedSegment};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::visitors::segmentation::component_links;
@@ -19,7 +19,7 @@ pub fn run<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<()> {
     if q.is_segment() {
         return Ok(());
@@ -68,7 +68,7 @@ fn consumer(n: &crate::dag::Node) -> bool {
 
 /// Measure-level links, then query-level ones not overridden per segment;
 /// unique by (segment, mode), sorted the way Rails sorts them.
-fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, LinkMode)> {
+fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &ResolvedQuery<'a>) -> Vec<(usize, LinkMode)> {
     let node = &graph.nodes[id];
     let mut links: Vec<(usize, LinkMode)> =
         node.projections.iter().filter(|p| p.is_measure()).flat_map(|p| component_links(&p.proj)).collect();
@@ -91,7 +91,7 @@ fn build_segment_node<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    segment: &Rc<RSegment<'a>>,
+    segment: &Rc<ResolvedSegment<'a>>,
 ) -> Result<NodeId> {
     let sq = segment.as_query();
     let opts = Options { datasource: Some(graph.datasource), ..Default::default() };
@@ -124,11 +124,11 @@ fn build_segment_node<'a>(
 
 /// Rails `Node#owner_tree_identity`: a custom tree shape, leaves rendered as
 /// the filter's text, in Ruby's `inspect` form.
-fn tree_identity(segment: &RSegment) -> String {
+fn tree_identity(segment: &ResolvedSegment) -> String {
     if segment.def.filter_tree.is_none() || !segment.custom_tree {
         return String::new();
     }
-    fn render(t: &FilledTree, segment: &RSegment) -> String {
+    fn render(t: &FilledTree, segment: &ResolvedSegment) -> String {
         match t {
             FilledTree::Group(op, kids) => {
                 let mut parts = vec![ruby_str(op)];
@@ -139,7 +139,7 @@ fn tree_identity(segment: &RSegment) -> String {
                 let f = segment.filters.iter().find(|f| f.fid == *fid).expect("segment filter");
                 ruby_str(&format!(
                     "<f:{}:{}:{}>",
-                    crate::model::field_to_s(f.field),
+                    crate::resolved::field_identity(f.field),
                     f.def.predicate.name(),
                     f.def.filter_value.clone().unwrap_or_default()
                 ))
@@ -154,7 +154,7 @@ fn ruby_str(s: &str) -> String {
 }
 
 /// Pre-binds each carried column to the segment node's definition projection.
-fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId, segment: &Rc<RSegment<'a>>) -> Result<()> {
+fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId, segment: &Rc<ResolvedSegment<'a>>) -> Result<()> {
     let carried: Vec<_> = graph.nodes[id]
         .projections
         .iter()
@@ -175,7 +175,7 @@ fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId
     Ok(())
 }
 
-fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Result<()> {
+fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = &graph.nodes[id];
     if node.kind == NodeKind::Merge {
         return Ok(());
@@ -192,7 +192,7 @@ fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -
     Ok(())
 }
 
-fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<RSegment<'a>>, q: &RQuery<'a>) -> Result<()> {
+fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<ResolvedSegment<'a>>, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = &graph.nodes[id];
     let base = node.universe.as_ref().expect("consumer universe");
     let missing: Vec<String> = segment.key_dimensions().iter().filter(|k| !base.has_dimension(k.id)).map(|k| k.name.clone()).collect();

@@ -3,7 +3,7 @@
 //! actually walks. Paths come from the snapshot for now; the formation
 //! crate will compute them.
 
-use crate::model::table_to_s;
+use crate::resolved::table_identity;
 use std::collections::HashSet;
 use std::sync::Arc;
 use zsql_semantic::{Datasource, Field, FieldKind, Id, Path, SemanticModel, Table, Tier};
@@ -23,7 +23,7 @@ pub struct Base<'a> {
     dimension_ids: HashSet<Id>,
     table_nodes: Vec<Id>,
     local_field_ids: HashSet<Id>,
-    to_s: String,
+    identity: String,
     /// The paths grouped by join path, in first-seen order: what every
     /// node's subtrees slice from, computed once per universe.
     groups: Vec<Arc<PathGroup<'a>>>,
@@ -63,7 +63,7 @@ impl<'a> Base<'a> {
         }
         let local_field_ids = semantic.expressions_of(root.id).map(|e| e.field_id).collect();
         let datasource = semantic.datasource(root.datasource_id).expect("table datasource");
-        let to_s = format!("<{}>", table_to_s(semantic, root));
+        let identity = format!("<{}>", table_identity(semantic, root));
         let mut groups: Vec<(Vec<Id>, Vec<&'a Path>)> = Vec::new();
         for p in &paths {
             match groups.iter_mut().find(|(jp, _)| *jp == p.joins) {
@@ -78,7 +78,7 @@ impl<'a> Base<'a> {
                 Arc::new(PathGroup { join_path, paths, join_cost, route })
             })
             .collect();
-        Base { root, datasource, paths, field_ids, field_set, measure_ids, dimension_ids, table_nodes, local_field_ids, to_s, groups }
+        Base { root, datasource, paths, field_ids, field_set, measure_ids, dimension_ids, table_nodes, local_field_ids, identity, groups }
     }
 
     /// The paths grouped by join path, cheapest path first within each.
@@ -95,8 +95,8 @@ impl<'a> Base<'a> {
     pub fn has_dimension(&self, id: Id) -> bool {
         self.dimension_ids.contains(&id)
     }
-    pub fn to_s(&self) -> &str {
-        &self.to_s
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
     pub fn all_dimensions(&self, ids: &[Id]) -> bool {
         ids.iter().all(|i| self.dimension_ids.contains(i))
@@ -131,7 +131,7 @@ pub trait Model {
     fn measure_count(&self, wanted: &HashSet<Id>) -> usize;
     fn local_field_ids(&self) -> &HashSet<Id>;
     fn cost(&self) -> i64;
-    fn to_s(&self) -> String;
+    fn identity(&self) -> String;
     fn has_field(&self, id: Id) -> bool;
     fn tier(&self) -> i64 {
         match self.datasource().tier {
@@ -165,8 +165,8 @@ impl<'a> Model for Arc<Base<'a>> {
     fn cost(&self) -> i64 {
         self.root.cost
     }
-    fn to_s(&self) -> String {
-        self.to_s.clone()
+    fn identity(&self) -> String {
+        self.identity.clone()
     }
     fn has_field(&self, id: Id) -> bool {
         self.field_set.contains(&id)
@@ -271,8 +271,8 @@ impl<'a> Model for Subtree<'a> {
     fn cost(&self) -> i64 {
         self.join_cost
     }
-    fn to_s(&self) -> String {
-        format!("{}:[{}]", self.base.to_s, self.route)
+    fn identity(&self) -> String {
+        format!("{}:[{}]", self.base.identity, self.route)
     }
     fn has_field(&self, id: Id) -> bool {
         self.paths.iter().any(|p| p.field_id == id)

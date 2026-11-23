@@ -1,5 +1,5 @@
 //! The visitor pipeline, in the order `Planner.run_plan` runs it. Only the
-//! visitors the current port needs exist; `model::check_supported` refuses
+//! visitors the current port needs exist; `resolved::check_supported` refuses
 //! queries that would need the others.
 
 pub mod alias;

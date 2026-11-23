@@ -4,7 +4,7 @@
 //! two periods join on the same date column.
 
 use crate::dag::{Filtered, Graph, MultiExpr, NodeId, NodeKind, Projected, Reference};
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::sql::dates::parse_value;
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
@@ -16,7 +16,7 @@ use std::rc::Rc;
 use zsql_semantic::{Field, Predicate, SemanticModel};
 use zsql_spec::{Decorator, DecoratorKind};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = graph.root();
     let measures: Vec<Projected<'a>> = graph.nodes[node]
         .projections
@@ -56,7 +56,7 @@ fn unit(t: &Decorator) -> String {
     t.str("transform").unwrap_or("ERROR").split('_').next().unwrap_or("ERROR").to_string()
 }
 
-fn projected_grain(q: &RQuery) -> Option<String> {
+fn projected_grain(q: &ResolvedQuery) -> Option<String> {
     let date = q.projections.iter().find(|p| p.field.map(|f| f.is_date()).unwrap_or(false))?;
     date.def.decorators.iter().find(|d| d.kind == DecoratorKind::Truncate).and_then(|d| d.grain().map(str::to_string))
 }
@@ -72,7 +72,7 @@ fn unit_rank(u: &str) -> Option<i32> {
     })
 }
 
-fn unit_is_higher(t: &Decorator, q: &RQuery) -> bool {
+fn unit_is_higher(t: &Decorator, q: &ResolvedQuery) -> bool {
     match (unit_rank(&unit(t)), projected_grain(q).and_then(|g| unit_rank(&g))) {
         (Some(u), Some(g)) => u >= g,
         _ => false,
@@ -84,11 +84,11 @@ fn digest(name: &str, t: &Decorator) -> String {
     format!("{}{}_{}", SKIP_ALIAS_PREFIX, prefix, &format!("{:x}", md5::compute(name.as_bytes()))[..9])
 }
 
-fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>, mp: &Projected<'a>) -> Result<()> {
+fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, mp: &Projected<'a>) -> Result<()> {
     let t = temporalizer(mp);
     let field = mp.field().expect("measure field");
     let agg = graph.live().find(|n| n.purpose.is_none() && n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid)).map(|n| n.id);
-    let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
+    let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.identity())))?;
     let calc = transformed_calculation(graph, semantic, q, field, &t, Some(agg), Some(mp))?;
     let sql = if t.bool("percent_change", false) {
         format!(
@@ -114,7 +114,7 @@ fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQu
 fn process_calculation<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     mp: &Projected<'a>,
     merge: NodeId,
 ) -> Result<()> {
@@ -138,8 +138,8 @@ fn process_calculation<'a>(
 fn update_transformed_fields<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
-    calc: &Rc<RProjection<'a>>,
+    q: &ResolvedQuery<'a>,
+    calc: &Rc<ResolvedProjection<'a>>,
     sql: &str,
     t: &Decorator,
 ) -> Result<String> {
@@ -155,12 +155,12 @@ fn update_transformed_fields<'a>(
 fn update_transformed_projection_refs<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     sql: &str,
     alias: &str,
     merge: NodeId,
     t: &Decorator,
-    parent: &Rc<RProjection<'a>>,
+    parent: &Rc<ResolvedProjection<'a>>,
 ) -> Result<String> {
     let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(alias)).cloned() else { return Ok(sql.to_string()) };
     let mut out = sql.to_string();
@@ -183,8 +183,8 @@ fn update_transformed_projection_refs<'a>(
 fn transformed_formula<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
-    calc: &Rc<RProjection<'a>>,
+    q: &ResolvedQuery<'a>,
+    calc: &Rc<ResolvedProjection<'a>>,
     merge: NodeId,
     t: &Decorator,
     seen: &mut Vec<usize>,
@@ -211,7 +211,7 @@ fn transformed_formula<'a>(
 fn process_compound<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     mp: &Projected<'a>,
     merge: NodeId,
     exp: &'a zsql_semantic::Expression,
@@ -243,12 +243,12 @@ fn process_compound<'a>(
 fn transformed_calculation<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     t: &Decorator,
     agg: Option<NodeId>,
     mp: Option<&Projected<'a>>,
-) -> Result<Rc<RProjection<'a>>> {
+) -> Result<Rc<ResolvedProjection<'a>>> {
     let agg = match agg {
         Some(a) => a,
         None => graph
@@ -307,7 +307,7 @@ fn transformed_calculation<'a>(
 fn find_or_create_transformed_node<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     t: &Decorator,
     agg: NodeId,
@@ -330,7 +330,7 @@ fn find_or_create_transformed_node<'a>(
     if let Some(n) = found {
         return Ok(n);
     }
-    let projections: Vec<Rc<RProjection<'a>>> =
+    let projections: Vec<Rc<ResolvedProjection<'a>>> =
         graph.nodes[agg].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
     let mut filters: Vec<Filtered<'a>> = graph.nodes[agg].filters.iter().filter(|f| !f.is_date()).cloned().collect();
     // Date filters will be shifted, so they get uncoupled copies.
@@ -356,7 +356,7 @@ fn find_or_create_transformed_node<'a>(
 }
 
 /// Push projected dates forward one period so the comparison rows join.
-fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &RQuery<'a>) -> Result<()> {
+fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &ResolvedQuery<'a>) -> Result<()> {
     let u = unit(t);
     let base_sql = graph.dialect.date_add(&u, 1, "@expression")?;
     let grain = projected_grain(q);
@@ -381,7 +381,7 @@ fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorat
 }
 
 /// Shift the date filters back one period.
-fn transform_date_filters<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &RQuery<'a>) -> Result<()> {
+fn transform_date_filters<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &ResolvedQuery<'a>) -> Result<()> {
     let u = unit(t);
     let grain = projected_grain(q);
     let higher = unit_is_higher(t, q);

@@ -7,9 +7,9 @@
 //! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
-pub mod model;
 pub mod profile;
 pub mod pruner;
+pub mod resolved;
 pub mod resolver;
 pub mod sql;
 pub mod universe;
@@ -203,7 +203,7 @@ impl<'a> Planner<'a> {
     /// Without measures, one universe must reach every dimension.
     pub fn explore(&self, query: zsql_spec::Query) -> Result<Exploration<'a>> {
         use zsql_semantic::Id;
-        let rquery = model::RQuery::resolve(self.semantic, query)?;
+        let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
         let measures = resolver::measures(self.semantic, &rquery);
         let dimensions = resolver::dimensions(self.semantic, &rquery);
         let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
@@ -254,8 +254,8 @@ impl<'a> Planner<'a> {
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
-        let rquery = model::RQuery::resolve(self.semantic, query)?;
-        model::check_supported(&rquery, self.semantic, principal)?;
+        let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
+        resolved::check_supported(&rquery, self.semantic, principal)?;
         match run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, vec![], explain) {
             // A segment keyed in another datasource: resolve again with every key required.
             Err(Error::SegmentDatasource(_)) => {
@@ -272,7 +272,7 @@ fn run_plan<'a>(
     semantic: &'a SemanticModel,
     universes: &universe::Universes<'a>,
     dialects: &Dialects,
-    rquery: &model::RQuery<'a>,
+    rquery: &resolved::ResolvedQuery<'a>,
     principal: Option<&SecurityContext>,
     required_dims: Vec<&'a zsql_semantic::Field>,
     explain: bool,
@@ -343,29 +343,29 @@ fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
                 root: n.is_root(),
                 table: base.map(|b| b.root.name.clone()),
                 datasource: base.map(|b| b.datasource.uid.clone()),
-                paths: n.subtrees.iter().map(universe::Model::to_s).collect(),
+                paths: n.subtrees.iter().map(universe::Model::identity).collect(),
                 purpose: n.purpose,
                 transform: n.transform.clone(),
                 segment: n.owner.is_some(),
-                projections: n.projections.iter().map(|p| format!("{} AS {}", p.to_s(), p.alias)).collect(),
-                filters: n.filters.iter().map(|f| f.to_s()).collect(),
+                projections: n.projections.iter().map(|p| format!("{} AS {}", p.identity(), p.alias)).collect(),
+                filters: n.filters.iter().map(|f| f.identity()).collect(),
                 inputs: n.plain_inputs(),
                 strategies: n.strategies.iter().map(|s| ExplainStrategy { node: s.node, kind: s.kind.name().to_string() }).collect(),
                 join_type: if n.is_merge() { n.join_type.clone() } else { String::new() },
                 group_by: n.should_group_by.unwrap_or(false),
-                security_filters: n.security_filters.iter().map(|(f, allowed)| security_to_s(f, allowed)).collect(),
+                security_filters: n.security_filters.iter().map(|(f, allowed)| security_identity(f, allowed)).collect(),
                 security_masks: n
                     .security_masks
                     .iter()
-                    .map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_to_s(f, allowed)))
+                    .map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_identity(f, allowed)))
                     .collect(),
-                identity: n.to_s(graph),
+                identity: n.identity(graph),
             }
         })
         .collect()
 }
 
-fn security_to_s(f: &zsql_semantic::Field, allowed: &Option<Vec<String>>) -> String {
+fn security_identity(f: &zsql_semantic::Field, allowed: &Option<Vec<String>>) -> String {
     match allowed {
         Some(v) => format!("[{}] in {v:?}", f.name),
         None => format!("[{}] denied", f.name),

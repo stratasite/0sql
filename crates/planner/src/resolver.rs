@@ -2,8 +2,8 @@
 //! and the DAG that composes them.
 
 use crate::dag::{Graph, Node, NodeKind};
-use crate::model::{RProjection, RQuery};
 use crate::pruner::{prune_to_minimum, sort_for_max_hints_and_dims, sort_paths_for_max_hints_and_dims};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::universe::{Base, Model, Universes};
 use crate::{Error, Result};
 use std::rc::Rc;
@@ -21,7 +21,7 @@ fn uniq_fields(fields: Vec<&Field>) -> Vec<&Field> {
     out
 }
 
-pub fn measures<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn measures<'a>(semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Vec<&'a Field> {
     let mut uids: Vec<&str> = Vec::new();
     for p in q.projections.iter().filter(|p| !p.is_calculation() && p.is_measure()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
@@ -39,7 +39,7 @@ pub fn measures<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>) -> Vec<&'a Fiel
     uniq_fields(uids.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Measure))).collect())
 }
 
-pub fn dimensions<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn dimensions<'a>(semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Vec<&'a Field> {
     let mut uids: Vec<&str> = Vec::new();
     for p in q.projections.iter().filter(|p| !p.is_calculation() && !p.is_carried() && p.is_dimension()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
@@ -74,7 +74,12 @@ impl<'a> Default for Options<'a> {
     }
 }
 
-pub fn resolve<'a>(semantic: &'a SemanticModel, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<Graph<'a>> {
+pub fn resolve<'a>(
+    semantic: &'a SemanticModel,
+    universes: &Universes<'a>,
+    dialects: &Dialects,
+    q: &ResolvedQuery<'a>,
+) -> Result<Graph<'a>> {
     resolve_with(semantic, universes, dialects, q, &Options::default())
 }
 
@@ -82,7 +87,7 @@ pub fn resolve_with<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     opts: &Options<'a>,
 ) -> Result<Graph<'a>> {
     let segment_keys = if opts.segment_keys { q.query_level_key_dimensions() } else { vec![] };
@@ -113,7 +118,7 @@ fn resolve_inner<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     opts: &Options<'a>,
     segment_keys: &[&'a Field],
 ) -> Result<Graph<'a>> {
@@ -200,11 +205,11 @@ fn resolve_inner<'a>(
         }
         let to = graph.add_node(merge);
 
-        let pushdown: Vec<Rc<RProjection<'a>>> = q.projections.iter().filter(|c| pushable(c, q)).cloned().collect();
+        let pushdown: Vec<Rc<ResolvedProjection<'a>>> = q.projections.iter().filter(|c| pushable(c, q)).cloned().collect();
         let mut pushed: Vec<usize> = Vec::new();
 
         for u in &chosen {
-            let mut projections: Vec<Rc<RProjection<'a>>> = q
+            let mut projections: Vec<Rc<ResolvedProjection<'a>>> = q
                 .projections
                 .iter()
                 .filter(|p| !p.is_calculation())
@@ -214,7 +219,7 @@ fn resolve_inner<'a>(
 
             // Dimension calculations this universe can evaluate are computed
             // here, as derived dimensions.
-            let local_calcs: Vec<Rc<RProjection<'a>>> = pushdown.iter().filter(|c| resolvable_in(u, c, q)).cloned().collect();
+            let local_calcs: Vec<Rc<ResolvedProjection<'a>>> = pushdown.iter().filter(|c| resolvable_in(u, c, q)).cloned().collect();
             for c in &local_calcs {
                 if !pushed.contains(&c.pid) {
                     pushed.push(c.pid);
@@ -224,7 +229,7 @@ fn resolve_inner<'a>(
 
             // Materialize every field the merge-level calculations reference
             // that this universe resolves, so the merge reads it as a column.
-            let merge_calcs: Vec<&Rc<RProjection<'a>>> =
+            let merge_calcs: Vec<&Rc<ResolvedProjection<'a>>> =
                 q.projections.iter().filter(|p| p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid)).collect();
             let ref_uids: Vec<&str> =
                 merge_calcs.iter().flat_map(|c| c.def.measure_refs.iter().chain(c.def.dimension_refs.iter()).map(String::as_str)).collect();
@@ -232,7 +237,7 @@ fn resolve_inner<'a>(
             let calc_dimensions = calculation_fields(semantic, q, FieldKind::Dimension);
             for f in calc_measures.iter().chain(calc_dimensions.iter()) {
                 if ref_uids.contains(&f.uid.as_str()) && u.has_field(f.id) && !projections.iter().any(|p| p.field_id() == Some(f.id)) {
-                    let mut rp = RProjection::for_field(f);
+                    let mut rp = ResolvedProjection::for_field(f);
                     rp.def.ordinal = Some((projections.len() as i64 - 1).max(0));
                     projections.push(Rc::new(rp));
                 }
@@ -241,7 +246,7 @@ fn resolve_inner<'a>(
             for f in q.filters.iter().filter(|f| f.is_measure() && u.has_field(f.field.id)) {
                 let projected = q.projections.iter().any(|p| p.field_id() == Some(f.field.id) && p.def.decorators.is_empty());
                 if !projected {
-                    projections.push(Rc::new(RProjection::for_field(f.field)));
+                    projections.push(Rc::new(ResolvedProjection::for_field(f.field)));
                 }
             }
             let filters = q
@@ -267,7 +272,7 @@ fn resolve_inner<'a>(
 }
 
 /// Measures (or dimensions) named by calculations, in reference order, unique.
-fn calculation_fields<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>, kind: FieldKind) -> Vec<&'a Field> {
+fn calculation_fields<'a>(semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, kind: FieldKind) -> Vec<&'a Field> {
     let uids: Vec<&String> = q
         .projections
         .iter()
@@ -278,7 +283,7 @@ fn calculation_fields<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>, kind: Fie
 }
 
 /// Rails `pushable?`: a calculation standing only on dimensions.
-fn pushable<'a>(c: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> bool {
+fn pushable<'a>(c: &Rc<ResolvedProjection<'a>>, q: &ResolvedQuery<'a>) -> bool {
     if !c.is_calculation() || !c.is_dimension() || c.measure_dependent(&q.projections) {
         return false;
     }
@@ -289,7 +294,7 @@ fn pushable<'a>(c: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> bool {
 }
 
 /// Rails `resolvable_in?`: the universe reaches every field the calculation reads.
-fn resolvable_in<'a>(u: &Arc<Base<'a>>, c: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> bool {
+fn resolvable_in<'a>(u: &Arc<Base<'a>>, c: &Rc<ResolvedProjection<'a>>, q: &ResolvedQuery<'a>) -> bool {
     let mut fields: Vec<&Field> = c.field_refs.clone();
     for r in &c.def.projection_refs {
         if let Some(f) = q.projections.iter().find(|p| p.match_alias(r)).and_then(|p| p.field) {
@@ -299,7 +304,7 @@ fn resolvable_in<'a>(u: &Arc<Base<'a>>, c: &Rc<RProjection<'a>>, q: &RQuery<'a>)
     fields.iter().all(|f| u.has_field(f.id))
 }
 
-fn calculations_depend_on_measures(q: &RQuery) -> bool {
+fn calculations_depend_on_measures(q: &ResolvedQuery) -> bool {
     q.projections.iter().filter(|p| p.is_calculation()).any(|c| {
         !c.def.measure_refs.is_empty()
             || c.def.projection_refs.iter().any(|a| q.projections.iter().any(|p| p.match_alias(a) && p.is_measure()))
@@ -307,7 +312,7 @@ fn calculations_depend_on_measures(q: &RQuery) -> bool {
 }
 
 /// Rails `Dag.set_subtrees_and_tables`.
-pub fn set_subtrees<'a>(graph: &mut Graph<'a>, id: usize, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn set_subtrees<'a>(graph: &mut Graph<'a>, id: usize, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let _t = crate::profile::span("resolve.subtrees");
     let node = &graph.nodes[id];
     let base = node.universe.clone().expect("query node has a universe");

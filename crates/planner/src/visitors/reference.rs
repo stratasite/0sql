@@ -3,13 +3,13 @@
 //! composition of those).
 
 use crate::dag::{Entity, Graph, MultiExpr, NodeId, NodeKind, RefKey, Reference};
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::universe::Subtree;
 use crate::{Error, Result};
 use std::rc::Rc;
 use zsql_semantic::{Expression, Field, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, _q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, _q: &ResolvedQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         match graph.nodes[id].kind {
             NodeKind::Query | NodeKind::Aggregation => visit_query_node(graph, id, semantic)?,
@@ -36,7 +36,7 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a Semanti
         graph.nodes[id].field_refs.insert(RefKey::Field(field.id), r);
     }
     // Calculations: a formula over the node's own fields and projections.
-    let calcs: Vec<Rc<RProjection<'a>>> =
+    let calcs: Vec<Rc<ResolvedProjection<'a>>> =
         graph.nodes[id].projections.iter().filter(|p| p.is_calculation()).map(|p| p.proj.clone()).collect();
     for calc in calcs {
         if graph.nodes[id].field_refs.contains_key(&RefKey::Proj(calc.pid)) {
@@ -95,7 +95,7 @@ fn create_reference_within<'a>(
         chain.push(field.name.clone());
         return Err(Error::Resolution(format!(
             "The expression for {} references itself: {}. Fix the model; this field cannot be planned.",
-            crate::model::field_to_s(field),
+            crate::resolved::field_identity(field),
             chain.join(" -> ")
         )));
     }
@@ -106,7 +106,7 @@ fn create_reference_within<'a>(
             None => {
                 let base = node.universe.clone().expect("query node universe");
                 let path = base.path_for(field.id).ok_or_else(|| {
-                    Error::Resolution(format!("Could not find path for {} with id: {}.", crate::model::field_to_s(field), field.id))
+                    Error::Resolution(format!("Could not find path for {} with id: {}.", crate::resolved::field_identity(field), field.id))
                 })?;
                 let node = &mut graph.nodes[id];
                 match node.subtrees.iter_mut().find(|t| t.join_path == path.joins) {
@@ -125,7 +125,7 @@ fn create_reference_within<'a>(
     let exp = exp.ok_or_else(|| {
         Error::Resolution(format!(
             "Could not find expression for {} in the the target table {}.",
-            crate::model::field_to_s(field),
+            crate::resolved::field_identity(field),
             path.target_table_id
         ))
     })?;
@@ -142,7 +142,7 @@ fn create_reference_within<'a>(
 fn append_projection_references<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    calc: &Rc<RProjection<'a>>,
+    calc: &Rc<ResolvedProjection<'a>>,
     sources: &mut Vec<Reference<'a>>,
 ) -> Result<()> {
     for alias in calc.def.projection_refs.clone() {
@@ -328,7 +328,7 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a Semanti
                 if graph.nodes[id].get_ref(p.pid, field_id).is_some() {
                     continue;
                 }
-                return Err(Error::Resolution(format!("No input materializes {}", p.to_s())));
+                return Err(Error::Resolution(format!("No input materializes {}", p.identity())));
             };
             let r = Reference::Node { entity: Entity::Proj(p.clone()), node: source };
             let node = &mut graph.nodes[id];

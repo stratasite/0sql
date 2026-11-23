@@ -2,7 +2,7 @@
 //! the filtered node by the ranked dimension, limited to n rows.
 
 use crate::dag::{Graph, NodeId, NodeKind, Strategy, StrategyKind};
-use crate::model::{FilledTree, RFilter, RProjection, RQuery};
+use crate::resolved::{FilledTree, ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::visitors::grain::create_agg_node;
@@ -17,14 +17,14 @@ pub fn run<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<()> {
     for id in graph.post_order() {
         let n = &graph.nodes[id];
         if n.removed || n.kind == NodeKind::Merge || !n.filters.iter().any(|f| f.predicate == Predicate::TopN) {
             continue;
         }
-        let top_filters: Vec<Rc<RFilter<'a>>> =
+        let top_filters: Vec<Rc<ResolvedFilter<'a>>> =
             graph.nodes[id].filters.iter().filter(|f| f.predicate == Predicate::TopN).map(|f| f.filter.clone()).collect();
         for f in top_filters {
             create_top_n_segmentation(graph, id, semantic, universes, dialects, q, &f)?;
@@ -39,10 +39,10 @@ fn create_top_n_segmentation<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
-    top: &Rc<RFilter<'a>>,
+    q: &ResolvedQuery<'a>,
+    top: &Rc<ResolvedFilter<'a>>,
 ) -> Result<()> {
-    let filters: Vec<Rc<RFilter<'a>>> =
+    let filters: Vec<Rc<ResolvedFilter<'a>>> =
         graph.nodes[id].filters.iter().filter(|f| f.predicate != Predicate::TopN).map(|f| f.filter.clone()).collect();
     let filter_fids: Vec<usize> = filters.iter().map(|f| f.fid).collect();
     let measure = top.def.top_n_measure.as_ref().and_then(|u| semantic.field_by_uid(u, Some(FieldKind::Measure)));
@@ -85,18 +85,18 @@ fn build_via_sub_graph<'a>(
     semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     dimension: &'a zsql_semantic::Field,
     measure: &'a zsql_semantic::Field,
 ) -> Result<NodeId> {
-    let mut dim = RProjection::for_field(dimension);
+    let mut dim = ResolvedProjection::for_field(dimension);
     dim.def.ordinal = Some(0);
-    let mut msr = RProjection::for_field(measure);
+    let mut msr = ResolvedProjection::for_field(measure);
     msr.def.ordinal = Some(1);
     msr.def.order_by = Some(OrderBy::Desc);
-    let filters: Vec<Rc<RFilter<'a>>> =
+    let filters: Vec<Rc<ResolvedFilter<'a>>> =
         q.filters.iter().filter(|f| f.def.predicate != Predicate::TopN && f.is_dimension()).cloned().collect();
-    let sub = RQuery {
+    let sub = ResolvedQuery {
         def: zsql_spec::Query::planner_sub(format!("{}-top_n", q.def.name.clone().unwrap_or_default())),
         projections: vec![Rc::new(dim), Rc::new(msr)],
         filters: filters.clone(),
@@ -119,16 +119,16 @@ fn build_via_sub_graph<'a>(
 fn build_count_node<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     id: NodeId,
     dimension: &'a zsql_semantic::Field,
-    filters: Vec<Rc<RFilter<'a>>>,
+    filters: Vec<Rc<ResolvedFilter<'a>>>,
 ) -> Result<NodeId> {
     let mut calc = (*q.static_calc(semantic, "row_count_measure", "count(*)")).clone_shallow();
     calc.def.order_by = Some(OrderBy::Desc);
     calc.def.ordinal = Some(1);
     let base = graph.nodes[id].universe.clone().ok_or_else(|| Error::Resolution("top-n on a node without a universe".into()))?;
-    let projections = vec![Rc::new(RProjection::for_field(dimension)), Rc::new(calc)];
+    let projections = vec![Rc::new(ResolvedProjection::for_field(dimension)), Rc::new(calc)];
     let top = create_agg_node(graph, semantic, q, base, projections, filters)?;
     graph.nodes[top].purpose = Some("strategy");
     Ok(top)

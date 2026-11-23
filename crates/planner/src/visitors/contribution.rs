@@ -3,7 +3,7 @@
 //! decorator names, computed in a sibling node.
 
 use crate::dag::{Filtered, Graph, MultiExpr, NodeId, NodeKind, Projected, Reference};
-use crate::model::{RFilter, RProjection, RQuery};
+use crate::resolved::{ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
 use crate::visitors::grain::{create_agg_node, create_merge_node, dimensionally_equivalent};
@@ -12,7 +12,7 @@ use std::rc::Rc;
 use zsql_semantic::{Field, SemanticModel};
 use zsql_spec::{Decorator, DecoratorKind};
 
-pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = graph.root();
     let measures: Vec<Projected<'a>> = graph.nodes[node]
         .projections
@@ -36,7 +36,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a
         } else {
             let agg =
                 graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid) && n.purpose.is_none()).map(|n| n.id);
-            let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
+            let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.identity())))?;
             process_table(graph, semantic, q, &mp, agg)?;
         }
     }
@@ -51,7 +51,13 @@ fn other_decorators(mp: &Projected) -> Vec<Decorator> {
     mp.decorators().into_iter().filter(|d| d.kind != DecoratorKind::Contribute).cloned().collect()
 }
 
-fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>, mp: &Projected<'a>, agg: NodeId) -> Result<()> {
+fn process_table<'a>(
+    graph: &mut Graph<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    mp: &Projected<'a>,
+    agg: NodeId,
+) -> Result<()> {
     let c = contributor(mp);
     if graph.root() == agg {
         let merge = create_merge_node(graph, q);
@@ -71,7 +77,7 @@ fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQu
 fn process_compound<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     mp: &Projected<'a>,
     merge: NodeId,
     exp: &'a zsql_semantic::Expression,
@@ -97,7 +103,7 @@ fn process_compound<'a>(
     Ok(())
 }
 
-fn process_calculation<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>, mp: &Projected<'a>) -> Result<()> {
+fn process_calculation<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, mp: &Projected<'a>) -> Result<()> {
     let c = contributor(mp);
     let root = graph.root();
     let numerator = mp.proj.def.sql.clone().unwrap_or_default();
@@ -117,12 +123,12 @@ fn process_calculation<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q
 fn update_denominator_projection_refs<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     sql: &str,
     alias: &str,
     merge: NodeId,
     c: &Decorator,
-    parent: &Rc<RProjection<'a>>,
+    parent: &Rc<ResolvedProjection<'a>>,
 ) -> Result<String> {
     let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(alias)).cloned() else { return Ok(sql.to_string()) };
     let mut out = sql.to_string();
@@ -141,8 +147,8 @@ fn update_denominator_projection_refs<'a>(
 fn update_denominator_fields<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
-    calc: &Rc<RProjection<'a>>,
+    q: &ResolvedQuery<'a>,
+    calc: &Rc<ResolvedProjection<'a>>,
     sql: &str,
     c: &Decorator,
 ) -> Result<String> {
@@ -162,10 +168,10 @@ fn digest(name: &str, prefix: &str) -> String {
 fn total_calculation<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     c: &Decorator,
-) -> Result<Rc<RProjection<'a>>> {
+) -> Result<Rc<ResolvedProjection<'a>>> {
     let agg = graph.live().find(|n| n.kind == NodeKind::Aggregation && n.has_field(measure.id)).map(|n| n.id);
     let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", measure.name)))?;
     let total_node = find_or_create_total_node(graph, semantic, q, measure, c, agg)?;
@@ -185,13 +191,13 @@ fn total_calculation<'a>(
 fn find_or_create_total_node<'a>(
     graph: &mut Graph<'a>,
     semantic: &'a SemanticModel,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     c: &Decorator,
     agg: NodeId,
 ) -> Result<NodeId> {
-    let dims: Vec<Rc<RProjection<'a>>> = denominator_dimensions(c, q);
-    let filters: Vec<Rc<RFilter<'a>>> = denominator_filters(c, q, measure);
+    let dims: Vec<Rc<ResolvedProjection<'a>>> = denominator_dimensions(c, q);
+    let filters: Vec<Rc<ResolvedFilter<'a>>> = denominator_filters(c, q, measure);
     let dims_w: Vec<Projected<'a>> = dims.iter().cloned().map(Projected::new).collect();
     let filters_w: Vec<Filtered<'a>> = filters.iter().cloned().map(Filtered::new).collect();
     let signature = crate::visitors::segmentation::node_signature(&graph.nodes[agg]);
@@ -223,15 +229,15 @@ fn find_or_create_total_node<'a>(
 }
 
 /// Rails `Contributor#denominator_dimensions`.
-fn denominator_dimensions<'a>(c: &Decorator, q: &RQuery<'a>) -> Vec<Rc<RProjection<'a>>> {
-    let dims: Vec<Rc<RProjection<'a>>> = q.projections.iter().filter(|p| p.is_dimension()).cloned().collect();
+fn denominator_dimensions<'a>(c: &Decorator, q: &ResolvedQuery<'a>) -> Vec<Rc<ResolvedProjection<'a>>> {
+    let dims: Vec<Rc<ResolvedProjection<'a>>> = q.projections.iter().filter(|p| p.is_dimension()).cloned().collect();
     let refs = c.strs("partition_refs");
     let auto = c.is_null("partition_refs") || refs.iter().any(|r| r == "-1");
     if !auto {
         return dims.into_iter().filter(|p| p.def.field_uid.as_ref().map(|u| refs.contains(u)).unwrap_or(false)).collect();
     }
     let date = dims.iter().find(|p| p.field.map(|f| f.is_date()).unwrap_or(false)).cloned();
-    let partitioning: Vec<Rc<RProjection<'a>>> =
+    let partitioning: Vec<Rc<ResolvedProjection<'a>>> =
         dims.iter().filter(|p| date.as_ref().map(|d| d.pid != p.pid).unwrap_or(true)).cloned().collect();
     match (&date, partitioning.len()) {
         (Some(d), n) if n > 0 => vec![d.clone()],
@@ -243,8 +249,8 @@ fn denominator_dimensions<'a>(c: &Decorator, q: &RQuery<'a>) -> Vec<Rc<RProjecti
 }
 
 /// Rails `Contributor#denominator_filters`.
-fn denominator_filters<'a>(c: &Decorator, q: &RQuery<'a>, measure: &Field) -> Vec<Rc<RFilter<'a>>> {
-    let filters: Vec<Rc<RFilter<'a>>> = q.filters.iter().filter(|f| f.field.id != measure.id).cloned().collect();
+fn denominator_filters<'a>(c: &Decorator, q: &ResolvedQuery<'a>, measure: &Field) -> Vec<Rc<ResolvedFilter<'a>>> {
+    let filters: Vec<Rc<ResolvedFilter<'a>>> = q.filters.iter().filter(|f| f.field.id != measure.id).cloned().collect();
     if !c.bool("ignore_partition_filters", true) {
         return filters;
     }
