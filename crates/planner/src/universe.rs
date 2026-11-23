@@ -6,7 +6,7 @@
 use crate::model::table_to_s;
 use std::collections::HashSet;
 use std::sync::Arc;
-use zsql_semantic::{Datasource, Field, FieldKind, Id, Path, Table, Tier, Universe};
+use zsql_semantic::{Datasource, Field, FieldKind, Id, Path, SemanticModel, Table, Tier};
 
 /// Rails `Planner::Universe::Base`: a root table and the paths from it,
 /// cheapest first. Rails breaks ties on row id; here they break on the
@@ -40,8 +40,8 @@ pub struct PathGroup<'a> {
 }
 
 impl<'a> Base<'a> {
-    fn new(universe: &'a Universe, root: &'a Table, mut paths: Vec<&'a Path>) -> Self {
-        paths.sort_by_cached_key(|p| (p.cost, universe.path_signature(p)));
+    fn new(semantic: &'a SemanticModel, root: &'a Table, mut paths: Vec<&'a Path>) -> Self {
+        paths.sort_by_cached_key(|p| (p.cost, semantic.path_signature(p)));
         let mut field_ids = Vec::new();
         let mut field_set = HashSet::new();
         let mut measure_ids = HashSet::new();
@@ -61,9 +61,9 @@ impl<'a> Base<'a> {
                 }
             }
         }
-        let local_field_ids = universe.expressions_of(root.id).map(|e| e.field_id).collect();
-        let datasource = universe.datasource(root.datasource_id).expect("table datasource");
-        let to_s = format!("<{}>", table_to_s(universe, root));
+        let local_field_ids = semantic.expressions_of(root.id).map(|e| e.field_id).collect();
+        let datasource = semantic.datasource(root.datasource_id).expect("table datasource");
+        let to_s = format!("<{}>", table_to_s(semantic, root));
         let mut groups: Vec<(Vec<Id>, Vec<&'a Path>)> = Vec::new();
         for p in &paths {
             match groups.iter_mut().find(|(jp, _)| *jp == p.joins) {
@@ -74,7 +74,7 @@ impl<'a> Base<'a> {
         let groups = groups
             .into_iter()
             .map(|(join_path, paths)| {
-                let (join_cost, route) = route_of(universe, &join_path);
+                let (join_cost, route) = route_of(semantic, &join_path);
                 Arc::new(PathGroup { join_path, paths, join_cost, route })
             })
             .collect();
@@ -190,20 +190,20 @@ pub struct Subtree<'a> {
 /// A join path's summed cost and its route as table uids past the root
 /// (`customer>customer_address`). Rails prints join row ids in the route;
 /// uids make node identity, and so CTE names, the same on every branch.
-fn route_of(universe: &Universe, join_path: &[Id]) -> (i64, String) {
-    let joins: Vec<_> = join_path.iter().filter_map(|j| universe.join(*j)).collect();
+fn route_of(semantic: &SemanticModel, join_path: &[Id]) -> (i64, String) {
+    let joins: Vec<_> = join_path.iter().filter_map(|j| semantic.join(*j)).collect();
     let join_cost = joins.iter().map(|j| j.cost).sum();
     let route = joins
         .iter()
-        .map(|j| universe.table(j.right_id).map(|t| t.uid.clone()).unwrap_or_else(|| j.right_id.to_string()))
+        .map(|j| semantic.table(j.right_id).map(|t| t.uid.clone()).unwrap_or_else(|| j.right_id.to_string()))
         .collect::<Vec<_>>()
         .join(">");
     (join_cost, route)
 }
 
 impl<'a> Subtree<'a> {
-    pub fn new(universe: &Universe, base: Arc<Base<'a>>, join_path: Vec<Id>, paths: Vec<&'a Path>) -> Self {
-        let (join_cost, route) = route_of(universe, &join_path);
+    pub fn new(semantic: &SemanticModel, base: Arc<Base<'a>>, join_path: Vec<Id>, paths: Vec<&'a Path>) -> Self {
+        let (join_cost, route) = route_of(semantic, &join_path);
         Subtree { base, join_path, paths, join_cost, route }
     }
 
@@ -286,19 +286,19 @@ pub struct Universes<'a> {
 
 impl<'a> Universes<'a> {
     /// Universes over the paths stored with the snapshot.
-    pub fn build(universe: &'a Universe) -> Self {
-        Self::build_from(universe, &universe.snapshot().paths)
+    pub fn build(semantic: &'a SemanticModel) -> Self {
+        Self::build_from(semantic, &semantic.snapshot().paths)
     }
 
     /// Universes over the given paths, formed or stored.
-    pub fn build_from(universe: &'a Universe, all_paths: &'a [Path]) -> Self {
-        let snap = universe.snapshot();
+    pub fn build_from(semantic: &'a SemanticModel, all_paths: &'a [Path]) -> Self {
+        let snap = semantic.snapshot();
         let bases = snap
             .tables
             .iter()
             .map(|t| {
                 let paths = all_paths.iter().filter(|p| p.root_table_id == t.id).collect();
-                Arc::new(Base::new(universe, t, paths))
+                Arc::new(Base::new(semantic, t, paths))
             })
             .collect();
         Universes { bases }
@@ -309,7 +309,7 @@ impl<'a> Universes<'a> {
     }
 
     /// Datasource ids holding an expression for every one of the measures.
-    pub fn datasources_with_all_measures(&self, universe: &Universe, measures: &[&Field]) -> Vec<Id> {
+    pub fn datasources_with_all_measures(&self, semantic: &SemanticModel, measures: &[&Field]) -> Vec<Id> {
         let mut ds_ids: Vec<Id> = Vec::new();
         for b in &self.bases {
             if !ds_ids.contains(&b.datasource.id) {
@@ -323,7 +323,7 @@ impl<'a> Universes<'a> {
             .into_iter()
             .filter(|ds| {
                 measures.iter().all(|m| {
-                    self.bases.iter().filter(|b| b.datasource.id == *ds).any(|b| universe.expression_for(b.root.id, m.id).is_some())
+                    self.bases.iter().filter(|b| b.datasource.id == *ds).any(|b| semantic.expression_for(b.root.id, m.id).is_some())
                 })
             })
             .collect()

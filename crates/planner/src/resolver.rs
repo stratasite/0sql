@@ -9,7 +9,7 @@ use crate::{PlanError, Result};
 use std::rc::Rc;
 use std::sync::Arc;
 use zsql_dialect::Dialects;
-use zsql_semantic::{Field, FieldKind, Id, Universe};
+use zsql_semantic::{Field, FieldKind, Id, SemanticModel};
 
 fn uniq_fields(fields: Vec<&Field>) -> Vec<&Field> {
     let mut out: Vec<&Field> = Vec::new();
@@ -21,7 +21,7 @@ fn uniq_fields(fields: Vec<&Field>) -> Vec<&Field> {
     out
 }
 
-pub fn measures<'a>(universe: &'a Universe, q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn measures<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>) -> Vec<&'a Field> {
     let mut uids: Vec<&str> = Vec::new();
     for p in q.projections.iter().filter(|p| !p.is_calculation() && p.is_measure()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
@@ -36,10 +36,10 @@ pub fn measures<'a>(universe: &'a Universe, q: &RQuery<'a>) -> Vec<&'a Field> {
     }
     let mut seen = std::collections::HashSet::new();
     uids.retain(|u| seen.insert(*u));
-    uniq_fields(uids.iter().filter_map(|u| universe.field_by_uid(u, Some(FieldKind::Measure))).collect())
+    uniq_fields(uids.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Measure))).collect())
 }
 
-pub fn dimensions<'a>(universe: &'a Universe, q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn dimensions<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>) -> Vec<&'a Field> {
     let mut uids: Vec<&str> = Vec::new();
     for p in q.projections.iter().filter(|p| !p.is_calculation() && !p.is_carried() && p.is_dimension()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
@@ -54,7 +54,7 @@ pub fn dimensions<'a>(universe: &'a Universe, q: &RQuery<'a>) -> Vec<&'a Field> 
     }
     let mut seen = std::collections::HashSet::new();
     uids.retain(|u| seen.insert(*u));
-    uniq_fields(uids.iter().filter_map(|u| universe.field_by_uid(u, Some(FieldKind::Dimension))).collect())
+    uniq_fields(uids.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension))).collect())
 }
 
 /// How a resolution is constrained: a sub-plan levels dimensions loosely and
@@ -74,23 +74,23 @@ impl<'a> Default for Options<'a> {
     }
 }
 
-pub fn resolve<'a>(universe: &'a Universe, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<Graph<'a>> {
-    resolve_with(universe, universes, dialects, q, &Options::default())
+pub fn resolve<'a>(semantic: &'a SemanticModel, universes: &Universes<'a>, dialects: &Dialects, q: &RQuery<'a>) -> Result<Graph<'a>> {
+    resolve_with(semantic, universes, dialects, q, &Options::default())
 }
 
 pub fn resolve_with<'a>(
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
     opts: &Options<'a>,
 ) -> Result<Graph<'a>> {
     let segment_keys = if opts.segment_keys { q.query_level_key_dimensions() } else { vec![] };
-    match resolve_inner(universe, universes, dialects, q, opts, &segment_keys) {
+    match resolve_inner(semantic, universes, dialects, q, opts, &segment_keys) {
         Err(PlanError::Resolution(msg)) if !segment_keys.is_empty() => {
             // Re-resolve without the keys: when that works, the segments are to blame.
             let without = Options { segment_keys: false, ..opts.clone() };
-            match resolve_inner(universe, universes, dialects, q, &without, &[]) {
+            match resolve_inner(semantic, universes, dialects, q, &without, &[]) {
                 Ok(_) => {
                     let names: Vec<String> =
                         q.query_level_links().iter().filter_map(|(sid, _)| q.segment(*sid)).map(|s| s.name()).collect();
@@ -110,7 +110,7 @@ pub fn resolve_with<'a>(
 }
 
 fn resolve_inner<'a>(
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -123,8 +123,8 @@ fn resolve_inner<'a>(
     if q.is_segment() && q.projections.iter().all(|p| !(p.is_dimension() && !p.is_calculation() && !p.def.is_expansion())) {
         return Err(PlanError::Resolution("Query is not valid: a segment needs key dimensions".into()));
     }
-    let measures = measures(universe, q);
-    let mut dimensions = dimensions(universe, q);
+    let measures = measures(semantic, q);
+    let mut dimensions = dimensions(semantic, q);
     for d in opts.required_dims.iter().chain(segment_keys.iter()) {
         if !dimensions.iter().any(|x| x.id == d.id) {
             dimensions.push(d);
@@ -132,7 +132,7 @@ fn resolve_inner<'a>(
     }
     let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
     let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
-    let ds_ids = universes.datasources_with_all_measures(universe, &measures);
+    let ds_ids = universes.datasources_with_all_measures(semantic, &measures);
     if ds_ids.is_empty() {
         let names: Vec<&str> = measures.iter().map(|m| m.name.as_str()).collect();
         return Err(PlanError::Resolution(format!(
@@ -169,7 +169,7 @@ fn resolve_inner<'a>(
     let dim_filters: Vec<_> = q.filters.iter().filter(|f| f.is_dimension()).cloned().collect();
     let chosen = {
         let _t = crate::profile::span("resolve.rank");
-        let sorted = sort_for_max_hints_and_dims(candidates, &measures, &dimensions, &q.hints, &dim_filters, universe);
+        let sorted = sort_for_max_hints_and_dims(candidates, &measures, &dimensions, &q.hints, &dim_filters, semantic);
         prune_to_minimum(sorted, &measures, &[])?
     };
 
@@ -191,7 +191,7 @@ fn resolve_inner<'a>(
         };
         let node = Node::with_universe(kind, u.clone(), projections, filters);
         let id = graph.add_node(node);
-        set_subtrees(&mut graph, id, universe, q)?;
+        set_subtrees(&mut graph, id, semantic, q)?;
     } else {
         let merge_filters = q.filters.iter().filter(|f| f.is_measure() && graph.dialect.final_measure_filter()).cloned().collect();
         let mut merge = Node::merge(q.projections.clone(), merge_filters, graph.dialect.final_pass_measure_join_type().to_string());
@@ -228,8 +228,8 @@ fn resolve_inner<'a>(
                 q.projections.iter().filter(|p| p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid)).collect();
             let ref_uids: Vec<&str> =
                 merge_calcs.iter().flat_map(|c| c.def.measure_refs.iter().chain(c.def.dimension_refs.iter()).map(String::as_str)).collect();
-            let calc_measures = calculation_fields(universe, q, FieldKind::Measure);
-            let calc_dimensions = calculation_fields(universe, q, FieldKind::Dimension);
+            let calc_measures = calculation_fields(semantic, q, FieldKind::Measure);
+            let calc_dimensions = calculation_fields(semantic, q, FieldKind::Dimension);
             for f in calc_measures.iter().chain(calc_dimensions.iter()) {
                 if ref_uids.contains(&f.uid.as_str()) && u.has_field(f.id) && !projections.iter().any(|p| p.field_id() == Some(f.id)) {
                     let mut rp = RProjection::for_field(f);
@@ -252,7 +252,7 @@ fn resolve_inner<'a>(
                 .collect();
             let node = Node::with_universe(NodeKind::Aggregation, u.clone(), projections, filters);
             let from = graph.add_node(node);
-            set_subtrees(&mut graph, from, universe, q)?;
+            set_subtrees(&mut graph, from, semantic, q)?;
             graph.add_edge(from, to);
         }
 
@@ -267,14 +267,14 @@ fn resolve_inner<'a>(
 }
 
 /// Measures (or dimensions) named by calculations, in reference order, unique.
-fn calculation_fields<'a>(universe: &'a Universe, q: &RQuery<'a>, kind: FieldKind) -> Vec<&'a Field> {
+fn calculation_fields<'a>(semantic: &'a SemanticModel, q: &RQuery<'a>, kind: FieldKind) -> Vec<&'a Field> {
     let uids: Vec<&String> = q
         .projections
         .iter()
         .filter(|p| p.is_calculation())
         .flat_map(|p| if kind == FieldKind::Measure { p.def.measure_refs.iter() } else { p.def.dimension_refs.iter() })
         .collect();
-    uniq_fields(uids.iter().filter_map(|u| universe.field_by_uid(u, Some(kind))).collect())
+    uniq_fields(uids.iter().filter_map(|u| semantic.field_by_uid(u, Some(kind))).collect())
 }
 
 /// Rails `pushable?`: a calculation standing only on dimensions.
@@ -307,13 +307,13 @@ fn calculations_depend_on_measures(q: &RQuery) -> bool {
 }
 
 /// Rails `Dag.set_subtrees_and_tables`.
-pub fn set_subtrees<'a>(graph: &mut Graph<'a>, id: usize, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
+pub fn set_subtrees<'a>(graph: &mut Graph<'a>, id: usize, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
     let _t = crate::profile::span("resolve.subtrees");
     let node = &graph.nodes[id];
     let base = node.universe.clone().expect("query node has a universe");
     let measures = node.measures();
     let dimensions = node.dimensions();
-    let sorted = sort_paths_for_max_hints_and_dims(universe, base, &measures, &dimensions, &q.hints);
+    let sorted = sort_paths_for_max_hints_and_dims(semantic, base, &measures, &dimensions, &q.hints);
     graph.nodes[id].subtrees = prune_to_minimum(sorted, &measures, &dimensions)?;
     Ok(())
 }

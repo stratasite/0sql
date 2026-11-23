@@ -9,11 +9,11 @@
 //! projected under its own name.
 
 use zsql_dialect::Dialects;
-use zsql_semantic::Universe;
+use zsql_semantic::SemanticModel;
 
 /// One table with a dimension, two distinct measures, and a name carried
 /// by both a dimension and a measure.
-fn universe(name: &str) -> (Universe, Dialects) {
+fn semantic(name: &str) -> (SemanticModel, Dialects) {
     // A directory per caller: these tests run in parallel, and sharing
     // one would have them deleting each other's project mid-load.
     let dir = std::env::temp_dir().join(format!("zsql-calc-refs-{}-{name}", std::process::id()));
@@ -54,15 +54,15 @@ fields:
     let dialects = Dialects::builtin();
     let loaded = zsql_project::load(&dir, &dialects).expect("loads");
     let _ = std::fs::remove_dir_all(&dir);
-    (Universe::build(loaded.snapshot).expect("universe"), dialects)
+    (SemanticModel::build(loaded.snapshot).expect("universe"), dialects)
 }
 
 fn plan(name: &str, spec: serde_json::Value) -> Result<String, String> {
-    let (universe, dialects) = universe(name);
+    let (semantic, dialects) = semantic(name);
     let spec = zsql_spec::Spec::from_value(spec).map_err(|e| e.to_string())?;
     let base = dialects.base().map_err(|e| e.to_string())?;
-    let q = zsql_spec::lower(&spec, &universe, &base).map_err(|e| e.to_string())?;
-    zsql_planner::Planner::new(&universe, &dialects, None).plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string())
+    let q = zsql_spec::lower(&spec, &semantic, &base).map_err(|e| e.to_string())?;
+    zsql_planner::Planner::new(&semantic, &dialects, None).plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string())
 }
 
 /// The case that already worked, and must keep working: a bare reference

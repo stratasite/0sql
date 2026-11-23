@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use zsql_dialect::Dialect;
-use zsql_semantic::{DataType, Field, FieldKind, Predicate, Universe};
+use zsql_semantic::{DataType, Field, FieldKind, Predicate, SemanticModel};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpecError {
@@ -317,7 +317,7 @@ fn parse_filter_node(v: &Value) -> Result<FilterNodeSpec> {
 /// regard to case; an `@d`/`@m` suffix (or the longer `@dim`, `@measure`)
 /// or an explicit `kind` picks between a dimension and a measure that
 /// share the spelling. Hidden fields resolve like any other.
-pub fn resolve_field<'u>(universe: &'u Universe, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
+pub fn resolve_field<'u>(semantic: &'u SemanticModel, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
     let reference = reference.trim();
     let (base, suffix) = match reference.split_once('@') {
         Some((b, s)) => (b, Some(s)),
@@ -328,15 +328,15 @@ pub fn resolve_field<'u>(universe: &'u Universe, reference: &str, kind: Option<&
         Some(k) => vec![k],
         None => vec![FieldKind::Dimension, FieldKind::Measure],
     };
-    let mut matches: Vec<&Field> = kinds.iter().filter_map(|k| universe.field_by_uid(base, Some(*k))).collect();
+    let mut matches: Vec<&Field> = kinds.iter().filter_map(|k| semantic.field_by_uid(base, Some(*k))).collect();
     if matches.is_empty() {
         let wanted = base.trim().to_lowercase();
-        matches = universe.fields().iter().filter(|f| kinds.contains(&f.kind) && f.name.trim().to_lowercase() == wanted).collect();
+        matches = semantic.fields().iter().filter(|f| kinds.contains(&f.kind) && f.name.trim().to_lowercase() == wanted).collect();
     }
     // A synonym the modeler wrote resolves like the name itself.
     if matches.is_empty() {
         let wanted = base.trim().to_lowercase();
-        matches = universe
+        matches = semantic
             .fields()
             .iter()
             .filter(|f| kinds.contains(&f.kind) && f.synonyms.iter().any(|s| s.trim().to_lowercase() == wanted))
@@ -386,7 +386,7 @@ fn ref_text(v: &Value) -> Result<String> {
 // ------------------------------------------------------------------ lowering
 
 struct Cx<'u> {
-    universe: &'u Universe,
+    semantic: &'u SemanticModel,
     reserved: Vec<String>,
     aggregates: Vec<String>,
     corrections: std::cell::RefCell<Vec<crate::fuzzy::Correction>>,
@@ -397,14 +397,14 @@ impl<'u> Cx<'u> {
     /// nothing answers exactly. A near match is recorded as a correction;
     /// an unclear one fails naming the closest fields.
     fn resolve(&self, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
-        match resolve_field(self.universe, reference, kind) {
+        match resolve_field(self.semantic, reference, kind) {
             Err(SpecError::NotFound(msg)) => {
                 let (base, suffix) = reference.trim().split_once('@').map(|(b, s)| (b, Some(s))).unwrap_or((reference.trim(), None));
                 let kinds: Vec<FieldKind> = match kind_hint(kind).or_else(|| kind_hint(suffix)) {
                     Some(k) => vec![k],
                     None => vec![FieldKind::Dimension, FieldKind::Measure],
                 };
-                let ranked = crate::fuzzy::suggest(self.universe, base, &kinds);
+                let ranked = crate::fuzzy::suggest(self.semantic, base, &kinds);
                 match crate::fuzzy::pick(&ranked) {
                     Some(best) => {
                         self.corrections.borrow_mut().push(crate::fuzzy::Correction {
@@ -426,9 +426,9 @@ impl<'u> Cx<'u> {
 /// Lowers a spec into the typed query the planner consumes. `dialect` is
 /// the base dialect (`Dialects::base`): its reserved keywords and aggregate
 /// functions parse each calculation's formula, as Rails' defaults do.
-pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Query> {
+pub fn lower(spec: &Spec, semantic: &SemanticModel, dialect: &Dialect) -> Result<Query> {
     let cx =
-        Cx { universe, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions(), corrections: Default::default() };
+        Cx { semantic, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions(), corrections: Default::default() };
 
     // Projections in listed order, calculations in place, then the
     // separate calculations list; formulas resolve against every field
@@ -461,7 +461,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
         .filter(|p| p.field_kind == Some(FieldKind::Dimension) && !p.is_calculation())
         .filter_map(|p| {
             let uid = p.field_uid.clone()?;
-            let name = cx.universe.field_by_uid(&uid, Some(FieldKind::Dimension)).map(|f| f.name.to_lowercase()).unwrap_or_default();
+            let name = cx.semantic.field_by_uid(&uid, Some(FieldKind::Dimension)).map(|f| f.name.to_lowercase()).unwrap_or_default();
             Some((uid, name, display_alias(&cx, p).trim().to_lowercase()))
         })
         .collect();
@@ -473,7 +473,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
             let name = p
                 .field_uid
                 .as_deref()
-                .and_then(|u| cx.universe.field_by_uid(u, Some(FieldKind::Measure)))
+                .and_then(|u| cx.semantic.field_by_uid(u, Some(FieldKind::Measure)))
                 .map(|f| f.name.to_lowercase())
                 .unwrap_or_default();
             (uid, name, display_alias(&cx, p).trim().to_lowercase())
@@ -639,7 +639,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     let mut sql = sql;
     let mut measure_refs = Vec::new();
     for name in &parsed.measure_refs {
-        let f = match cx.universe.field_by_name(name, FieldKind::Measure) {
+        let f = match cx.semantic.field_by_name(name, FieldKind::Measure) {
             Some(f) => f,
             None => {
                 let f = cx.resolve(name, Some("measure")).map_err(|e| {
@@ -653,7 +653,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     }
     let mut dimension_refs = Vec::new();
     for name in &parsed.dimension_refs {
-        let f = match cx.universe.field_by_name(name, FieldKind::Dimension) {
+        let f = match cx.semantic.field_by_name(name, FieldKind::Dimension) {
             Some(f) => f,
             None => {
                 let f = cx.resolve(name, Some("dimension")).map_err(|e| {
@@ -676,8 +676,8 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
             projection_refs.push(name.clone());
             continue;
         }
-        let dim = cx.universe.field_by_name(name, FieldKind::Dimension);
-        let msr = cx.universe.field_by_name(name, FieldKind::Measure);
+        let dim = cx.semantic.field_by_name(name, FieldKind::Dimension);
+        let msr = cx.semantic.field_by_name(name, FieldKind::Measure);
         // A name belongs to at most one dimension and at most one
         // measure, so the only ambiguity is a name that is both.
         match (dim, msr) {
@@ -965,7 +965,7 @@ fn humanize(s: &str) -> String {
 }
 
 fn display_alias(cx: &Cx, p: &Projection) -> String {
-    let name = p.field_uid.as_deref().and_then(|u| cx.universe.field_by_uid(u, p.field_kind)).map(|f| f.name.as_str());
+    let name = p.field_uid.as_deref().and_then(|u| cx.semantic.field_by_uid(u, p.field_kind)).map(|f| f.name.as_str());
     derived_alias(p, name)
 }
 
@@ -1176,7 +1176,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
         };
         let first_key = projections[0].source_ref.clone().unwrap_or_default();
         let key_name = cx
-            .universe
+            .semantic
             .field_by_uid(projections[0].field_uid.as_deref().unwrap_or(""), Some(FieldKind::Dimension))
             .map(|f| f.name.clone())
             .unwrap_or(first_key);
@@ -1292,7 +1292,7 @@ fn measure_projection_for<'p>(cx: &Cx, projections: &'p [Projection], reference:
     if matches.is_empty() {
         // Rails `resolve_target_ref`: a measure's name or uid becomes its uid
         // before matching; a ref that is no field is tried as written.
-        let uid = match resolve_field(cx.universe, reference, Some("measure")) {
+        let uid = match resolve_field(cx.semantic, reference, Some("measure")) {
             Ok(f) => f.uid.to_lowercase(),
             Err(_) => reference.split('@').next().unwrap_or("").trim().to_lowercase(),
         };

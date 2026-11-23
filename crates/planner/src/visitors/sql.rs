@@ -6,12 +6,12 @@ use crate::sql::dates::date_lit;
 use crate::sql::expr::{entity_gsub, qualify, ungroupable};
 use crate::sql::Builder;
 use crate::{PlanError, Result};
-use zsql_semantic::{DataType, Expression, Field, Predicate, Universe};
+use zsql_semantic::{DataType, Expression, Field, Predicate, SemanticModel};
 use zsql_spec::DecoratorKind;
 
-pub fn run<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
-        let sql = node_to_sql(graph, universe, q, id)?;
+        let sql = node_to_sql(graph, semantic, q, id)?;
         *graph.nodes[id].sql.borrow_mut() = Some(sql);
     }
     Ok(())
@@ -19,12 +19,12 @@ pub fn run<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Res
 
 struct Ctx<'g, 'a> {
     graph: &'g Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     q: &'g RQuery<'a>,
 }
 
-fn node_to_sql<'a>(graph: &Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, id: NodeId) -> Result<String> {
-    let cx = Ctx { graph, universe, q };
+fn node_to_sql<'a>(graph: &Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>, id: NodeId) -> Result<String> {
+    let cx = Ctx { graph, semantic, q };
     let node = &graph.nodes[id];
     let mut sql = Builder::new();
 
@@ -108,12 +108,12 @@ fn from_clauses<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>) -> Result<Vec<String>> {
     let mut processed = vec![root.id];
     let mut clauses = vec![format!("\n\t{} {}", root.physical_name, node.table_alias(AliasKey::Table(root.id), 'T'))];
 
-    let mut stack: std::collections::VecDeque<_> = node.from_clause_join_defs(cx.universe).into_iter().collect();
+    let mut stack: std::collections::VecDeque<_> = node.from_clause_join_defs(cx.semantic).into_iter().collect();
     let stack_size = stack.len();
     let mut missed = 1;
     while let Some(jd) = stack.pop_front() {
         if processed.contains(&jd.left_id) {
-            let right = cx.universe.table(jd.right_id).expect("join right table");
+            let right = cx.semantic.table(jd.right_id).expect("join right table");
             let left_alias = node.table_alias(AliasKey::Table(jd.left_id), 'T');
             let right_alias = node.table_alias(AliasKey::Table(jd.right_id), 'T');
             let join = to_join(join_type_name(jd.join_type), &right.physical_name, &right_alias)?;
@@ -432,7 +432,7 @@ fn resolve_expression<'a>(
             .ok_or_else(|| PlanError::Resolution(format!("Could not find path for {}", crate::model::field_to_s(field))))?
         }
     };
-    cx.universe
+    cx.semantic
         .expression_for(path.target_table_id, field.id)
         .ok_or_else(|| PlanError::Resolution(format!("Could not find expression for {}", crate::model::field_to_s(field))))
 }
@@ -444,7 +444,7 @@ fn aliased_expression_sql<'a>(cx: &Ctx<'_, 'a>, parent: &Node<'a>, expression: &
 /// Rails `Strategy::Base#append_path_joins`: joins along the path, cheapest
 /// first, skipping tables the parent already aliased.
 fn append_path_joins<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>, path: &zsql_semantic::Path) {
-    let mut jds: Vec<&zsql_semantic::JoinDef> = path.joins.iter().filter_map(|j| cx.universe.join(*j)).collect();
+    let mut jds: Vec<&zsql_semantic::JoinDef> = path.joins.iter().filter_map(|j| cx.semantic.join(*j)).collect();
     jds.sort_by_key(|j| (j.cost, j.id));
     for jd in jds {
         if parent.table_aliased(&AliasKey::Table(jd.right_id)) {
@@ -453,7 +453,7 @@ fn append_path_joins<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder, parent: &Node<'a>,
         let left = parent.table_alias(AliasKey::Table(jd.left_id), 'T');
         let right = parent.table_alias(AliasKey::Table(jd.right_id), 'T');
         let cond = replace_ci(&replace_ci(&jd.sql, "left.", &format!("{left}.")), "right.", &format!("{right}."));
-        let right_table = cx.universe.table(jd.right_id).expect("join right table");
+        let right_table = cx.semantic.table(jd.right_id).expect("join right table");
         sql.from(format!(
             "\n\t{} JOIN {} {}\n\t\tON {}",
             join_type_name(jd.join_type).to_uppercase(),

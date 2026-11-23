@@ -4,7 +4,7 @@ use std::collections::HashMap;
 /// A branch's semantic model, indexed for lookup and checked for
 /// referential integrity. Immutable once built; share it behind an `Arc`.
 #[derive(Debug)]
-pub struct Universe {
+pub struct SemanticModel {
     snap: Snapshot,
     tables_by_id: HashMap<Id, usize>,
     tables_by_uid: HashMap<String, usize>,
@@ -24,7 +24,7 @@ pub enum BuildError {
     Integrity(Vec<String>),
 }
 
-impl Universe {
+impl SemanticModel {
     pub fn build(snap: Snapshot) -> Result<Self, BuildError> {
         let mut problems = Vec::new();
         let mut warnings = Vec::new();

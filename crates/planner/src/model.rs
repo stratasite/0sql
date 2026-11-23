@@ -6,7 +6,7 @@ use crate::{PlanError, Result};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
-use zsql_semantic::{Field, FieldKind, Id, Table, Universe};
+use zsql_semantic::{Field, FieldKind, Id, SemanticModel, Table};
 use zsql_spec::{Decorator, DecoratorKind, Filter, LinkMode, LinkTarget, Projection, Query, SecurityContext, Tree};
 
 thread_local! {
@@ -262,8 +262,8 @@ pub fn field_to_s(f: &Field) -> String {
 }
 
 /// Rails `Semantic::Table#to_s`: `[datasource_uid:table_uid]`.
-pub fn table_to_s(universe: &Universe, t: &Table) -> String {
-    let ds = universe.datasource(t.datasource_id).map(|d| d.uid.as_str()).unwrap_or("");
+pub fn table_to_s(semantic: &SemanticModel, t: &Table) -> String {
+    let ds = semantic.datasource(t.datasource_id).map(|d| d.uid.as_str()).unwrap_or("");
     format!("[{}:{}]", ds, t.uid)
 }
 
@@ -290,13 +290,13 @@ impl<'a> RFilter<'a> {
 /// mistake rather than a preference, so it refuses instead of going quiet;
 /// one that resolves to two tables is the same mistake with more than one
 /// way to read it, and says both.
-fn resolve_hints<'a>(universe: &'a Universe, hints: &[String], whose: &dyn Fn() -> String) -> Result<Vec<&'a Table>> {
+fn resolve_hints<'a>(semantic: &'a SemanticModel, hints: &[String], whose: &dyn Fn() -> String) -> Result<Vec<&'a Table>> {
     let mut out = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     for h in hints {
-        match universe.tables_by_uid_or_name(h).as_slice() {
+        match semantic.tables_by_uid_or_name(h).as_slice() {
             [one] => out.push(*one),
-            [] => unknown.push(format!("{h}{}", did_you_mean(universe, h))),
+            [] => unknown.push(format!("{h}{}", did_you_mean(semantic, h))),
             several => {
                 let names: Vec<&str> = several.iter().map(|t| t.uid.as_str()).collect();
                 return Err(PlanError::Resolution(format!(
@@ -318,12 +318,12 @@ fn resolve_hints<'a>(universe: &'a Universe, hints: &[String], whose: &dyn Fn() 
 /// normalized first, as every other near-match in the system is: without
 /// that, `web sails` scores below the floor against `web_sales` and the
 /// hint spelling this resolver exists to accept gets no suggestion.
-fn did_you_mean(universe: &Universe, term: &str) -> String {
+fn did_you_mean(semantic: &SemanticModel, term: &str) -> String {
     let want = zsql_spec::fuzzy::normalize(term);
     if want.chars().count() < zsql_spec::fuzzy::MIN_LEN {
         return String::new();
     }
-    let mut near: Vec<(f64, &str)> = universe
+    let mut near: Vec<(f64, &str)> = semantic
         .tables()
         .iter()
         .flat_map(|t| {
@@ -442,11 +442,11 @@ impl FilledTree {
 }
 
 impl<'a> RQuery<'a> {
-    pub fn resolve(universe: &'a Universe, def: Query) -> Result<Self> {
+    pub fn resolve(semantic: &'a SemanticModel, def: Query) -> Result<Self> {
         let mut projections: Vec<RProjection<'a>> = Vec::new();
         for p in &def.projections {
             let field = match (&p.field_uid, p.is_calculation()) {
-                (Some(uid), false) => Some(universe.field_by_uid(uid, p.field_kind).ok_or_else(|| {
+                (Some(uid), false) => Some(semantic.field_by_uid(uid, p.field_kind).ok_or_else(|| {
                     PlanError::Resolution(format!(
                         "Query is not valid: [\"Projections Field {uid} is no longer available in this branch\"]"
                     ))
@@ -476,12 +476,12 @@ impl<'a> RQuery<'a> {
             }
             let mut field_refs = Vec::new();
             for uid in &p.dimension_refs {
-                if let Some(f) = universe.field_by_uid(uid, Some(FieldKind::Dimension)) {
+                if let Some(f) = semantic.field_by_uid(uid, Some(FieldKind::Dimension)) {
                     field_refs.push(f);
                 }
             }
             for uid in &p.measure_refs {
-                if let Some(f) = universe.field_by_uid(uid, Some(FieldKind::Measure)) {
+                if let Some(f) = semantic.field_by_uid(uid, Some(FieldKind::Measure)) {
                     field_refs.push(f);
                 }
             }
@@ -501,7 +501,7 @@ impl<'a> RQuery<'a> {
         let mut filters = Vec::new();
         let mut by_ref = std::collections::HashMap::new();
         for (i, f) in def.filters.iter().enumerate() {
-            let field = universe.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
+            let field = semantic.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
                 PlanError::Resolution(format!(
                     "Query is not valid: [\"Filters Field {} is no longer available in this branch\"]",
                     f.field_uid
@@ -514,7 +514,7 @@ impl<'a> RQuery<'a> {
             Some(t) => FilledTree::from_tree(t, &by_ref).unwrap_or(FilledTree::Group("and".into(), vec![])),
             None => FilledTree::Group("and".into(), (0..filters.len()).map(FilledTree::Leaf).collect()),
         };
-        let hints = resolve_hints(universe, &def.hints, &|| "the query's".to_string())?;
+        let hints = resolve_hints(semantic, &def.hints, &|| "the query's".to_string())?;
 
         // Segments: their own components, then links resolved onto the
         // query's projections and carried columns onto their definitions.
@@ -524,17 +524,17 @@ impl<'a> RQuery<'a> {
             let mut sprojs = Vec::new();
             for p in &s.projections {
                 let field = match (&p.field_uid, p.is_calculation()) {
-                    (Some(uid), false) => universe.field_by_uid(uid, p.field_kind),
+                    (Some(uid), false) => semantic.field_by_uid(uid, p.field_kind),
                     _ => None,
                 };
                 let mut field_refs = Vec::new();
                 for uid in &p.dimension_refs {
-                    if let Some(f) = universe.field_by_uid(uid, Some(FieldKind::Dimension)) {
+                    if let Some(f) = semantic.field_by_uid(uid, Some(FieldKind::Dimension)) {
                         field_refs.push(f);
                     }
                 }
                 for uid in &p.measure_refs {
-                    if let Some(f) = universe.field_by_uid(uid, Some(FieldKind::Measure)) {
+                    if let Some(f) = semantic.field_by_uid(uid, Some(FieldKind::Measure)) {
                         field_refs.push(f);
                     }
                 }
@@ -556,7 +556,7 @@ impl<'a> RQuery<'a> {
                 sby_ref.insert(*q_ref, q_fid);
             }
             for f in &s.filters {
-                let field = universe.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
+                let field = semantic.field_by_uid(&f.field_uid, f.field_kind).ok_or_else(|| {
                     PlanError::Resolution(format!("Query is not valid: [\"Segment filter field {} is no longer available\"]", f.field_uid))
                 })?;
                 sby_ref.insert(f.reference.as_str(), fid);
@@ -584,7 +584,7 @@ impl<'a> RQuery<'a> {
                 .collect();
             // Named lazily: the overwhelming majority of segments have no
             // hints at all, and this is per segment per query.
-            let hints = resolve_hints(universe, &s.hints, &|| match s.name.as_deref() {
+            let hints = resolve_hints(semantic, &s.hints, &|| match s.name.as_deref() {
                 Some(name) => format!("segment '{name}'"),
                 None => "the segment's".to_string(),
             })?;
@@ -675,10 +675,10 @@ impl<'a> RQuery<'a> {
     /// Rails `Query.static_calc`: a measure calculation over the formula,
     /// with its `[Name]@m`, `[Name]@d` and `[Alias]` references resolved,
     /// seated after the query's projections and appended to them.
-    pub fn static_calc(&self, universe: &'a Universe, alias: &str, sql: &str) -> Rc<RProjection<'a>> {
+    pub fn static_calc(&self, semantic: &'a SemanticModel, alias: &str, sql: &str) -> Rc<RProjection<'a>> {
         let (measures, dims, projs) = crate::sql::expr::parse_refs(sql);
-        let measure_refs: Vec<&Field> = measures.iter().filter_map(|n| universe.field_by_name(n, FieldKind::Measure)).collect();
-        let dimension_refs: Vec<&Field> = dims.iter().filter_map(|n| universe.field_by_name(n, FieldKind::Dimension)).collect();
+        let measure_refs: Vec<&Field> = measures.iter().filter_map(|n| semantic.field_by_name(n, FieldKind::Measure)).collect();
+        let dimension_refs: Vec<&Field> = dims.iter().filter_map(|n| semantic.field_by_name(n, FieldKind::Dimension)).collect();
         let mut rp = RProjection::for_calc_typed(
             sql.to_string(),
             alias.to_string(),
@@ -715,7 +715,7 @@ impl<'a> RQuery<'a> {
 }
 
 /// Refuses, as unimplemented, queries that need visitors not yet ported.
-pub fn check_supported(q: &RQuery, universe: &Universe, principal: Option<&SecurityContext>) -> Result<()> {
+pub fn check_supported(q: &RQuery, semantic: &SemanticModel, principal: Option<&SecurityContext>) -> Result<()> {
     for p in &q.projections {
         for d in &p.def.decorators {
             match d.kind {
@@ -729,6 +729,6 @@ pub fn check_supported(q: &RQuery, universe: &Universe, principal: Option<&Secur
             }
         }
     }
-    let _ = (principal, universe);
+    let _ = (principal, semantic);
     Ok(())
 }

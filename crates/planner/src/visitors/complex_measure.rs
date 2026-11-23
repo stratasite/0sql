@@ -9,7 +9,7 @@ use crate::universe::Universes;
 use crate::{PlanError, Result};
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_semantic::{Field, Universe};
+use zsql_semantic::{Field, SemanticModel};
 
 /// A compound component of a node and the measures it needs from elsewhere.
 enum Component<'a> {
@@ -28,14 +28,14 @@ impl<'a> Component<'a> {
 
 pub fn run<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
 ) -> Result<()> {
     let mut registry: HashMap<i64, Signature> = HashMap::new();
     for id in graph.post_order() {
-        visit(graph, id, universe, universes, dialects, q, &mut registry)?;
+        visit(graph, id, semantic, universes, dialects, q, &mut registry)?;
     }
     Ok(())
 }
@@ -47,7 +47,7 @@ use std::collections::HashMap;
 fn register_reference_signatures<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     q: &RQuery<'a>,
     component: &Component<'a>,
     registry: &mut HashMap<i64, Signature>,
@@ -56,9 +56,9 @@ fn register_reference_signatures<'a>(
         Component::Proj(p) => signature(p),
         Component::Filter(_) => vec![],
     };
-    let exp = graph.nodes[id].expression(universe, component.field())?;
+    let exp = graph.nodes[id].expression(semantic, component.field())?;
     for mid in &exp.measure_ref_ids {
-        let Some(field) = universe.field(*mid) else { continue };
+        let Some(field) = semantic.field(*mid) else { continue };
         if let Some(prev) = registry.get(&field.id) {
             if *prev != sig {
                 return Err(conflict(component, field, q));
@@ -99,7 +99,7 @@ fn conflict<'a>(component: &Component<'a>, field: &Field, q: &RQuery<'a>) -> Pla
 fn visit<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -108,25 +108,25 @@ fn visit<'a>(
     if graph.nodes[id].removed || graph.nodes[id].kind == NodeKind::Merge {
         return Ok(());
     }
-    let non_local = non_local_measure_references(graph, id, universe)?;
+    let non_local = non_local_measure_references(graph, id, semantic)?;
     if non_local.is_empty() {
         return Ok(());
     }
     for (component, measures) in non_local {
-        register_reference_signatures(graph, id, universe, q, &component, registry)?;
-        let merge = setup_merge_node(graph, id, universe, &component, q)?;
+        register_reference_signatures(graph, id, semantic, q, &component, registry)?;
+        let merge = setup_merge_node(graph, id, semantic, &component, q)?;
         let segmented = matches!(&component, Component::Proj(p) if !component_links(p).is_empty());
         if segmented {
             let Component::Proj(p) = &component else { unreachable!() };
-            create_segmented_component_graph(graph, id, merge, universe, universes, dialects, q, p)?;
+            create_segmented_component_graph(graph, id, merge, semantic, universes, dialects, q, p)?;
             graph.nodes[id].delete_projection(p.pid);
         } else {
-            project_local_reference(graph, id, universe, &component)?;
+            project_local_reference(graph, id, semantic, &component)?;
             match &component {
                 Component::Proj(p) => graph.nodes[id].delete_projection(p.pid),
                 Component::Filter(f) => graph.nodes[id].delete_filter(f.fid),
             }
-            create_non_local_measure_graph(graph, id, merge, universe, universes, dialects, q, &component, measures)?;
+            create_non_local_measure_graph(graph, id, merge, semantic, universes, dialects, q, &component, measures)?;
         }
     }
     if !graph.nodes[id].projections.iter().any(|p| p.is_measure()) {
@@ -139,7 +139,7 @@ fn visit<'a>(
 fn non_local_measure_references<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
 ) -> Result<Vec<(Component<'a>, Vec<&'a Field>)>> {
     let base = graph.nodes[id].universe.clone().expect("query node universe");
     let mut components: Vec<Component<'a>> = Vec::new();
@@ -155,9 +155,9 @@ fn non_local_measure_references<'a>(
     }
     let mut out = Vec::new();
     for c in components {
-        let exp = graph.nodes[id].expression(universe, c.field())?;
+        let exp = graph.nodes[id].expression(semantic, c.field())?;
         let non_local: Vec<&Field> =
-            exp.measure_ref_ids.iter().filter(|m| !base.has_measure(**m)).filter_map(|m| universe.field(*m)).collect();
+            exp.measure_ref_ids.iter().filter(|m| !base.has_measure(**m)).filter_map(|m| semantic.field(*m)).collect();
         if !exp.measure_ref_ids.is_empty() && !non_local.is_empty() {
             out.push((c, non_local));
         }
@@ -171,7 +171,7 @@ fn non_local_measure_references<'a>(
 fn setup_merge_node<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     component: &Component<'a>,
     q: &RQuery<'a>,
 ) -> Result<NodeId> {
@@ -196,7 +196,7 @@ fn setup_merge_node<'a>(
             graph.nodes[merge].filters.push(crate::dag::Filtered::new(f.clone()));
         }
     }
-    let exp = graph.nodes[id].expression(universe, component.field())?;
+    let exp = graph.nodes[id].expression(semantic, component.field())?;
     let key = match component {
         Component::Filter(f) => RefKey::Field(f.field.id),
         Component::Proj(p) if !p.is_calculation() => RefKey::Field(p.field.expect("field").id),
@@ -210,12 +210,12 @@ fn setup_merge_node<'a>(
 }
 
 /// Referenced measures this universe holds are projected here so the merge can read them.
-fn project_local_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, component: &Component<'a>) -> Result<()> {
-    let exp = graph.nodes[id].expression(universe, component.field())?;
+fn project_local_reference<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, component: &Component<'a>) -> Result<()> {
+    let exp = graph.nodes[id].expression(semantic, component.field())?;
     let base = graph.nodes[id].universe.clone().expect("universe");
     for mid in &exp.measure_ref_ids {
         if !has_clean_projected_measure(&graph.nodes[id], *mid) && base.has_measure(*mid) {
-            let m = universe.field(*mid).expect("measure");
+            let m = semantic.field(*mid).expect("measure");
             let mut rp = RProjection::for_field(m);
             rp.def.ordinal = Some(graph.nodes[id].projections.len() as i64);
             graph.nodes[id].add_projection(Rc::new(rp));
@@ -233,7 +233,7 @@ fn create_non_local_measure_graph<'a>(
     graph: &mut Graph<'a>,
     _id: NodeId,
     merge: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -279,10 +279,10 @@ fn create_non_local_measure_graph<'a>(
         segments: vec![],
     };
     let opts = Options { auto_level_dims: true, datasource: Some(graph.datasource), ..Default::default() };
-    let mut sub_graph = resolver::resolve_with(universe, universes, dialects, &sub, &opts)?;
+    let mut sub_graph = resolver::resolve_with(semantic, universes, dialects, &sub, &opts)?;
     // Sub-plans carry no db settings, but render inside the main graph.
     sub_graph.dialect = graph.dialect.clone();
-    run(&mut sub_graph, universe, universes, dialects, &sub)?;
+    run(&mut sub_graph, semantic, universes, dialects, &sub)?;
     let sub_root = graph.import(sub_graph);
     graph.add_edge(sub_root, merge);
     Ok(())
@@ -295,14 +295,14 @@ fn create_segmented_component_graph<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
     merge: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
     component: &Rc<RProjection<'a>>,
 ) -> Result<()> {
-    let exp = graph.nodes[id].expression(universe, component.field.expect("measure"))?;
-    let measures: Vec<&Field> = exp.measure_ref_ids.iter().filter_map(|m| universe.field(*m)).collect();
+    let exp = graph.nodes[id].expression(semantic, component.field.expect("measure"))?;
+    let measures: Vec<&Field> = exp.measure_ref_ids.iter().filter_map(|m| semantic.field(*m)).collect();
     let mut projections: Vec<Rc<RProjection<'a>>> = q.all_projections().into_iter().filter(|p| p.is_dimension()).collect();
     for m in &measures {
         let mut rp = RProjection::for_field(m);
@@ -337,11 +337,11 @@ fn create_segmented_component_graph<'a>(
         }
     }
     let opts = Options { auto_level_dims: true, datasource: Some(graph.datasource), required_dims: required.clone(), ..Default::default() };
-    let mut sub_graph = match resolver::resolve_with(universe, universes, dialects, &sub, &opts) {
+    let mut sub_graph = match resolver::resolve_with(semantic, universes, dialects, &sub, &opts) {
         Ok(g) => g,
         Err(PlanError::Resolution(m)) => {
             let unpinned = Options { auto_level_dims: true, datasource: None, required_dims: required, ..Default::default() };
-            return match resolver::resolve_with(universe, universes, dialects, &sub, &unpinned) {
+            return match resolver::resolve_with(semantic, universes, dialects, &sub, &unpinned) {
                 Ok(_) => Err(PlanError::SegmentDatasource(m)),
                 Err(_) => Err(PlanError::Resolution(m)),
             };
@@ -349,7 +349,7 @@ fn create_segmented_component_graph<'a>(
         Err(e) => return Err(e),
     };
     sub_graph.dialect = graph.dialect.clone();
-    run(&mut sub_graph, universe, universes, dialects, &sub)?;
+    run(&mut sub_graph, semantic, universes, dialects, &sub)?;
     let sub_root = graph.import(sub_graph);
     graph.add_edge(sub_root, merge);
     Ok(())

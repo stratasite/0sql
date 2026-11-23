@@ -11,7 +11,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use zsql_semantic::{Cardinality, Field, FieldKind, Id, Path, Tier, Universe};
+use zsql_semantic::{Cardinality, Field, FieldKind, Id, Path, SemanticModel, Tier};
 
 pub struct Formation {
     pub paths: Vec<Path>,
@@ -35,8 +35,8 @@ struct Route {
     tables: Vec<Id>,
 }
 
-pub fn form(universe: &Universe) -> Formation {
-    let snap = universe.snapshot();
+pub fn form(semantic: &SemanticModel) -> Formation {
+    let snap = semantic.snapshot();
     let mut warnings = Vec::new();
 
     let mut edges: HashMap<Id, Vec<Edge>> = HashMap::new();
@@ -46,14 +46,14 @@ pub fn form(universe: &Universe) -> Formation {
     }
 
     let tier_of = |table_id: Id| -> Option<i64> {
-        universe.table(table_id).and_then(|t| universe.datasource(t.datasource_id)).and_then(|d| d.tier).map(|t| match t {
+        semantic.table(table_id).and_then(|t| semantic.datasource(t.datasource_id)).and_then(|d| d.tier).map(|t| match t {
             Tier::Hot => 0,
             Tier::Warm => 1,
             Tier::Cold => 2,
         })
     };
     let fields_on =
-        |table_id: Id| -> Vec<&Field> { universe.expressions_of(table_id).filter_map(|e| universe.field(e.field_id)).collect() };
+        |table_id: Id| -> Vec<&Field> { semantic.expressions_of(table_id).filter_map(|e| semantic.field(e.field_id)).collect() };
 
     let mut paths: Vec<Path> = Vec::new();
     let mut next_id: Id = 1;
@@ -84,28 +84,28 @@ pub fn form(universe: &Universe) -> Formation {
     // Multi-hop routes: one tree over all joins for dimensions, one over
     // measure-safe joins for measures.
     for root in &snap.tables {
-        let dim_tree = shortest_routes(root.id, &edges, false, &mut warnings, universe);
-        let msr_tree = shortest_routes(root.id, &edges, true, &mut warnings, universe);
+        let dim_tree = shortest_routes(root.id, &edges, false, &mut warnings, semantic);
+        let msr_tree = shortest_routes(root.id, &edges, true, &mut warnings, semantic);
         let emit = |route: &Route, kind: FieldKind, paths: &mut Vec<Path>, next_id: &mut Id| {
             let target = *route.tables.last().expect("route target");
             let from = if route.tables.len() >= 2 { route.tables[route.tables.len() - 2] } else { root.id };
             let cost = route.cost.max(route.joins.len() as i64);
             let mut nodes: Vec<Id> = Vec::new();
             for j in &route.joins {
-                if let Some(jd) = universe.join(*j) {
+                if let Some(jd) = semantic.join(*j) {
                     if !nodes.contains(&jd.left_id) {
                         nodes.push(jd.left_id);
                     }
                 }
             }
             for j in &route.joins {
-                if let Some(jd) = universe.join(*j) {
+                if let Some(jd) = semantic.join(*j) {
                     if !nodes.contains(&jd.right_id) {
                         nodes.push(jd.right_id);
                     }
                 }
             }
-            let Some(target_table) = universe.table(target) else { return };
+            let Some(target_table) = semantic.table(target) else { return };
             for f in fields_on(target).into_iter().filter(|f| f.kind == kind) {
                 paths.push(Path {
                     id: *next_id,
@@ -140,8 +140,8 @@ pub fn form(universe: &Universe) -> Formation {
         }
     }
 
-    extended_blend_paths(universe, &mut paths, &mut next_id);
-    ambiguous_field_routes(universe, &paths, &mut warnings);
+    extended_blend_paths(semantic, &mut paths, &mut next_id);
+    ambiguous_field_routes(semantic, &paths, &mut warnings);
 
     Formation { paths, warnings }
 }
@@ -150,7 +150,7 @@ pub fn form(universe: &Universe) -> Formation {
 /// same cost: the model does not say whose value the user gets, and the
 /// engine can only pick consistently, not correctly. Named so the modeler
 /// can split the dimension or set costs so the intended table wins.
-fn ambiguous_field_routes(universe: &Universe, paths: &[Path], warnings: &mut Vec<String>) {
+fn ambiguous_field_routes(semantic: &SemanticModel, paths: &[Path], warnings: &mut Vec<String>) {
     let mut by_pair: HashMap<(Id, Id), Vec<&Path>> = HashMap::new();
     for p in paths.iter().filter(|p| p.blending_field_id.is_none()) {
         by_pair.entry((p.root_table_id, p.field_id)).or_default().push(p);
@@ -159,15 +159,15 @@ fn ambiguous_field_routes(universe: &Universe, paths: &[Path], warnings: &mut Ve
     keys.sort();
     for key in keys {
         let mut candidates = by_pair[key].clone();
-        candidates.sort_by_key(|p| (p.cost, universe.path_signature(p)));
+        candidates.sort_by_key(|p| (p.cost, semantic.path_signature(p)));
         let cheapest = candidates[0];
         let tied: Vec<&Path> =
             candidates.iter().copied().filter(|p| p.cost == cheapest.cost && p.target_table_id != cheapest.target_table_id).collect();
         if tied.is_empty() {
             continue;
         }
-        let name = |id: Id| universe.table(id).map(|t| t.uid.as_str()).unwrap_or("?");
-        let field = universe.field(key.1).map(|f| f.name.as_str()).unwrap_or("?");
+        let name = |id: Id| semantic.table(id).map(|t| t.uid.as_str()).unwrap_or("?");
+        let field = semantic.field(key.1).map(|f| f.name.as_str()).unwrap_or("?");
         let mut tables: Vec<String> =
             std::iter::once(cheapest).chain(tied.iter().copied()).map(|p| name(p.target_table_id).to_string()).collect();
         tables.sort();
@@ -191,9 +191,9 @@ fn shortest_routes(
     edges: &HashMap<Id, Vec<Edge>>,
     measures_only: bool,
     warnings: &mut Vec<String>,
-    universe: &Universe,
+    semantic: &SemanticModel,
 ) -> HashMap<Id, Route> {
-    let uid = |id: Id| universe.table(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
+    let uid = |id: Id| semantic.table(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
     let mut best: HashMap<Id, Route> = HashMap::new();
     let mut heap: BinaryHeap<Reverse<(i64, usize, String, Vec<Id>, Id)>> = BinaryHeap::new();
     heap.push(Reverse((0, 0, uid(root), vec![], root)));
@@ -207,8 +207,8 @@ fn shortest_routes(
                 if existing.cost == cost && existing.joins != joins {
                     warnings.push(format!(
                         "root {} reaches {} by two routes of cost {}: {:?} chosen over {:?}",
-                        universe.table(root).map(|t| t.uid.as_str()).unwrap_or("?"),
-                        universe.table(table).map(|t| t.uid.as_str()).unwrap_or("?"),
+                        semantic.table(root).map(|t| t.uid.as_str()).unwrap_or("?"),
+                        semantic.table(table).map(|t| t.uid.as_str()).unwrap_or("?"),
                         cost,
                         existing.joins,
                         joins
@@ -245,9 +245,9 @@ fn shortest_routes(
 /// Rails `create_extended_blending_paths`: a dimension in a blend group is
 /// answered from any universe holding another member of the group, through
 /// that local member's path.
-fn extended_blend_paths(universe: &Universe, paths: &mut Vec<Path>, next_id: &mut Id) {
+fn extended_blend_paths(semantic: &SemanticModel, paths: &mut Vec<Path>, next_id: &mut Id) {
     let mut groups: Vec<(String, Vec<Id>)> = Vec::new();
-    for f in universe.fields().iter().filter(|f| f.kind == FieldKind::Dimension) {
+    for f in semantic.fields().iter().filter(|f| f.kind == FieldKind::Dimension) {
         if let Some(g) = &f.extended_blend_group {
             match groups.iter_mut().find(|(k, _)| k == g) {
                 Some((_, v)) => v.push(f.id),

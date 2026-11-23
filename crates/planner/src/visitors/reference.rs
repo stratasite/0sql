@@ -7,19 +7,19 @@ use crate::model::{RProjection, RQuery};
 use crate::universe::Subtree;
 use crate::{PlanError, Result};
 use std::rc::Rc;
-use zsql_semantic::{Expression, Field, Universe};
+use zsql_semantic::{Expression, Field, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, _q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, _q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         match graph.nodes[id].kind {
-            NodeKind::Query | NodeKind::Aggregation => visit_query_node(graph, id, universe)?,
-            NodeKind::Merge => visit_merge_node(graph, id, universe)?,
+            NodeKind::Query | NodeKind::Aggregation => visit_query_node(graph, id, semantic)?,
+            NodeKind::Merge => visit_merge_node(graph, id, semantic)?,
         }
     }
     Ok(())
 }
 
-fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe) -> Result<()> {
+fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel) -> Result<()> {
     let fields: Vec<&Field> = {
         let n = &graph.nodes[id];
         n.dimensions().into_iter().chain(n.measures()).collect()
@@ -32,7 +32,7 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
         if only_carried(graph, id, field) {
             continue;
         }
-        let r = create_reference(graph, id, universe, field)?;
+        let r = create_reference(graph, id, semantic, field)?;
         graph.nodes[id].field_refs.insert(RefKey::Field(field.id), r);
     }
     // Calculations: a formula over the node's own fields and projections.
@@ -44,7 +44,7 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
         }
         let mut sources = Vec::new();
         for rf in calc.field_refs.clone() {
-            sources.push(create_reference(graph, id, universe, rf)?);
+            sources.push(create_reference(graph, id, semantic, rf)?);
         }
         append_projection_references(graph, id, &calc, &mut sources)?;
         graph.nodes[id].field_refs.insert(
@@ -55,7 +55,7 @@ fn visit_query_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
     if graph.dialect.greedy_apply_date_filters() {
         let date_fields: Vec<&Field> = graph.nodes[id].filters.iter().filter(|f| f.is_date()).map(|f| f.field()).collect();
         for field in date_fields {
-            create_greedy_filter_ref(graph, id, universe, field);
+            create_greedy_filter_ref(graph, id, semantic, field);
         }
     }
     Ok(())
@@ -70,8 +70,8 @@ fn only_carried(graph: &Graph, id: NodeId, field: &Field) -> bool {
 
 /// Rails `create_reference`: the field's expression on the cheapest path
 /// of the subtree holding it, adding the path to the node when none does.
-pub fn create_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, field: &'a Field) -> Result<Reference<'a>> {
-    create_reference_within(graph, id, universe, field, &mut Vec::new())
+pub fn create_reference<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, field: &'a Field) -> Result<Reference<'a>> {
+    create_reference_within(graph, id, semantic, field, &mut Vec::new())
 }
 
 /// `visiting` is the chain of fields whose expressions are being built,
@@ -86,12 +86,12 @@ pub fn create_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Uni
 fn create_reference_within<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     field: &'a Field,
     visiting: &mut Vec<zsql_semantic::Id>,
 ) -> Result<Reference<'a>> {
     if visiting.contains(&field.id) {
-        let mut chain: Vec<String> = visiting.iter().filter_map(|i| universe.field(*i)).map(|f| f.name.clone()).collect();
+        let mut chain: Vec<String> = visiting.iter().filter_map(|i| semantic.field(*i)).map(|f| f.name.clone()).collect();
         chain.push(field.name.clone());
         return Err(PlanError::Resolution(format!(
             "The expression for {} references itself: {}. Fix the model; this field cannot be planned.",
@@ -111,16 +111,16 @@ fn create_reference_within<'a>(
                 let node = &mut graph.nodes[id];
                 match node.subtrees.iter_mut().find(|t| t.join_path == path.joins) {
                     Some(t) => t.push(path),
-                    None => node.subtrees.push(Subtree::new(universe, base, path.joins.clone(), vec![path])),
+                    None => node.subtrees.push(Subtree::new(semantic, base, path.joins.clone(), vec![path])),
                 }
                 path
             }
         }
     };
     let exp = if let Some(blend) = path.blending_field_id.filter(|_| field.is_dimension() && path.extended_blend_group.is_some()) {
-        universe.expression_for(path.target_table_id, blend)
+        semantic.expression_for(path.target_table_id, blend)
     } else {
-        universe.expression_for(path.target_table_id, field.id)
+        semantic.expression_for(path.target_table_id, field.id)
     };
     let exp = exp.ok_or_else(|| {
         PlanError::Resolution(format!(
@@ -129,9 +129,9 @@ fn create_reference_within<'a>(
             path.target_table_id
         ))
     })?;
-    let table = universe.table(exp.table_id).expect("expression table");
+    let table = semantic.table(exp.table_id).expect("expression table");
     if !exp.dimension_ref_ids.is_empty() || !exp.measure_ref_ids.is_empty() {
-        create_local_multi_reference(graph, id, universe, field, exp, visiting)
+        create_local_multi_reference(graph, id, semantic, field, exp, visiting)
     } else {
         Ok(Reference::Table { entity: Entity::Field(field), expression: exp, table, greedy: vec![] })
     }
@@ -169,13 +169,13 @@ fn append_projection_references<'a>(
 
 /// Rails `build_out_multi_source_reference`: a merge-level formula with no
 /// sources yet reads each referenced field from the input that outputs it.
-fn build_out_multi_source_reference<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, key: RefKey) -> Result<()> {
+fn build_out_multi_source_reference<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, key: RefKey) -> Result<()> {
     let (expr, entity) = match graph.nodes[id].field_refs.get(&key) {
         Some(Reference::Multi { expression: Some(e), sources, entity }) if sources.is_empty() => (e.clone(), entity.clone()),
         _ => return Ok(()),
     };
     let fields: Vec<&'a Field> = match &expr {
-        MultiExpr::Semantic(e) => e.dimension_ref_ids.iter().chain(e.measure_ref_ids.iter()).filter_map(|i| universe.field(*i)).collect(),
+        MultiExpr::Semantic(e) => e.dimension_ref_ids.iter().chain(e.measure_ref_ids.iter()).filter_map(|i| semantic.field(*i)).collect(),
         MultiExpr::Calc(c) => c.field_refs.clone(),
     };
     let inputs = graph.nodes[id].inputs.clone();
@@ -212,20 +212,20 @@ fn build_out_multi_source_reference<'a>(graph: &mut Graph<'a>, id: NodeId, unive
 fn create_local_multi_reference<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     field: &'a Field,
     exp: &'a Expression,
     visiting: &mut Vec<zsql_semantic::Id>,
 ) -> Result<Reference<'a>> {
     let mut sources = Vec::new();
     if !exp.column_refs.is_empty() {
-        let table = universe.table(exp.table_id).expect("expression table");
+        let table = semantic.table(exp.table_id).expect("expression table");
         sources.push(Reference::Table { entity: Entity::Field(field), expression: exp, table, greedy: vec![] });
     }
     visiting.push(field.id);
     for rid in exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()) {
-        let rf = universe.field(*rid).ok_or_else(|| PlanError::Resolution(format!("referenced field {rid} not found")))?;
-        let r = create_reference_within(graph, id, universe, rf, visiting);
+        let rf = semantic.field(*rid).ok_or_else(|| PlanError::Resolution(format!("referenced field {rid} not found")))?;
+        let r = create_reference_within(graph, id, semantic, rf, visiting);
         match r {
             Ok(r) => sources.push(r),
             Err(e) => {
@@ -240,7 +240,7 @@ fn create_local_multi_reference<'a>(
 
 /// Expressions of a date field on the node's other joined tables, so the
 /// same filter can be applied on every side of the join.
-fn create_greedy_filter_ref<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, field: &'a Field) {
+fn create_greedy_filter_ref<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, field: &'a Field) {
     let node = &graph.nodes[id];
     let (ref_table_id, _) = match node.field_refs.get(&RefKey::Field(field.id)) {
         Some(Reference::Table { table, .. }) => (table.id, ()),
@@ -256,7 +256,7 @@ fn create_greedy_filter_ref<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a
     }
     table_ids.retain(|t| *t != ref_table_id);
     let extra: Vec<&'a Expression> =
-        universe.snapshot().expressions.iter().filter(|e| e.field_id == field.id && table_ids.contains(&e.table_id)).collect();
+        semantic.snapshot().expressions.iter().filter(|e| e.field_id == field.id && table_ids.contains(&e.table_id)).collect();
     if let Some(Reference::Table { greedy, .. }) = graph.nodes[id].field_refs.get_mut(&RefKey::Field(field.id)) {
         for e in extra {
             if !greedy.iter().any(|g| g.id == e.id) {
@@ -267,7 +267,7 @@ fn create_greedy_filter_ref<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a
 }
 
 /// Rails `set_field_reference_by_input_nodes` for a merge.
-fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe) -> Result<()> {
+fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel) -> Result<()> {
     let inputs = graph.nodes[id].inputs.clone();
     let projections: Vec<_> = graph.nodes[id].projections.iter().map(|p| p.proj.clone()).collect();
 
@@ -296,10 +296,10 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
         projections.into_iter().partition(|p| !(p.is_measure() && !crate::visitors::segmentation::component_links(p).is_empty()));
     let projections: Vec<_> = plain.into_iter().chain(constrained).collect();
     for p in projections {
-        build_out_multi_source_reference(graph, id, universe, RefKey::Proj(p.pid))?;
+        build_out_multi_source_reference(graph, id, semantic, RefKey::Proj(p.pid))?;
         if let Some(f) = p.field_id() {
             if !graph.nodes[id].field_refs.contains_key(&RefKey::Proj(p.pid)) {
-                build_out_multi_source_reference(graph, id, universe, RefKey::Field(f))?;
+                build_out_multi_source_reference(graph, id, semantic, RefKey::Field(f))?;
             }
         }
         if graph.nodes[id].field_refs.contains_key(&RefKey::Proj(p.pid)) {
@@ -340,7 +340,7 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Univers
     }
     let filters: Vec<_> = graph.nodes[id].filters.iter().map(|f| f.filter.clone()).collect();
     for f in filters {
-        build_out_multi_source_reference(graph, id, universe, RefKey::Field(f.field.id))?;
+        build_out_multi_source_reference(graph, id, semantic, RefKey::Field(f.field.id))?;
         if graph.nodes[id].field_refs.contains_key(&RefKey::Field(f.field.id)) {
             continue;
         }

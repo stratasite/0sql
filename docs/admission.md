@@ -23,7 +23,7 @@ TPC-DS sample:
 |---|---|
 | plan (`sql`, `explain`) | ~70 µs |
 | explore, fields search | a walk or a trigram scoring pass over every visible field; milliseconds, grows with the model |
-| deploy, validate, test | untar, load YAML, build the universe and the per-root index, run the tests; seconds for a real model |
+| deploy, validate, test | untar, load YAML, build the semantic model and the per-root universes, run the tests; seconds for a real model |
 
 ## Admission: concurrency caps per cost class
 

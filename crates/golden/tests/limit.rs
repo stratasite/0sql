@@ -15,7 +15,7 @@ fn a_limit_is_carried_only_when_the_caller_sends_one() {
 
     let (_, cases) = fx.cases().unwrap().into_iter().next().expect("a golden case file");
     let case = cases.first().expect("a golden case");
-    let (universe, _) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+    let (semantic, _) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
 
     // Every golden spec carries a limit; they were captured that way.
     assert!(case.spec.get("limit").is_some(), "this case was expected to carry a limit");
@@ -26,11 +26,11 @@ fn a_limit_is_carried_only_when_the_caller_sends_one() {
             Some(n) => object.insert("limit".into(), serde_json::json!(n)),
             None => object.remove("limit"),
         };
-        lower(&Spec::from_value(value).unwrap(), &universe, &base).unwrap()
+        lower(&Spec::from_value(value).unwrap(), &semantic, &base).unwrap()
     };
 
     assert_eq!(
-        lower(&Spec::from_value(case.spec.clone()).unwrap(), &universe, &base).unwrap().limit,
+        lower(&Spec::from_value(case.spec.clone()).unwrap(), &semantic, &base).unwrap().limit,
         case.spec.get("limit").and_then(|v| v.as_i64()),
     );
     // Absent stays absent: nothing supplies 5000, or anything else.
@@ -48,10 +48,10 @@ fn the_statement_carries_the_limit_only_through_sql_with_limit() {
 
     let (_, cases) = fx.cases().unwrap().into_iter().next().expect("a golden case file");
     let case = cases.first().expect("a golden case");
-    let (universe, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
-    let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+    let (semantic, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+    let planner = zsql_planner::Planner::new(&semantic, dialects, paths.as_deref().map(Vec::as_slice));
 
-    let query = lower(&Spec::from_value(case.spec.clone()).unwrap(), &universe, &base).unwrap();
+    let query = lower(&Spec::from_value(case.spec.clone()).unwrap(), &semantic, &base).unwrap();
     let plan = planner.plan_query(query, case.context.as_ref()).expect("the first golden case plans");
 
     assert!(
@@ -86,10 +86,10 @@ fn every_planned_case_takes_a_limit_in_one_place() {
 
     for (_, cases) in fx.cases().unwrap() {
         for case in &cases {
-            let Ok((universe, paths)) = fx.planner_for(&case.universe, PathSource::Formed) else { continue };
-            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            let Ok((semantic, paths)) = fx.planner_for(&case.universe, PathSource::Formed) else { continue };
+            let planner = zsql_planner::Planner::new(&semantic, dialects, paths.as_deref().map(Vec::as_slice));
             let Ok(spec) = Spec::from_value(case.spec.clone()) else { continue };
-            let Ok(query) = lower(&spec, &universe, &base) else { continue };
+            let Ok(query) = lower(&spec, &semantic, &base) else { continue };
             let Ok(plan) = planner.plan_query(query, case.context.as_ref()) else { continue };
             let dialect = dialects.get(&plan.adapter).unwrap();
 

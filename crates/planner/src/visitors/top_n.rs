@@ -9,12 +9,12 @@ use crate::visitors::grain::create_agg_node;
 use crate::{PlanError, Result};
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_semantic::{FieldKind, Predicate, Universe};
+use zsql_semantic::{FieldKind, Predicate, SemanticModel};
 use zsql_spec::OrderBy;
 
 pub fn run<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -27,7 +27,7 @@ pub fn run<'a>(
         let top_filters: Vec<Rc<RFilter<'a>>> =
             graph.nodes[id].filters.iter().filter(|f| f.predicate == Predicate::TopN).map(|f| f.filter.clone()).collect();
         for f in top_filters {
-            create_top_n_segmentation(graph, id, universe, universes, dialects, q, &f)?;
+            create_top_n_segmentation(graph, id, semantic, universes, dialects, q, &f)?;
         }
     }
     Ok(())
@@ -36,7 +36,7 @@ pub fn run<'a>(
 fn create_top_n_segmentation<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -45,7 +45,7 @@ fn create_top_n_segmentation<'a>(
     let filters: Vec<Rc<RFilter<'a>>> =
         graph.nodes[id].filters.iter().filter(|f| f.predicate != Predicate::TopN).map(|f| f.filter.clone()).collect();
     let filter_fids: Vec<usize> = filters.iter().map(|f| f.fid).collect();
-    let measure = top.def.top_n_measure.as_ref().and_then(|u| universe.field_by_uid(u, Some(FieldKind::Measure)));
+    let measure = top.def.top_n_measure.as_ref().and_then(|u| semantic.field_by_uid(u, Some(FieldKind::Measure)));
     let dimension = top.field;
 
     let existing = graph
@@ -68,8 +68,8 @@ fn create_top_n_segmentation<'a>(
     let top_node = match existing {
         Some(n) => n,
         None => match measure {
-            Some(m) => build_via_sub_graph(graph, universe, universes, dialects, q, dimension, m)?,
-            None => build_count_node(graph, universe, q, id, dimension, filters)?,
+            Some(m) => build_via_sub_graph(graph, semantic, universes, dialects, q, dimension, m)?,
+            None => build_count_node(graph, semantic, q, id, dimension, filters)?,
         },
     };
     let limit = top.def.filter_value.clone();
@@ -82,7 +82,7 @@ fn create_top_n_segmentation<'a>(
 /// The ranking as a sub-plan, so the resolver picks the measure's fact table.
 fn build_via_sub_graph<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -106,9 +106,9 @@ fn build_via_sub_graph<'a>(
         segments: vec![],
     };
     let opts = Options { auto_level_dims: true, datasource: Some(graph.datasource), ..Default::default() };
-    let mut sub_graph = resolver::resolve_with(universe, universes, dialects, &sub, &opts)?;
+    let mut sub_graph = resolver::resolve_with(semantic, universes, dialects, &sub, &opts)?;
     sub_graph.dialect = graph.dialect.clone();
-    crate::visitors::complex_measure::run(&mut sub_graph, universe, universes, dialects, &sub)?;
+    crate::visitors::complex_measure::run(&mut sub_graph, semantic, universes, dialects, &sub)?;
     let root = graph.import(sub_graph);
     graph.nodes[root].purpose = Some("strategy");
     graph.nodes[root].should_order_by = Some(true);
@@ -118,18 +118,18 @@ fn build_via_sub_graph<'a>(
 /// Rank by row count when no measure is named.
 fn build_count_node<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     q: &RQuery<'a>,
     id: NodeId,
     dimension: &'a zsql_semantic::Field,
     filters: Vec<Rc<RFilter<'a>>>,
 ) -> Result<NodeId> {
-    let mut calc = (*q.static_calc(universe, "row_count_measure", "count(*)")).clone_shallow();
+    let mut calc = (*q.static_calc(semantic, "row_count_measure", "count(*)")).clone_shallow();
     calc.def.order_by = Some(OrderBy::Desc);
     calc.def.ordinal = Some(1);
     let base = graph.nodes[id].universe.clone().ok_or_else(|| PlanError::Resolution("top-n on a node without a universe".into()))?;
     let projections = vec![Rc::new(RProjection::for_field(dimension)), Rc::new(calc)];
-    let top = create_agg_node(graph, universe, q, base, projections, filters)?;
+    let top = create_agg_node(graph, semantic, q, base, projections, filters)?;
     graph.nodes[top].purpose = Some("strategy");
     Ok(top)
 }

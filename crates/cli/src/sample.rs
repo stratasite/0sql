@@ -88,7 +88,7 @@ struct Job<'a> {
 pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     let model = Model::from_dir(&project.dir, Trust::Owned, local::dialects()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let s = model.universe().snapshot();
+    let s = model.semantic().snapshot();
     let only: Vec<String> = opts.names.iter().map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty()).collect();
 
     let out_path = project.dir.join("samples").join(zsql_project::values::FILE_NAME);

@@ -471,7 +471,7 @@ impl Engine {
             ));
         }
 
-        let s = model.universe().snapshot();
+        let s = model.semantic().snapshot();
         let columns: Vec<Column> = batches
             .schema
             .fields()

@@ -18,10 +18,10 @@ fn yoy_calculation_inlines_referenced_calculation() {
     projections[complex_at]["sql"] = "case when [Category] = 'Men' then [Double] else ([Net Paid]@m+[Local WNP])*2 end".into();
     projections.insert(complex_at, serde_json::json!({ "alias": "Double", "calculation": true, "sql": "[Net Paid]@m*2" }));
 
-    let universe = fx.universe(&base_case.universe).unwrap();
+    let semantic = fx.semantic(&base_case.universe).unwrap();
     let base = fx.dialects().base().unwrap();
-    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &universe, &base).unwrap();
-    let plan = zsql_planner::Planner::new(&universe, fx.dialects(), None).plan_query(query, None).unwrap();
+    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &semantic, &base).unwrap();
+    let plan = zsql_planner::Planner::new(&semantic, fx.dialects(), None).plan_query(query, None).unwrap();
     println!("{}", plan.sql);
 
     let line = plan.sql.lines().find(|l| l.contains("AS \"ComplexLocalCalc\"")).expect("calc column");

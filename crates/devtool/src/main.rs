@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use zsql_dialect::Dialects;
 use zsql_golden::{print_scoreboard, score, Fixtures, PathSource};
-use zsql_semantic::{Snapshot, Universe};
+use zsql_semantic::{SemanticModel, Snapshot};
 
 #[derive(Parser)]
 #[command(name = "zsql-dev", about = "zsql-dev: the engine on the command line, for its developers")]
@@ -142,8 +142,8 @@ fn main() -> Result<()> {
         Command::Check { source } => {
             let model = source.load()?;
             println!("{}", summary(&model.snapshot));
-            let universe = Universe::build(model.snapshot)?;
-            for w in model.warnings.iter().chain(universe.warnings().iter()) {
+            let semantic = SemanticModel::build(model.snapshot)?;
+            for w in model.warnings.iter().chain(semantic.warnings().iter()) {
                 println!("warning: {w}");
             }
         }
@@ -216,10 +216,10 @@ fn main() -> Result<()> {
                     }
                 }
                 let t = Instant::now();
-                let universe = Universe::build(loaded.snapshot)?;
+                let semantic = SemanticModel::build(loaded.snapshot)?;
                 index += t.elapsed();
                 let t = Instant::now();
-                let _p = zsql_planner::Planner::new(&universe, &dialects, None);
+                let _p = zsql_planner::Planner::new(&semantic, &dialects, None);
                 plan += t.elapsed();
             }
             let n = rounds.max(1) as f64;
@@ -242,7 +242,7 @@ fn main() -> Result<()> {
 
             let t = Instant::now();
             for h in &hashes {
-                fx.universe(h)?;
+                fx.semantic(h)?;
             }
             let load = t.elapsed();
             let t = Instant::now();
@@ -250,8 +250,8 @@ fn main() -> Result<()> {
                 fx.formed_paths(h)?;
             }
             let form = t.elapsed();
-            let held: Vec<(String, std::sync::Arc<Universe>, std::sync::Arc<Vec<zsql_semantic::Path>>)> =
-                hashes.iter().map(|h| Ok((h.clone(), fx.universe(h)?, fx.formed_paths(h)?))).collect::<Result<_>>()?;
+            let held: Vec<(String, std::sync::Arc<SemanticModel>, std::sync::Arc<Vec<zsql_semantic::Path>>)> =
+                hashes.iter().map(|h| Ok((h.clone(), fx.semantic(h)?, fx.formed_paths(h)?))).collect::<Result<_>>()?;
             let t = Instant::now();
             let planners: std::collections::HashMap<&str, zsql_planner::Planner<'_>> =
                 held.iter().map(|(h, u, p)| (h.as_str(), zsql_planner::Planner::new(u, dialects, Some(p)))).collect();
@@ -261,10 +261,10 @@ fn main() -> Result<()> {
             let mut n = 0usize;
             for _ in 0..rounds {
                 for case in &cases {
-                    let universe = fx.universe(&case.universe)?;
+                    let semantic = fx.semantic(&case.universe)?;
                     let planner = &planners[case.universe.as_str()];
                     let t = Instant::now();
-                    let lowered = zsql_spec::Spec::from_value(case.spec.clone()).and_then(|s| zsql_spec::lower(&s, &universe, &base));
+                    let lowered = zsql_spec::Spec::from_value(case.spec.clone()).and_then(|s| zsql_spec::lower(&s, &semantic, &base));
                     lower_time += t.elapsed();
                     if let Ok(q) = lowered {
                         let t = Instant::now();
@@ -316,12 +316,12 @@ fn main() -> Result<()> {
             let from_project = source.project.is_some();
             let model = source.load()?;
             let stored = model.snapshot.paths.clone();
-            let universe = Universe::build(model.snapshot)?;
-            let formed = zsql_formation::form(&universe);
+            let semantic = SemanticModel::build(model.snapshot)?;
+            let formed = zsql_formation::form(&semantic);
             if from_project {
-                println!("{} paths over {} root tables", formed.paths.len(), universe.tables().len());
+                println!("{} paths over {} root tables", formed.paths.len(), semantic.tables().len());
             } else {
-                let report = zsql_golden::compare_paths(&universe, &stored, &formed.paths);
+                let report = zsql_golden::compare_paths(&semantic, &stored, &formed.paths);
                 println!("{}", report.summary());
                 for line in report.mismatches.iter().take(20) {
                     println!("  {line}");

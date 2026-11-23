@@ -4,7 +4,7 @@
 //! most of their trigrams; abbreviations do not, and belong in synonyms.
 
 use std::collections::HashSet;
-use zsql_semantic::{Field, FieldKind, Universe};
+use zsql_semantic::{Field, FieldKind, SemanticModel};
 
 /// A reference shorter than this only resolves exactly; trigram overlap
 /// on three letters is noise.
@@ -70,13 +70,13 @@ fn overlap(ta: &HashSet<[char; 3]>, tb: &HashSet<[char; 3]>) -> f64 {
 
 /// Every field of the wanted kinds ranked by its best form's similarity to
 /// `term`, best first, those scoring nothing left out.
-pub fn suggest<'u>(universe: &'u Universe, term: &str, kinds: &[FieldKind]) -> Vec<Suggestion<'u>> {
+pub fn suggest<'u>(semantic: &'u SemanticModel, term: &str, kinds: &[FieldKind]) -> Vec<Suggestion<'u>> {
     let wanted = normalize(term);
     if wanted.chars().count() < MIN_LEN {
         return vec![];
     }
     let tw = trigrams(&wanted);
-    let mut out: Vec<Suggestion> = universe
+    let mut out: Vec<Suggestion> = semantic
         .fields()
         .iter()
         .filter(|f| kinds.contains(&f.kind))

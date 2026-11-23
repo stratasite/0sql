@@ -10,7 +10,7 @@ fn formed_paths_match_stored_paths() {
     let (mut pairs, mut matched, mut mismatched) = (0, 0, 0);
     let mut samples: Vec<String> = Vec::new();
     for hash in fx.snapshot_hashes().unwrap() {
-        let u = fx.universe(&hash).unwrap();
+        let u = fx.semantic(&hash).unwrap();
         let formed = zsql_formation::form(&u);
         let report = compare_paths(&u, &u.snapshot().paths, &formed.paths);
         pairs += report.pairs;

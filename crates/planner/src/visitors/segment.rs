@@ -11,12 +11,12 @@ use crate::{PlanError, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_semantic::Universe;
+use zsql_semantic::SemanticModel;
 use zsql_spec::LinkMode;
 
 pub fn run<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     q: &RQuery<'a>,
@@ -38,7 +38,7 @@ pub fn run<'a>(
             let seg_node = match segment_nodes.get(&sid) {
                 Some(n) => *n,
                 None => {
-                    let n = build_segment_node(graph, universe, universes, dialects, &segment)?;
+                    let n = build_segment_node(graph, semantic, universes, dialects, &segment)?;
                     segment_nodes.insert(sid, n);
                     n
                 }
@@ -88,24 +88,24 @@ fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, L
 /// fact-shaping visitors, with the datasource pinned to the consumer's.
 fn build_segment_node<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
     segment: &Rc<RSegment<'a>>,
 ) -> Result<NodeId> {
     let sq = segment.as_query();
     let opts = Options { datasource: Some(graph.datasource), ..Default::default() };
-    let mut sub = match resolver::resolve_with(universe, universes, dialects, &sq, &opts) {
+    let mut sub = match resolver::resolve_with(semantic, universes, dialects, &sq, &opts) {
         Ok(g) => g,
         Err(PlanError::Resolution(m)) => return Err(PlanError::Resolution(format!("Could not resolve segment {}: {}", segment.name(), m))),
         Err(e) => return Err(e),
     };
     sub.dialect = graph.dialect.clone();
-    crate::visitors::complex_measure::run(&mut sub, universe, universes, dialects, &sq)?;
-    crate::visitors::exclusion::run(&mut sub, universe, &sq)?;
-    crate::visitors::inclusion::run(&mut sub, universe, &sq)?;
-    crate::visitors::snapshot::run(&mut sub, universe, &sq)?;
-    crate::visitors::top_n::run(&mut sub, universe, universes, dialects, &sq)?;
+    crate::visitors::complex_measure::run(&mut sub, semantic, universes, dialects, &sq)?;
+    crate::visitors::exclusion::run(&mut sub, semantic, &sq)?;
+    crate::visitors::inclusion::run(&mut sub, semantic, &sq)?;
+    crate::visitors::snapshot::run(&mut sub, semantic, &sq)?;
+    crate::visitors::top_n::run(&mut sub, semantic, universes, dialects, &sq)?;
 
     let owner = Rc::new(Owner { sid: segment.sid, tree: sq.tree.clone(), identity: tree_identity(segment) });
     let first_new = graph.nodes.len();

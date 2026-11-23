@@ -41,7 +41,7 @@ pub enum ProjectError {
     #[error("{0}")]
     Dialect(#[from] zsql_dialect::DialectError),
     #[error("{0}")]
-    Universe(#[from] BuildError),
+    SemanticModel(#[from] BuildError),
 }
 
 type Result<T> = std::result::Result<T, ProjectError>;
@@ -1220,8 +1220,8 @@ impl<'d> Builder<'d> {
     }
 
     fn form(&mut self) -> Result<()> {
-        let universe = Universe::build(self.snapshot())?;
-        let formed = zsql_formation::form(&universe);
+        let semantic = SemanticModel::build(self.snapshot())?;
+        let formed = zsql_formation::form(&semantic);
         self.warnings.extend(formed.warnings.iter().map(|w| format!("formation: {w}")));
         self.paths = formed.paths;
         Ok(())
@@ -1347,7 +1347,7 @@ impl<'d> Builder<'d> {
                     return Err(invalid(
                         &pe.file,
                         format!(
-                            "[{}] on {table_name}: Sql Referenced dimensions in the formula could not be located in a single Universe.",
+                            "[{}] on {table_name}: Sql Referenced dimensions in the formula could not be located in a single SemanticModel.",
                             pe.field_name
                         ),
                     ));

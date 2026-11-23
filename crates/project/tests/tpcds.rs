@@ -2,17 +2,17 @@
 
 use std::path::PathBuf;
 use zsql_dialect::Dialects;
-use zsql_semantic::Universe;
+use zsql_semantic::SemanticModel;
 
 fn sample() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects/tpcds")
 }
 
-fn plan(universe: &Universe, dialects: &Dialects, spec: serde_json::Value) -> Result<String, String> {
+fn plan(semantic: &SemanticModel, dialects: &Dialects, spec: serde_json::Value) -> Result<String, String> {
     let spec = zsql_spec::Spec::from_value(spec).map_err(|e| e.to_string())?;
     let base = dialects.base().map_err(|e| e.to_string())?;
-    let query = zsql_spec::lower(&spec, universe, &base).map_err(|e| e.to_string())?;
-    let planner = zsql_planner::Planner::new(universe, dialects, None);
+    let query = zsql_spec::lower(&spec, semantic, &base).map_err(|e| e.to_string())?;
+    let planner = zsql_planner::Planner::new(semantic, dialects, None);
     planner.plan_query(query, None).map(|p| p.sql).map_err(|e| e.to_string())
 }
 
@@ -51,9 +51,9 @@ fn tpcds_sample_loads_forms_and_plans() {
     let again = zsql_semantic::Snapshot::from_str(&text).unwrap();
     assert_eq!(serde_json::to_string(&again).unwrap(), text);
 
-    let universe = Universe::build(loaded.snapshot).unwrap();
+    let semantic = SemanticModel::build(loaded.snapshot).unwrap();
     let sql = plan(
-        &universe,
+        &semantic,
         &dialects,
         serde_json::json!({
             "projections": [{ "field": "Item Category" }, { "field": "Store Net Paid" }, { "field": "Date", "decorators": [{ "type": "truncate", "grain": "month" }] }],
@@ -67,7 +67,7 @@ fn tpcds_sample_loads_forms_and_plans() {
 
     // Two fact tables merge; a calculation reads both.
     let sql = plan(
-        &universe,
+        &semantic,
         &dialects,
         serde_json::json!({
             "projections": [{ "field": "item-category" }, { "field": "store-net-paid" }, { "field": "catalog-net-paid" }],
@@ -80,7 +80,7 @@ fn tpcds_sample_loads_forms_and_plans() {
 
     // A snapshot measure on the inventory table.
     let sql = plan(
-        &universe,
+        &semantic,
         &dialects,
         serde_json::json!({ "projections": [{ "field": "Date", "decorators": [{ "type": "truncate", "grain": "month" }] }, { "field": "Inventory Quantity On Hand" }] }),
     )
@@ -88,7 +88,7 @@ fn tpcds_sample_loads_forms_and_plans() {
     assert!(sql.to_lowercase().contains("inv_quantity_on_hand"), "{sql}");
 
     // Names resolve without regard to case, and a bad name is refused by name.
-    let err = plan(&universe, &dialects, serde_json::json!({ "projections": [{ "field": "No Such Field" }] })).unwrap_err();
+    let err = plan(&semantic, &dialects, serde_json::json!({ "projections": [{ "field": "No Such Field" }] })).unwrap_err();
     assert!(err.contains("No field named 'No Such Field'"), "{err}");
 }
 

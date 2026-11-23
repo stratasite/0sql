@@ -13,15 +13,15 @@ use crate::visitors::segmentation::{component_links, keys_for, node_signature, s
 use crate::{PlanError, Result};
 use std::rc::Rc;
 use std::sync::Arc;
-use zsql_semantic::{Field, Universe};
+use zsql_semantic::{Field, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Universes<'a>, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, universes: &Universes<'a>, q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         if graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
             continue;
         }
         adopt_calculation_links(graph, id, q)?;
-        let Some(buckets) = bucket_measures(graph, id, universe, universes, q)? else { continue };
+        let Some(buckets) = bucket_measures(graph, id, semantic, universes, q)? else { continue };
         let mut order: Vec<usize> = (0..buckets.len()).collect();
         order.sort_by_cached_key(|i| {
             let (sig, uni, _) = &buckets[*i];
@@ -30,7 +30,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Univer
         let home = order[0];
         for i in order.iter().skip(1) {
             let (sig, uni, projs) = &buckets[*i];
-            fork_measures(graph, id, universe, q, projs, sig, uni.clone())?;
+            fork_measures(graph, id, semantic, q, projs, sig, uni.clone())?;
         }
         if order.len() > 1 {
             materialize_filter_columns(graph, id);
@@ -38,7 +38,7 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, universes: &Univer
         let (_, home_universe, _) = &buckets[home];
         let current = graph.nodes[id].universe.clone().expect("agg universe");
         if home_universe.root.id != current.root.id {
-            rebind_universe(graph, id, universe, q, home_universe.clone())?;
+            rebind_universe(graph, id, semantic, q, home_universe.clone())?;
         }
     }
     Ok(())
@@ -50,10 +50,10 @@ fn sig_to_s(sig: &Signature) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-fn rebind_universe<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, base: Arc<Base<'a>>) -> Result<()> {
+fn rebind_universe<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>, base: Arc<Base<'a>>) -> Result<()> {
     graph.nodes[id].projections.retain(|p| p.proj.persisted || p.field().map(|f| base.has_field(f.id)).unwrap_or(true));
     graph.nodes[id].universe = Some(base);
-    set_subtrees(graph, id, universe, q)
+    set_subtrees(graph, id, semantic, q)
 }
 
 /// Rails `Dag.materialize_filter_columns` onto a node.
@@ -132,7 +132,7 @@ type Bucket<'a> = (Signature, Arc<Base<'a>>, Vec<Rc<RProjection<'a>>>);
 fn bucket_measures<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     q: &RQuery<'a>,
 ) -> Result<Option<Vec<Bucket<'a>>>> {
@@ -170,7 +170,7 @@ fn bucket_measures<'a>(
             }
         } else {
             for p in projs {
-                let uni = universe_for(graph, id, universe, universes, q, &p)?;
+                let uni = universe_for(graph, id, semantic, universes, q, &p)?;
                 push(sig.clone(), uni, Some(p), &mut buckets);
             }
         }
@@ -200,7 +200,7 @@ fn owner_projection<'a>(node: &crate::dag::Node<'a>, f: &Filtered<'a>) -> Option
 fn fork_measures<'a>(
     graph: &mut Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     q: &RQuery<'a>,
     projs: &[Rc<RProjection<'a>>],
     sig: &Signature,
@@ -278,7 +278,7 @@ fn fork_measures<'a>(
                 .collect();
             projections.extend(built.iter().cloned());
             let rfilters: Vec<Rc<RFilter<'a>>> = filters.iter().map(|f| f.filter.clone()).collect();
-            let t = create_agg_node(graph, universe, q, uni, projections, rfilters)?;
+            let t = create_agg_node(graph, semantic, q, uni, projections, rfilters)?;
             graph.add_edge(t, merge);
         }
     }
@@ -295,7 +295,7 @@ fn fork_measures<'a>(
 fn universe_for<'a>(
     graph: &Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     q: &RQuery<'a>,
     p: &Rc<RProjection<'a>>,
@@ -330,6 +330,6 @@ fn universe_for<'a>(
     }
     let dims: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
     let dim_filters: Vec<Rc<RFilter<'a>>> = node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.filter.clone()).collect();
-    let sorted = sort_for_max_hints_and_dims(candidates, &[field], &dims, &q.hints, &dim_filters, universe);
+    let sorted = sort_for_max_hints_and_dims(candidates, &[field], &dims, &q.hints, &dim_filters, semantic);
     Ok(sorted[0].clone())
 }

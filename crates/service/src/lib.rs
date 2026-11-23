@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use zsql_dialect::Dialects;
-use zsql_semantic::{FieldKind, Snapshot, Universe};
+use zsql_semantic::{FieldKind, SemanticModel, Snapshot};
 use zsql_spec::SecurityContext;
 
 pub use zsql_project::values::ValueCatalog;
@@ -93,7 +93,7 @@ pub enum LoadError {
     #[error("{0}")]
     Project(#[from] zsql_project::ProjectError),
     #[error("{0}")]
-    Universe(#[from] zsql_semantic::BuildError),
+    SemanticModel(#[from] zsql_semantic::BuildError),
 }
 
 /// Why a stored model (what [`Model::write`] put on disk) did not load.
@@ -102,7 +102,7 @@ pub enum StoredError {
     #[error("{0}")]
     Snapshot(#[from] zsql_semantic::snapshot::LoadError),
     #[error("{0}")]
-    Universe(#[from] zsql_semantic::BuildError),
+    SemanticModel(#[from] zsql_semantic::BuildError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("tests.json does not parse: {0}")]
@@ -129,13 +129,13 @@ pub fn load(dir: &Path, trust: Trust, dialects: &Dialects) -> std::result::Resul
     }
 }
 
-// A model's universe and the planner index built over it, in one cell:
-// the planner borrows the universe, so the two must live and die
-// together, and the cell keeps the universe where the borrow expects
+// A semantic model and the planner index built over it, in one cell:
+// the planner borrows the model, so the two must live and die
+// together, and the cell keeps the model where the borrow expects
 // it. Built once per load; every request borrows it.
 self_cell::self_cell!(
     struct Engine {
-        owner: Universe,
+        owner: SemanticModel,
         #[covariant]
         dependent: Planner,
     }
@@ -143,7 +143,7 @@ self_cell::self_cell!(
 
 type Planner<'a> = zsql_planner::Planner<'a>;
 
-/// One branch of one project, ready to answer: the universe, the
+/// One branch of one project, ready to answer: the semantic model, the
 /// planner over it, the sampled values and the tests it came with.
 pub struct Model {
     pub uid: String,
@@ -197,7 +197,7 @@ fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut V
 pub const TESTS_FILE: &str = "tests.json";
 
 impl Model {
-    /// Over a snapshot alone: no values, no tests, the universe's own
+    /// Over a snapshot alone: no values, no tests, the semantic model's own
     /// warnings.
     pub fn build(
         uid: &str,
@@ -205,15 +205,15 @@ impl Model {
         snapshot: Snapshot,
         dialects: &'static Dialects,
     ) -> std::result::Result<Model, zsql_semantic::BuildError> {
-        let universe = Universe::build(snapshot)?;
-        let warnings = universe.warnings().to_vec();
+        let semantic = SemanticModel::build(snapshot)?;
+        let warnings = semantic.warnings().to_vec();
         let mut tables_by_field: HashMap<zsql_semantic::Id, Vec<String>> = HashMap::new();
-        for e in &universe.snapshot().expressions {
-            if let Some(t) = universe.table(e.table_id) {
+        for e in &semantic.snapshot().expressions {
+            if let Some(t) = semantic.table(e.table_id) {
                 tables_by_field.entry(e.field_id).or_default().push(t.uid.clone());
             }
         }
-        let engine = Engine::new(universe, |u| Planner::new(u, dialects, None));
+        let engine = Engine::new(semantic, |u| Planner::new(u, dialects, None));
         Ok(Model {
             uid: uid.to_string(),
             branch: branch.to_string(),
@@ -228,7 +228,7 @@ impl Model {
         })
     }
 
-    /// Over what the loader read: its warnings first, then the universe's.
+    /// Over what the loader read: its warnings first, then the semantic model's.
     pub fn from_loaded(
         uid: &str,
         branch: &str,
@@ -276,7 +276,7 @@ impl Model {
     /// tests.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(self.universe().snapshot())?)?;
+        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(self.semantic().snapshot())?)?;
         let values_path = dir.join(zsql_project::values::FILE_NAME);
         match &self.values {
             Some(v) => v.write(&values_path)?,
@@ -289,7 +289,7 @@ impl Model {
         std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)
     }
 
-    pub fn universe(&self) -> &Universe {
+    pub fn semantic(&self) -> &SemanticModel {
         self.engine.borrow_owner()
     }
 
@@ -300,7 +300,7 @@ impl Model {
     /// Counts and warnings: what a deploy answers with, and what
     /// `GET /projects/{uid}/branches/{branch}` says.
     pub fn summary(&self) -> Value {
-        let s = self.universe().snapshot();
+        let s = self.semantic().snapshot();
         json!({
             "project": self.uid, "branch": self.branch, "deployed_at": self.loaded_at,
             "datasources": s.datasources.len(), "tables": s.tables.len(), "fields": s.fields.len(),
@@ -328,7 +328,7 @@ impl Model {
                     .collect(),
                 ..Default::default()
             };
-            let outcome = zsql_spec::lower(&spec, self.universe(), &base)
+            let outcome = zsql_spec::lower(&spec, self.semantic(), &base)
                 .map_err(|e| e.to_string())
                 .and_then(|q| planner.plan_query(q, None).map(|p| p.sql).map_err(|e| e.to_string()));
             let (status, detail) = match (&outcome, &t.assert_sql, &t.assert_regex) {
@@ -376,14 +376,14 @@ impl Model {
     /// Resolves and plans one request. `explain` also collects the
     /// phase timings and the node graph.
     pub fn plan_request(&self, req: SqlRequest, explain: bool, check: ShapeCheck) -> Result<Planned> {
-        if req.context.is_none() && !self.universe().policies().is_empty() {
+        if req.context.is_none() && !self.semantic().policies().is_empty() {
             return Err(ServiceError::invalid("ContextRequired", "this branch has security policies; a context is required to plan"));
         }
         let base = self.dialects.base()?;
         let (spec_value, made_spec, items) = spec_of(req.spec, req.expr.as_deref(), check)?;
         let t0 = Instant::now();
         let spec = zsql_spec::Spec::from_value(spec_value)?;
-        let mut query = zsql_spec::lower(&spec, self.universe(), &base)?;
+        let mut query = zsql_spec::lower(&spec, self.semantic(), &base)?;
         let corrections = std::mem::take(&mut query.corrections);
         // Planning does not read the limit, so take it here while the query is
         // still whole. A zero or negative limit is nothing to emit.
@@ -443,7 +443,7 @@ impl Model {
         let (spec_value, made, items) = spec_of(req.spec, req.expr.as_deref(), check)?;
         let t0 = Instant::now();
         let spec = zsql_spec::Spec::from_value(spec_value)?;
-        let query = zsql_spec::lower(&spec, self.universe(), &base)?;
+        let query = zsql_spec::lower(&spec, self.semantic(), &base)?;
         let x = self.planner().explore(query)?;
         let q = req.q.as_deref().map(zsql_spec::fuzzy::normalize).filter(|q| !q.is_empty());
         let wanted = |f: &zsql_semantic::Field| -> Option<f64> {
@@ -515,10 +515,10 @@ impl Model {
             v
         };
         if needle.is_empty() {
-            return json!({ "fields": self.universe().fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() });
+            return json!({ "fields": self.semantic().fields().iter().filter(visible).map(|f| describe(f, None)).collect::<Vec<_>>() });
         }
         let mut out: Vec<Value> = self
-            .universe()
+            .semantic()
             .fields()
             .iter()
             .filter(visible)
@@ -530,7 +530,7 @@ impl Model {
             .map(|f| describe(f, Some(1.0)))
             .collect();
         let seen: std::collections::HashSet<String> = out.iter().filter_map(|v| v["uid"].as_str()).map(str::to_string).collect();
-        for s in zsql_spec::fuzzy::suggest(self.universe(), &needle, &[FieldKind::Dimension, FieldKind::Measure]) {
+        for s in zsql_spec::fuzzy::suggest(self.semantic(), &needle, &[FieldKind::Dimension, FieldKind::Measure]) {
             if s.score < zsql_spec::fuzzy::FLOOR / 2.0 {
                 break;
             }
@@ -550,7 +550,7 @@ impl Model {
     pub fn datasources(&self, q: &str) -> Value {
         let wanted = holds(q);
         let out: Vec<Value> = self
-            .universe()
+            .semantic()
             .snapshot()
             .datasources
             .iter()
@@ -572,13 +572,13 @@ impl Model {
     /// reader that connects, so its secrets are in it. Not for serving.
     pub fn datasource(&self, datasource: &str) -> Option<&zsql_semantic::Datasource> {
         let want = datasource.trim().to_lowercase();
-        self.universe().snapshot().datasources.iter().find(|d| d.uid.to_lowercase() == want)
+        self.semantic().snapshot().datasources.iter().find(|d| d.uid.to_lowercase() == want)
     }
 
     /// The model's tables. With `q`, the ones whose uid, name or
     /// physical name holds it.
     pub fn tables(&self, q: &str) -> Value {
-        let u = self.universe();
+        let u = self.semantic();
         let wanted = holds(q);
         let out: Vec<Value> = u
             .tables()
@@ -602,7 +602,7 @@ impl Model {
     /// only the sampled values that hold it; the counts beside them
     /// still describe the whole sample.
     pub fn values_of(&self, dim: &str, q: &str) -> Result<Value> {
-        let u = self.universe();
+        let u = self.semantic();
         let field = match u.field_by_uid(dim, Some(FieldKind::Dimension)).or_else(|| u.field_by_name(dim, FieldKind::Dimension)) {
             Some(f) => f,
             None => {
@@ -952,7 +952,7 @@ mod tests {
         assert!(names(&model.datasources(adapter), "datasources", "uid").contains(&uid.to_string()));
         assert!(names(&model.datasources("no datasource is called this"), "datasources", "uid").is_empty());
 
-        let dim = model.universe().fields().iter().find(|f| f.is_dimension()).expect("a dimension").uid.clone();
+        let dim = model.semantic().fields().iter().find(|f| f.is_dimension()).expect("a dimension").uid.clone();
         let count = |v: &str, n: i64| ValueCount { v: v.into(), n };
         model.values = Some(ValueCatalog {
             dimensions: vec![DimensionValues {

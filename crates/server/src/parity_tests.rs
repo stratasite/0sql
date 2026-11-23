@@ -113,7 +113,7 @@ fn as_server(r: Result<Value, zsql_service::ServiceError>) -> (StatusCode, Value
 /// of the first dimensions with each of the first measures, a filter, a
 /// near-miss name and an unknown one.
 fn specs_over(model: &Model) -> Vec<Value> {
-    let u = model.universe();
+    let u = model.semantic();
     let names = |kind: zsql_semantic::FieldKind, n: usize| -> Vec<String> {
         u.fields().iter().filter(|f| f.kind == kind && !f.hidden).map(|f| f.name.clone()).take(n).collect()
     };

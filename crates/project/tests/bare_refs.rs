@@ -249,12 +249,12 @@ fn bare_and_suffixed_plan_the_same_sql() {
         ),
     )
     .expect("loads");
-    let universe = zsql_semantic::Universe::build(loaded.snapshot.clone()).expect("universe");
+    let semantic = zsql_semantic::SemanticModel::build(loaded.snapshot.clone()).expect("universe");
     let plan = |field: &str| {
         let spec = zsql_spec::Spec::from_value(serde_json::json!({ "projections": [{ "field": field }] })).unwrap();
         let base = dialects.base().unwrap();
-        let q = zsql_spec::lower(&spec, &universe, &base).unwrap();
-        zsql_planner::Planner::new(&universe, &dialects, None).plan_query(q, None).unwrap().sql
+        let q = zsql_spec::lower(&spec, &semantic, &base).unwrap();
+        zsql_planner::Planner::new(&semantic, &dialects, None).plan_query(q, None).unwrap().sql
     };
     let bare = plan("Bare").replace("Bare", "X");
     let suffixed = plan("Suffixed").replace("Suffixed", "X");
@@ -290,11 +290,11 @@ fn a_cyclic_snapshot_already_on_disk_is_an_error_not_a_crash() {
     }
 
     let dialects = Dialects::builtin();
-    let universe = zsql_semantic::Universe::build(snapshot).expect("a cyclic model still builds a universe");
+    let semantic = zsql_semantic::SemanticModel::build(snapshot).expect("a cyclic model still builds a universe");
     let spec = zsql_spec::Spec::from_value(serde_json::json!({ "projections": [{ "field": "M" }] })).unwrap();
     let base = dialects.base().unwrap();
-    let q = zsql_spec::lower(&spec, &universe, &base).unwrap();
-    let err = zsql_planner::Planner::new(&universe, &dialects, None).plan_query(q, None).expect_err("refuses to plan");
+    let q = zsql_spec::lower(&spec, &semantic, &base).unwrap();
+    let err = zsql_planner::Planner::new(&semantic, &dialects, None).plan_query(q, None).expect_err("refuses to plan");
     let msg = err.to_string();
     assert!(msg.contains("references itself"), "{msg}");
 }

@@ -4,21 +4,21 @@
 //! the policy. Bypass flags still open the door explicitly.
 
 use zsql_golden::Fixtures;
-use zsql_semantic::{Universe, Unresolved};
+use zsql_semantic::{SemanticModel, Unresolved};
 use zsql_spec::{Group, SecurityContext};
 
-fn plan(universe: &Universe, fx: &Fixtures, spec: serde_json::Value, ctx: &SecurityContext) -> String {
+fn plan(semantic: &SemanticModel, fx: &Fixtures, spec: serde_json::Value, ctx: &SecurityContext) -> String {
     let base = fx.dialects().base().unwrap();
-    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), universe, &base).unwrap();
-    zsql_planner::Planner::new(universe, fx.dialects(), None).plan_query(query, Some(ctx)).unwrap().sql
+    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), semantic, &base).unwrap();
+    zsql_planner::Planner::new(semantic, fx.dialects(), None).plan_query(query, Some(ctx)).unwrap().sql
 }
 
-fn universe_with(fx: &Fixtures, hash: &str, unresolved: Unresolved) -> Universe {
+fn universe_with(fx: &Fixtures, hash: &str, unresolved: Unresolved) -> SemanticModel {
     let mut snap = fx.snapshot(hash).unwrap();
     for p in snap.security_policies.iter_mut() {
         p.unresolved = unresolved;
     }
-    Universe::build(snap).unwrap()
+    SemanticModel::build(snap).unwrap()
 }
 
 #[test]

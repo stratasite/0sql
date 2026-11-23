@@ -22,7 +22,7 @@ pub fn findings(model: &Model) -> Value {
     let Some(dir) = model.sources.iter().find(|p| p.file_name().is_some_and(|n| n == "project.yml")).and_then(|p| p.parent()) else {
         return json!({ "unchecked": ["no project directory"] });
     };
-    let s = model.universe().snapshot();
+    let s = model.semantic().snapshot();
     let mut out: Vec<Value> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
     for ds in &s.datasources {

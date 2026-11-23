@@ -243,14 +243,14 @@ fn catalog(app: &App) -> String {
     }
     let mut short = String::from("# Deployed branches\nToo many fields to list here; call fields with q to find them.\n");
     for d in &deployed {
-        let s = d.universe().snapshot();
+        let s = d.semantic().snapshot();
         short.push_str(&format!("- {}/{}: {} tables, {} fields\n", d.uid, d.branch, s.tables.len(), s.fields.len()));
     }
     short
 }
 
 fn branch_catalog(d: &Model) -> String {
-    let u = d.universe();
+    let u = d.semantic();
     let s = u.snapshot();
     // Field id to the uids of the tables carrying it, sorted.
     let mut tables_of: HashMap<i64, Vec<String>> = HashMap::new();
@@ -440,7 +440,7 @@ fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, Ap
     match of_project.as_slice() {
         [] => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}"))),
         [one] => Ok(one.branch.clone()),
-        several => several.iter().find(|d| d.universe().snapshot().branch.uid == d.branch).map(|d| d.branch.clone()).ok_or_else(|| {
+        several => several.iter().find(|d| d.semantic().snapshot().branch.uid == d.branch).map(|d| d.branch.clone()).ok_or_else(|| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 "Invalid",

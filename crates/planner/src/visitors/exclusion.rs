@@ -5,9 +5,9 @@ use crate::dag::{Filtered, Graph, NodeId, NodeKind, Projected};
 use crate::model::RQuery;
 use crate::visitors::grain::*;
 use crate::{PlanError, Result};
-use zsql_semantic::{ExclusionType, Field, FilterMode, Universe};
+use zsql_semantic::{ExclusionType, Field, FilterMode, SemanticModel};
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &RQuery<'a>) -> Result<()> {
     for id in graph.post_order() {
         if graph.nodes[id].removed || graph.nodes[id].kind != NodeKind::Aggregation {
             continue;
@@ -19,14 +19,14 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) ->
             }
         }
         for m in measures {
-            process(graph, id, universe, q, m)?;
+            process(graph, id, semantic, q, m)?;
         }
     }
     Ok(())
 }
 
-fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQuery<'a>, measure: &'a Field) -> Result<()> {
-    let (dims, filters) = allowed_components(graph, id, universe, q, measure)?;
+fn process<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a SemanticModel, q: &RQuery<'a>, measure: &'a Field) -> Result<()> {
+    let (dims, filters) = allowed_components(graph, id, semantic, q, measure)?;
     if dimensionally_equivalent(&graph.nodes[id], &dims, &filters) {
         return Ok(());
     }
@@ -46,7 +46,7 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
     let base = graph.nodes[id].universe.clone().expect("agg universe");
     let mut projections = measure_projections.clone();
     projections.extend(dims.iter().map(|d| d.proj.clone()));
-    let target = create_agg_node(graph, universe, q, base, projections, filters.iter().map(|f| f.filter.clone()).collect())?;
+    let target = create_agg_node(graph, semantic, q, base, projections, filters.iter().map(|f| f.filter.clone()).collect())?;
 
     if graph.nodes[id].is_root() {
         merge = create_merge_node(graph, q);
@@ -74,7 +74,7 @@ fn process<'a>(graph: &mut Graph<'a>, id: NodeId, universe: &'a Universe, q: &RQ
 fn allowed_components<'a>(
     graph: &Graph<'a>,
     id: NodeId,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     q: &RQuery<'a>,
     measure: &'a Field,
 ) -> Result<(Vec<Projected<'a>>, Vec<Filtered<'a>>)> {
@@ -98,7 +98,7 @@ fn allowed_components<'a>(
     let dim_projs: Vec<&Projected<'a>> = node.projections.iter().filter(|p| p.is_dimension()).collect();
     let dim_filters: Vec<&Filtered<'a>> = node.filters.iter().filter(|f| f.is_dimension()).collect();
 
-    let rule_ids: Vec<i64> = measure.exclusions.iter().flat_map(|r| exclusion_dimension_ids(universe, r)).collect();
+    let rule_ids: Vec<i64> = measure.exclusions.iter().flat_map(|r| exclusion_dimension_ids(semantic, r)).collect();
     let excluded = |p: &Projected<'a>| -> bool {
         if p.is_calculation() {
             calc_dimension_ids(&p.proj, q).iter().any(|i| rule_ids.contains(i))

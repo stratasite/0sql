@@ -5,11 +5,11 @@
 use zsql_golden::Fixtures;
 
 fn sql_for(fx: &Fixtures, universe_id: &str, line: &str) -> String {
-    let universe = fx.universe(universe_id).unwrap();
+    let semantic = fx.semantic(universe_id).unwrap();
     let (spec, _) = zsql_shorthand::parse_line(line).expect("the line parses");
     let base = fx.dialects().base().unwrap();
-    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &universe, &base).expect("resolves");
-    zsql_planner::Planner::new(&universe, fx.dialects(), None).plan_query(query, None).expect("plans").sql
+    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &semantic, &base).expect("resolves");
+    zsql_planner::Planner::new(&semantic, fx.dialects(), None).plan_query(query, None).expect("plans").sql
 }
 
 #[test]

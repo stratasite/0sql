@@ -392,7 +392,7 @@ impl<'a> Node<'a> {
 
     /// Rails `Dag::Query#expression`: the field's expression on the cheapest
     /// path of the subtree holding it, adding the path when none does.
-    pub fn expression(&mut self, universe: &'a zsql_semantic::Universe, field: &'a Field) -> crate::Result<&'a Expression> {
+    pub fn expression(&mut self, universe: &'a zsql_semantic::SemanticModel, field: &'a Field) -> crate::Result<&'a Expression> {
         let base = self.universe.clone().ok_or_else(|| crate::PlanError::Resolution("node has no universe".into()))?;
         let path = match self.subtrees.iter().find(|t| t.paths.iter().any(|p| p.field_id == field.id)) {
             Some(t) => t.path_for(field.id).expect("subtree holds field"),
@@ -574,7 +574,7 @@ impl<'a> Node<'a> {
 
     /// Rails `Node#from_clause_join_defs`: the joins the FROM walks, most
     /// expensive first, unique.
-    pub fn from_clause_join_defs(&self, universe: &'a zsql_semantic::Universe) -> Vec<&'a zsql_semantic::JoinDef> {
+    pub fn from_clause_join_defs(&self, universe: &'a zsql_semantic::SemanticModel) -> Vec<&'a zsql_semantic::JoinDef> {
         let mut jds: Vec<&zsql_semantic::JoinDef> =
             self.subtrees.iter().flat_map(|s| s.join_path.iter()).filter_map(|j| universe.join(*j)).collect();
         jds.sort_by_cached_key(|j| {

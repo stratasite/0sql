@@ -12,11 +12,11 @@ const LINE: &str = "Item Id";
 const CASE: &str = "BasketPairTest#test_dedupe_lt_keeps_one_canonical_ordering_per_pair#1";
 
 fn plan_line(fx: &Fixtures, universe_id: &str, line: &str) -> Result<String, String> {
-    let universe = fx.universe(universe_id).unwrap();
+    let semantic = fx.semantic(universe_id).unwrap();
     let (spec, _) = zsql_shorthand::parse_line(line).expect("the line parses");
     let base = fx.dialects().base().unwrap();
-    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &universe, &base).map_err(|e| e.to_string())?;
-    zsql_planner::Planner::new(&universe, fx.dialects(), None).plan_query(query, None).map(|p| p.sql).map_err(|e| e.to_string())
+    let query = zsql_spec::lower(&zsql_spec::Spec::from_value(spec).unwrap(), &semantic, &base).map_err(|e| e.to_string())?;
+    zsql_planner::Planner::new(&semantic, fx.dialects(), None).plan_query(query, None).map(|p| p.sql).map_err(|e| e.to_string())
 }
 
 fn universe_of(fx: &Fixtures) -> String {
