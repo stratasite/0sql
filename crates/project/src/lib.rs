@@ -561,6 +561,14 @@ impl<'d> Builder<'d> {
                 description: str_of(d, "description"),
                 extra_query_params: get(d, "extra_query_params").map(yaml_to_json).unwrap_or(Json::Object(Default::default())),
                 query_timeout: int_of(d, "query_timeout"),
+                // Everything else the entry says is kept as written:
+                // deployed with it means meant to be there.
+                connection: d
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.as_str()?.trim().to_string(), v)))
+                    .filter(|(k, v)| !v.is_null() && !DATASOURCE_FIELDS.contains(&k.as_str()))
+                    .map(|(k, v)| (k, yaml_to_json(v)))
+                    .collect(),
             });
         }
         if self.datasources.is_empty() {

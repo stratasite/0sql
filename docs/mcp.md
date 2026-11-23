@@ -12,10 +12,12 @@ describes.
 - **Streamable HTTP, stateless, JSON only.** Each HTTP request carries
   one JSON-RPC message. No `Mcp-Session-Id`, no server-sent events, no
   GET stream: `GET` and `DELETE` answer 405.
-- **Read-only tools, one per read the API has:** `list_projects`,
+- **Read-only tools, one per read of a model:** `list_projects`,
   `fields`, `tables`, `values`, `explore`, `sql`, `explain`. Each runs
-  the function the matching REST handler runs. No deploy, no removal,
-  and the server never executes SQL, so what the endpoint exposes is
+  the function the matching REST handler runs, and the three lists
+  take the same optional `q`. No deploy, no removal, no probe of a
+  datasource (that takes a warehouse credential, which is not a
+  model's to send), and no tool executes SQL, so what the endpoint exposes is
   model metadata and SQL text, not rows.
 - **Specs only, never the shorthand.** `sql`, `explain` and `explore`
   take a query spec, and the spec's JSON schema travels in the tool

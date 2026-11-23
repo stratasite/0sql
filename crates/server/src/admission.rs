@@ -22,6 +22,11 @@ pub(crate) enum Class {
     Explore,
     /// deploy, validate, test: seconds of CPU.
     Heavy,
+    /// a probe of a datasource: a connection to a warehouse and a read
+    /// of its catalog. No CPU to speak of, and seconds of waiting on
+    /// someone else's machine, so it has seats of its own: a slow
+    /// warehouse fills them and leaves planning and deploys alone.
+    Probe,
     /// liveness and the root: no admission.
     Exempt,
 }
@@ -32,6 +37,7 @@ impl Class {
             Class::Plan => "plan",
             Class::Explore => "explore",
             Class::Heavy => "heavy",
+            Class::Probe => "probe",
             Class::Exempt => "exempt",
         }
     }
@@ -44,6 +50,9 @@ pub(crate) fn classify(path: &str) -> Class {
         [] | ["healthz"] => Class::Exempt,
         ["projects", _, "branches", _, "deploy" | "validate" | "test"] => Class::Heavy,
         ["projects", _, "branches", _, "explore" | "fields"] => Class::Explore,
+        // Below a datasource is the warehouse; the list of datasources
+        // itself is the model's, and cheap.
+        ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route
@@ -83,7 +92,8 @@ fn patience(class: Class) -> Duration {
 /// to give its own answer first.
 pub(crate) fn deadline(class: Class) -> Duration {
     match class {
-        Class::Heavy => Duration::from_secs(90),
+        // A probe waits on a warehouse, which can take its time to wake.
+        Class::Heavy | Class::Probe => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
@@ -94,6 +104,7 @@ pub struct AdmissionCounts {
     pub plan: usize,
     pub explore: usize,
     pub heavy: usize,
+    pub probe: usize,
 }
 
 impl Default for AdmissionCounts {
@@ -101,7 +112,7 @@ impl Default for AdmissionCounts {
     /// is neither.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2 }
+        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2 }
     }
 }
 
@@ -109,6 +120,7 @@ pub(crate) struct Admission {
     plan: Arc<Semaphore>,
     explore: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
+    probe: Arc<Semaphore>,
 }
 
 impl Admission {
@@ -117,6 +129,7 @@ impl Admission {
             plan: Arc::new(Semaphore::new(counts.plan)),
             explore: Arc::new(Semaphore::new(counts.explore)),
             heavy: Arc::new(Semaphore::new(counts.heavy)),
+            probe: Arc::new(Semaphore::new(counts.probe)),
         }
     }
 
@@ -125,6 +138,7 @@ impl Admission {
             Class::Plan => &self.plan,
             Class::Explore => &self.explore,
             Class::Heavy => &self.heavy,
+            Class::Probe => &self.probe,
             Class::Exempt => return None,
         })
     }
@@ -160,6 +174,9 @@ mod tests {
             ("/projects/a/branches/main/validate", Heavy),
             ("/projects/a/branches/main/test", Heavy),
             ("/projects/a/branches/main/values/dim", Plan),
+            ("/projects/a/branches/main/datasources", Plan),
+            ("/projects/a/branches/main/datasources/dw/tables", Probe),
+            ("/projects/a/branches/main/datasources/dw/tables/dse.cs_contact_f", Probe),
             ("/projects/a/branches/main", Plan),
             ("/projects", Plan),
             ("/mcp", Plan),
@@ -194,6 +211,9 @@ mod tests {
             ("GET", "/projects/a/branches/main/fields"),
             ("GET", "/projects/a/branches/main/tables"),
             ("GET", "/projects/a/branches/main/values/dim"),
+            ("GET", "/projects/a/branches/main/datasources"),
+            ("POST", "/projects/a/branches/main/datasources/dw/tables"),
+            ("POST", "/projects/a/branches/main/datasources/dw/tables/dse.cs_contact_f"),
             ("GET", "/projects"),
             ("POST", "/mcp"),
             ("GET", "/healthz"),
