@@ -25,7 +25,7 @@ use zsql_dialect::Dialect;
 use zsql_semantic::{DataType, Field, FieldKind, Predicate, SemanticModel};
 
 #[derive(Debug, thiserror::Error)]
-pub enum SpecError {
+pub enum Error {
     /// No field answers to a reference.
     #[error("{0}")]
     NotFound(String),
@@ -42,7 +42,7 @@ pub enum SpecError {
     RecordInvalid(String),
 }
 
-impl SpecError {
+impl Error {
     /// The `class` an API error carries. Flat and 0sql's own, like the
     /// envelope classes beside it (`Unauthorized`, `ContextRequired`): what
     /// a caller switches on should not name the framework that happened to
@@ -50,18 +50,18 @@ impl SpecError {
     /// `NotFound`, which is a different failure entirely.
     pub fn error_class(&self) -> &'static str {
         match self {
-            SpecError::NotFound(_) => "FieldNotFound",
-            SpecError::Ambiguous(_) => "FieldAmbiguous",
-            SpecError::Invalid(_) => "InvalidSpec",
-            SpecError::RecordInvalid(_) => "InvalidValue",
+            Error::NotFound(_) => "FieldNotFound",
+            Error::Ambiguous(_) => "FieldAmbiguous",
+            Error::Invalid(_) => "InvalidSpec",
+            Error::RecordInvalid(_) => "InvalidValue",
         }
     }
 }
 
-type Result<T> = std::result::Result<T, SpecError>;
+type Result<T> = std::result::Result<T, Error>;
 
-fn invalid(msg: impl Into<String>) -> SpecError {
-    SpecError::Invalid(msg.into())
+fn invalid(msg: impl Into<String>) -> Error {
+    Error::Invalid(msg.into())
 }
 
 /// The dialect settings a query may change: how it is planned, not how
@@ -97,8 +97,8 @@ fn checked_db_settings(given: Option<&Attrs>) -> Result<Attrs> {
     Ok(given.clone())
 }
 
-fn record_invalid(msg: impl Into<String>) -> SpecError {
-    SpecError::RecordInvalid(msg.into())
+fn record_invalid(msg: impl Into<String>) -> Error {
+    Error::RecordInvalid(msg.into())
 }
 
 // ---------------------------------------------------------------- spec types
@@ -343,9 +343,9 @@ pub fn resolve_field<'u>(semantic: &'u SemanticModel, reference: &str, kind: Opt
             .collect();
     }
     match matches.len() {
-        0 => Err(SpecError::NotFound(format!("No field named '{base}' in this model."))),
+        0 => Err(Error::NotFound(format!("No field named '{base}' in this model."))),
         1 => Ok(matches[0]),
-        _ => Err(SpecError::Ambiguous(format!(
+        _ => Err(Error::Ambiguous(format!(
             "Field '{base}' is ambiguous — more than one field answers to it. Use {base}@d or {base}@m to pick the dimension or the measure."
         ))),
     }
@@ -398,7 +398,7 @@ impl<'u> Cx<'u> {
     /// an unclear one fails naming the closest fields.
     fn resolve(&self, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
         match resolve_field(self.semantic, reference, kind) {
-            Err(SpecError::NotFound(msg)) => {
+            Err(Error::NotFound(msg)) => {
                 let (base, suffix) = reference.trim().split_once('@').map(|(b, s)| (b, Some(s))).unwrap_or((reference.trim(), None));
                 let kinds: Vec<FieldKind> = match kind_hint(kind).or_else(|| kind_hint(suffix)) {
                     Some(k) => vec![k],
@@ -415,7 +415,7 @@ impl<'u> Cx<'u> {
                         });
                         Ok(best.field)
                     }
-                    None => Err(SpecError::NotFound(format!("{msg}{}", crate::fuzzy::did_you_mean(&ranked)))),
+                    None => Err(Error::NotFound(format!("{msg}{}", crate::fuzzy::did_you_mean(&ranked)))),
                 }
             }
             other => other,
@@ -1128,7 +1128,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     for k in &s.keys {
         let text = ref_text(k)?;
         let f = cx.resolve(&text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
+            Error::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Dimension {
@@ -1140,7 +1140,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     for m in &s.measures {
         let text = ref_text(m)?;
         let f = cx.resolve(&text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => cx.resolve(&text, Some("measure")),
+            Error::Ambiguous(_) => cx.resolve(&text, Some("measure")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Measure {
@@ -1183,7 +1183,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
         for e in &s.expanding {
             let text = ref_text(&e.field)?;
             let f = cx.resolve(&text, None).or_else(|err| match err {
-                SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
+                Error::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
                 err => Err(err),
             })?;
             if f.kind != FieldKind::Dimension {
@@ -1274,9 +1274,9 @@ fn rename_ref(sql: &str, old: &str, new: &str) -> String {
 }
 
 /// The "Did you mean" tail of a not-found error, or empty.
-fn did_you_mean_suffix(e: &SpecError) -> String {
+fn did_you_mean_suffix(e: &Error) -> String {
     match e {
-        SpecError::NotFound(m) | SpecError::Ambiguous(m) => m.find(" Did you mean").map(|i| m[i..].to_string()).unwrap_or_default(),
+        Error::NotFound(m) | Error::Ambiguous(m) => m.find(" Did you mean").map(|i| m[i..].to_string()).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -1560,10 +1560,10 @@ mod tests {
     /// is a deliberate act with a failing test, not a silent break.
     #[test]
     fn error_classes_are_0sqls_own() {
-        assert_eq!(SpecError::NotFound(String::new()).error_class(), "FieldNotFound");
-        assert_eq!(SpecError::Ambiguous(String::new()).error_class(), "FieldAmbiguous");
-        assert_eq!(SpecError::Invalid(String::new()).error_class(), "InvalidSpec");
-        assert_eq!(SpecError::RecordInvalid(String::new()).error_class(), "InvalidValue");
+        assert_eq!(Error::NotFound(String::new()).error_class(), "FieldNotFound");
+        assert_eq!(Error::Ambiguous(String::new()).error_class(), "FieldAmbiguous");
+        assert_eq!(Error::Invalid(String::new()).error_class(), "InvalidSpec");
+        assert_eq!(Error::RecordInvalid(String::new()).error_class(), "InvalidValue");
         // Nothing here may name a framework we are not.
         for class in ["FieldNotFound", "FieldAmbiguous", "InvalidSpec", "InvalidValue"] {
             assert!(!class.contains("ActiveRecord") && !class.contains("::"), "{class}");

@@ -3,7 +3,7 @@
 //! references are refused by name.
 
 use zsql_golden::{run_case_on, Fixtures, PathSource};
-use zsql_spec::{lower, resolve_field, Spec, SpecError};
+use zsql_spec::{lower, resolve_field, Spec};
 
 #[test]
 fn specs_serialize_back_and_lower_to_the_same_plan() {
@@ -79,7 +79,7 @@ fn unresolvable_references_are_named_in_the_error() {
     let hash = fx.snapshot_hashes().unwrap().into_iter().next().unwrap();
     let semantic = fx.semantic(&hash).unwrap();
     match resolve_field(&semantic, "no_such_field_anywhere", None) {
-        Err(SpecError::NotFound(msg)) => assert!(msg.contains("no_such_field_anywhere"), "{msg}"),
+        Err(zsql_spec::Error::NotFound(msg)) => assert!(msg.contains("no_such_field_anywhere"), "{msg}"),
         other => panic!("expected NotFound, got {other:?}"),
     }
     let f = semantic.fields().first().unwrap();
@@ -89,7 +89,7 @@ fn unresolvable_references_are_named_in_the_error() {
         assert_eq!(resolve_field(&semantic, &h.uid, None).unwrap().uid, h.uid);
     }
     let bad = Spec::from_value(serde_json::json!({ "projections": [], "filtres": [] }));
-    assert!(matches!(bad, Err(SpecError::Invalid(ref m)) if m.contains("filtres")), "{bad:?}");
+    assert!(matches!(bad, Err(zsql_spec::Error::Invalid(ref m)) if m.contains("filtres")), "{bad:?}");
 }
 
 /// A window's or contribution's partition and order refs resolve by name
@@ -158,7 +158,7 @@ fn partition_and_order_refs_resolve_by_name_and_refuse_a_miss() {
             checked += 1;
             if miss.to_value() != spec.to_value() {
                 match lower(&miss, &semantic, &base) {
-                    Err(SpecError::RecordInvalid(msg)) => assert!(msg.contains("not a projected dimension"), "{}: {msg}", case.id),
+                    Err(zsql_spec::Error::RecordInvalid(msg)) => assert!(msg.contains("not a projected dimension"), "{}: {msg}", case.id),
                     other => panic!("{}: a partition naming nothing was accepted: {other:?}", case.id),
                 }
                 refused += 1;

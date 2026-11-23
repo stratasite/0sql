@@ -43,4 +43,4 @@ pub mod fuzzy;
 pub mod model;
 pub mod spec;
 pub use model::*;
-pub use spec::{lower, resolve_field, Spec, SpecError};
+pub use spec::{lower, resolve_field, Error, Spec};

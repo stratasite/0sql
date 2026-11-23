@@ -67,8 +67,8 @@ impl ServiceError {
     }
 }
 
-impl From<zsql_spec::SpecError> for ServiceError {
-    fn from(e: zsql_spec::SpecError) -> Self {
+impl From<zsql_spec::Error> for ServiceError {
+    fn from(e: zsql_spec::Error) -> Self {
         Self::unprocessable(e.error_class(), e.to_string())
     }
 }

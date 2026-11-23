@@ -138,7 +138,7 @@ pub enum PlanError {
 
 impl PlanError {
     /// The Rails exception class this error corresponds to.
-    /// The `class` an API error carries; see `SpecError::error_class`.
+    /// The `class` an API error carries; see `zsql_spec::Error::error_class`.
     pub fn error_class(&self) -> &'static str {
         match self {
             PlanError::Resolution(_) => "Unresolvable",
