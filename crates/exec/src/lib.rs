@@ -41,7 +41,7 @@ pub const DEFAULT_CAP: u64 = 10_000;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Debug, thiserror::Error)]
-pub enum ExecError {
+pub enum Error {
     #[error("planning: {0}")]
     Plan(String),
     #[error("{0}")]
@@ -60,7 +60,7 @@ pub enum ExecError {
     RowsFormat(String, String),
 }
 
-pub type Result<T> = std::result::Result<T, ExecError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 // ----------------------------------------------------------------- manifest
 
@@ -166,7 +166,7 @@ pub struct Stored {
 
 impl Store {
     pub fn open(root: &Path) -> Result<Store> {
-        std::fs::create_dir_all(root).map_err(|e| ExecError::Io(root.display().to_string(), e))?;
+        std::fs::create_dir_all(root).map_err(|e| Error::Io(root.display().to_string(), e))?;
         Ok(Store { root: root.to_path_buf() })
     }
 
@@ -185,7 +185,7 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
         Ok(Some(Stored { manifest: serde_json::from_str(&text)?, dir }))
     }
 
@@ -216,13 +216,13 @@ impl Store {
             .filter(|s| s.manifest.id == want || s.manifest.id.starts_with(want) || s.manifest.key.starts_with(want))
             .collect();
         match hits.len() {
-            0 => Err(ExecError::NotFound(want.to_string())),
+            0 => Err(Error::NotFound(want.to_string())),
             1 => Ok(hits.remove(0)),
             _ => {
                 if let Some(i) = hits.iter().position(|s| s.manifest.id == want) {
                     Ok(hits.remove(i))
                 } else {
-                    Err(ExecError::Ambiguous(want.to_string()))
+                    Err(Error::Ambiguous(want.to_string()))
                 }
             }
         }
@@ -230,16 +230,16 @@ impl Store {
 
     pub fn remove(&self, key: &str) -> Result<()> {
         let dir = self.dir_of(key);
-        std::fs::remove_dir_all(&dir).map_err(|e| ExecError::Io(dir.display().to_string(), e))
+        std::fs::remove_dir_all(&dir).map_err(|e| Error::Io(dir.display().to_string(), e))
     }
 
     /// Every result of this project, gone.
     pub fn purge(&self) -> Result<usize> {
         let n = self.list()?.len();
         if self.root.exists() {
-            std::fs::remove_dir_all(&self.root).map_err(|e| ExecError::Io(self.root.display().to_string(), e))?;
+            std::fs::remove_dir_all(&self.root).map_err(|e| Error::Io(self.root.display().to_string(), e))?;
         }
-        std::fs::create_dir_all(&self.root).map_err(|e| ExecError::Io(self.root.display().to_string(), e))?;
+        std::fs::create_dir_all(&self.root).map_err(|e| Error::Io(self.root.display().to_string(), e))?;
         Ok(n)
     }
 
@@ -249,12 +249,12 @@ impl Store {
     fn write(&self, manifest: &Manifest, rows: &Batches) -> Result<Stored> {
         let dir = self.dir_of(&manifest.key);
         let tmp = dir.with_extension("tmp");
-        let io = |p: &Path, e: std::io::Error| ExecError::Io(p.display().to_string(), e);
+        let io = |p: &Path, e: std::io::Error| Error::Io(p.display().to_string(), e);
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).map_err(|e| io(&tmp, e))?;
         let rows_path = tmp.join(ROWS_FILE);
         {
-            let arrow = |e: arrow_schema::ArrowError| ExecError::Arrow(rows_path.display().to_string(), e);
+            let arrow = |e: arrow_schema::ArrowError| Error::Arrow(rows_path.display().to_string(), e);
             let file = std::fs::File::create(&rows_path).map_err(|e| io(&rows_path, e))?;
             let options = arrow_ipc::writer::IpcWriteOptions::default()
                 .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))
@@ -292,8 +292,8 @@ impl Stored {
         match self.manifest.rows_format.as_str() {
             ROWS_FORMAT => {
                 let path = self.dir.join(ROWS_FILE);
-                let arrow = |e: arrow_schema::ArrowError| ExecError::Arrow(path.display().to_string(), e);
-                let file = std::fs::File::open(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                let arrow = |e: arrow_schema::ArrowError| Error::Arrow(path.display().to_string(), e);
+                let file = std::fs::File::open(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
                 let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None).map_err(arrow)?;
                 let schema = reader.schema();
                 let batches = reader.collect::<std::result::Result<Vec<_>, _>>().map_err(arrow)?;
@@ -301,10 +301,10 @@ impl Stored {
             }
             ROWS_FORMAT_TEXT => {
                 let path = self.dir.join(ROWS_FILE_TEXT);
-                let file = std::fs::File::open(&path).map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                let file = std::fs::File::open(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
                 let mut rows: Vec<Vec<Option<String>>> = Vec::new();
                 for line in std::io::BufReader::new(flate2::read::GzDecoder::new(file)).lines() {
-                    let line = line.map_err(|e| ExecError::Io(path.display().to_string(), e))?;
+                    let line = line.map_err(|e| Error::Io(path.display().to_string(), e))?;
                     if !line.trim().is_empty() {
                         rows.push(serde_json::from_str(&line)?);
                     }
@@ -312,7 +312,7 @@ impl Stored {
                 let columns = self.manifest.columns.iter().map(|c| c.name.clone()).collect();
                 Ok(Batches::from_text(&Rows { columns, rows }))
             }
-            other => Err(ExecError::RowsFormat(self.dir.display().to_string(), other.to_string())),
+            other => Err(Error::RowsFormat(self.dir.display().to_string(), other.to_string())),
         }
     }
 
@@ -401,20 +401,18 @@ impl Engine {
         let expr = req.query.expr.clone();
         let spec = req.query.spec.clone();
         let context_digest = req.query.context.as_ref().map(|c| sha256(&serde_json::to_string(c).unwrap_or_default()));
-        let planned = model.plan_request(req.query, false, &zsql_core::unlimited).map_err(|e| ExecError::Plan(e.to_string()))?;
+        let planned = model.plan_request(req.query, false, &zsql_core::unlimited).map_err(|e| Error::Plan(e.to_string()))?;
         let plan_us = t0.elapsed().as_micros();
-        let dialect = model.dialects.get(&planned.plan.adapter).map_err(|e| ExecError::Plan(e.to_string()))?;
+        let dialect = model.dialects.get(&planned.plan.adapter).map_err(|e| Error::Plan(e.to_string()))?;
 
         // The user's limit is the question's; the cap is this side's.
         // Without a user limit, one past the cap goes into the statement,
         // so the warehouse never ships more than is kept plus one.
         let (sql, cap, max_rows) = match (planned.limit, req.limit) {
-            (Some(n), _) => (planned.plan.sql_with_limit(Some(n), &dialect).map_err(|e| ExecError::Plan(e.to_string()))?, None, n as usize),
-            (None, Limit::Rows(cap)) => (
-                planned.plan.sql_with_limit(Some(cap + 1), &dialect).map_err(|e| ExecError::Plan(e.to_string()))?,
-                Some(cap),
-                cap as usize + 1,
-            ),
+            (Some(n), _) => (planned.plan.sql_with_limit(Some(n), &dialect).map_err(|e| Error::Plan(e.to_string()))?, None, n as usize),
+            (None, Limit::Rows(cap)) => {
+                (planned.plan.sql_with_limit(Some(cap + 1), &dialect).map_err(|e| Error::Plan(e.to_string()))?, Some(cap), cap as usize + 1)
+            }
             (None, Limit::All) => (planned.plan.sql.clone(), None, usize::MAX),
         };
         let datasource_uid = planned.plan.datasource_uid.clone();
@@ -691,7 +689,7 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(store.get(&manifest.id[..6]).unwrap().manifest.key, key, "a prefix of the id");
         assert_eq!(store.get(&key[..10]).unwrap().manifest.key, key, "a prefix of the key");
-        assert!(matches!(store.get("r-1999").unwrap_err(), ExecError::NotFound(_)));
+        assert!(matches!(store.get("r-1999").unwrap_err(), Error::NotFound(_)));
         assert!(!store.lookup(&key).unwrap().unwrap().expired());
 
         // What a build before 0.7 left behind: gzipped JSON lines and a
@@ -716,7 +714,7 @@ mod tests {
         assert_eq!(read.rows().unwrap().rows, rows, "an old result still answers");
         assert!(read.batches().unwrap().schema.fields().iter().all(|f| f.data_type() == &arrow_schema::DataType::Utf8));
         let unknown = Stored { manifest: Manifest { rows_format: "parquet".into(), ..manifest.clone() }, dir: old_dir.clone() };
-        assert!(matches!(unknown.batches().unwrap_err(), ExecError::RowsFormat(_, f) if f == "parquet"));
+        assert!(matches!(unknown.batches().unwrap_err(), Error::RowsFormat(_, f) if f == "parquet"));
         store.remove(&old_key).unwrap();
 
         store.remove(&key).unwrap();
