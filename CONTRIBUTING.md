@@ -11,7 +11,7 @@ the SQLite and DuckDB the CLI bundles.
 ```sh
 cargo build --release -p zsql-cli                         # target/release/zsql
 cargo test --workspace
-cargo run --release -p zsql-devtool -- golden --strict    # the 385 golden cases
+cargo xtask golden --strict    # the 385 golden cases
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```

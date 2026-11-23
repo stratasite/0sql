@@ -113,7 +113,7 @@ prints the error. `.reload` forces it. With `-r` the repl is unchanged.
 ### Loader efficiency, measured before cached
 
 Budget on the TPC-DS fixture: local `zsql sql` under 25 ms end to end,
-repl reload under 15 ms. `zsql-dev load-bench --project DIR` reports
+repl reload under 15 ms. `cargo xtask load-bench --project DIR` reports
 the loader step by step (`Loaded.phases`), which is what decided the
 work below. A compiled snapshot cache under `$XDG_CACHE_HOME/zsql/<uid>/`,
 keyed on `Loaded.sources` plus the snapshot format, is built only if the

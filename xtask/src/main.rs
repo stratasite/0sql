@@ -1,4 +1,4 @@
-//! zsql-dev: the engine on the command line, for its developers. What
+//! `cargo xtask`: the engine on the command line, for its developers. What
 //! a user does with a model is `zsql`'s job (it plans here or on a
 //! server); this is for checking the engine itself: the golden
 //! scoreboard, the benches, formation against stored paths, and
@@ -14,7 +14,7 @@ use zsql_golden::{print_scoreboard, score, Fixtures, PathSource};
 use zsql_semantic::{SemanticModel, Snapshot};
 
 #[derive(Parser)]
-#[command(name = "zsql-dev", about = "zsql-dev: the engine on the command line, for its developers")]
+#[command(name = "cargo xtask", bin_name = "cargo xtask", about = "The engine on the command line, for its developers")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -83,7 +83,7 @@ enum Paths {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Load the model, build the universe and report what is in it.
+    /// Load the model, build its index and report what is in it.
     Check {
         #[command(flatten)]
         source: Source,
@@ -110,7 +110,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Paths::Formed)]
         paths: Paths,
     },
-    /// Time loading a project directory, step by step: the YAML load with formation, the universe index, the planner index.
+    /// Time loading a project directory, step by step: the YAML load with formation, the model index, the planner index.
     LoadBench {
         #[arg(long)]
         project: PathBuf,

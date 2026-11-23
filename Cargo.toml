@@ -14,8 +14,8 @@ members = [
   "crates/core",
   "crates/server",
   "crates/golden",
-  "crates/devtool",
   "crates/cli",
+  "xtask",
 ]
 
 [workspace.package]

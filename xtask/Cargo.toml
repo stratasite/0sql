@@ -1,16 +1,12 @@
 [package]
-name = "zsql-devtool"
+name = "xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = false
-description = "zsql-dev: the engine on the command line for its developers: goldens, bench, formation, export"
-
-[[bin]]
-name = "zsql-dev"
-path = "src/main.rs"
+description = "cargo xtask: the engine on the command line for its developers: goldens, bench, formation, export"
 
 [dependencies]
 zsql-semantic.workspace = true

@@ -171,7 +171,7 @@ compiler for the SQLite and DuckDB the CLI bundles to run queries.
 cargo build --release -p zsql-cli              # target/release/zsql
 cargo build -p zsql-cli --no-default-features  # the CLI without the server
 cargo test --workspace
-cargo run --release -p zsql-devtool -- golden --strict
+cargo xtask golden --strict
 ```
 
 ```
@@ -188,7 +188,7 @@ crates/exec       running a planned query and keeping its rows: the result store
 crates/log        where the log goes: level, format and destination, in one place
 crates/server     the server: deploy, plan, MCP
 crates/cli        zsql
-crates/devtool    zsql-dev: the goldens, benches and formation checks, for developers of the engine
+xtask/            cargo xtask: the goldens, benches and formation checks, for developers of the engine
 crates/golden     the golden cases and the scoreboard
 fixtures/         public sample projects (TPC-DS, a grocery store) and the golden cases
 harness/          how the golden cases were captured, and the MCP wording evaluation

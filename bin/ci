@@ -84,7 +84,7 @@ sources() {
 step "Format"                 cargo fmt --all --check
 step "Clippy"                 cargo clippy --workspace --all-targets --locked -- -D warnings
 step "Tests"                  cargo test --workspace --locked
-step "Goldens"                cargo run --release --locked -p zsql-devtool -- golden --strict
+step "Goldens"                cargo run --release --locked -p xtask -- golden --strict
 step "CLI without defaults"   cargo check --locked -p zsql-cli --no-default-features
 step "Docs without warnings"  env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 step "Deny"                   cargo deny check

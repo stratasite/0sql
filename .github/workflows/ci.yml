@@ -33,7 +33,7 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
       - name: Goldens
-        run: cargo run --release --locked -p zsql-devtool -- golden --strict
+        run: cargo run --release --locked -p xtask -- golden --strict
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
       # The same list bin/ci runs; this is the step it had and CI did not,
