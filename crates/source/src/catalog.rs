@@ -148,6 +148,7 @@ impl Catalog {
     /// merge knows what a read can replace and what it cannot speak to.
     pub fn read_filtered(src: &mut dyn Source, datasource: &str, f: &Filter) -> Result<Catalog> {
         let adapter = src.adapter().to_string();
+        let f = &Filter { adapter: adapter.clone(), ..f.clone() };
         let tables = match adapter.as_str() {
             "postgres" => postgres(src, f)?,
             "redshift" => redshift(src, f)?,
@@ -181,6 +182,36 @@ impl Catalog {
             added,
             tables,
         })
+    }
+
+    /// One page of what `src` holds: the tables the filter admits, by
+    /// schema and name, `limit` of them after the first `offset`. Only
+    /// the tables are read, never their columns or keys, and the
+    /// warehouse cuts the page, so a first look at a warehouse of any
+    /// size costs one short statement. `more` says whether another page
+    /// follows.
+    pub fn list(src: &mut dyn Source, f: &Filter, limit: usize, offset: usize) -> Result<Listing> {
+        // One more than asked for: its presence is the answer to `more`.
+        let adapter = src.adapter().to_string();
+        let f = Filter { page: Some(Page { limit: limit + 1, offset }), adapter: adapter.clone(), ..f.clone() };
+        let mut tables = match adapter.as_str() {
+            "postgres" => postgres(src, &f)?,
+            "redshift" => redshift(src, &f)?,
+            "clickhouse" => clickhouse(src, &f)?,
+            "mysql" => mysql(src, &f)?,
+            "sqlserver" => sqlserver(src, &f)?,
+            "trino" => trino(src, &f)?,
+            "athena" => athena(src, &f)?,
+            "snowflake" => snowflake(src, &f)?,
+            "databricks" => databricks(src, &f)?,
+            "bigquery" => bigquery(src, &f)?,
+            "sqlite" => sqlite(src, &f)?,
+            "duckdb" => duckdb(src, &f)?,
+            other => return Err(SourceError::Unsupported(other.to_string())),
+        };
+        let more = tables.len() > limit;
+        tables.truncate(limit);
+        Ok(Listing { tables, more })
     }
 
     /// Whether this catalog can speak to a table: it is inside a schema
@@ -259,6 +290,29 @@ pub struct Filter {
     /// One schema, or every non-system one.
     pub schema: Option<String>,
     pub name: Names,
+    /// Set by [`Catalog::list`]: one page of tables, by schema and name,
+    /// and nothing below a table. The warehouse does the paging, so a
+    /// page of a hundred costs a hundred rows however many there are.
+    page: Option<Page>,
+    /// The engine being read, set at the top of a read: a name pattern
+    /// is spelled differently from one to the next.
+    adapter: String,
+}
+
+/// A window on a listing: this many tables, after that many.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Page {
+    limit: usize,
+    offset: usize,
+}
+
+/// One page of a datasource's tables, and whether there are more.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    /// Each with its schema, kind, row estimate and comment; no columns
+    /// and no keys, which a listing does not read.
+    pub tables: Vec<Table>,
+    pub more: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -273,13 +327,36 @@ pub enum Names {
 
 impl Filter {
     pub fn schema(schema: Option<&str>) -> Filter {
-        Filter { schema: schema.map(str::to_string), name: Names::Any }
+        Filter { schema: schema.map(str::to_string), name: Names::Any, ..Default::default() }
     }
     pub fn table(schema: Option<&str>, name: &str) -> Filter {
-        Filter { schema: schema.map(str::to_string), name: Names::Exact(name.to_string()) }
+        Filter { schema: schema.map(str::to_string), name: Names::Exact(name.to_string()), ..Default::default() }
     }
     pub fn like(schema: Option<&str>, pattern: &str) -> Filter {
-        Filter { schema: schema.map(str::to_string), name: Names::Like(pattern.to_string()) }
+        Filter { schema: schema.map(str::to_string), name: Names::Like(pattern.to_string()), ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn holding_for_test(adapter: &str, pattern: &str) -> String {
+    holding(adapter, "t", pattern)
+}
+
+#[cfg(test)]
+pub(crate) fn paged_for_test(adapter: &str, tables_sql: &str, limit: usize, offset: usize) -> String {
+    paged(adapter, tables_sql, Page { limit, offset })
+}
+
+/// The tables statement narrowed to one page, in the adapter's own
+/// spelling. Every tables statement here ends in `ORDER BY 1, 2`, schema
+/// then name, which is what makes one page follow another.
+fn paged(adapter: &str, tables_sql: &str, page: Page) -> String {
+    let Page { limit, offset } = page;
+    match adapter {
+        // Trino's grammar puts the offset first, and Athena is Trino.
+        "trino" | "athena" => format!("{tables_sql} OFFSET {offset} LIMIT {limit}"),
+        "sqlserver" => format!("{tables_sql} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"),
+        _ => format!("{tables_sql} LIMIT {limit} OFFSET {offset}"),
     }
 }
 
@@ -287,8 +364,14 @@ impl Filter {
 /// one row per column, joined here by schema and table name. Each adapter
 /// supplies the statements; the column names they must answer with are
 /// fixed, so the assembly is written once.
-fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result<Vec<Table>> {
-    let t = src.query(tables_sql, MAX_TABLES)?;
+fn assemble(src: &mut dyn Source, f: &Filter, tables_sql: &str, columns_sql: &str) -> Result<Vec<Table>> {
+    let t = match f.page {
+        Some(page) => {
+            let sql = paged(src.adapter(), tables_sql, page);
+            src.query(&sql, page.limit)?
+        }
+        None => src.query(tables_sql, MAX_TABLES)?,
+    };
     let mut tables: Vec<Table> = t
         .rows
         .iter()
@@ -303,6 +386,10 @@ fn assemble(src: &mut dyn Source, tables_sql: &str, columns_sql: &str) -> Result
             foreign_keys: vec![],
         })
         .collect();
+    // A page of a listing is the tables alone.
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let c = src.query(columns_sql, MAX_COLUMNS)?;
     for r in &c.rows {
         let schema = c.get(r, "table_schema");
@@ -408,9 +495,43 @@ fn scope_clause(schema_col: &str, table_col: &str, f: &Filter) -> String {
     match &f.name {
         Names::Any => schema,
         Names::Exact(n) => format!("{schema} AND LOWER({table_col}) = '{}'", lit(&n.to_lowercase())),
-        Names::Like(p) => {
-            format!("{schema} AND LOWER({table_col}) LIKE '%{}%'", lit(&p.to_lowercase().replace('%', "").replace('_', "\\_")))
+        Names::Like(p) => format!("{schema} AND {}", holding(&f.adapter, table_col, p)),
+    }
+}
+
+/// `LOWER(column) LIKE …` for the names that hold `pattern`, every
+/// character of it meant as itself: a `_` in a search is an underscore,
+/// which is what most table names are held together with.
+///
+/// There is no one spelling for that. The standard's `ESCAPE` clause is
+/// the widest, and is used wherever it exists; a bare backslash, which
+/// this once relied on, is not an escape on DuckDB, SQL Server, Trino or
+/// Athena, where it matched nothing with an underscore in it. ClickHouse
+/// and BigQuery have no clause and each takes a backslash its own way.
+fn holding(adapter: &str, column: &str, pattern: &str) -> String {
+    let slashes = matches!(adapter, "clickhouse" | "bigquery");
+    let pattern: String = pattern.to_lowercase().replace('\'', "''").chars().filter(|c| !(slashes && *c == '\\')).collect();
+    let escaped = |by: &str, special: &[char]| -> String {
+        let mut out = String::new();
+        for c in pattern.chars() {
+            if special.contains(&c) {
+                out.push_str(by);
+            }
+            out.push(c);
         }
+        out
+    };
+    match adapter {
+        // A string literal here keeps the backslash of `\_` and `\%`
+        // for exactly this. A backslash in the search itself was
+        // dropped above rather than escaped twice over: it is in no
+        // table name.
+        "clickhouse" => format!("LOWER({column}) LIKE '%{}%'", escaped("\\", &['%', '_'])),
+        // Two backslashes in the literal are the one the pattern needs.
+        "bigquery" => format!("LOWER({column}) LIKE '%{}%'", escaped("\\\\", &['%', '_'])),
+        // SQL Server also reads `[` as the start of a character class.
+        "sqlserver" => format!("LOWER({column}) LIKE '%{}%' ESCAPE '!'", escaped("!", &['%', '_', '!', '['])),
+        _ => format!("LOWER({column}) LIKE '%{}%' ESCAPE '!'", escaped("!", &['%', '_', '!'])),
     }
 }
 
@@ -428,7 +549,10 @@ fn postgres(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     // Columns from pg_attribute rather than information_schema.columns,
     // which does not list a materialized view's.
     let columns = pg_columns_sql(f, "('r', 'p', 'v', 'm', 'f')");
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     // pg_constraint holds the key columns as attribute numbers; unnest
     // them with their ordinality so each row is one column in order, and
     // for a foreign key the referenced column at the same ordinal.
@@ -510,7 +634,10 @@ pub(crate) fn redshift_sql(f: &Filter) -> (String, String, String) {
 
 fn redshift(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let (tables_sql, columns_sql, keys_sql) = redshift_sql(f);
-    let mut tables = assemble(src, &tables_sql, &columns_sql)?;
+    let mut tables = assemble(src, f, &tables_sql, &columns_sql)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let k = src.query(&keys_sql, MAX_COLUMNS)?;
     let expanded = expand_attnums(&tables, &k);
     apply_keys(&mut tables, &expanded);
@@ -588,7 +715,10 @@ fn clickhouse(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM system.columns WHERE {} ORDER BY 1, 2, position",
         scope_clause("database", "table", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     // system.tables.primary_key is one expression string, "a, b"; split
     // it into its columns. ClickHouse has no foreign keys.
     let keys_sql = format!(
@@ -622,7 +752,10 @@ fn mysql(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          column_comment AS column_comment FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", "table_name", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let keys_sql = format!(
         "SELECT kcu.table_schema AS table_schema, kcu.table_name AS table_name, \
          IF(tc.constraint_type = 'PRIMARY KEY', 'primary', 'foreign') AS key_kind, kcu.constraint_name AS key_name, \
@@ -667,7 +800,10 @@ fn sqlserver(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          WHERE {} ORDER BY 1, 2, c.ORDINAL_POSITION",
         scope_clause("c.TABLE_SCHEMA", "c.TABLE_NAME", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let keys_sql = format!(
         "SELECT s.name AS table_schema, t.name AS table_name, 'primary' AS key_kind, kc.name AS key_name, \
          col.name AS column_name, CAST(ic.key_ordinal AS VARCHAR(10)) AS position, \
@@ -717,7 +853,7 @@ fn trino(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", "table_name", f)
     );
-    assemble(src, &tables, &columns)
+    assemble(src, f, &tables, &columns)
 }
 
 /// `INFORMATION_SCHEMA` of the session's database for the tables and
@@ -728,7 +864,7 @@ fn trino(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
 /// way Snowflake folds an unquoted name.
 fn snowflake(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
     let scope = f.schema.as_deref().map(crate::snowflake::ident);
-    let f = &Filter { schema: scope.clone(), name: f.name.clone() };
+    let f = &Filter { schema: scope.clone(), ..f.clone() };
     let tables = format!(
         "SELECT table_schema AS \"table_schema\", table_name AS \"table_name\", \
          CASE WHEN table_type LIKE '%VIEW' THEN 'view' ELSE 'table' END AS \"table_kind\", \
@@ -745,7 +881,10 @@ fn snowflake(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM INFORMATION_SCHEMA.COLUMNS WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", "table_name", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let within = match &scope {
         Some(s) => format!("IN SCHEMA \"{}\"", s.replace('"', "\"\"")),
         None => "IN DATABASE".to_string(),
@@ -808,7 +947,7 @@ fn athena(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", "table_name", f)
     );
-    assemble(src, &tables, &columns)
+    assemble(src, f, &tables, &columns)
 }
 
 /// Unity Catalog's `information_schema`, which the session's catalog
@@ -830,7 +969,10 @@ fn databricks(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM information_schema.columns WHERE {} ORDER BY 1, 2, ordinal_position",
         scope_clause("table_schema", "table_name", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let keys_sql = format!("{} AND {}", standard_keys_sql("information_schema", false), scope_clause("k.table_schema", "k.table_name", f));
     keys(src, &mut tables, &keys_sql)?;
     Ok(tables)
@@ -910,7 +1052,10 @@ fn bigquery(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          WHERE {} ORDER BY 1, 2, c.ordinal_position",
         scope_clause("c.table_schema", "c.table_name", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let keys_sql = format!(
         "{} AND {}",
         standard_keys_sql(&format!("{qualifier}.INFORMATION_SCHEMA"), true),
@@ -944,7 +1089,10 @@ fn duckdb(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
          FROM duckdb_columns() WHERE NOT internal AND {} ORDER BY 1, 2, column_index",
         scope_clause("schema_name", "table_name", f)
     );
-    let mut tables = assemble(src, &tables, &columns)?;
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if f.page.is_some() {
+        return Ok(tables);
+    }
     let keys_sql = format!(
         "SELECT schema_name AS table_schema, table_name, \
          CASE constraint_type WHEN 'PRIMARY KEY' THEN 'primary' ELSE 'foreign' END AS key_kind, \
@@ -995,6 +1143,10 @@ fn sqlite(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
         MAX_TABLES,
     )?;
     let mut tables = Vec::new();
+    // The names are filtered here rather than in the statement, so a
+    // page is counted here too: so many wanted tables passed over, then
+    // so many kept.
+    let mut passed = 0;
     for r in &t.rows {
         let name = t.get(r, "name").unwrap_or_default().to_string();
         let wanted = match &f.name {
@@ -1003,6 +1155,26 @@ fn sqlite(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
             Names::Like(p) => name.to_lowercase().contains(&p.to_lowercase()),
         };
         if !wanted {
+            continue;
+        }
+        if let Some(page) = f.page {
+            passed += 1;
+            if passed <= page.offset {
+                continue;
+            }
+            if tables.len() == page.limit {
+                break;
+            }
+            tables.push(Table {
+                schema: None,
+                name,
+                kind: t.get(r, "type").unwrap_or("table").to_string(),
+                rows: None,
+                comment: None,
+                columns: vec![],
+                primary_key: vec![],
+                foreign_keys: vec![],
+            });
             continue;
         }
         let c = src.query(&format!("PRAGMA table_info(\"{}\")", name.replace('"', "\"\"")), MAX_COLUMNS)?;

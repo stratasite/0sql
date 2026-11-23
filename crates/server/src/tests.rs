@@ -859,3 +859,298 @@ async fn liveness_needs_nothing() {
         assert_eq!(s.get(gone).await.status, StatusCode::NOT_FOUND, "{gone}");
     }
 }
+
+// ------------------------------------------------------------------- lists
+
+/// Every list read takes `q` and keeps what holds it, over REST and as
+/// the MCP tools; a term too long to be a search is refused.
+#[tokio::test]
+async fn every_list_takes_a_q() {
+    let s = server();
+    for branch in ["main", "staging"] {
+        let a = s.deploy(CS, branch, archive(CS, "one")).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    }
+    let deployments = |a: &Answer| -> Vec<String> {
+        a.body["deployments"].as_array().expect("deployments").iter().map(|d| d["branch"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(deployments(&s.get("/projects").await), ["main", "staging"]);
+    assert_eq!(deployments(&s.get("/projects?q=STAG").await), ["staging"]);
+    assert_eq!(deployments(&s.get("/projects?q=customer").await), ["main", "staging"], "the project's name counts too");
+    assert!(deployments(&s.get("/projects?q=nowhere").await).is_empty());
+
+    let base = format!("/projects/{CS}/branches/main");
+    let count = |a: &Answer, list: &str| a.body[list].as_array().map(Vec::len);
+    assert_eq!(count(&s.get(&format!("{base}/tables")).await, "tables"), Some(1));
+    assert_eq!(count(&s.get(&format!("{base}/tables?q=SAL")).await, "tables"), Some(1));
+    assert_eq!(count(&s.get(&format!("{base}/tables?q=nowhere")).await, "tables"), Some(0));
+    assert_eq!(count(&s.get(&format!("{base}/datasources")).await, "datasources"), Some(1));
+    let a = s.get(&format!("{base}/datasources?q=duck")).await;
+    assert_eq!(
+        a.body["datasources"][0],
+        json!({
+            "uid": "dw", "name": "Warehouse", "adapter": "duckdb", "tier": "hot", "description": null,
+            "query_timeout": null, "extra_query_params": {}, "connection": {}, "secrets": [],
+        })
+    );
+    assert_eq!(count(&s.get(&format!("{base}/datasources?q=nowhere")).await, "datasources"), Some(0));
+
+    let long = "x".repeat(201);
+    for path in [
+        format!("/projects?q={long}"),
+        format!("{base}/tables?q={long}"),
+        format!("{base}/datasources?q={long}"),
+        format!("{base}/values/Category?q={long}"),
+    ] {
+        let a = s.get(&path).await;
+        assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "TooLarge"), "{path}");
+    }
+
+    let listed = |a: &Answer, list: &str| a.body["result"]["structuredContent"][list].as_array().map(Vec::len);
+    assert_eq!(listed(&s.tool(&[], "list_projects", json!({ "q": "stag" })).await, "deployments"), Some(1));
+    assert_eq!(listed(&s.tool(&[], "list_projects", json!({})).await, "deployments"), Some(2));
+    assert_eq!(listed(&s.tool(&[], "tables", json!({ "project": CS, "q": "nowhere" })).await, "tables"), Some(0));
+    assert_eq!(listed(&s.tool(&[], "tables", json!({ "project": CS, "q": "sales" })).await, "tables"), Some(1));
+}
+
+// ------------------------------------------------------------------ probes
+
+/// A warehouse in a file: two schemas, a name in both, comments and keys.
+fn warehouse(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("zsqld-probe-{name}-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dw.duckdb");
+    let db = ::duckdb::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE SCHEMA dse;\
+         CREATE TABLE dse.cs_agent_d (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL);\
+         CREATE TABLE dse.cs_contact_f (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL REFERENCES dse.cs_agent_d (id), \
+           opened DATE NOT NULL, note VARCHAR(40));\
+         COMMENT ON TABLE dse.cs_contact_f IS 'One row per contact';\
+         COMMENT ON COLUMN dse.cs_contact_f.note IS 'What the agent wrote';\
+         CREATE VIEW dse.cs_recent AS SELECT id FROM dse.cs_contact_f;\
+         CREATE TABLE main.cs_contact_f (id INTEGER);\
+         CREATE TABLE main.orders (id INTEGER);",
+    )
+    .unwrap();
+    path
+}
+
+/// A datasource is probed with the connection the request carries: a
+/// page of its tables, narrowed by schema and name, and one table's
+/// structure. Nothing about the connection is deployed, and none of it
+/// comes back.
+#[tokio::test]
+async fn a_probe_reads_the_warehouse_the_request_points_at() {
+    // With a deploy token set: a probe is a read, and needs none.
+    let s = server_with(Some("s3cret"));
+    let a = s
+        .send(
+            Method::POST,
+            &format!("/projects/{CS}/branches/main/deploy"),
+            &[("authorization", "Bearer s3cret")],
+            Some(("application/gzip", archive(CS, "one"))),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let file = warehouse("reads");
+    let conn = json!({ "connection": { "file": file.to_str().unwrap(), "password": "not-needed-and-never-echoed" } });
+    let base = format!("/projects/{CS}/branches/main/datasources/dw");
+    let names = |a: &Answer| -> Vec<String> {
+        a.body["tables"].as_array().expect("tables").iter().map(|t| t["physical_name"].as_str().unwrap().to_string()).collect()
+    };
+
+    // The whole listing, by schema then name, tables only.
+    let a = s.post(&format!("{base}/tables"), conn.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(names(&a), ["dse.cs_agent_d", "dse.cs_contact_f", "dse.cs_recent", "main.cs_contact_f", "main.orders"]);
+    assert_eq!((&a.body["limit"], &a.body["offset"], &a.body["next_offset"]), (&json!(100), &json!(0), &Value::Null));
+    assert_eq!((&a.body["datasource"], &a.body["adapter"]), (&json!("dw"), &json!("duckdb")));
+    let contact = &a.body["tables"][1];
+    assert_eq!(
+        (&contact["kind"], &contact["comment"], &contact["schema"]),
+        (&json!("table"), &json!("One row per contact"), &json!("dse"))
+    );
+    assert!(contact.get("columns").is_none(), "a listing reads nothing below a table");
+    assert_eq!(a.body["tables"][2]["kind"], "view");
+    assert!(!a.body.to_string().contains("never-echoed"), "nothing of the connection comes back");
+
+    // Pages: next_offset is where the next one starts, null on the last.
+    let mut seen = Vec::new();
+    let mut offset = json!(0);
+    while !offset.is_null() {
+        let a = s.post(&format!("{base}/tables?limit=2&offset={offset}"), conn.clone()).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+        seen.extend(names(&a));
+        offset = a.body["next_offset"].clone();
+    }
+    assert_eq!(seen.len(), 5, "{seen:?}");
+
+    // Narrowed by schema, by name, by both; paged while narrowed.
+    assert_eq!(names(&s.post(&format!("{base}/tables?schema=main"), conn.clone()).await), ["main.cs_contact_f", "main.orders"]);
+    assert_eq!(names(&s.post(&format!("{base}/tables?q=CONTACT"), conn.clone()).await), ["dse.cs_contact_f", "main.cs_contact_f"]);
+    assert_eq!(names(&s.post(&format!("{base}/tables?q=cs_&schema=dse&limit=1&offset=1"), conn.clone()).await), ["dse.cs_contact_f"]);
+    assert!(names(&s.post(&format!("{base}/tables?q=nowhere"), conn.clone()).await).is_empty());
+
+    // One table, named by the path or with its schema beside it.
+    for path in [
+        format!("{base}/tables/dse.cs_contact_f"),
+        format!("{base}/tables/cs_contact_f?schema=dse"),
+        format!("{base}/tables/CS_CONTACT_F?schema=dse"),
+    ] {
+        let a = s.post(&path, conn.clone()).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.error());
+        let t = &a.body["table"];
+        assert_eq!((&t["physical_name"], &t["comment"]), (&json!("dse.cs_contact_f"), &json!("One row per contact")), "{path}");
+        let columns: Vec<(&str, &str, bool)> = t["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["name"].as_str().unwrap(), c["data_type"].as_str().unwrap(), c["nullable"].as_bool().unwrap()))
+            .collect();
+        assert_eq!(
+            columns,
+            [("id", "INTEGER", false), ("agent_id", "INTEGER", false), ("opened", "DATE", false), ("note", "VARCHAR", true)]
+        );
+        assert_eq!(t["columns"][3]["comment"], "What the agent wrote");
+        assert_eq!(t["primary_key"], json!(["id"]));
+        assert_eq!(t["foreign_keys"][0]["references_table"], "cs_agent_d");
+        assert!(a.body["read_at"].as_str().is_some_and(|at| at.ends_with('Z')));
+    }
+
+    // A name in two schemas is not answered with the first.
+    let a = s.post(&format!("{base}/tables/cs_contact_f"), conn.clone()).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Ambiguous"));
+    assert!(a.error().contains("dse.cs_contact_f") && a.error().contains("main.cs_contact_f"), "{}", a.error());
+    let a = s.post(&format!("{base}/tables/dse.nothing"), conn.clone()).await;
+    assert_eq!((a.status, a.class()), (StatusCode::NOT_FOUND, "NotFound"), "{}", a.error());
+    assert!(a.error().contains("in schema dse"), "{}", a.error());
+
+    // An engine without catalogs says so, in the query or in the path.
+    for path in [format!("{base}/tables?catalog=prod"), format!("{base}/tables/prod.dse.cs_contact_f")] {
+        let a = s.post(&path, conn.clone()).await;
+        assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DatasourceError"), "{path}");
+        assert!(a.error().contains("has no catalogs"), "{}", a.error());
+    }
+
+    // What is wrong with a request is said before anything is opened.
+    let refused = |a: Answer, status: StatusCode, class: &str, says: &str| {
+        assert_eq!((a.status, a.class()), (status, class), "{}", a.error());
+        assert!(a.error().contains(says), "wanted {says:?} in {:?}", a.error());
+    };
+    refused(s.post(&format!("{base}/tables?limit=101"), conn.clone()).await, StatusCode::BAD_REQUEST, "TooLarge", "the limit is 100");
+    refused(s.post(&format!("{base}/tables?limit=0"), conn.clone()).await, StatusCode::BAD_REQUEST, "Invalid", "at least 1");
+    refused(s.post(&format!("{base}/tables?schemas=main"), conn.clone()).await, StatusCode::BAD_REQUEST, "Invalid", "schemas");
+    refused(
+        s.post(&format!("{base}/tables"), json!({ "connection": { "flie": "x" } })).await,
+        StatusCode::BAD_REQUEST,
+        "Invalid",
+        "connection.flie is not a connection setting",
+    );
+    refused(
+        s.post(&format!("{base}/tables"), json!({ "connection": { "file": "x", "adapter": "postgres" } })).await,
+        StatusCode::BAD_REQUEST,
+        "Invalid",
+        "deployed as duckdb",
+    );
+    refused(
+        s.post(&format!("{base}/tables"), json!({ "connection": { "port": "five" } })).await,
+        StatusCode::BAD_REQUEST,
+        "Invalid",
+        "connection.port must be a number",
+    );
+    refused(
+        s.post(&format!("/projects/{CS}/branches/main/datasources/lake/tables"), conn.clone()).await,
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        "no datasource lake (it has: dw)",
+    );
+    refused(
+        s.post(&format!("/projects/{CS}/branches/nowhere/datasources/dw/tables"), conn.clone()).await,
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        "no deployment",
+    );
+    // A warehouse that is not there is named in the refusal.
+    let absent = file.with_file_name("absent.duckdb");
+    let a = s.post(&format!("{base}/tables"), json!({ "connection": { "file": absent.to_str().unwrap() } })).await;
+    assert_eq!(a.class(), "DatasourceError", "{:?}", a.body);
+    assert!(a.error().contains("absent.duckdb"), "{}", a.error());
+    // No body is what was deployed, and this deploy said nothing of where.
+    let a = s.send(Method::POST, &format!("{base}/tables"), &[], None).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DatasourceError"), "{:?}", a.body);
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+/// What a datasource's entry says when it is deployed is kept, every key
+/// of it, and is the connection a probe uses: nothing need be sent. The
+/// request says only what differs. A secret deployed in the entry opens
+/// the warehouse and is never served.
+#[tokio::test]
+async fn a_datasource_is_kept_as_it_was_deployed_and_probed_with_it() {
+    let s = server();
+    let file = warehouse("deployed");
+    let mut files = fixture_files(CS, "one");
+    files.iter_mut().find(|(p, _)| p == "datasources.yml").unwrap().1 = format!(
+        "dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n  query_timeout: 30\n  file: {}\n  \
+         password: hunter2-never-served\n  team: data\n  oauth:\n    client_secret: nested-never-served\n    scope: read\n",
+        file.display()
+    );
+    let a = s.deploy(CS, "main", archive_of(&files)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let base = format!("/projects/{CS}/branches/main/datasources/dw");
+    let names = |a: &Answer| -> Vec<String> {
+        a.body["tables"].as_array().expect("tables").iter().map(|t| t["physical_name"].as_str().unwrap().to_string()).collect()
+    };
+
+    // Every key the entry carried is there to read, but for the secrets,
+    // which are named and not shown.
+    let a = s.get(&format!("/projects/{CS}/branches/main/datasources")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let dw = &a.body["datasources"][0];
+    assert_eq!((&dw["adapter"], &dw["query_timeout"]), (&json!("duckdb"), &json!(30)));
+    assert_eq!(dw["connection"], json!({ "file": file.to_str().unwrap(), "team": "data", "oauth": { "scope": "read" } }));
+    assert_eq!(dw["secrets"], json!(["oauth.client_secret", "password"]));
+    assert!(!a.body.to_string().contains("never-served"), "{}", a.body);
+
+    // No body, an empty one, and an empty connection all probe what was deployed.
+    let a = s.send(Method::POST, &format!("{base}/tables?schema=main"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(names(&a), ["main.cs_contact_f", "main.orders"]);
+    assert!(!a.body.to_string().contains("never-served"));
+    for body in [json!({}), json!({ "connection": {} })] {
+        let a = s.post(&format!("{base}/tables?schema=main"), body).await;
+        assert_eq!(names(&a), ["main.cs_contact_f", "main.orders"]);
+    }
+    let a = s.send(Method::POST, &format!("{base}/tables/dse.cs_contact_f"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["table"]["primary_key"], json!(["id"]));
+
+    // What the request sends wins over what was deployed, key by key.
+    let absent = file.with_file_name("absent.duckdb");
+    let a = s.post(&format!("{base}/tables"), json!({ "connection": { "file": absent.to_str().unwrap() } })).await;
+    assert_eq!(a.class(), "DatasourceError", "{:?}", a.body);
+    assert!(a.error().contains("absent.duckdb"), "{}", a.error());
+    // A key the deploy could carry is still not one a request may invent.
+    let a = s.post(&format!("{base}/tables"), json!({ "connection": { "team": "ops" } })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Invalid"));
+    // And a body that is not JSON is refused without being quoted back.
+    let a = s.send(Method::POST, &format!("{base}/tables"), &[], Some(("application/json", b"{\"connection\": hunter3".to_vec()))).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Invalid"));
+    assert!(!a.error().contains("hunter3"), "{}", a.error());
+
+    // It is in the snapshot, so a restart has it too.
+    let again = app_over(&s.data_dir, None);
+    reload(&again).unwrap();
+    let again = Server { router: router(again.clone()), app: again, data_dir: s.data_dir.clone() };
+    let a = again.send(Method::POST, &format!("{base}/tables?schema=main"), &[], None).await;
+    assert_eq!(names(&a), ["main.cs_contact_f", "main.orders"]);
+
+    // A deploy that says nothing of where the warehouse is leaves it to the request.
+    let a = s.deploy(CS, "bare", archive(CS, "one")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let a = s.send(Method::POST, &format!("/projects/{CS}/branches/bare/datasources/dw/tables"), &[], None).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DatasourceError"), "{:?}", a.body);
+    assert!(a.error().contains("deploy it in datasources.yml or send it"), "{}", a.error());
+}

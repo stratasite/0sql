@@ -330,6 +330,8 @@ fn tools(settings: &Settings) -> Vec<Value> {
         "project": { "type": "string", "description": "the project uid" },
         "branch": { "type": "string", "description": "a deployed branch; the project's production branch when omitted" },
     });
+    // The list tools' filter: the same `q` the REST lists take.
+    let holding = json!({ "q": { "type": "string", "description": "keep only entries holding this text, in any case" } });
     let mut spec = settings.schema.clone();
     let defs = spec.as_object_mut().and_then(|m| m.remove("$defs")).unwrap_or(Value::Null);
     let spec_arg = json!({ "spec": spec });
@@ -347,12 +349,12 @@ fn tools(settings: &Settings) -> Vec<Value> {
         out
     };
     let all = vec![
-        json!({ "name": "list_projects", "description": describe("list_projects"), "inputSchema": schema(&[], &[], "no arguments", false) }),
+        json!({ "name": "list_projects", "description": describe("list_projects"), "inputSchema": schema(&[&holding], &[], "optionally, what to look for", false) }),
         json!({ "name": "fields", "description": describe("fields"),
                 "inputSchema": schema(&[&target, &json!({ "q": { "type": "string", "description": "text to search for" }, "hidden": { "type": "boolean", "description": "include hidden fields" } })], &["project"], "which branch, and what to look for", false) }),
-        json!({ "name": "tables", "description": describe("tables"), "inputSchema": schema(&[&target], &["project"], "which branch", false) }),
+        json!({ "name": "tables", "description": describe("tables"), "inputSchema": schema(&[&target, &holding], &["project"], "which branch", false) }),
         json!({ "name": "values", "description": describe("values"),
-                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } })], &["project", "dimension"], "which dimension", false) }),
+                "inputSchema": schema(&[&target, &json!({ "dimension": { "type": "string", "description": "the dimension's uid or name" } }), &holding], &["project", "dimension"], "which dimension", false) }),
         json!({ "name": "explore", "description": describe("explore"),
                 "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
         json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
@@ -363,7 +365,10 @@ fn tools(settings: &Settings) -> Vec<Value> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NoArgs {}
+struct ListArgs {
+    #[serde(default)]
+    q: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,6 +376,8 @@ struct BranchArgs {
     project: String,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -392,6 +399,8 @@ struct ValuesArgs {
     #[serde(default)]
     branch: Option<String>,
     dimension: String,
+    #[serde(default)]
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -493,8 +502,8 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
     }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
-            let NoArgs {} = args(arguments)?;
-            Ok(projects_of(app))
+            let a: ListArgs = args(arguments)?;
+            projects_of(app, a.q.as_deref().unwrap_or(""))
         }
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
@@ -517,11 +526,11 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| tables_of(app, &a.project, &b))
+            branch_for(app, &a.project, a.branch).and_then(|b| tables_of(app, &a.project, &b, a.q.as_deref().unwrap_or("")))
         }
         "values" => {
             let a: ValuesArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| values_of(app, &a.project, &b, &a.dimension))
+            branch_for(app, &a.project, a.branch).and_then(|b| values_of(app, &a.project, &b, &a.dimension, a.q.as_deref().unwrap_or("")))
         }
         "explore" => {
             let a: QueryArgs = args(arguments)?;

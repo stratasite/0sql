@@ -35,7 +35,7 @@ pub mod sqlserver;
 pub mod tls;
 pub mod trino;
 
-pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Names, Scope, Table};
+pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Listing, Names, Scope, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -69,6 +69,8 @@ pub enum SourceError {
     NoCredentials(String, String),
     #[error("{0} has no schemas; read it without --schema")]
     NoSchemas(&'static str),
+    #[error("{0} has no catalogs above its schemas; ask without a catalog")]
+    NoCatalogs(&'static str),
     #[error("{0}: private key: {1}")]
     PrivateKey(String, String),
 }
@@ -157,8 +159,10 @@ impl SslMode {
 // ---------------------------------------------------------------- connection
 
 /// Where a datasource lives. These are the `datasources.yml` keys the
-/// model loader reads past: the deployed model keeps only the name, the
-/// adapter and the tier, so nothing here ever reaches the server.
+/// planner never reads. The deployed model keeps them as they were
+/// written, beside the name, adapter and tier, so a server that probes
+/// a warehouse has what the deploy said and takes the rest, or a
+/// replacement for any of it, from the request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connection {
     pub uid: String,
@@ -228,41 +232,72 @@ impl Connection {
         let mut out = Vec::new();
         for (key, d) in map {
             let Some(uid) = key.as_str() else { continue };
-            let s = |k: &str| d.get(k).and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-            let i = |k: &str| d.get(k).and_then(|v| v.as_i64());
-            out.push(Connection {
-                uid: uid.trim().to_lowercase(),
-                adapter: s("adapter").map(|a| a.to_lowercase()).unwrap_or_default(),
-                host: s("host"),
-                port: i("port").and_then(|p| u16::try_from(p).ok()),
-                database: s("database"),
-                schema: s("schema").or_else(|| s("dataset")),
-                username: s("username"),
-                url: s("url").map(|u| u.trim_end_matches('/').to_string()),
-                file: s("file").map(PathBuf::from),
-                query_timeout: i("query_timeout"),
-                sslmode: match s("sslmode").or_else(|| s("ssl_mode")) {
-                    Some(m) => SslMode::parse(&m)?,
-                    None => SslMode::default(),
-                },
-                ca_file: s("ca_file").or_else(|| s("sslrootcert")).or_else(|| s("ssl_ca")).map(PathBuf::from),
-                account: s("account").or_else(|| s("account_identifier")),
-                warehouse: s("warehouse"),
-                role: s("role"),
-                private_key_file: s("private_key_file").or_else(|| s("private_key_path")).map(PathBuf::from),
-                catalog: s("catalog"),
-                client_id: s("client_id").or_else(|| s("oauth_client_id")),
-                project: s("project").or_else(|| s("project_id")),
-                location: s("location"),
-                key_file: s("key_file").or_else(|| s("credentials_file")).map(PathBuf::from),
-                region: s("region"),
-                workgroup: s("workgroup"),
-                output_location: s("output_location").or_else(|| s("s3_output_location")),
-                profile: s("profile"),
-                cache_ttl: i("cache_ttl"),
-            });
+            out.push(Connection::from_value(uid, d)?);
         }
         Ok(out)
+    }
+
+    /// One datasource from its settings, spelled as `datasources.yml`
+    /// spells them: an entry of that file, or the same keys sent by a
+    /// caller that holds the connection itself. Keys this does not know
+    /// are read past; [`CONNECTION_KEYS`] is the list for a caller that
+    /// would rather refuse a typo.
+    pub fn from_value(uid: &str, d: &serde_yaml::Value) -> Result<Connection> {
+        let s = |k: &str| d.get(k).and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let i = |k: &str| d.get(k).and_then(|v| v.as_i64());
+        Ok(Connection {
+            uid: uid.trim().to_lowercase(),
+            adapter: s("adapter").map(|a| a.to_lowercase()).unwrap_or_default(),
+            host: s("host"),
+            port: i("port").and_then(|p| u16::try_from(p).ok()),
+            database: s("database"),
+            schema: s("schema").or_else(|| s("dataset")),
+            username: s("username"),
+            url: s("url").map(|u| u.trim_end_matches('/').to_string()),
+            file: s("file").map(PathBuf::from),
+            query_timeout: i("query_timeout"),
+            sslmode: match s("sslmode").or_else(|| s("ssl_mode")) {
+                Some(m) => SslMode::parse(&m)?,
+                None => SslMode::default(),
+            },
+            ca_file: s("ca_file").or_else(|| s("sslrootcert")).or_else(|| s("ssl_ca")).map(PathBuf::from),
+            account: s("account").or_else(|| s("account_identifier")),
+            warehouse: s("warehouse"),
+            role: s("role"),
+            private_key_file: s("private_key_file").or_else(|| s("private_key_path")).map(PathBuf::from),
+            catalog: s("catalog"),
+            client_id: s("client_id").or_else(|| s("oauth_client_id")),
+            project: s("project").or_else(|| s("project_id")),
+            location: s("location"),
+            key_file: s("key_file").or_else(|| s("credentials_file")).map(PathBuf::from),
+            region: s("region"),
+            workgroup: s("workgroup"),
+            output_location: s("output_location").or_else(|| s("s3_output_location")),
+            profile: s("profile"),
+            cache_ttl: i("cache_ttl"),
+        })
+    }
+
+    /// Points this connection at another catalog: the level above a
+    /// schema, which each warehouse spells its own way and some do not
+    /// have. On Postgres, Redshift, SQL Server, Snowflake and Trino it
+    /// is the database; on Databricks and Athena the catalog; on
+    /// BigQuery the project. MySQL and ClickHouse call their one level
+    /// a database and it is the schema here; SQLite and DuckDB are a
+    /// file. Those four refuse a catalog rather than read past it.
+    pub fn in_catalog(&mut self, catalog: &str) -> Result<()> {
+        let catalog = Some(catalog.trim().to_string());
+        match self.adapter.as_str() {
+            "postgres" | "redshift" | "sqlserver" | "snowflake" | "trino" => self.database = catalog,
+            "databricks" | "athena" => self.catalog = catalog,
+            "bigquery" => self.project = catalog,
+            "mysql" => return Err(SourceError::NoCatalogs("MySQL")),
+            "clickhouse" => return Err(SourceError::NoCatalogs("ClickHouse")),
+            "sqlite" => return Err(SourceError::NoCatalogs("SQLite")),
+            "duckdb" => return Err(SourceError::NoCatalogs("DuckDB")),
+            other => return Err(SourceError::Unsupported(other.to_string())),
+        }
+        Ok(())
     }
 
     /// One datasource by its key, as `datasources.yml` spells it.
@@ -393,7 +428,66 @@ pub const SECRET_FIELDS: [&str; 8] = [
     "session_token",
 ];
 
+/// Every key [`Connection::from_value`] reads, aliases included, for a
+/// caller that refuses a key it would otherwise read past.
+pub const CONNECTION_KEYS: [&str; 35] = [
+    "adapter",
+    "host",
+    "port",
+    "database",
+    "schema",
+    "dataset",
+    "username",
+    "url",
+    "file",
+    "query_timeout",
+    "sslmode",
+    "ssl_mode",
+    "ca_file",
+    "sslrootcert",
+    "ssl_ca",
+    "account",
+    "account_identifier",
+    "warehouse",
+    "role",
+    "private_key_file",
+    "private_key_path",
+    "catalog",
+    "client_id",
+    "oauth_client_id",
+    "project",
+    "project_id",
+    "location",
+    "key_file",
+    "credentials_file",
+    "region",
+    "workgroup",
+    "output_location",
+    "s3_output_location",
+    "profile",
+    "cache_ttl",
+];
+
 impl Secrets {
+    /// The secrets a caller sent beside the connection, under the names
+    /// of [`SECRET_FIELDS`]: for a server that is handed a credential
+    /// with each request and keeps none. Nothing is read from the
+    /// environment or a file here.
+    pub fn from_value(d: &serde_yaml::Value) -> Secrets {
+        let get =
+            |field: &str| d.get(field).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(|s| Secret(s.to_string()));
+        Secrets {
+            password: get("password"),
+            personal_access_token: get("personal_access_token"),
+            private_key: get("private_key"),
+            oauth_client_id: get("oauth_client_id"),
+            oauth_client_secret: get("oauth_client_secret"),
+            access_key_id: get("access_key_id"),
+            secret_access_key: get("secret_access_key"),
+            session_token: get("session_token"),
+        }
+    }
+
     /// Just a password, which is what most adapters are given.
     pub fn password(password: Option<Secret>) -> Secrets {
         Secrets { password, ..Default::default() }

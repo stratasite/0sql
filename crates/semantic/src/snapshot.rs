@@ -234,7 +234,19 @@ pub struct Datasource {
     #[serde(default)]
     pub extra_query_params: Value,
     pub query_timeout: Option<i64>,
+    /// Every other key the datasource's entry carried when it was
+    /// deployed, as it was written: where the warehouse is (`host`,
+    /// `database`, `account`, ...) and anything else the entry said. The
+    /// planner reads none of it; it is kept because whoever deployed it
+    /// put it there, for a reader that connects. A secret deployed in
+    /// the entry is here too, so this is never served as it stands.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub connection: serde_json::Map<String, Value>,
 }
+
+/// The keys of a datasource's entry the snapshot holds in fields of
+/// their own; every other key is in [`Datasource::connection`].
+pub const DATASOURCE_FIELDS: [&str; 6] = ["name", "adapter", "tier", "description", "extra_query_params", "query_timeout"];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

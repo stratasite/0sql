@@ -214,7 +214,7 @@ async fn local_and_server_answer_alike() {
         }
 
         // The catalog and the search.
-        assert_eq!(get(&router, &format!("{base}/tables")).await, (StatusCode::OK, local.tables()), "{uid} tables");
+        assert_eq!(get(&router, &format!("{base}/tables")).await, (StatusCode::OK, local.tables("")), "{uid} tables");
         for (q, hidden) in [("", false), ("", true), ("date", false), ("disc", true), ("zzzz", false)] {
             assert_eq!(
                 get(&router, &format!("{base}/fields?q={q}&hidden={hidden}")).await,
@@ -224,7 +224,7 @@ async fn local_and_server_answer_alike() {
         }
         // By name, by a unique substring, by one that matches several, and by none.
         for dim in ["department", "depart", "d", "zzzz"] {
-            assert_eq!(get(&router, &format!("{base}/values/{dim}")).await, as_server(local.values_of(dim)), "{uid} values {dim}");
+            assert_eq!(get(&router, &format!("{base}/values/{dim}")).await, as_server(local.values_of(dim, "")), "{uid} values {dim}");
         }
     }
     assert!(compared > 40, "only {compared} specs compared");

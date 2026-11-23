@@ -100,7 +100,7 @@ fn check_shape(spec: &Value) -> Result<(), ApiError> {
 }
 
 /// A search term long enough to be slow to score against every field.
-fn check_term(term: &str) -> Result<(), ApiError> {
+pub(crate) fn check_term(term: &str) -> Result<(), ApiError> {
     if term.len() > shape::SEARCH_TERM {
         return Err(too_big("characters in this search term", term.len(), shape::SEARCH_TERM));
     }
@@ -198,23 +198,40 @@ pub(crate) fn fields_of(app: &Shared, uid: &str, branch: &str, q: FieldsQuery) -
     Ok(d.fields(&q.q, q.hidden))
 }
 
-pub(crate) async fn tables(State(app): State<Shared>, Params((uid, branch)): Params<(String, String)>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(tables_of(&app, &uid, &branch)?))
+/// What every list read takes: `?q=text` keeps the entries that hold
+/// the text, in any case. Without it the list is whole.
+#[derive(Deserialize, Default)]
+pub(crate) struct ListQuery {
+    #[serde(default)]
+    pub(crate) q: String,
 }
 
-pub(crate) fn tables_of(app: &Shared, uid: &str, branch: &str) -> Result<Value, ApiError> {
-    Ok(app.model(uid, branch)?.tables())
+pub(crate) async fn tables(
+    State(app): State<Shared>,
+    Params((uid, branch)): Params<(String, String)>,
+    Search(q): Search<ListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(tables_of(&app, &uid, &branch, &q.q)?))
+}
+
+pub(crate) fn tables_of(app: &Shared, uid: &str, branch: &str, q: &str) -> Result<Value, ApiError> {
+    let d = app.model(uid, branch)?;
+    check_term(q)?;
+    Ok(d.tables(q))
 }
 
 pub(crate) async fn values(
     State(app): State<Shared>,
     Params((uid, branch, dim)): Params<(String, String, String)>,
+    Search(q): Search<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(values_of(&app, &uid, &branch, &dim)?))
+    Ok(Json(values_of(&app, &uid, &branch, &dim, &q.q)?))
 }
 
-pub(crate) fn values_of(app: &Shared, uid: &str, branch: &str, dim: &str) -> Result<Value, ApiError> {
-    Ok(app.model(uid, branch)?.values_of(dim)?)
+pub(crate) fn values_of(app: &Shared, uid: &str, branch: &str, dim: &str, q: &str) -> Result<Value, ApiError> {
+    let d = app.model(uid, branch)?;
+    check_term(q)?;
+    Ok(d.values_of(dim, q)?)
 }
 
 pub(crate) async fn test(
@@ -237,13 +254,16 @@ pub(crate) async fn branch_summary(
     Ok(Json(app.model(&uid, &branch)?.summary()))
 }
 
-/// Every deployed branch.
-pub(crate) async fn projects(State(app): State<Shared>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(projects_of(&app)))
+/// Every deployed branch; with `q`, the ones whose project or branch
+/// holds it.
+pub(crate) async fn projects(State(app): State<Shared>, Search(q): Search<ListQuery>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(projects_of(&app, &q.q)?))
 }
 
-pub(crate) fn projects_of(app: &Shared) -> Value {
-    let mut out: Vec<Value> = read(&app.models).values().map(|d| d.summary()).collect();
+pub(crate) fn projects_of(app: &Shared, q: &str) -> Result<Value, ApiError> {
+    check_term(q)?;
+    let wanted = zsql_service::holds(q);
+    let mut out: Vec<Value> = read(&app.models).values().filter(|d| wanted(&d.uid) || wanted(&d.branch)).map(|d| d.summary()).collect();
     out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
-    json!({ "deployments": out })
+    Ok(json!({ "deployments": out }))
 }

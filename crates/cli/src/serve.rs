@@ -73,7 +73,12 @@ impl ServeArgs {
         cfg.public_url = self.public_url.clone();
         cfg.deploy_token = var("ZSQL_DEPLOY_TOKEN");
         let a = &mut cfg.admission;
-        for (name, slot) in [("ZSQL_ADMIT_PLAN", &mut a.plan), ("ZSQL_ADMIT_EXPLORE", &mut a.explore), ("ZSQL_ADMIT_HEAVY", &mut a.heavy)] {
+        for (name, slot) in [
+            ("ZSQL_ADMIT_PLAN", &mut a.plan),
+            ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
+            ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
+            ("ZSQL_ADMIT_PROBE", &mut a.probe),
+        ] {
             if let Some(v) = var(name) {
                 *slot = number(&v, name)?;
             }

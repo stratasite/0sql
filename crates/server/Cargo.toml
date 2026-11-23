@@ -21,9 +21,14 @@ flate2.workspace = true
 tar = "0.4"
 libc = "0.2"
 zsql-service.workspace = true
+zsql-source.workspace = true
+serde_yaml.workspace = true
 
 [dev-dependencies]
 zsql-shorthand.workspace = true
+# The engine is already linked through zsql-source; the probe tests
+# build a file with it the way a warehouse would hold one.
+duckdb = { version = "1.20000.0", features = ["bundled"] }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

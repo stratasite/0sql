@@ -34,6 +34,7 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 | class | routes | permits | wait before 503 |
 |---|---|---|---|
 | heavy | deploy, validate, test | 2 | 5 s |
+| probe | a datasource's tables and one table's structure: `POST .../datasources/{ds}/tables` and `.../tables/{table}` | cores × 2 | 1 s |
 | explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
 | plan | everything else: sql, explain, tables, values, branch summary, projects, removal, `POST /mcp` | cores × 4 | 1 s |
 
@@ -42,6 +43,13 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 The heavy class also runs on `tokio::task::spawn_blocking`, so a deploy
 never holds a runtime worker. Measured: 508 deploys running flat out
 during a load test cost plan throughput 20% and left its p99 at 5.7 ms.
+
+A probe spends no CPU to speak of and seconds waiting on a warehouse,
+so it has seats of its own, and runs on a blocking thread as heavy work
+does: a slow warehouse fills the probe seats and leaves planning and
+deploys alone. Its statement is given 80 s at most, short of the
+deadline below, so a warehouse that is slow is answered with its own
+error.
 
 An MCP request is one tool call and is admitted as a plan by the guard;
 the two explore-class tools take an explore seat as well, inside the
@@ -52,7 +60,7 @@ so it costs nothing and never waits behind a deploy to be told no.
 
 ## Deadlines
 
-90 s for heavy, 30 s for everything else. A deadline that passes
+90 s for heavy and for a probe, 30 s for everything else. A deadline that passes
 answers `503 Timeout` **without** `Retry-After`, because unlike `Busy`
 it happened after the handler started.
 
@@ -84,7 +92,7 @@ Each refusal is a `400 TooLarge` naming the limit.
 ## Configuration
 
 ```
-ZSQL_ADMIT_PLAN, ZSQL_ADMIT_EXPLORE, ZSQL_ADMIT_HEAVY    concurrency permits
+ZSQL_ADMIT_PLAN, ZSQL_ADMIT_EXPLORE, ZSQL_ADMIT_HEAVY, ZSQL_ADMIT_PROBE    concurrency permits
 ```
 
 ## What clients see

@@ -99,6 +99,82 @@ What to keep in mind whichever path is used:
   every model and plans under any context it claims. It gets SQL text
   and the shape of the warehouse, not rows; policies protect data
   through the application that runs the SQL, not against the network.
+- **A probe connects where the deploy and the request say.** `POST
+  .../datasources/{ds}/tables` and `.../tables/{table}` read a
+  warehouse's own catalog with the connection the datasource was
+  deployed with and, over it, the one in the request body: host, user
+  and secret, in the keys `datasources.yml` and `.zsql` take. The
+  server keeps nothing a request sends, on disk or in a log, and holds
+  no connection open afterwards. But it does open the connection, from
+  its own network position, to whatever host the body names, and a
+  `file`, `ca_file` or `key_file` there is a path on the server. These
+  routes are reads and take no token, so the service in front decides
+  who may send them and with what: forward them only for a caller it
+  would trust with that reach, and build the connection itself rather
+  than pass a client's through.
+- **A deployed secret is on disk.** A deploy keeps every key of a
+  datasource's entry. `zsql deploy` strips the secret-shaped ones
+  before it sends, so the CLI never puts one on the server; an archive
+  built another way that carries a `password` has it kept in
+  `snapshot.json.gz`, in the clear, readable by the server's user and
+  in every backup of the data directory. No read serves it, and anyone
+  who reaches the port can then probe that warehouse with it.
+
+## Probing a datasource
+
+What `zsql catalog` reads from a project directory, for a caller that
+has only the server. A deploy keeps a datasource's entry whole: name,
+adapter, tier, `query_timeout`, `extra_query_params`, and every other
+key as written. `GET .../datasources` lists each with those under
+`connection`, leaving out any secret and naming it under `secrets`.
+
+```
+GET  /projects/{uid}/branches/{branch}/datasources                      ?q=
+POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables          ?q=&schema=&catalog=&limit=&offset=
+POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables/{table}  ?schema=&catalog=
+```
+
+Both POSTs take the same body, and it is optional. The connection is
+what was deployed, and each key the body sends replaces the deployed
+one (`null` unsets it), so a datasource deployed with everything is
+probed with no body, one deployed with all but its password is sent
+`{"connection": {"password": "…"}}`, and one deployed with only its
+adapter is sent the lot. The adapter is the deployed one and need not
+be sent; a key in the body that is not a connection setting is refused
+by name.
+
+```json
+{"connection": {"host": "db.internal", "port": 5432, "database": "analytics",
+                "username": "reader", "password": "…", "sslmode": "verify-full"}}
+```
+
+The listing is always a page: 100 tables unless `limit` asks for fewer,
+by schema and name, each with its kind, the warehouse's row estimate
+and its comment. `next_offset` is the `offset` of the next page and
+null on the last. `q` keeps the tables whose name holds it, an
+underscore meaning an underscore. `schema` narrows to one schema;
+without it every schema but the engine's own is listed.
+
+`catalog` is the level above a schema, which engines spell differently
+and some lack:
+
+| engine | `catalog` is | `schema` is |
+|---|---|---|
+| Postgres, Redshift, SQL Server, Snowflake, Trino | the database | the schema |
+| Databricks, Athena | the catalog | the schema (Athena: the database) |
+| BigQuery | the project | the dataset |
+| MySQL, ClickHouse | refused: there is none | the database |
+| DuckDB | refused | the schema |
+| SQLite | refused | refused: a file has neither |
+
+One table is named in the path as `table`, `schema.table` or
+`catalog.schema.table`; with `?schema=` the path is the whole name. The
+answer is its columns in order with the warehouse's own types, its
+primary and foreign keys, comment and row estimate. A name found in
+several schemas is refused with the schemas (`Ambiguous`), not answered
+with the first; one found nowhere is `NotFound`. A connection the
+request got wrong is `400 DatasourceError`; a warehouse that would not
+connect or answer is `502 DatasourceError` with what it said.
 
 ## What is on disk
 
@@ -127,7 +203,7 @@ same thing. The ones an operator sets:
 | `ZSQL_DATA_DIR` | the data directory |
 | `ZSQL_DEPLOY_TOKEN` | what a deploy, a validate, a test and a removal must present; a variable only, never a flag |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
-| `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY` | how much of each kind of work runs at once; `docs/admission.md` |
+| `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE` | how much of each kind of work runs at once; `docs/admission.md` |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 
 `ops/zsqld.service` is a systemd unit to start from: a dedicated user, a
