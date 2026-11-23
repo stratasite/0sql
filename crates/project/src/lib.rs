@@ -30,7 +30,7 @@ use zsql_spec::expr::ParsedExpression;
 pub mod values;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ProjectError {
+pub enum Error {
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error("{0}: {1}")]
@@ -44,10 +44,10 @@ pub enum ProjectError {
     SemanticModel(#[from] BuildError),
 }
 
-type Result<T> = std::result::Result<T, ProjectError>;
+type Result<T> = std::result::Result<T, Error>;
 
-fn invalid(file: &Path, message: impl Into<String>) -> ProjectError {
-    ProjectError::Invalid { file: file.display().to_string(), message: message.into() }
+fn invalid(file: &Path, message: impl Into<String>) -> Error {
+    Error::Invalid { file: file.display().to_string(), message: message.into() }
 }
 
 /// A loaded project: the snapshot, with paths formed, and what the loader
@@ -129,8 +129,8 @@ fn load_with(dir: &Path, dialects: &Dialects, confined: bool) -> Result<Loaded> 
 // ------------------------------------------------------------------ YAML
 
 fn read_yaml(path: &Path) -> Result<Yaml> {
-    let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(path.display().to_string(), e))?;
-    let v: Yaml = serde_yaml::from_str(&text).map_err(|e| ProjectError::Yaml(path.display().to_string(), e))?;
+    let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+    let v: Yaml = serde_yaml::from_str(&text).map_err(|e| Error::Yaml(path.display().to_string(), e))?;
     Ok(v)
 }
 
@@ -476,7 +476,7 @@ impl<'d> Builder<'d> {
         let mut out = Vec::new();
         let mut dirs = vec![root.clone()];
         if root.is_dir() {
-            walk(&root, &mut out, &mut dirs).map_err(|e| ProjectError::Io(root.display().to_string(), e))?;
+            walk(&root, &mut out, &mut dirs).map_err(|e| Error::Io(root.display().to_string(), e))?;
         }
         self.sources.extend(dirs);
         if self.confined {
@@ -1686,8 +1686,8 @@ impl<'d> Builder<'d> {
             return Ok(());
         }
         let mut files: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(&dir).map_err(|e| ProjectError::Io(dir.display().to_string(), e))? {
-            let path = entry.map_err(|e| ProjectError::Io(dir.display().to_string(), e))?.path();
+        for entry in std::fs::read_dir(&dir).map_err(|e| Error::Io(dir.display().to_string(), e))? {
+            let path = entry.map_err(|e| Error::Io(dir.display().to_string(), e))?.path();
             if matches!(path.extension().and_then(|e| e.to_str()), Some("yml" | "yaml")) {
                 files.push(path);
             }

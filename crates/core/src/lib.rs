@@ -91,7 +91,7 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("{0}")]
-    Project(#[from] zsql_project::ProjectError),
+    Project(#[from] zsql_project::Error),
     #[error("{0}")]
     SemanticModel(#[from] zsql_semantic::BuildError),
 }
@@ -122,7 +122,7 @@ pub enum Trust {
 }
 
 /// Loads a project directory as the trust level says.
-pub fn load(dir: &Path, trust: Trust, dialects: &Dialects) -> std::result::Result<Loaded, zsql_project::ProjectError> {
+pub fn load(dir: &Path, trust: Trust, dialects: &Dialects) -> std::result::Result<Loaded, zsql_project::Error> {
     match trust {
         Trust::Owned => zsql_project::load(dir, dialects),
         Trust::Untrusted => zsql_project::load_confined(dir, dialects),
