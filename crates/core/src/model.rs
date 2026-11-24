@@ -301,6 +301,25 @@ impl Model {
         })
     }
 
+    /// The physical tables of `datasource` a planned statement names,
+    /// as the model spells them: what a change to one of them makes
+    /// stale. Found by name in the statement, so a table whose name is
+    /// part of another's is counted with it; never one too few.
+    pub fn tables_read(&self, datasource_uid: &str, sql: &str) -> Vec<String> {
+        let snapshot = self.semantic().snapshot();
+        let sql = sql.to_lowercase();
+        let mut tables: Vec<String> = snapshot
+            .tables
+            .iter()
+            .filter(|t| snapshot.datasources.iter().any(|d| d.id == t.datasource_id && d.uid == datasource_uid))
+            .filter(|t| sql.contains(&t.physical_name.to_lowercase()))
+            .map(|t| t.physical_name.clone())
+            .collect();
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
     pub fn sql(&self, req: SqlRequest, check: ShapeCheck) -> Result<SqlResponse> {
         let p = self.plan_request(req, false, check)?;
         let dialect = self.dialects.get(&p.plan.adapter)?;

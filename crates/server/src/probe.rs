@@ -172,13 +172,14 @@ fn scalar(key: &str, value: &Value) -> Option<Value> {
 /// `datasources.yml` is, past whatever is not a connection setting; the
 /// request is checked key by key, so a misspelled setting is named and
 /// not read past into a confusing refusal from the warehouse.
-fn connection_of(
+pub(crate) fn connection_of(
     app: &Shared,
     uid: &str,
     branch: &str,
     datasource: &str,
     catalog: Option<&str>,
-    req: ProbeRequest,
+    sent: &Map<String, Value>,
+    longest: Option<i64>,
 ) -> Result<(Connection, Secrets), ApiError> {
     let d = app.model(uid, branch)?;
     check_term(datasource)?;
@@ -201,7 +202,7 @@ fn connection_of(
     if let Some(seconds) = deployed.query_timeout {
         settings.insert("query_timeout".into(), Value::from(seconds));
     }
-    for (key, value) in &req.connection {
+    for (key, value) in sent {
         if !CONNECTION_KEYS.contains(&key.as_str()) && !SECRET_FIELDS.contains(&key.as_str()) {
             return Err(invalid(format!("connection.{key} is not a connection setting")));
         }
@@ -228,7 +229,11 @@ fn connection_of(
     if let Some(catalog) = catalog {
         conn.in_catalog(catalog).map_err(refused)?;
     }
-    conn.query_timeout = Some(conn.query_timeout.filter(|s| *s > 0).unwrap_or(60).min(STATEMENT_SECS));
+    // A probe's statement is kept short of its request's deadline; a
+    // run's is the datasource's own.
+    if let Some(longest) = longest {
+        conn.query_timeout = Some(conn.query_timeout.filter(|s| *s > 0).unwrap_or(60).min(longest));
+    }
     Ok((conn, Secrets::from_value(&settings)))
 }
 
@@ -267,7 +272,7 @@ pub(crate) async fn tables(
         return Err(too_big("tables in one page", limit, PAGE));
     }
     let offset = p.offset.unwrap_or(0);
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
+    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
         let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
@@ -335,7 +340,7 @@ pub(crate) async fn table(
 ) -> Result<Json<Value>, ApiError> {
     check_term(&table)?;
     let (catalog, schema, name) = split(&table, named(p.schema)?, named(p.catalog)?)?;
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
+    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
         let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;

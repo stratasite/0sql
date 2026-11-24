@@ -124,6 +124,19 @@ pub const SECRET_FIELDS: [&str; 9] = [
 ];
 
 impl Secrets {
+    /// Whether nothing was given: no field of it holds a secret.
+    pub fn is_empty(&self) -> bool {
+        self.password.is_none()
+            && self.personal_access_token.is_none()
+            && self.private_key.is_none()
+            && self.oauth_client_id.is_none()
+            && self.oauth_client_secret.is_none()
+            && self.access_key_id.is_none()
+            && self.secret_access_key.is_none()
+            && self.session_token.is_none()
+            && self.oauth_token.is_none()
+    }
+
     /// The secrets a caller sent beside the connection, under the names
     /// of [`SECRET_FIELDS`]: for a server that is handed a credential
     /// with each request and keeps none. Nothing is read from the

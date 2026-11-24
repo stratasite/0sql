@@ -5,7 +5,7 @@
 use crate::admission::{Admission, AdmissionCounts};
 use crate::deploy::is_swap_leftover;
 use crate::guard::guard;
-use crate::{deploy, mcp, probe, reads, write, App, Shared};
+use crate::{deploy, exec, mcp, probe, reads, write, App, Shared};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::collections::HashMap;
@@ -90,6 +90,8 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/datasources", get(probe::datasources))
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables", post(probe::tables))
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
+        .route("/projects/{uid}/branches/{branch}/run", post(exec::run))
+        .route("/results/{id}", get(exec::result).delete(exec::cancel))
         .route(mcp::PATH, post(mcp::endpoint))
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive
@@ -125,6 +127,28 @@ pub struct Config {
     /// need `Authorization: Bearer <token>`. Without one they are as
     /// open as the reads, which is right on a loopback and nowhere else.
     pub deploy_token: Option<String>,
+    /// How many statements run at once, how many may wait, and the row
+    /// limit a run is given when its request has none.
+    pub runs: RunLimits,
+    /// The credential this server holds for a datasource, by its uid:
+    /// used when a request for a run sends none.
+    pub secrets: crate::SecretsOf,
+}
+
+/// What bounds the statements a server runs.
+#[derive(Debug, Clone)]
+pub struct RunLimits {
+    pub concurrent: usize,
+    pub queue_max: usize,
+    /// `None` is no limit: a query with no limit of its own returns
+    /// every row.
+    pub default_sql_limit: Option<u64>,
+}
+
+impl Default for RunLimits {
+    fn default() -> Self {
+        RunLimits { concurrent: 100, queue_max: 5_000, default_sql_limit: None }
+    }
 }
 
 impl Config {
@@ -138,6 +162,8 @@ impl Config {
             admission: AdmissionCounts::default(),
             mcp: mcp::Settings::builtin(),
             deploy_token: None,
+            runs: RunLimits::default(),
+            secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
         }
     }
 }
@@ -157,14 +183,21 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let advertised = config.public_url.clone();
     let deploy_token = config.deploy_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let runs = crate::open_runs(&config.data_dir, &config.runs)?;
     let app: Shared = Arc::new(App {
         dialects,
         data_dir: config.data_dir,
         models: RwLock::new(HashMap::new()),
-        admission: Admission::new(&config.admission),
+        admission: Admission::new(&AdmissionCounts {
+            run: 2 * (config.runs.concurrent + config.runs.queue_max),
+            ..config.admission.clone()
+        }),
         mcp: config.mcp,
         deploy_token,
         deploying: std::sync::Mutex::new(()),
+        runs,
+        default_sql_limit: config.runs.default_sql_limit,
+        secrets: config.secrets,
     });
     let (n, skipped) = reload(&app)?;
     tracing::info!(

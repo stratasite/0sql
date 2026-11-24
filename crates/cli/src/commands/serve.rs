@@ -83,6 +83,21 @@ impl ServeArgs {
                 *slot = number(&v, name)?;
             }
         }
+        // The statements the server runs: how many at once, how many
+        // may wait, and the row limit a request with none is given.
+        if let Some(v) = var("ZSQL_CONCURRENT_RUNS") {
+            cfg.runs.concurrent = number(&v, "ZSQL_CONCURRENT_RUNS")?;
+        }
+        if let Some(v) = var("ZSQL_QUEUE_MAX") {
+            cfg.runs.queue_max = number(&v, "ZSQL_QUEUE_MAX")?;
+        }
+        if let Some(v) = var("ZSQL_DEFAULT_SQL_LIMIT") {
+            cfg.runs.default_sql_limit = Some(number(&v, "ZSQL_DEFAULT_SQL_LIMIT")? as u64).filter(|n| *n > 0);
+        }
+        // The credential the server holds for a datasource, for a run
+        // whose request sends none: ZSQL_DS_<UID>_<FIELD>, read when it
+        // is asked for, from the environment and nowhere else.
+        cfg.secrets = std::sync::Arc::new(|uid| zsql_datasource::secrets(None, uid));
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
             .map_err(|e| anyhow::anyhow!(e))?;

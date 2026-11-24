@@ -4046,9 +4046,11 @@ name = "zsql-server"
 version = "0.6.10"
 dependencies = [
  "anyhow",
+ "arrow-ipc",
  "axum",
  "duckdb",
  "flate2",
+ "futures-core",
  "http-body-util",
  "libc",
  "regex",
@@ -4062,6 +4064,7 @@ dependencies = [
  "zsql-core",
  "zsql-datasource",
  "zsql-dialect",
+ "zsql-exec",
  "zsql-semantic",
  "zsql-shorthand",
  "zsql-spec",

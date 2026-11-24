@@ -52,6 +52,7 @@
 pub mod admission;
 mod deploy;
 mod error;
+mod exec;
 mod guard;
 mod mcp;
 mod names;
@@ -61,7 +62,7 @@ mod run;
 
 pub use admission::AdmissionCounts;
 pub use mcp::Settings as McpSettings;
-pub use run::{run, run_blocking, serve, Config};
+pub use run::{run, run_blocking, serve, Config, RunLimits};
 
 use crate::admission::Admission;
 use crate::error::{not_found, ApiError};
@@ -106,7 +107,18 @@ pub(crate) struct App {
     /// One deploy writes at a time: two for the same branch would race
     /// each other's renames while swapping in.
     deploying: std::sync::Mutex<()>,
+    /// The statements this server runs and their results.
+    runs: zsql_exec::Runs,
+    /// The row limit a run is given when its request has none. `None`
+    /// leaves it without one: a bound is the caller's to set.
+    default_sql_limit: Option<u64>,
+    /// The credential this server holds for a datasource, used when a
+    /// request sends none.
+    secrets: SecretsOf,
 }
+
+/// What this server was given to connect to a datasource with, by its uid.
+pub type SecretsOf = Arc<dyn Fn(&str) -> zsql_datasource::Secrets + Send + Sync>;
 
 /// A deployment's key in the models map.
 pub(crate) fn key(uid: &str, branch: &str) -> String {
@@ -130,6 +142,35 @@ impl App {
 }
 
 pub(crate) type Shared = Arc<App>;
+
+/// Where results and their records live under a data directory. A dot
+/// in front, because every other directory there is a project, and a
+/// project may well be called `cache`; a project's uid never starts
+/// with a dot.
+pub(crate) const CACHE_DIR: &str = ".cache";
+
+/// The runs of a server whose data is under `data_dir`, with their
+/// records on this node's disk.
+pub(crate) fn open_runs(data_dir: &std::path::Path, limits: &RunLimits) -> anyhow::Result<zsql_exec::Runs> {
+    let cache = data_dir.join(CACHE_DIR);
+    let registry: Arc<dyn zsql_exec::Registry> = Arc::new(zsql_exec::Local::open(&cache.join("records"))?);
+    let limits = zsql_exec::Limits { concurrent: limits.concurrent, queue_max: limits.queue_max, hostname: hostname() };
+    Ok(zsql_exec::Runs::open(&cache.join("results"), registry, limits)?)
+}
+
+/// This machine's name, as it calls itself.
+fn hostname() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is ours and its length is what is passed; the
+    // name is read back only up to the first NUL.
+    let named = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
+    let name: String = if named { buffer.iter().take_while(|b| **b != 0).map(|b| *b as char).collect() } else { String::new() };
+    if name.is_empty() {
+        "localhost".to_string()
+    } else {
+        name
+    }
+}
 
 /// Runs work that would hold a runtime thread for seconds on a blocking
 /// thread instead, so a deploy never stalls the planning the rest of

@@ -108,7 +108,7 @@ pub(crate) fn check_term(term: &str) -> Result<(), ApiError> {
 }
 
 /// A shorthand line long enough to be slow to parse.
-fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
+pub(crate) fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
     if let Some(line) = expr {
         if line.len() > shape::EXPR {
             return Err(too_big("characters in this expression", line.len(), shape::EXPR));
@@ -118,7 +118,7 @@ fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
 }
 
 /// The shape bound, as the service takes it.
-fn shape_check(v: &Value) -> Result<(), zsql_core::Error> {
+pub(crate) fn shape_check(v: &Value) -> Result<(), zsql_core::Error> {
     check_shape(v).map_err(|ApiError(_, class, message)| zsql_core::Error::invalid(class, message))
 }
 

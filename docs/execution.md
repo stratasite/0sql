@@ -260,6 +260,28 @@ exposed on the old understanding.
 - **Which adapters restrict a connection to reads**, beyond DuckDB and
   ClickHouse, which were checked.
 
+## What the second phase found
+
+- **Results live under `.cache/` in the data directory**, not
+  `cache/`: every other directory there is a project, and a project
+  may be called `cache`. The object store's prefix is still `cache/`.
+- **A failed run is not a failed request.** `run` and `results` answer
+  200 with a record whose `status` is `failed`; 202 while it has not
+  ended; an HTTP error only for a request that could not be taken.
+- **A request with no credential is not refused before it is queued.**
+  The adapter refuses when the run opens it, naming what is missing,
+  and the run is recorded as failed.
+- **Cancelling stops a run when its read next looks**: between
+  batches, or at the timeout. A statement the warehouse is still
+  computing is not interrupted there yet.
+- **`tables` is found by name in the statement**, so a table whose
+  name is part of another's is listed with it: more may be
+  invalidated than was read, never less.
+- **The cache key does what it says.** A request that sends its own
+  connection for a datasource is answered from a result another
+  connection made, when the project and the statement are the same.
+  `fresh` asks the warehouse.
+
 ## Not yet decided
 
 - Credentials, after execution exists.
@@ -280,7 +302,10 @@ exposed on the old understanding.
    from a server yet, and `zsql run` reads as it did. Run against real
    Postgres, MySQL, SQL Server, ClickHouse and Trino; the fakes for the
    rest; the driver tests by hand.
-2. **A run, on one node.** `query_timeout` over the whole read on
+2. **A run, on one node. Done, 2026-11-24**, but for a cancel that
+   reaches the warehouse (see what the phase found). What follows is
+   what was asked for.
+   **A run, on one node.** `query_timeout` over the whole read on
    every transport; the record and the `Registry` trait with its local
    implementation; `run`, `GET` and `DELETE /results/{id}`;
    seats and the queue; `query_timeout`, `query_wait_time`, attach;

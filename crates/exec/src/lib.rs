@@ -34,4 +34,4 @@ pub use manifest::{Column, Lineage, Manifest, Timings, MANIFEST_FORMAT, ROWS_FOR
 pub use record::{run_cache_key, Kind, Record, Status, DEFAULT_ORG};
 pub use registry::{Local, Registry, RESTARTED};
 pub use runs::{How, Limits, Opener, Runs, Submit};
-pub use store::{each_batch, page, rows_file, Store, Stored, Writing};
+pub use store::{arrow_stream, each_batch, page, rows_file, Store, Stored, Writing};

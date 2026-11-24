@@ -23,6 +23,9 @@ libc = "0.2"
 zsql-core.workspace = true
 tracing.workspace = true
 zsql-datasource.workspace = true
+zsql-exec.workspace = true
+# A response body fed by a reader on its own thread.
+futures-core = "0.3"
 serde_yaml.workspace = true
 
 [dev-dependencies]
@@ -33,6 +36,8 @@ duckdb = { version = "1.20000.0", features = ["bundled"] }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Reading an Arrow answer back, to see that it is one.
+arrow-ipc = "60"
 
 [lints]
 workspace = true

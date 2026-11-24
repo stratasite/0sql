@@ -297,6 +297,44 @@ pub fn each_batch(
     Ok(())
 }
 
+/// A result's file as an Arrow IPC stream, given to `emit` in pieces as
+/// it is written: for sending a whole result on without holding it.
+pub fn arrow_stream(path: &Path, emit: impl FnMut(Vec<u8>) -> Result<()>) -> Result<()> {
+    struct Pieces<F> {
+        emit: F,
+        failed: Option<Error>,
+    }
+    impl<F: FnMut(Vec<u8>) -> Result<()>> std::io::Write for Pieces<F> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match (self.emit)(bytes.to_vec()) {
+                Ok(()) => Ok(bytes.len()),
+                Err(e) => {
+                    let said = std::io::Error::other(e.to_string());
+                    self.failed = Some(e);
+                    Err(said)
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let arrow = |e: arrow_schema::ArrowError| Error::Arrow(path.display().to_string(), e);
+    let file = std::fs::File::open(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+    let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None).map_err(arrow)?;
+    // A piece is a buffer's worth, not a write's: the writer makes many
+    // small writes to a batch.
+    let out = std::io::BufWriter::with_capacity(256 * 1024, Pieces { emit, failed: None });
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(out, &reader.schema()).map_err(arrow)?;
+    for batch in reader {
+        writer.write(&batch.map_err(arrow)?).map_err(arrow)?;
+    }
+    writer.finish().map_err(arrow)?;
+    let mut out = writer.into_inner().map_err(arrow)?;
+    std::io::Write::flush(&mut out).map_err(|e| Error::Io(path.display().to_string(), e))?;
+    Ok(())
+}
+
 impl Stored {
     pub fn dir(&self) -> &Path {
         &self.dir

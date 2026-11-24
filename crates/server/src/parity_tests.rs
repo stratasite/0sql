@@ -41,6 +41,9 @@ fn server_over(data_dir: &std::path::Path) -> Shared {
         mcp: mcp::Settings::builtin(),
         deploy_token: None,
         deploying: std::sync::Mutex::new(()),
+        runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
+        default_sql_limit: None,
+        secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
     })
 }
 

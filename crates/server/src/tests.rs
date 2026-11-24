@@ -59,6 +59,9 @@ fn app_over(data_dir: &std::path::Path, deploy_token: Option<&str>) -> Shared {
         mcp: mcp::Settings::builtin(),
         deploy_token: deploy_token.map(str::to_string),
         deploying: std::sync::Mutex::new(()),
+        runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
+        default_sql_limit: None,
+        secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
     })
 }
 
@@ -68,6 +71,8 @@ struct Answer {
     status: StatusCode,
     body: Value,
     headers: axum::http::HeaderMap,
+    /// The body as it came, for an answer that is not JSON.
+    raw: Vec<u8>,
 }
 
 impl Answer {
@@ -96,7 +101,7 @@ impl Server {
         let status = res.status();
         let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), 16 << 20).await.unwrap();
-        Answer { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers }
+        Answer { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers, raw: bytes.to_vec() }
     }
 
     /// One JSON-RPC message to the MCP endpoint, with any headers.
@@ -1153,4 +1158,187 @@ async fn a_datasource_is_kept_as_it_was_deployed_and_probed_with_it() {
     let a = s.send(Method::POST, &format!("/projects/{CS}/branches/bare/datasources/dw/tables"), &[], None).await;
     assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DatasourceError"), "{:?}", a.body);
     assert!(a.error().contains("deploy it in datasources.yml or send it"), "{}", a.error());
+}
+
+// -------------------------------------------------------------------- runs
+
+/// The fixture's warehouse in a file: the `sales` table the model reads.
+fn sales(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("zsqld-run-{name}-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dw.duckdb");
+    let db = ::duckdb::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE sales (category VARCHAR, marker_one VARCHAR, revenue DECIMAL(12, 2));\
+         INSERT INTO sales VALUES ('books', 'm', 10.50), ('books', 'm', 20.00), ('games', 'm', 5.25), ('toys', NULL, 1.00);",
+    )
+    .unwrap();
+    path
+}
+
+/// A plan is run: the rows come back with their types, the record says
+/// where they came from, an identical question is answered from what is
+/// stored, and a result is read again by its id, a page at a time or
+/// whole as Arrow.
+#[tokio::test]
+async fn a_run_answers_with_rows_and_is_found_again() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    let file = sales("rows");
+    let run = format!("/projects/{CS}/branches/main/run");
+    let ask = |extra: Value| {
+        let mut body =
+            json!({ "expr": "category asc, revenue", "connection": { "file": file.to_str().unwrap(), "password": "never-echoed" } });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+
+    let a = s.post(&run, ask(json!({}))).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!((&a.body["status"], &a.body["cache"], &a.body["type"]), (&json!("succeeded"), &json!("miss"), &json!("semantic")));
+    assert_eq!((&a.body["row_count"], &a.body["complete"]), (&json!(3), &json!(true)));
+    assert_eq!(a.body["columns"][0]["type"], "string");
+    assert_eq!((&a.body["columns"][1]["type"], &a.body["columns"][1]["arrow_type"]), (&json!("decimal"), &json!("Decimal128(38, 2)")));
+    assert_eq!(a.body["rows"], json!([["books", "30.50"], ["games", "5.25"], ["toys", "1.00"]]), "a decimal is a string, at its scale");
+    assert_eq!(
+        (&a.body["project_uid"], &a.body["branch"], &a.body["datasource_uid"], &a.body["org_uid"]),
+        (&json!(CS), &json!("main"), &json!("dw"), &json!("default"))
+    );
+    assert_eq!((&a.body["tables"], &a.body["dirty"], &a.body["row_limit"]), (&json!(["sales"]), &json!(false), &Value::Null));
+    assert!(a.body["sql"].as_str().unwrap().contains("sales T0"), "{}", a.body["sql"]);
+    assert!(a.body["expires_at"].as_str() > a.body["finished_at"].as_str());
+    assert!(!String::from_utf8_lossy(&a.raw).contains("never-echoed"), "a credential is in no answer");
+    let id = a.body["id"].as_str().unwrap().to_string();
+
+    // The same question again is the stored result; fresh runs anyway.
+    let again = s.post(&run, ask(json!({}))).await;
+    assert_eq!((&again.body["cache"], again.body["id"].as_str()), (&json!("hit"), Some(id.as_str())));
+    assert_eq!(again.body["rows"], a.body["rows"]);
+    let fresh = s.post(&run, ask(json!({ "fresh": true }))).await;
+    assert_eq!(fresh.body["cache"], "miss");
+    assert_ne!(fresh.body["id"], a.body["id"]);
+
+    // By its id: a page from the middle, and the whole of it as Arrow.
+    let page = s.get(&format!("/results/{id}?offset=1&limit=1")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!((&page.body["rows"], &page.body["complete"], &page.body["offset"]), (&json!([["games", "5.25"]]), &json!(false), &json!(1)));
+    assert!(page.body.get("cache").is_none(), "only a request to run says how it was met");
+    let last = s.get(&format!("/results/{id}?offset=2")).await;
+    assert_eq!((&last.body["rows"], &last.body["complete"]), (&json!([["toys", "1.00"]]), &json!(true)));
+    let arrow = s.send(Method::GET, &format!("/results/{id}"), &[("accept", "application/vnd.apache.arrow.stream")], None).await;
+    assert_eq!(arrow.status, StatusCode::OK);
+    assert_eq!(arrow.headers["content-type"], "application/vnd.apache.arrow.stream");
+    let read = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow.raw), None).unwrap();
+    assert_eq!(read.schema().field(1).data_type().to_string(), "Decimal128(38, 2)");
+    assert_eq!(read.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
+
+    // What a request may not ask for, and an id nobody has.
+    assert_eq!(s.get(&format!("/results/{id}?limit=0")).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(s.get(&format!("/results/{id}?limit=100001")).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(s.post(&run, ask(json!({ "wait": -1 }))).await.status, StatusCode::BAD_REQUEST);
+    let misspelled = s.post(&run, ask(json!({ "wiat": 1 }))).await;
+    assert!(
+        misspelled.status.is_client_error() && misspelled.error().contains("wiat"),
+        "a misspelled key is named, not read past: {}",
+        misspelled.body
+    );
+    let none = s.get("/results/r-none").await;
+    assert_eq!((none.status, none.class()), (StatusCode::NOT_FOUND, "NotFound"));
+    assert_eq!(s.send(Method::DELETE, "/results/r-none", &[], None).await.status, StatusCode::NOT_FOUND);
+    // A request that plans to nothing is refused as `sql` refuses it.
+    let bad = s.post(&run, json!({ "expr": "no_such_field", "connection": { "file": file.to_str().unwrap() } })).await;
+    assert_eq!(bad.status, s.post(&format!("/projects/{CS}/branches/main/sql"), json!({ "expr": "no_such_field" })).await.status);
+}
+
+/// A request that will not wait is answered with the id at once, and
+/// the id is asked about until the rows are there. A run that fails is
+/// a record that says so, not a failed request.
+#[tokio::test]
+async fn a_run_is_answered_by_its_id_and_a_failure_is_recorded() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    let file = sales("async");
+    let run = format!("/projects/{CS}/branches/main/run");
+    let a = s.post(&run, json!({ "expr": "category, revenue", "wait": 0, "connection": { "file": file.to_str().unwrap() } })).await;
+    assert_eq!(a.status, StatusCode::ACCEPTED, "{}", a.body);
+    assert!(matches!(a.body["status"].as_str(), Some("queued" | "running")), "{}", a.body);
+    assert!(a.body.get("rows").is_none());
+    let id = a.body["id"].as_str().unwrap().to_string();
+    let done = s.get(&format!("/results/{id}?wait=20")).await;
+    assert_eq!((done.status, &done.body["status"], &done.body["row_count"]), (StatusCode::OK, &json!("succeeded"), &json!(3)));
+    // Over already: cancelling changes nothing and says how it ended.
+    let late = s.send(Method::DELETE, &format!("/results/{id}"), &[], None).await;
+    assert_eq!((late.status, &late.body["status"]), (StatusCode::OK, &json!("succeeded")));
+
+    // The warehouse is not there. The request is answered; the run failed.
+    // (Asked fresh: the cache is found by the project and the statement
+    // alone, so without it the result above would answer this too.)
+    let absent = file.with_file_name("absent.duckdb");
+    let failed =
+        s.post(&run, json!({ "expr": "category, revenue", "fresh": true, "connection": { "file": absent.to_str().unwrap() } })).await;
+    assert_eq!((failed.status, &failed.body["status"]), (StatusCode::OK, &json!("failed")), "{}", failed.body);
+    assert!(failed.body["error"].as_str().unwrap().contains("absent.duckdb"), "{}", failed.body);
+    assert!(failed.body.get("rows").is_none() && failed.body["expires_at"].is_null());
+    // A failure does not answer the next request.
+    let next = s.post(&run, json!({ "expr": "category, revenue", "connection": { "file": file.to_str().unwrap() } })).await;
+    assert_eq!(
+        (&next.body["status"], &next.body["cache"]),
+        (&json!("succeeded"), &json!("hit")),
+        "the earlier result still does: {}",
+        next.body
+    );
+}
+
+/// What the server was told about limits and credentials: a row limit
+/// for a request with none, a datasource that keeps nothing, and the
+/// credential it holds when the request sends none.
+#[tokio::test]
+async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_credential() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
+    let app: Shared = Arc::new(App {
+        dialects,
+        data_dir: data_dir.clone(),
+        models: RwLock::new(HashMap::new()),
+        admission: Admission::new(&AdmissionCounts::default()),
+        mcp: mcp::Settings::builtin(),
+        deploy_token: None,
+        deploying: std::sync::Mutex::new(()),
+        runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
+        default_sql_limit: Some(2),
+        secrets: Arc::new(move |uid| {
+            seen.lock().unwrap().push(uid.to_string());
+            zsql_datasource::Secrets::default()
+        }),
+    });
+    let s = Server { router: router(app.clone()), app, data_dir };
+    let file = sales("limits");
+    // Deployed whole, and saying it keeps nothing.
+    let mut files = fixture_files(CS, "one");
+    files[1].1 = format!(
+        "dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n  cache_ttl: 0\n  query_wait_time: 30\n  file: {}\n",
+        file.display()
+    );
+    assert_eq!(s.deploy(CS, "main", archive_of(&files)).await.status, StatusCode::OK);
+    let run = format!("/projects/{CS}/branches/main/run");
+
+    let a = s.post(&run, json!({ "expr": "category asc, revenue" })).await;
+    assert_eq!((a.status, &a.body["status"]), (StatusCode::OK, &json!("succeeded")), "{}", a.body);
+    assert_eq!((&a.body["row_limit"], &a.body["row_count"]), (&json!(2), &json!(2)), "the server's limit, for a request with none");
+    assert!(a.body["sql"].as_str().unwrap().to_uppercase().contains("LIMIT 2"), "{}", a.body["sql"]);
+    assert!(a.body["cache_key"].is_null(), "cache_ttl: 0 keeps nothing");
+    assert_eq!(*asked.lock().unwrap(), ["dw"], "nothing was sent, so the server's credential for dw was asked for");
+    let b = s.post(&run, json!({ "expr": "category asc, revenue" })).await;
+    assert_eq!(b.body["cache"], "miss", "and so nothing is found again");
+    assert_ne!(a.body["id"], b.body["id"]);
+
+    // The request's own limit wins, and its own credential is the one used.
+    let own = s.post(&run, json!({ "expr": "category asc, revenue, limit 1", "connection": { "password": "theirs" } })).await;
+    assert_eq!((&own.body["row_limit"], &own.body["row_count"]), (&json!(1), &json!(1)), "{}", own.body);
+    assert_eq!(asked.lock().unwrap().len(), 2, "a credential was sent, so the server's was not asked for");
 }

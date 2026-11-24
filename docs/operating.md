@@ -185,6 +185,8 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 |---|---|
 | `<project>/<branch>/` | a deployed branch: the compiled model (`snapshot.json.gz`), its tests and sampled values |
 | `lock` | held by the running server; its pid, address and public URL, which `zsql server status` reads |
+| `.cache/results/` | the rows of each run the server made, an Arrow file each |
+| `.cache/records/` | the record of each run, when the records are not in a database |
 
 A deploy is staged beside the branch and swapped in by rename, so a
 reader of the directory sees a branch as it was or as it is, never half
@@ -205,6 +207,10 @@ same thing. The ones an operator sets:
 | `ZSQL_LOG`, `ZSQL_LOG_FORMAT` | what is logged and how; the log, below |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE` | how much of each kind of work runs at once; `docs/admission.md` |
+| `ZSQL_CONCURRENT_RUNS` | how many statements run at once; 100 |
+| `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
+| `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |
+| `ZSQL_DS_<UID>_<FIELD>` | the credential the server holds for a datasource, used by a run whose request sends none |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 
 `ops/zsqld.service` is a systemd unit to start from: a dedicated user, a

@@ -27,6 +27,11 @@ pub(crate) enum Class {
     /// someone else's machine, so it has seats of its own: a slow
     /// warehouse fills them and leaves planning and deploys alone.
     Probe,
+    /// a run, or a question about one: a request that mostly waits for
+    /// a statement another thread is running. How many statements run
+    /// and how many wait is the runs' own business; a seat here is
+    /// only a request in the server.
+    Run,
     /// liveness and the root: no admission.
     Exempt,
 }
@@ -38,6 +43,7 @@ impl Class {
             Class::Explore => "explore",
             Class::Heavy => "heavy",
             Class::Probe => "probe",
+            Class::Run => "run",
             Class::Exempt => "exempt",
         }
     }
@@ -53,6 +59,7 @@ pub(crate) fn classify(path: &str) -> Class {
         // Below a datasource is the warehouse; the list of datasources
         // itself is the model's, and cheap.
         ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
+        ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] => Class::Run,
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route
@@ -93,7 +100,7 @@ fn patience(class: Class) -> Duration {
 pub(crate) fn deadline(class: Class) -> Duration {
     match class {
         // A probe waits on a warehouse, which can take its time to wake.
-        Class::Heavy | Class::Probe => Duration::from_secs(90),
+        Class::Heavy | Class::Probe | Class::Run => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
@@ -105,6 +112,9 @@ pub struct AdmissionCounts {
     pub explore: usize,
     pub heavy: usize,
     pub probe: usize,
+    /// Requests for a run in the server at once: every statement that
+    /// may run or wait, and as many again asking after them.
+    pub run: usize,
 }
 
 impl Default for AdmissionCounts {
@@ -112,7 +122,7 @@ impl Default for AdmissionCounts {
     /// is neither.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2 }
+        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2, run: 2 * (100 + 5_000) }
     }
 }
 
@@ -121,6 +131,7 @@ pub(crate) struct Admission {
     explore: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
     probe: Arc<Semaphore>,
+    run: Arc<Semaphore>,
 }
 
 impl Admission {
@@ -130,6 +141,7 @@ impl Admission {
             explore: Arc::new(Semaphore::new(counts.explore)),
             heavy: Arc::new(Semaphore::new(counts.heavy)),
             probe: Arc::new(Semaphore::new(counts.probe)),
+            run: Arc::new(Semaphore::new(counts.run)),
         }
     }
 
@@ -139,6 +151,7 @@ impl Admission {
             Class::Explore => &self.explore,
             Class::Heavy => &self.heavy,
             Class::Probe => &self.probe,
+            Class::Run => &self.run,
             Class::Exempt => return None,
         })
     }
