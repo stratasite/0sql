@@ -19,51 +19,93 @@ use zsql_dialect::Dialects;
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
 
-/// What the data directory holds, loaded: `<project>/<branch>/`.
+/// The directories of `dir`, by name.
+fn dirs_of(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| (p.file_name().unwrap_or_default().to_string_lossy().to_string(), p))
+        .collect();
+    out.sort();
+    out
+}
+
+/// What the data directory holds, loaded: `<org>/<project>/<branch>/`.
+///
+/// An org is its directory's name and nothing else, so a directory
+/// renamed while the server is down is that org under its new name the
+/// next time it starts: `default` renamed to `acme` is how what was
+/// deployed with no org becomes acme's.
 pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
     let mut n = 0;
     let mut skipped: Vec<String> = Vec::new();
-    let Ok(projects) = std::fs::read_dir(&app.data_dir) else { return Ok((0, skipped)) };
-    for p in projects.flatten().filter(|e| e.path().is_dir()) {
-        let uid = p.file_name().to_string_lossy().to_string();
-        let Ok(branches) = std::fs::read_dir(p.path()) else { continue };
-        for b in branches.flatten().filter(|e| e.path().is_dir()) {
-            let branch = b.file_name().to_string_lossy().to_string();
-            // A branch name never starts with a dot. A deploy's own
-            // staging or previous copy, left by a crash between two
-            // renames, is swept; any other dot directory is somebody
-            // else's and is left alone, since a data directory can be
-            // pointed anywhere by a typo.
-            if branch.starts_with('.') {
-                if is_swap_leftover(&branch) {
-                    let _ = std::fs::remove_dir_all(b.path());
-                }
+    for (org, org_dir) in dirs_of(&app.data_dir) {
+        // The server's own directories start with a dot, and so may
+        // anything else a data directory pointed at the wrong place
+        // holds: neither is an org.
+        if !crate::names::is_slug(&org) {
+            continue;
+        }
+        for (uid, project_dir) in dirs_of(&org_dir) {
+            // A model one level up from where a branch keeps it is a
+            // deployment from before there were orgs, when the data
+            // directory held `<project>/<branch>/`. It is not moved
+            // and not served: said, so it is not simply missing.
+            if project_dir.join(zsql_core::SNAPSHOT_FILE).exists() {
+                tracing::warn!(
+                    "{org}/{uid} is a deployment laid out as <project>/<branch>, from before orgs: move {} under {}/ or deploy it again",
+                    org_dir.display(),
+                    app.data_dir.join(crate::names::DEFAULT_ORG).display()
+                );
+                skipped.push(format!("{org}/{uid}"));
                 continue;
             }
-            if !b.path().join(zsql_core::SNAPSHOT_FILE).exists() {
-                continue;
-            }
-            // One unreadable branch is not a reason to refuse to
-            // start. A model that will not load is almost always a
-            // format this build is too old or too new for, and the
-            // archive it was compiled from lives in someone's
-            // repository, so the fix is a redeploy of that one branch.
-            // Coming up without it, and saying which, beats a restart
-            // loop that systemd gives up on after five tries.
-            let key = crate::key(&uid, &branch);
-            match Model::from_stored(&b.path(), &uid, &branch, app.dialects) {
-                Ok(m) => {
-                    write(&app.models).insert(key, Arc::new(m));
-                    n += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("{key} was not loaded: {e}");
-                    skipped.push(key);
-                }
-            }
+            n += reload_project(app, &org, &uid, &project_dir, &mut skipped);
         }
     }
     Ok((n, skipped))
+}
+
+/// The branches of one project, loaded; how many were.
+fn reload_project(app: &App, org: &str, uid: &str, project_dir: &std::path::Path, skipped: &mut Vec<String>) -> usize {
+    let mut n = 0;
+    for (branch, dir) in dirs_of(project_dir) {
+        // A branch name never starts with a dot. A deploy's own
+        // staging or previous copy, left by a crash between two
+        // renames, is swept; any other dot directory is somebody
+        // else's and is left alone, since a data directory can be
+        // pointed anywhere by a typo.
+        if branch.starts_with('.') {
+            if is_swap_leftover(&branch) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            continue;
+        }
+        if !dir.join(zsql_core::SNAPSHOT_FILE).exists() {
+            continue;
+        }
+        // One unreadable branch is not a reason to refuse to start. A
+        // model that will not load is almost always a format this
+        // build is too old or too new for, and the archive it was
+        // compiled from lives in someone's repository, so the fix is a
+        // redeploy of that one branch. Coming up without it, and
+        // saying which, beats a restart loop that systemd gives up on
+        // after five tries.
+        let key = crate::key(org, uid, &branch);
+        match Model::from_stored(&dir, uid, &branch, app.dialects) {
+            Ok(m) => {
+                write(&app.models).insert(key, Arc::new(m));
+                n += 1;
+            }
+            Err(e) => {
+                tracing::warn!("{key} was not loaded: {e}");
+                skipped.push(key);
+            }
+        }
+    }
+    n
 }
 
 /// Every route, behind the guard, over the app. Built here so the
@@ -72,6 +114,22 @@ pub(crate) fn router(app: Shared) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
+        .route("/orgs", get(reads::orgs))
+        // Once for the default org, and once for the org the path names.
+        .merge(of_an_org())
+        .nest("/orgs/{org}", of_an_org())
+        .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
+        // Every route but a deploy takes a small JSON body; the archive
+        // routes raise their own limit above.
+        .layer(axum::extract::DefaultBodyLimit::max(JSON_LIMIT))
+        .with_state(app)
+}
+
+/// Everything that is one org's: its projects, its results and its
+/// MCP endpoint. Which org is the handler's to read, with
+/// [`crate::error::Org`]: the one in the path, or the default.
+fn of_an_org() -> Router<Shared> {
+    Router::new()
         .route("/projects", get(reads::projects))
         .route("/projects/{uid}/branches/{branch}", get(reads::branch_summary))
         .route("/projects/{uid}/branches/{branch}/deploy", post(deploy::deploy).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
@@ -95,11 +153,6 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/results/{id}", get(exec::result).delete(exec::cancel))
         .route("/cache/invalidate", post(exec::invalidate))
         .route(mcp::PATH, post(mcp::endpoint))
-        .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
-        // Every route but a deploy takes a small JSON body; the archive
-        // routes raise their own limit above.
-        .layer(axum::extract::DefaultBodyLimit::max(JSON_LIMIT))
-        .with_state(app)
 }
 
 async fn root() -> String {
@@ -199,7 +252,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// port a bind of `:0` was given, which is what a caller that then
 /// talks to the server needs.
 pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + 'static) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&config.data_dir)?;
+    // The default org's directory is always there, so what is deployed
+    // with no org has somewhere to go, and so that renaming it to give
+    // its projects to a named org leaves a default behind to deploy to.
+    std::fs::create_dir_all(config.data_dir.join(crate::names::DEFAULT_ORG))?;
     let mut lock = lock_data_dir(&config.data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let advertised = config.public_url.clone();

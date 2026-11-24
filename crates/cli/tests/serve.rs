@@ -251,11 +251,60 @@ fn inside_a_project_it_serves_that_project_and_minus_r_reaches_it() {
 
     let (status, _) = s.stop();
     assert!(status.success());
-    let branch = data.join("grocery-store/main");
+    let branch = data.join("default/grocery-store/main");
     assert!(branch.join("snapshot.json.gz").exists() && branch.join("tests.json").exists());
-    let names: Vec<String> =
-        std::fs::read_dir(data.join("grocery-store")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    let names: Vec<String> = std::fs::read_dir(data.join("default/grocery-store"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
     assert_eq!(names, vec!["main"]);
+}
+
+/// A project that names an org in project.yml is deployed under it and
+/// asked for under it, with no flag; `--org` asks another org, which
+/// has nothing of this one's.
+#[cfg(unix)]
+#[test]
+fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
+    let root = Scratch::new("org");
+    let project = root.path("grocery-store");
+    copy_dir(&fixture(), &project);
+    let yml = project.join("project.yml");
+    std::fs::write(&yml, format!("{}\norg: acme\n", std::fs::read_to_string(&yml).unwrap().trim_end())).unwrap();
+    let data = root.path("data");
+    let s = Server::start(&project, &root.path("home"), &["--data-dir", data.to_str().unwrap()]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !get(&s.addr, "/orgs/acme/projects").1.contains("\"grocery-store\"") {
+        assert!(std::time::Instant::now() < deadline, "the project was not deployed under its org");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!get(&s.addr, "/projects").1.contains("grocery-store"), "the default org has none of it");
+
+    let run = |args: &[&str]| {
+        zsql()
+            .args(args)
+            .current_dir(&project)
+            .env("ZSQL_HOME", root.path("home"))
+            .env("ZSQL_SERVER", format!("http://{}", s.addr))
+            .output()
+            .unwrap()
+    };
+    let said = |o: &std::process::Output| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let local = run(&["sql", "--json", "--expr", "department, sales value"]);
+    let remote = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"]);
+    assert!(local.status.success() && remote.status.success(), "{}\n{}", said(&local), said(&remote));
+    assert_eq!(String::from_utf8_lossy(&local.stdout), String::from_utf8_lossy(&remote.stdout));
+    assert!(said(&run(&["list"])).contains("grocery-store"));
+    assert!(!said(&run(&["list", "--org", "default"])).contains("grocery-store"));
+    let elsewhere = run(&["status", "-r", "--branch", "main", "--org", "globex"]);
+    assert!(!elsewhere.status.success() && said(&elsewhere).contains("in org globex"), "{}", said(&elsewhere));
+
+    let (status, _) = s.stop();
+    assert!(status.success());
+    assert!(data.join("acme/grocery-store/main/snapshot.json.gz").exists());
+    assert!(data.join("default").is_dir(), "the default org's directory is made at startup");
+    assert_eq!(std::fs::read_dir(data.join("default")).unwrap().count(), 0);
 }
 
 /// The server asks nobody who they are, so a bind beyond this machine

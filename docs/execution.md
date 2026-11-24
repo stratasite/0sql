@@ -39,6 +39,12 @@ Two kinds of run:
 | `DELETE /results/{id}` | cancel |
 | `POST /cache/invalidate` | mark results dirty by datasource and tables |
 
+Each is also served under `/orgs/{org}`, for that org; without the
+prefix the org is `default`. A result belongs to the org it was run
+for: under any other org its id answers 404, to a read and to a cancel,
+and an invalidation marks one org's results. See "Orgs" in
+`docs/operating.md`.
+
 The same runs as an MCP tool come after, and as `zsql run -r` last of
 all, with the rest of the command line's work.
 
@@ -127,7 +133,7 @@ with a Postgres and a local implementation.
 | `cache_key` | empty for `sql` |
 | `dirty` | set by invalidation |
 | `tables` | array of physical names, as the model's `physical_name` has them; empty for `sql` |
-| `org_uid` | `default` until there are orgs |
+| `org_uid` | the org of the request's path, `default` when it names none |
 | `project_uid`, `branch`, `datasource_uid` | where it came from; `branch` is for origin only |
 | `sql` | the statement run |
 | `spec`, `expr` | the semantic request, whichever was sent |
@@ -298,7 +304,6 @@ exposed on the old understanding.
 ## Not yet decided
 
 - Credentials, after execution exists.
-- Where an org uid comes from.
 
 ## Order of work
 

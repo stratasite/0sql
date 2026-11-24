@@ -52,7 +52,12 @@ impl Class {
 /// A request's class, from its method and path alone.
 pub(crate) fn classify(path: &str) -> Class {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match p.as_slice() {
+    // A route under an org costs what it costs without one.
+    let p = match p.as_slice() {
+        ["orgs", _, rest @ ..] => rest,
+        whole => whole,
+    };
+    match p {
         [] | ["healthz"] => Class::Exempt,
         ["projects", _, "branches", _, "deploy" | "validate" | "test"] => Class::Heavy,
         ["projects", _, "branches", _, "explore" | "fields"] => Class::Explore,

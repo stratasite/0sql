@@ -239,10 +239,11 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Status { remote } => {
             let t = Where::with(project, remote).target(false)?;
-            show::print_json(&t.client.get(&remote::branch_path(&t.uid, &t.branch))?)
+            show::print_json(&t.client.get(&remote::branch_path(t.org.as_deref(), &t.uid, &t.branch))?)
         }
         Command::Deployments { remote } => {
-            let v = Where::with(project, remote).client().get("/projects")?;
+            let at = Where::with(project, remote);
+            let v = at.client().get(&format!("{}/projects", remote::org_path(at.org().as_deref())))?;
             for d in v["deployments"].as_array().into_iter().flatten() {
                 println!(
                     "{:<32} {:<16} {} tables, {} fields, {} policies, {} values, {} tests",
@@ -259,11 +260,11 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Undeploy { yes, remote } => {
             let t = Where::with(project, remote).target(false)?;
-            let sure = yes || tty::confirm(&format!("remove {}/{} from {}?", t.uid, t.branch, t.client.server), "--yes")?;
+            let sure = yes || tty::confirm(&format!("remove {} from {}?", t.name(), t.client.server), "--yes")?;
             if !sure {
                 bail!("nothing removed");
             }
-            show::print_json(&t.client.delete(&remote::branch_path(&t.uid, &t.branch))?)
+            show::print_json(&t.client.delete(&remote::branch_path(t.org.as_deref(), &t.uid, &t.branch))?)
         }
         Command::Health { remote } => {
             let client = Where::with(project, remote).client();

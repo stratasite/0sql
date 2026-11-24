@@ -1,6 +1,7 @@
 //! One error type for the API: a status, a class the goldens would
 //! name, and a message, and the conversions into it.
 
+use crate::names::{check_org, DEFAULT_ORG};
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
@@ -32,8 +33,9 @@ impl From<zsql_core::Error> for ApiError {
     }
 }
 
-pub(crate) fn not_found(uid: &str, branch: &str) -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid} branch {branch}"))
+pub(crate) fn not_found(org: &str, uid: &str, branch: &str) -> ApiError {
+    let within = if org == DEFAULT_ORG { String::new() } else { format!(" in org {org}") };
+    ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid} branch {branch}{within}"))
 }
 
 /// An answer that says when to come back.
@@ -65,16 +67,45 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Input<T> {
     }
 }
 
-/// The path's parameters.
+/// What the org is called in a route: `/orgs/{org}/...`.
+const ORG: &str = "org";
+
+async fn raw_params<S: Send + Sync>(parts: &mut Parts, state: &S) -> Result<axum::extract::RawPathParams, ApiError> {
+    axum::extract::RawPathParams::from_request_parts(parts, state).await.map_err(|e| ApiError(e.status(), "Invalid", e.body_text()))
+}
+
+/// The path's parameters below the org, in order, as a tuple. Every
+/// route is served twice, with an org in front and without, and a
+/// handler reads the same parameters either way; the org is [`Org`]'s.
 pub(crate) struct Params<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Params<T> {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
-        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
-            Ok(axum::extract::Path(v)) => Ok(Params(v)),
-            Err(e) => Err(ApiError(e.status(), "Invalid", e.body_text())),
+        let raw = raw_params(parts, state).await?;
+        let values: Vec<String> = raw.iter().filter(|(name, _)| *name != ORG).map(|(_, value)| value.to_string()).collect();
+        T::deserialize(serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(values.into_iter()))
+            .map(Params)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, "Invalid", e.to_string()))
+    }
+}
+
+/// The org a request is for: the one its path names, checked, or the
+/// default one when the path names none.
+pub(crate) struct Org(pub(crate) String);
+
+impl<S: Send + Sync> FromRequestParts<S> for Org {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let raw = raw_params(parts, state).await?;
+        match raw.iter().find(|(name, _)| *name == ORG) {
+            Some((_, org)) => {
+                check_org(org)?;
+                Ok(Org(org.to_string()))
+            }
+            None => Ok(Org(DEFAULT_ORG.to_string())),
         }
     }
 }

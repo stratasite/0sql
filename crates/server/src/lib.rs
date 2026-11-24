@@ -15,8 +15,15 @@
 //! and a removal are as open as a read, and whoever may do any of them
 //! is decided by the service in front.
 //!
+//! A project belongs to an org, and an org is a directory of the data
+//! directory and nothing more: `<org>/<project>/<branch>`. Every route
+//! below, down to `/mcp`, is also served under `/orgs/{org}` for that
+//! org's projects, results and MCP endpoint; without the prefix a
+//! request is for the org `default`. Who may ask for which org is,
+//! like everything else, decided in front.
+//!
 //! ```text
-//! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
+//! POST /projects/{uid}/branches/{branch}/deploy       body: tar.gz of the project; tests run, results in the answer
 //! POST /projects/{uid}/branches/{branch}/validate      the same, keeping nothing
 //! POST /projects/{uid}/branches/{branch}/sql           {"spec": {...}, "context": {...}} or {"expr": "..."}
 //! POST /projects/{uid}/branches/{branch}/explain       the same, with the node graph and timings
@@ -36,6 +43,8 @@
 //! GET  /results/{id}                                   a run: its record and a page of rows; DELETE cancels it
 //! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
+//! ANY  /orgs/{org}/...                                 any route above, for one org
+//! GET  /orgs                                           the orgs with something deployed
 //! GET  /healthz
 //! ```
 //!
@@ -44,7 +53,7 @@
 //! - `guard`: the admission cap and the deadline
 //!   every request meets
 //! - `admission`: how much of each kind of work runs at once
-//! - `names`: the project and branch names that become directories
+//! - `names`: the org, project and branch names that become directories
 //! - `deploy`: an archive in, a model out
 //! - `reads`: sql, explain, explore and the catalog
 //! - `probe`: a datasource's own tables, read from the warehouse with
@@ -98,7 +107,7 @@ pub(crate) struct App {
     /// planner can borrow it for as long as its universe.
     dialects: &'static Dialects,
     data_dir: PathBuf,
-    /// Deployments by `project/branch`.
+    /// Deployments by `org/project/branch`.
     models: RwLock<HashMap<String, Arc<Model>>>,
     /// How much of each kind of work may be in the server at once.
     admission: Admission,
@@ -120,33 +129,54 @@ pub(crate) struct App {
 /// What this server was given to connect to a datasource with, by its uid.
 pub type SecretsOf = Arc<dyn Fn(&str) -> zsql_datasource::Secrets + Send + Sync>;
 
-/// A deployment's key in the models map.
-pub(crate) fn key(uid: &str, branch: &str) -> String {
-    format!("{uid}/{branch}")
+/// A deployment's key in the models map. None of the three names can
+/// hold a `/`, so the keys of one org are the ones that start with it
+/// and a `/`.
+pub(crate) fn key(org: &str, uid: &str, branch: &str) -> String {
+    format!("{org}/{uid}/{branch}")
 }
 
 impl App {
     /// Where a deployed branch lives on disk.
-    pub(crate) fn dir(&self, uid: &str, branch: &str) -> PathBuf {
-        self.data_dir.join(uid).join(branch)
+    pub(crate) fn dir(&self, org: &str, uid: &str, branch: &str) -> PathBuf {
+        self.data_dir.join(org).join(uid).join(branch)
     }
 
     /// The deployed model of a branch. The names are checked first, so
     /// a name that could not have been deployed is told so rather than
     /// reported as merely missing.
-    pub(crate) fn model(&self, uid: &str, branch: &str) -> Result<Arc<Model>, ApiError> {
+    pub(crate) fn model(&self, org: &str, uid: &str, branch: &str) -> Result<Arc<Model>, ApiError> {
+        names::check_org(org)?;
         names::check_uid(uid)?;
         names::check_branch(branch)?;
-        read(&self.models).get(&key(uid, branch)).cloned().ok_or_else(|| not_found(uid, branch))
+        read(&self.models).get(&key(org, uid, branch)).cloned().ok_or_else(|| not_found(org, uid, branch))
+    }
+
+    /// Every deployment of one org, by project and branch. Nothing of
+    /// another org is in it: a listing, a catalog and a default branch
+    /// are always one org's.
+    pub(crate) fn of_org(&self, org: &str) -> Vec<Arc<Model>> {
+        let prefix = format!("{org}/");
+        let mut out: Vec<Arc<Model>> = read(&self.models).iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, m)| m.clone()).collect();
+        out.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+        out
+    }
+
+    /// The orgs with something deployed, and the default one.
+    pub(crate) fn orgs(&self) -> Vec<String> {
+        let mut out: Vec<String> = read(&self.models).keys().filter_map(|k| k.split('/').next()).map(str::to_string).collect();
+        out.push(names::DEFAULT_ORG.to_string());
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
 pub(crate) type Shared = Arc<App>;
 
 /// Where results and their records live under a data directory. A dot
-/// in front, because every other directory there is a project, and a
-/// project may well be called `cache`; a project's uid never starts
-/// with a dot.
+/// in front, because every other directory there is an org, and an
+/// org may well be called `cache`; an org never starts with a dot.
 pub(crate) const CACHE_DIR: &str = ".cache";
 
 /// The runs of a server whose data is under `data_dir`, with their

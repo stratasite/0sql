@@ -81,7 +81,7 @@ impl Side for Target {
     }
 
     fn announce(&mut self) -> Result<Vec<String>> {
-        let summary = self.client.get(&remote::branch_path(&self.uid, &self.branch))?;
+        let summary = self.client.get(&remote::branch_path(self.org.as_deref(), &self.uid, &self.branch))?;
         println!(
             "{}",
             dim(&format!(
@@ -115,33 +115,41 @@ impl Side for Target {
     }
 
     fn tables(&mut self) -> Result<Value> {
-        self.client.get(&format!("{}/tables", remote::branch_path(&self.uid, &self.branch)))
+        self.client.get(&format!("{}/tables", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)))
     }
 
     fn fields(&mut self, q: &str, hidden: bool) -> Result<Value> {
-        self.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&self.uid, &self.branch), remote::urlencode(q)))
+        self.client.get(&format!(
+            "{}/fields?q={}&hidden={hidden}",
+            remote::branch_path(self.org.as_deref(), &self.uid, &self.branch),
+            remote::urlencode(q)
+        ))
     }
 
     fn values(&mut self, dim: &str) -> Result<Value> {
-        remote::values_for(&self.client, &self.uid, &self.branch, dim)
+        remote::values_for(&self.client, self.org.as_deref(), &self.uid, &self.branch, dim)
     }
 
     fn explore(&mut self, query: &Query, context: Option<&Value>, term: Option<&str>) -> Result<Value> {
-        remote::explore(&self.client, &self.uid, &self.branch, query, context, term)
+        remote::explore(&self.client, self.org.as_deref(), &self.uid, &self.branch, query, context, term)
     }
 
     fn sql(&mut self, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
-        remote::sql(&self.client, &self.uid, &self.branch, query, context, explain)
+        remote::sql(&self.client, self.org.as_deref(), &self.uid, &self.branch, query, context, explain)
     }
 
     fn check(&mut self) -> Result<Value> {
         let Some(p) = &self.project else { anyhow::bail!("validating on the server needs a project directory") };
         let archive = crate::project::archive(&p.dir)?;
-        self.client.post_bytes(&format!("{}/validate", remote::branch_path(&self.uid, &self.branch)), "application/gzip", &archive)
+        self.client.post_bytes(
+            &format!("{}/validate", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)),
+            "application/gzip",
+            &archive,
+        )
     }
 
     fn test(&mut self) -> Result<Value> {
-        self.client.post(&format!("{}/test", remote::branch_path(&self.uid, &self.branch)), &serde_json::json!({}))
+        self.client.post(&format!("{}/test", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)), &serde_json::json!({}))
     }
 }
 

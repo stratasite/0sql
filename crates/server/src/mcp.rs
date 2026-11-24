@@ -23,6 +23,12 @@
 //! the header a plan runs with no context, which a branch with policies
 //! refuses exactly as it does over REST. See `docs/mcp.md`.
 //!
+//! The org is the connection's too, and for the same reason: it is in
+//! the endpoint's path, `/orgs/{org}/mcp`, or it is the default org at
+//! `/mcp`, and no tool takes one. The catalog an agent is given, the
+//! projects it can list and the results it can ask after are that
+//! org's and no other's.
+//!
 //! No authentication and no Origin check: like the rest of the server
 //! this endpoint answers whoever can reach it, and belongs behind the
 //! developer's own service or on a loopback.
@@ -34,11 +40,11 @@
 //! `application/json`, a notification with 202.
 
 use crate::admission::Class;
-use crate::error::ApiError;
+use crate::error::{ApiError, Org};
 use crate::guard::{busy, Held};
 use crate::names::check_uid;
 use crate::reads::{explain_of, explore_of, fields_of, projects_of, sql_of, tables_of, values_of, FieldsQuery};
-use crate::{read, App, Shared};
+use crate::{App, Shared};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -148,7 +154,7 @@ fn bad_request(code: i64, message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": code, "message": message } }))).into_response()
 }
 
-pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn endpoint(State(app): State<Shared>, Org(org): Org, headers: HeaderMap, body: Bytes) -> Response {
     let context = match context_of(&headers) {
         Ok(c) => c,
         Err(m) => return bad_request(-32600, &m),
@@ -176,7 +182,7 @@ pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes
         return StatusCode::ACCEPTED.into_response();
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(&app, context, &method, params).await {
+    match dispatch(&app, &org, context, &method, params).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err(Fail::Rpc(code, message)) => {
             Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })).into_response()
@@ -185,7 +191,7 @@ pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes
     }
 }
 
-async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, params: Value) -> Result<Value, Fail> {
+async fn dispatch(app: &Shared, org: &str, context: Option<SecurityContext>, method: &str, params: Value) -> Result<Value, Fail> {
     match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
@@ -202,7 +208,7 @@ async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, 
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, catalog(app)),
+                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, catalog(app, org)),
             }))
         }
         "ping" => Ok(json!({})),
@@ -210,7 +216,7 @@ async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, 
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            call(app, context, name, args).await
+            call(app, org, context, name, args).await
         }
         _ => Err(Fail::Rpc(METHOD_NOT_FOUND, format!("no method {method}"))),
     }
@@ -232,9 +238,10 @@ const CATALOG_BYTES: usize = 48 * 1024;
 /// where the table says which thing they describe. Deterministic, so the
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
-fn catalog(app: &App) -> String {
-    let mut deployed: Vec<Arc<Model>> = read(&app.models).values().cloned().collect();
-    deployed.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+fn catalog(app: &App, org: &str) -> String {
+    // One org's, by project and branch: an agent connected for one org
+    // is told nothing of another's.
+    let deployed = app.of_org(org);
     if deployed.is_empty() {
         return "No branch is deployed yet.".into();
     }
@@ -498,13 +505,13 @@ fn args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, Fail> {
 /// The branch a tool works on: the one named, else the one branch of
 /// the project that is deployed, else, among several, the project's
 /// production branch as its own project.yml names it.
-fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
+fn branch_for(app: &App, org: &str, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
     if let Some(b) = branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()) {
         return Ok(b);
     }
     check_uid(uid)?;
-    let models = read(&app.models);
-    let of_project: Vec<&Arc<Model>> = models.values().filter(|d| d.uid == uid).collect();
+    let models = app.of_org(org);
+    let of_project: Vec<&Arc<Model>> = models.iter().filter(|d| d.uid == uid).collect();
     match of_project.as_slice() {
         [] => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}"))),
         [one] => Ok(one.branch.clone()),
@@ -546,7 +553,7 @@ async fn admit_run(app: &App) -> Result<Held, Fail> {
 /// refusal then carries the search the client would otherwise make
 /// next, so a spec written from the request's own words costs one
 /// round trip when it is right and still only two when it is not.
-fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiError {
+fn with_candidates(app: &Shared, org: &str, uid: &str, branch: &str, e: ApiError) -> ApiError {
     let ApiError(status, class, message) = e;
     if class != "FieldNotFound" && class != "FieldAmbiguous" {
         return ApiError(status, class, message);
@@ -556,7 +563,7 @@ fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiErr
     if term.is_empty() || term.len() > 200 {
         return ApiError(status, class, message);
     }
-    let found = fields_of(app, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
+    let found = fields_of(app, org, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
     let Ok(found) = found else { return ApiError(status, class, message) };
     let mut lines = Vec::new();
     for f in found["fields"].as_array().into_iter().flatten().take(8) {
@@ -578,14 +585,14 @@ fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiErr
     ApiError(status, class, format!("{message}\nFields near '{term}', by uid:\n{}", lines.join("\n")))
 }
 
-async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, arguments: Value) -> Result<Value, Fail> {
+async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &str, arguments: Value) -> Result<Value, Fail> {
     if !app.mcp.exposed(name) {
         return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
     }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
             let a: ListArgs = args(arguments)?;
-            projects_of(app, a.q.as_deref().unwrap_or(""))
+            projects_of(app, org, a.q.as_deref().unwrap_or(""))
         }
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
@@ -596,7 +603,7 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                 // one initialize carries. One call is all the discovery a
                 // question needs, and a client that cut the instructions
                 // short gets it here in full.
-                let text = branch_for(app, &a.project, a.branch).and_then(|b| Ok(branch_catalog(&*app.model(&a.project, &b)?)));
+                let text = branch_for(app, org, &a.project, a.branch).and_then(|b| Ok(branch_catalog(&*app.model(org, &a.project, &b)?)));
                 return Ok(match text {
                     Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalog": text } }),
                     Err(ApiError(status, class, message)) => {
@@ -604,21 +611,23 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                     }
                 });
             }
-            branch_for(app, &a.project, a.branch).and_then(|b| fields_of(app, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| fields_of(app, org, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| tables_of(app, &a.project, &b, a.q.as_deref().unwrap_or("")))
+            branch_for(app, org, &a.project, a.branch).and_then(|b| tables_of(app, org, &a.project, &b, a.q.as_deref().unwrap_or("")))
         }
         "values" => {
             let a: ValuesArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| values_of(app, &a.project, &b, &a.dimension, a.q.as_deref().unwrap_or("")))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| values_of(app, org, &a.project, &b, &a.dimension, a.q.as_deref().unwrap_or("")))
         }
         "explore" => {
             let a: QueryArgs = args(arguments)?;
             let _seat = admit_explore(app).await?;
-            branch_for(app, &a.project, a.branch)
-                .and_then(|b| explore_of(app, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context, q: a.q }))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| explore_of(app, org, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context, q: a.q }))
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -627,21 +636,22 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                 return Err(Fail::Rpc(INVALID_PARAMS, "arguments: q is for explore".into()));
             }
             let req = SqlRequest { spec: Some(a.spec), expr: None, context };
-            branch_for(app, &a.project, a.branch).and_then(|b| {
+            branch_for(app, org, &a.project, a.branch).and_then(|b| {
                 let planned = if name == "sql" {
-                    sql_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    sql_of(app, org, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 } else {
-                    explain_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    explain_of(app, org, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 };
-                planned.map_err(|e| with_candidates(app, &a.project, &b, e))
+                planned.map_err(|e| with_candidates(app, org, &a.project, &b, e))
             })
         }
         "run" => {
             let a: RunArgs = args(arguments)?;
             let _seat = admit_run(app).await?;
-            match (branch_for(app, &a.project, a.branch), tool_page(a.offset, a.limit)) {
+            match (branch_for(app, org, &a.project, a.branch), tool_page(a.offset, a.limit)) {
                 (Ok(branch), Ok(page)) => {
-                    let asked = crate::exec::ToolRun { uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
+                    let asked =
+                        crate::exec::ToolRun { org: org.to_string(), uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
                     crate::exec::run_for_tool(app, asked, TOOL_WAIT, page).await
                 }
                 (Err(e), _) | (_, Err(e)) => Err(e),
@@ -651,7 +661,7 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
             let a: ResultArgs = args(arguments)?;
             let _seat = admit_run(app).await?;
             match tool_page(a.offset, a.limit) {
-                Ok(page) => crate::exec::result_for_tool(app, a.id, TOOL_WAIT, page).await,
+                Ok(page) => crate::exec::result_for_tool(app, org, a.id, TOOL_WAIT, page).await,
                 Err(e) => Err(e),
             }
         }

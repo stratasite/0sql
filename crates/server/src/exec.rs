@@ -16,7 +16,7 @@
 //! one, and otherwise the one this server was given for the datasource.
 //! Nothing here decides who may ask: the service in front does.
 
-use crate::error::{ApiError, Input, Params, Search};
+use crate::error::{ApiError, Input, Org, Params, Search};
 use crate::probe::connection_of;
 use crate::reads::{check_expr, shape_check};
 use crate::{blocking, Shared};
@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::time::{Duration, Instant};
 use zsql_core::SqlRequest;
-use zsql_exec::{How, Kind, Record, Status, Submit, DEFAULT_ORG};
+use zsql_exec::{How, Kind, Record, Status, Submit};
 use zsql_spec::SecurityContext;
 
 /// The longest a request waits for rows: short of the request's own
@@ -120,8 +120,8 @@ pub(crate) fn page_of(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u
 
 /// Plans the request and hands its statement to the runs. What comes
 /// back is the record, how the request was met, and how long to wait.
-fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Record, How, Duration), ApiError> {
-    let model = app.model(uid, branch)?;
+fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> Result<(Record, How, Duration), ApiError> {
+    let model = app.model(org, uid, branch)?;
     check_expr(req.expr.as_deref())?;
     let planned =
         model.plan_request(SqlRequest { spec: req.spec.clone(), expr: req.expr.clone(), context: req.context }, false, &shape_check)?;
@@ -133,7 +133,7 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
     let sql = planned.plan.sql_with_limit(row_limit, &dialect).map_err(zsql_core::Error::from)?;
     let datasource = planned.plan.datasource_uid.clone();
 
-    let (mut conn, sent) = connection_of(app, uid, branch, &datasource, None, &req.connection, None)?;
+    let (mut conn, sent) = connection_of(app, (org, uid, branch), &datasource, None, &req.connection, None)?;
     // What a statement may do is the database's to say, through the
     // credential it is run with: nothing here checks it.
     conn.access = zsql_datasource::Access::Unchecked;
@@ -142,13 +142,13 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
     let wait = wait_of(req.wait, conn.wait())?;
     // A datasource that keeps nothing is neither looked up nor found.
     let ttl = conn.cache_ttl.map(|s| Duration::from_secs(s.max(0) as u64)).unwrap_or(zsql_exec::DEFAULT_TTL);
-    let cache_key = (!ttl.is_zero()).then(|| zsql_exec::run_cache_key(DEFAULT_ORG, uid, &sql));
+    let cache_key = (!ttl.is_zero()).then(|| zsql_exec::run_cache_key(org, uid, &sql));
 
     let (record, how) = app
         .runs
         .submit(Submit {
             kind: Kind::Semantic,
-            org_uid: DEFAULT_ORG.into(),
+            org_uid: org.into(),
             project_uid: uid.into(),
             branch: branch.into(),
             datasource_uid: datasource.clone(),
@@ -160,7 +160,7 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
             cache_key,
             cache_ttl: ttl,
             fresh: req.fresh,
-            pool_key: Some(pool_key(uid, &conn, &secrets)),
+            pool_key: Some(pool_key(org, uid, &conn, &secrets)),
             close_first: None,
             open: Box::new(move || zsql_datasource::open(&conn, secrets)),
         })
@@ -172,15 +172,16 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
 /// points and how far it is trusted, and whose credential opened it. A
 /// connection is never handed to a run that would have opened another.
 ///
-/// The key starts with [`pool_scope`], the project and the datasource,
-/// so every connection to one datasource can be found together.
-pub(crate) fn pool_key(project: &str, conn: &zsql_datasource::Connection, secrets: &zsql_datasource::Secrets) -> String {
-    format!("{}{}", pool_scope(project, &conn.uid), zsql_exec::sha256(&format!("{conn:?}\n{}", secrets.fingerprint())))
+/// The key starts with [`pool_scope`], the org, the project and the
+/// datasource, so every connection to one datasource can be found
+/// together, and none is ever shared between two orgs.
+pub(crate) fn pool_key(org: &str, project: &str, conn: &zsql_datasource::Connection, secrets: &zsql_datasource::Secrets) -> String {
+    format!("{}{}", pool_scope(org, project, &conn.uid), zsql_exec::sha256(&format!("{conn:?}\n{}", secrets.fingerprint())))
 }
 
 /// What every pool key of one project's datasource starts with.
-fn pool_scope(project: &str, datasource: &str) -> String {
-    format!("{}#", &zsql_exec::sha256(&format!("{project}\n{datasource}"))[..16])
+fn pool_scope(org: &str, project: &str, datasource: &str) -> String {
+    format!("{}#", &zsql_exec::sha256(&format!("{org}\n{project}\n{datasource}"))[..16])
 }
 
 /// One statement, the caller's own, for a datasource of a branch.
@@ -210,11 +211,11 @@ impl std::fmt::Debug for SqlExecRequest {
 /// never looked up and never found again; two of the same are two
 /// runs, since a statement may write. Nothing here reads it beyond
 /// counting that it is one: what it may do is the database's to say.
-fn submit_sql(app: &Shared, uid: &str, branch: &str, req: SqlExecRequest) -> Result<(Record, Duration), ApiError> {
+fn submit_sql(app: &Shared, org: &str, uid: &str, branch: &str, req: SqlExecRequest) -> Result<(Record, Duration), ApiError> {
     if !zsql_datasource::single_statement(&req.sql) {
         return Err(invalid("sql is one statement: send each of several in a request of its own"));
     }
-    let (mut conn, sent) = connection_of(app, uid, branch, req.datasource.trim(), None, &req.connection, None)?;
+    let (mut conn, sent) = connection_of(app, (org, uid, branch), req.datasource.trim(), None, &req.connection, None)?;
     conn.access = zsql_datasource::Access::Writable;
     let secrets = if sent.is_empty() { (app.secrets)(&conn.uid) } else { sent };
     let wait = wait_of(req.wait, conn.wait())?;
@@ -227,7 +228,7 @@ fn submit_sql(app: &Shared, uid: &str, branch: &str, req: SqlExecRequest) -> Res
         .runs
         .submit(Submit {
             kind: Kind::Sql,
-            org_uid: DEFAULT_ORG.into(),
+            org_uid: org.into(),
             project_uid: uid.into(),
             branch: branch.into(),
             datasource_uid: conn.uid.clone(),
@@ -239,8 +240,8 @@ fn submit_sql(app: &Shared, uid: &str, branch: &str, req: SqlExecRequest) -> Res
             cache_key: None,
             cache_ttl: zsql_exec::DEFAULT_TTL,
             fresh: true,
-            pool_key: (!in_process).then(|| pool_key(uid, &conn, &secrets)),
-            close_first: in_process.then(|| pool_scope(uid, &conn.uid)),
+            pool_key: (!in_process).then(|| pool_key(org, uid, &conn, &secrets)),
+            close_first: in_process.then(|| pool_scope(org, uid, &conn.uid)),
             open: Box::new(move || zsql_datasource::open(&conn, secrets)),
         })
         .map_err(internal)?;
@@ -249,13 +250,14 @@ fn submit_sql(app: &Shared, uid: &str, branch: &str, req: SqlExecRequest) -> Res
 
 pub(crate) async fn sql_exec(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     headers: HeaderMap,
     Input(req): Input<SqlExecRequest>,
 ) -> Result<Response, ApiError> {
     let page = page_of(req.offset, req.limit)?;
     let running = app.clone();
-    let (record, wait) = blocking(move || submit_sql(&running, &uid, &branch, req)).await?;
+    let (record, wait) = blocking(move || submit_sql(&running, &org, &uid, &branch, req)).await?;
     let record = settled(&app, record, wait).await?;
     answer(&app, record, None, page, wants_arrow(&headers)).await
 }
@@ -277,6 +279,16 @@ async fn settled(app: &Shared, record: Record, wait: Duration) -> Result<Record,
 
 fn gone(id: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no result {id}"))
+}
+
+/// The record of a run, for the org asking. A result is its org's
+/// alone: asked for from any other org it is not there, in the same
+/// words as an id nothing ever had, so an id tells one org nothing
+/// about another.
+async fn of_org(app: &Shared, org: &str, id: &str) -> Result<Record, ApiError> {
+    let (runs, asked) = (app.runs.clone(), id.to_string());
+    let record = blocking(move || runs.get(&asked).map_err(internal)).await?;
+    record.filter(|r| r.org_uid == org).ok_or_else(|| gone(id))
 }
 
 fn wants_arrow(headers: &HeaderMap) -> bool {
@@ -335,16 +347,17 @@ pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, pa
 /// to send. What comes back is the record and a page, as `described`
 /// gives them.
 pub(crate) async fn run_for_tool(app: &Shared, asked: ToolRun, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
-    let ToolRun { uid, branch, spec, context, fresh } = asked;
+    let ToolRun { org, uid, branch, spec, context, fresh } = asked;
     let req = RunRequest { spec: Some(spec), context, fresh, wait: Some(wait.as_secs_f64()), ..RunRequest::default() };
     let planning = app.clone();
-    let (record, how, wait) = blocking(move || submit(&planning, &uid, &branch, req)).await?;
+    let (record, how, wait) = blocking(move || submit(&planning, &org, &uid, &branch, req)).await?;
     let record = settled(app, record, wait).await?;
     described(app, record, Some(how), page).await
 }
 
 /// What a tool asks to be run.
 pub(crate) struct ToolRun {
+    pub(crate) org: String,
     pub(crate) uid: String,
     pub(crate) branch: String,
     pub(crate) spec: Value,
@@ -353,9 +366,8 @@ pub(crate) struct ToolRun {
 }
 
 /// A result asked after by a tool, by its id.
-pub(crate) async fn result_for_tool(app: &Shared, id: String, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
-    let (runs, asked) = (app.runs.clone(), id.clone());
-    let record = blocking(move || runs.get(&asked).map_err(internal)).await?.ok_or_else(|| gone(&id))?;
+pub(crate) async fn result_for_tool(app: &Shared, org: &str, id: String, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
+    let record = of_org(app, org, &id).await?;
     let record = settled(app, record, wait).await?;
     described(app, record, None, page).await
 }
@@ -394,32 +406,35 @@ impl futures_core::Stream for Chunks {
 
 pub(crate) async fn run(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     headers: HeaderMap,
     Input(req): Input<RunRequest>,
 ) -> Result<Response, ApiError> {
     let page = page_of(req.offset, req.limit)?;
     let planning = app.clone();
-    let (record, how, wait) = blocking(move || submit(&planning, &uid, &branch, req)).await?;
+    let (record, how, wait) = blocking(move || submit(&planning, &org, &uid, &branch, req)).await?;
     let record = settled(&app, record, wait).await?;
     answer(&app, record, Some(how), page, wants_arrow(&headers)).await
 }
 
 pub(crate) async fn result(
     State(app): State<Shared>,
-    Params(id): Params<String>,
+    Org(org): Org,
+    Params((id,)): Params<(String,)>,
     Search(q): Search<PageQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let page = page_of(q.offset, q.limit)?;
     let wait = wait_of(q.wait, Duration::ZERO)?;
-    let (runs, asked) = (app.runs.clone(), id.clone());
-    let record = blocking(move || runs.get(&asked).map_err(internal)).await?.ok_or_else(|| gone(&id))?;
+    let record = of_org(&app, &org, &id).await?;
     let record = settled(&app, record, wait).await?;
     answer(&app, record, None, page, wants_arrow(&headers)).await
 }
 
-pub(crate) async fn cancel(State(app): State<Shared>, Params(id): Params<String>) -> Result<Response, ApiError> {
+pub(crate) async fn cancel(State(app): State<Shared>, Org(org): Org, Params((id,)): Params<(String,)>) -> Result<Response, ApiError> {
+    // Whose it is, before anything is stopped.
+    of_org(&app, &org, &id).await?;
     let (runs, asked) = (app.runs.clone(), id.clone());
     let record = blocking(move || runs.cancel(&asked).map_err(internal)).await?.ok_or_else(|| gone(&id))?;
     // A running statement stops when its read next looks; give it a
@@ -443,7 +458,7 @@ pub(crate) struct Invalidate {
 
 /// Marks as dirty every result that read one of the tables: it stops
 /// answering, the next request runs again, and cleanup removes it.
-pub(crate) async fn invalidate(State(app): State<Shared>, Input(req): Input<Invalidate>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn invalidate(State(app): State<Shared>, Org(org): Org, Input(req): Input<Invalidate>) -> Result<Json<Value>, ApiError> {
     if req.datasource.trim().is_empty() || req.tables.is_empty() || req.tables.iter().any(|t| t.trim().is_empty()) {
         return Err(invalid("an invalidation names a datasource and at least one table"));
     }
@@ -452,7 +467,6 @@ pub(crate) async fn invalidate(State(app): State<Shared>, Input(req): Input<Inva
     }
     let runs = app.runs.clone();
     let marked =
-        blocking(move || runs.invalidate(DEFAULT_ORG, req.project.as_deref(), req.datasource.trim(), &req.tables).map_err(internal))
-            .await?;
+        blocking(move || runs.invalidate(&org, req.project.as_deref(), req.datasource.trim(), &req.tables).map_err(internal)).await?;
     Ok(Json(json!({ "invalidated": marked })))
 }

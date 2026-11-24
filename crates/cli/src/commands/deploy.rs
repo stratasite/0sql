@@ -23,8 +23,12 @@ pub fn deploy(at: Where, dry_run: bool, watch: bool, skip_check: bool) -> Result
     let once = |t: &Target| -> Result<bool> {
         let archive = project::archive(&p.dir)?;
         let note = if t.branch == p.production_branch { " (the production branch)" } else { "" };
-        println!("{action} {} ({} bytes) as {}/{}{note} to {}", p.name, archive.len(), t.uid, t.branch, t.client.server);
-        let v = t.client.post_bytes(&format!("{}/{action}", remote::branch_path(&t.uid, &t.branch)), "application/gzip", &archive)?;
+        println!("{action} {} ({} bytes) as {}{note} to {}", p.name, archive.len(), t.name(), t.client.server);
+        let v = t.client.post_bytes(
+            &format!("{}/{action}", remote::branch_path(t.org.as_deref(), &t.uid, &t.branch)),
+            "application/gzip",
+            &archive,
+        )?;
         Ok(show::print_deploy(&v))
     };
     if !watch {
