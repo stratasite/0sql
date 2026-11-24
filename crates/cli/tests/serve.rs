@@ -273,7 +273,15 @@ fn a_bind_beyond_the_loopback_has_to_be_meant_and_then_anyone_who_reaches_it_dep
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--open") && err.contains("anyone who reaches it"), "{err}");
+    assert!(err.contains("--open") && err.contains("ZSQL_OPEN") && err.contains("anyone who reaches it"), "{err}");
+    // The variable says the same as the flag, and a no is a no.
+    let out = zsql()
+        .args(["serve", "--bind", "0.0.0.0:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+        .env("ZSQL_HOME", root.path("home"))
+        .env("ZSQL_OPEN", "0")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "ZSQL_OPEN=0 does not open it");
 
     let project = root.path("grocery-store");
     copy_dir(&fixture(), &project);
@@ -282,8 +290,8 @@ fn a_bind_beyond_the_loopback_has_to_be_meant_and_then_anyone_who_reaches_it_dep
     let s = Server::start_with(
         &project,
         &root.path("home"),
-        &["--bind", "0.0.0.0:0", "--open", "--data-dir", data.to_str().unwrap()],
-        &[("ZSQL_DEPLOY_TOKEN", "zdt_left-over")],
+        &["--bind", "0.0.0.0:0", "--data-dir", data.to_str().unwrap()],
+        &[("ZSQL_OPEN", "1"), ("ZSQL_DEPLOY_TOKEN", "zdt_left-over")],
     );
     let addr = format!("127.0.0.1:{}", s.addr.rsplit(':').next().unwrap());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);

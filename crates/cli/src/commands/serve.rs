@@ -34,8 +34,8 @@ pub struct ServeArgs {
     /// Where deployed models live; $ZSQL_HOME/data when neither this nor the variable says.
     #[arg(long, env = "ZSQL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Allow listening beyond the loopback. The server asks nobody who they are: anyone who can reach the port deploys, removes and runs statements.
-    #[arg(long)]
+    /// Allow listening beyond the loopback, for a server other machines reach: a node of a cluster, or one behind a proxy elsewhere. The server asks nobody who they are: anyone who can reach the port deploys, removes and runs statements.
+    #[arg(long, env = "ZSQL_OPEN", value_parser = clap::builder::BoolishValueParser::new())]
     pub open: bool,
     /// Serve only the data directory, even inside a project.
     #[arg(long)]
@@ -237,7 +237,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
     // The server asks nobody who they are, so where it listens is who
     // may use it. Beyond this machine, that has to be meant.
     if !args.open && !loopback(&bind) {
-        bail!("{bind} is not a loopback address, and anyone who reaches it may deploy, remove and run statements; add --open to mean it");
+        bail!("{bind} is not a loopback address, and anyone who reaches it may deploy, remove and run statements; add --open, or set ZSQL_OPEN=1, to mean it");
     }
     // A project named explicitly must be there; one looked for is optional.
     let project = match (args.no_project, at.project.is_some()) {

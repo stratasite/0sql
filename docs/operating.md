@@ -40,8 +40,13 @@ is ignored, `zsql auth` no longer exists, and an `api_key` left in a
 
 So who may deploy is decided where every other question of who is
 decided: by the service in front, or by who can reach the address.
-`zsql serve` refuses a bind beyond the loopback unless `--open` says
-the exposure is meant, since nothing else stands in the way.
+There are two ways to run it. Beside the service or proxy that
+fronts it, on the same machine, it binds the loopback, which is the
+default, and nothing off the machine reaches it. Reached from other
+machines, as a node of a cluster or behind a proxy elsewhere, it binds
+a private address, and `zsql serve` refuses to do that unless `--open`
+or `ZSQL_OPEN=1` says it is meant: nothing else stands between that
+address and a deploy.
 
 **Coming from a server that had a token:** it now takes a deploy from
 anyone who reaches it. Before upgrading, make sure the write routes
@@ -251,6 +256,7 @@ same thing. The ones an operator sets:
 | variable | what |
 |---|---|
 | `ZSQL_BIND` | the address; `127.0.0.1:3699` by default, and a proxy in front is the usual arrangement |
+| `ZSQL_OPEN` | `1` to allow a bind beyond the loopback, the same as `--open`: for a node other machines reach. It checks no caller; it says the exposure is meant |
 | `ZSQL_DATA_DIR` | the data directory |
 | `ZSQL_LOG`, `ZSQL_LOG_FORMAT` | what is logged and how; the log, below |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
