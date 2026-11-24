@@ -154,7 +154,8 @@ does, a green run says nothing about the driver path.
 ### The command line, set aside on 2026-11-23
 
 The command line's side of this is deferred as a whole; the server
-side comes first. What is owed to it:
+side comes first. All of it is logged as stratasite/0sql#41, with what
+was decided on 2026-11-24. What is owed to it:
 
 - **ADBC on the Linux release.** The static musl binary cannot load a
   driver, so `zsql run` there is always REST for Snowflake and

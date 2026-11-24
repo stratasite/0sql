@@ -299,9 +299,6 @@ exposed on the old understanding.
 
 - Credentials, after execution exists.
 - Where an org uid comes from.
-- The command line keeps `ZSQL_RUN_CAP` and its 10,000 rows for now;
-  aligning it with `ZSQL_DEFAULT_SQL_LIMIT` joins the deferred
-  command-line work.
 
 ## Order of work
 
@@ -360,9 +357,11 @@ exposed on the old understanding.
    link carries its own. A capped read is still inline. Run against a
    stand-in for the API, written from Databricks' reference; not
    against a workspace.
-9. **The command line, last.** Everything of the command line's waits
-   for this phase: `zsql run -r`, aligning `ZSQL_RUN_CAP` with
-   `ZSQL_DEFAULT_SQL_LIMIT`, and the deferred list in
-   `docs/exec-layer.md` (ADBC on the Linux release, fetching drivers,
-   the two result shapes, the OAuth flow). No earlier phase changes
-   what `zsql` does.
+9. **The command line, later.** Not built, and logged as one issue
+   (stratasite/0sql#41) that lists all of it. Two things were decided on
+   2026-11-24. `zsql run -r` will rely on the server's credential and
+   send none from the machine it runs on; an OAuth flow may change
+   that. And the row cap stays the command line's own: `ZSQL_RUN_CAP`
+   and its 10,000 rows are a client-side setting, not aligned with the
+   server's `ZSQL_DEFAULT_SQL_LIMIT`. No phase above changed what
+   `zsql` does.
