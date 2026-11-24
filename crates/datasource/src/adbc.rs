@@ -35,6 +35,11 @@ use std::time::Duration;
 pub struct Plan {
     pub driver: &'static str,
     pub options: Vec<(String, String)>,
+    /// The warehouse's decimals carry a fixed scale that says nothing
+    /// about the column (BigQuery's NUMERIC is always nine places), so
+    /// a value prints without its trailing zeros, as the warehouse's own
+    /// REST API spells it.
+    pub scale_is_nominal: bool,
 }
 
 /// Whether drivers are looked for at all.
@@ -64,6 +69,7 @@ pub struct Adbc {
     _database: ManagedDatabase,
     uid: String,
     timeout: Duration,
+    scale_is_nominal: bool,
 }
 
 impl Adbc {
@@ -72,7 +78,7 @@ impl Adbc {
         let options = plan.options.iter().map(|(k, v)| (OptionDatabase::from(k.as_str()), OptionValue::String(v.clone())));
         let database = driver.new_database_with_opts(options).map_err(fail)?;
         let connection = database.new_connection().map_err(fail)?;
-        Ok(Adbc { connection, _database: database, uid: uid.to_string(), timeout })
+        Ok(Adbc { connection, _database: database, uid: uid.to_string(), timeout, scale_is_nominal: plan.scale_is_nominal })
     }
 
     /// One read, under the row cap and the statement timeout.
@@ -93,11 +99,13 @@ impl Adbc {
         let cancel = statement.get_cancel_handle();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<Batches>>();
         let worker_uid = uid.clone();
+        let scale_is_nominal = self.scale_is_nominal;
         std::thread::spawn(move || {
             let outcome = (|| {
                 let reader = statement.execute().map_err(|e| Error::Query(worker_uid.clone(), e.message))?;
                 let schema = reader.schema();
-                batch::collect(&worker_uid, schema, reader, max_rows)
+                let got = batch::collect(&worker_uid, schema, reader, max_rows)?;
+                Ok(if scale_is_nominal { got.printing_decimals_trimmed() } else { got })
             })();
             // Nobody is listening once the caller has given up.
             let _ = done_tx.send(outcome);
@@ -302,7 +310,7 @@ pub fn snowflake(conn: &Connection, secrets: &Secrets) -> Plan {
     set(format!("{SF_CLIENT}login_timeout"), &secs);
     set(format!("{SF_CLIENT}request_timeout"), &secs);
     set(format!("{SF_CLIENT}app_name"), "zsql");
-    Plan { driver: "snowflake", options: o }
+    Plan { driver: "snowflake", options: o, scale_is_nominal: false }
 }
 
 /// `https://host:8443/path` as its scheme, host and port.
@@ -352,7 +360,7 @@ pub fn bigquery(conn: &Connection, secrets: &Secrets, env: &dyn Fn(&str) -> Opti
     if let Some(url) = &conn.url {
         set("bigquery.endpoint", url);
     }
-    Some(Plan { driver: "bigquery", options: o })
+    Some(Plan { driver: "bigquery", options: o, scale_is_nominal: true })
 }
 
 #[cfg(test)]
@@ -457,7 +465,11 @@ mod tests {
 
     fn local(options: &[(&str, &str)], timeout: Duration) -> Adbc {
         let driver = load("sqlite").unwrap().expect("the sqlite ADBC driver is installed");
-        let plan = Plan { driver: "sqlite", options: options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        let plan = Plan {
+            driver: "sqlite",
+            options: options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            scale_is_nominal: false,
+        };
         Adbc::open(driver, &plan, "local", timeout).unwrap()
     }
 

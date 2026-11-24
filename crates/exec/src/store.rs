@@ -240,17 +240,28 @@ mod tests {
         let schema: arrow_schema::SchemaRef = std::sync::Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("status", arrow_schema::DataType::Utf8, true),
             arrow_schema::Field::new("n", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("amount", arrow_schema::DataType::Decimal128(38, 9), true),
         ]));
         let batch = arrow_array::RecordBatch::try_new(
             schema.clone(),
             vec![
                 std::sync::Arc::new(arrow_array::StringArray::from(vec![Some("paid"), None])),
                 std::sync::Arc::new(arrow_array::Int64Array::from(vec![Some(3), Some(1)])),
+                std::sync::Arc::new(
+                    arrow_array::Decimal128Array::from(vec![Some(12_500_000_000), Some(3_000_000_000)])
+                        .with_precision_and_scale(38, 9)
+                        .unwrap(),
+                ),
             ],
         )
         .unwrap();
-        let written = Batches { schema, batches: vec![batch] };
-        let rows = vec![vec![Some("paid".to_string()), Some("3".to_string())], vec![None, Some("1".to_string())]];
+        // The decimal is marked to print without trailing zeros, as a
+        // warehouse of fixed scale marks it; the mark is kept with it.
+        let written = Batches { schema, batches: vec![batch] }.printing_decimals_trimmed();
+        let rows = vec![
+            vec![Some("paid".to_string()), Some("3".to_string()), Some("12.5".to_string())],
+            vec![None, Some("1".to_string()), Some("3".to_string())],
+        ];
         let stored = store.write(&manifest, &written).unwrap();
         assert!(stored.dir().join("rows.arrow").exists());
         assert!(stored.dir().join("manifest.json").exists());
@@ -284,7 +295,8 @@ mod tests {
         old.columns.push(Column { name: "n".into(), data_type: None, source: "unknown".into(), arrow_type: None, field_uid: None });
         std::fs::write(old_dir.join("manifest.json"), serde_json::to_string(&old).unwrap()).unwrap();
         let read = store.lookup(&old_key).unwrap().unwrap();
-        assert_eq!(read.rows().unwrap().rows, rows, "an old result still answers");
+        let old_rows = vec![vec![Some("paid".to_string()), Some("3".to_string())], vec![None, Some("1".to_string())]];
+        assert_eq!(read.rows().unwrap().rows, old_rows, "an old result still answers");
         assert!(read.batches().unwrap().schema.fields().iter().all(|f| f.data_type() == &arrow_schema::DataType::Utf8));
         let unknown = Stored { manifest: Manifest { rows_format: "parquet".into(), ..manifest.clone() }, dir: old_dir.clone() };
         assert!(matches!(unknown.batches().unwrap_err(), Error::RowsFormat(_, f) if f == "parquet"));

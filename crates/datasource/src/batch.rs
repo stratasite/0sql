@@ -54,6 +54,36 @@ impl Batches {
         Batches { schema, batches: vec![batch] }
     }
 
+    /// Marks every decimal column to print without trailing zeros, for
+    /// a warehouse whose scale is a fixed property of the type and not
+    /// of the column. The mark is field metadata, so it is stored with
+    /// the result and a stored result prints the same. Values and types
+    /// are untouched.
+    pub fn printing_decimals_trimmed(self) -> Batches {
+        let decimal = |t: &DataType| matches!(t, DataType::Decimal128(..) | DataType::Decimal256(..));
+        if !self.schema.fields().iter().any(|f| decimal(f.data_type())) {
+            return self;
+        }
+        let fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let mut field = f.as_ref().clone();
+                if decimal(f.data_type()) {
+                    let mut metadata = f.metadata().clone();
+                    metadata.insert(TRIM_ZEROS.to_string(), "true".to_string());
+                    field.set_metadata(metadata);
+                }
+                field
+            })
+            .collect();
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(fields, self.schema.metadata().clone()));
+        let batches =
+            self.batches.into_iter().map(|b| b.with_schema(schema.clone()).expect("the same columns, with metadata added")).collect();
+        Batches { schema, batches }
+    }
+
     /// Every cell as the text it prints as; a null stays a null.
     pub fn to_text(&self) -> Result<Rows> {
         let fail = |e: arrow_schema::ArrowError| Error::Query("result".into(), format!("rendering a value: {e}"));
@@ -66,9 +96,21 @@ impl Batches {
                 .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
                 .collect::<std::result::Result<_, _>>()
                 .map_err(fail)?;
+            let trimmed: Vec<bool> = self.schema.fields().iter().map(|f| f.metadata().contains_key(TRIM_ZEROS)).collect();
             for i in 0..batch.num_rows() {
                 rows.push(
-                    columns.iter().zip(&formatters).map(|(c, f)| if c.is_null(i) { None } else { Some(f.value(i).to_string()) }).collect(),
+                    columns
+                        .iter()
+                        .zip(&formatters)
+                        .zip(&trimmed)
+                        .map(|((c, f), trim)| {
+                            if c.is_null(i) {
+                                return None;
+                            }
+                            let text = f.value(i).to_string();
+                            Some(if *trim { trim_zeros(text) } else { text })
+                        })
+                        .collect(),
                 );
             }
         }
@@ -108,6 +150,19 @@ impl Batches {
         }
         self.batches = kept;
     }
+}
+
+/// The field metadata key that says a decimal prints without its
+/// trailing zeros.
+const TRIM_ZEROS: &str = "zsql:trim_zeros";
+
+/// `12.500000000` as `12.5`, `3.000` as `3`; anything without a
+/// fraction as it is.
+fn trim_zeros(text: String) -> String {
+    if !text.contains('.') || text.contains(['e', 'E']) {
+        return text;
+    }
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// A column as the formatter can print it. A timestamp in a named time
@@ -223,6 +278,30 @@ mod tests {
         assert_eq!(rows[0][2].as_deref(), Some("1970-01-01T05:30:00+05:30"), "an offset zone is printed as it was");
         // What is kept is what arrived: only the printing changes.
         assert_eq!(b.schema.field(0).data_type(), &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())));
+    }
+
+    /// A NUMERIC from BigQuery's driver: nine places whatever the value.
+    #[test]
+    fn a_marked_decimal_prints_without_its_trailing_zeros() {
+        use arrow_array::Decimal128Array;
+        let values = vec![Some(12_500_000_000), Some(3_000_000_000), Some(0), Some(-1_050_000_000), None, Some(100_000_000_000)];
+        let decimals: ArrayRef = Arc::new(Decimal128Array::from(values).with_precision_and_scale(38, 9).unwrap());
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![Some("1.500"); 6]));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Decimal128(38, 9), true), Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![decimals, strings]).unwrap();
+        let as_sent = Batches { schema, batches: vec![batch] };
+        let column = |b: &Batches, i: usize| b.to_text().unwrap().rows.into_iter().map(|r| r[i].clone()).collect::<Vec<_>>();
+        assert_eq!(column(&as_sent, 0)[0].as_deref(), Some("12.500000000"), "unmarked, a decimal prints at its scale");
+
+        let marked = as_sent.clone().printing_decimals_trimmed();
+        let got = column(&marked, 0);
+        let got: Vec<Option<&str>> = got.iter().map(|c| c.as_deref()).collect();
+        assert_eq!(got, [Some("12.5"), Some("3"), Some("0"), Some("-1.05"), None, Some("100")]);
+        assert_eq!(column(&marked, 1)[0].as_deref(), Some("1.500"), "text that looks like a decimal is left alone");
+        // Only the printing: the type and the values are what arrived.
+        assert_eq!(marked.schema.field(0).data_type(), &DataType::Decimal128(38, 9));
+        assert_eq!(marked.batches[0].column(0).as_ref(), as_sent.batches[0].column(0).as_ref());
     }
 
     #[test]

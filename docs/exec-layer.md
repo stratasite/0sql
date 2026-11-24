@@ -115,9 +115,12 @@ driver and another way without.
   cancelled by the driver in 3.25 s. One fault found and fixed: a
   timestamp labeled `UTC` could not be printed without a time zone
   database, so it is printed at offset `+00:00`, as `...Z`.
-  A NUMERIC prints at its full scale through the driver
-  (`12.500000000`) and as written over REST (`12.5`): the two result
-  shapes of one datasource, listed below.
+  BigQuery's NUMERIC is nine decimal places whatever the column, so
+  through the driver `12.5` arrived as `12.500000000`. A driver whose
+  scale is nominal marks its decimal columns, and a marked column
+  prints without trailing zeros, as REST spells it; the mark is field
+  metadata and is stored with the result. Decimals inside a struct or
+  a list are not trimmed.
   **Still unknown**: everything about a Snowflake account.
 - [x] **Phase 2 — results stored as Arrow.** A stored result is
   `rows.arrow`, an Arrow IPC file, LZ4-compressed; manifest format 2
