@@ -167,8 +167,9 @@ impl Databricks {
         });
         // A capped read asks for one row past its cap, enough to know
         // there were more; a streamed one asks for everything.
-        if let Some(max_rows) = out.limit() {
-            body["row_limit"] = serde_json::json!(max_rows + 1);
+        // A cap too large to add to is no cap worth sending.
+        if let Some(asked) = out.limit().and_then(|max_rows| max_rows.checked_add(1)).and_then(|n| i64::try_from(n).ok()) {
+            body["row_limit"] = serde_json::json!(asked);
         }
         if let Some(c) = &self.conn.catalog {
             body["catalog"] = serde_json::Value::String(c.clone());

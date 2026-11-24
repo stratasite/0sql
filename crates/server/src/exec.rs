@@ -104,7 +104,8 @@ fn internal(e: zsql_exec::Error) -> ApiError {
 fn wait_of(asked: Option<f64>, default: Duration) -> Result<Duration, ApiError> {
     match asked {
         None => Ok(default.min(LONGEST_WAIT)),
-        Some(s) if s.is_finite() && s >= 0.0 => Ok(Duration::from_secs_f64(s).min(LONGEST_WAIT)),
+        // Clamped as a number first: a duration cannot hold every f64.
+        Some(s) if s.is_finite() && s >= 0.0 => Ok(Duration::from_secs_f64(s.min(LONGEST_WAIT.as_secs_f64()))),
         Some(_) => Err(invalid("wait is a number of seconds, zero or more")),
     }
 }
@@ -318,8 +319,11 @@ pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, pa
         .await?;
         body["offset"] = json!(offset);
         body["limit"] = json!(limit);
-        // Whether this page reaches the end of the result.
-        body["complete"] = json!(offset + rows.len() as u64 >= total);
+        // Whether this page reaches the end of the result: it came back
+        // short, or it ends where the rows do. A statement that changed
+        // rows and returned none is complete, whatever it changed.
+        let returned = rows.len() as u64;
+        body["complete"] = json!(returned < limit || offset + returned >= total);
         body["columns"] = Value::Array(columns);
         body["rows"] = Value::Array(rows);
     }

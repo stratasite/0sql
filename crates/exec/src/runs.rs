@@ -153,6 +153,10 @@ pub struct Runs {
     inner: Arc<Inner>,
 }
 
+/// How soon a kept connection that has gone stale says so. A failure
+/// that takes longer than this was the statement's, not the connection's.
+const STALE_WITHIN: Duration = Duration::from_secs(2);
+
 /// How long a worker with nothing to do stays before its thread ends.
 const IDLE: Duration = Duration::from_secs(30);
 
@@ -181,19 +185,33 @@ impl Runs {
         let alive = Arc::downgrade(&inner);
         let beat = inner.limits.beat.max(Duration::from_millis(10));
         let mut swept = Instant::now();
+        let sweeping = Arc::new(AtomicBool::new(false));
         std::thread::Builder::new()
             .name("zsql-beat".into())
             .spawn(move || loop {
                 std::thread::sleep(beat);
                 let Some(inner) = alive.upgrade() else { return };
+                // Alive first, and only the runs a thread here holds: a
+                // record anything else left unfinished stops being
+                // marked, and is ended like any other nobody is running.
+                let held = inner.held();
+                let seen = inner.registry.touch(&held).and_then(|()| inner.registry.fail_abandoned(beat * 6, RESTARTED));
                 inner.close_idle();
-                if swept.elapsed() >= inner.limits.sweep {
+                // Cleanup can take a while, and the beat must not wait
+                // on it: other nodes would take this one for dead.
+                if swept.elapsed() >= inner.limits.sweep && !sweeping.swap(true, Ordering::SeqCst) {
                     swept = Instant::now();
-                    if let Err(e) = inner.sweep() {
-                        tracing::warn!("expired results could not all be cleared away: {e}");
+                    let (sweeper, done) = (inner.clone(), sweeping.clone());
+                    let spawned = std::thread::Builder::new().name("zsql-sweep".into()).spawn(move || {
+                        if let Err(e) = sweeper.sweep() {
+                            tracing::warn!("expired results could not all be cleared away: {e}");
+                        }
+                        done.store(false, Ordering::SeqCst);
+                    });
+                    if spawned.is_err() {
+                        sweeping.store(false, Ordering::SeqCst);
                     }
                 }
-                let seen = inner.registry.touch(&inner.limits.hostname).and_then(|()| inner.registry.fail_abandoned(beat * 6, RESTARTED));
                 match seen {
                     Ok(0) => {}
                     Ok(ended) => {
@@ -276,7 +294,11 @@ impl Runs {
             cache_ttl: submit.cache_ttl,
             cancel: Arc::default(),
         });
-        if state.idle == 0 && state.workers < inner.limits.concurrent.max(1) {
+        // A worker for this job unless one that is idle will take it:
+        // an idle worker is counted until it wakes, so the jobs already
+        // waiting are counted against the idle ones, and a burst gets a
+        // thread each rather than one between them.
+        if state.queue.len() > state.idle && state.workers < inner.limits.concurrent.max(1) {
             state.workers += 1;
             let worker = inner.clone();
             std::thread::Builder::new()
@@ -412,6 +434,13 @@ impl Inner {
         }
     }
 
+    /// The runs a thread of this process holds: waiting for a seat, or
+    /// in one.
+    fn held(&self) -> Vec<String> {
+        let state = self.lock();
+        state.queue.iter().map(|job| job.record.id.clone()).chain(state.cancels.keys().cloned()).collect()
+    }
+
     /// A kept connection under `key`, the one most recently used.
     fn take(&self, key: &str) -> Option<Box<dyn Source>> {
         let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -529,7 +558,12 @@ impl Inner {
                 break;
             }
             // Only what the store also holds is only a copy.
-            let copied = self.registry.get(&id)?.is_none_or(|r| r.object_store_path.is_some() || r.status != Status::Succeeded);
+            // Nor is the result of a run that has not ended, whose record
+            // does not yet say where it went.
+            let copied = self
+                .registry
+                .get(&id)?
+                .is_none_or(|r| r.status.is_final() && (r.object_store_path.is_some() || r.status != Status::Succeeded));
             if copied && std::fs::remove_dir_all(&dir).is_ok() {
                 over = over.saturating_sub(size.max(1));
             }
@@ -570,10 +604,13 @@ impl Inner {
         let now = unix_now();
         let mut cleared = 0u64;
         for (id, dir, _, _) in self.on_disk() {
+            // A run that has not ended is still writing its result, or
+            // has just landed it and not yet said so: it is left alone.
             let answers = self.registry.get(&id)?.is_some_and(|r| {
-                r.status == Status::Succeeded
-                    && !r.dirty
-                    && r.expires_at.as_deref().and_then(crate::engine::parse_rfc3339).is_some_and(|until| until > now)
+                !r.status.is_final()
+                    || (r.status == Status::Succeeded
+                        && !r.dirty
+                        && r.expires_at.as_deref().and_then(crate::engine::parse_rfc3339).is_some_and(|until| until > now))
             });
             if !answers && std::fs::remove_dir_all(&dir).is_ok() {
                 cleared += 1;
@@ -613,12 +650,16 @@ impl Inner {
                 None => (open()?, None),
             };
             let mut writing = self.store.begin(&record.id)?;
+            let asked = Instant::now();
             let mut streamed = src.stream(&record.sql, &mut Stoppable { sink: &mut writing, cancel: &cancel });
             // A kept connection may have gone stale while it waited. A
             // read that failed on one before it handed anything over is
             // asked again on a new connection. Never a statement that
             // might write: it may already have.
-            let nothing_yet = writing.result_schema().is_none() && writing.rows() == 0;
+            // And only a failure that came back at once, which is how a
+            // dead connection fails: a statement that ran to its timeout
+            // is not run a second time.
+            let nothing_yet = writing.result_schema().is_none() && writing.rows() == 0 && asked.elapsed() < STALE_WITHIN;
             if let (Err(_), Some(reopen), true, Kind::Semantic) = (&streamed, open.take(), nothing_yet, record.kind) {
                 if !cancel.load(Ordering::SeqCst) {
                     drop(src);

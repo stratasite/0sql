@@ -20,7 +20,31 @@ use tokio::sync::OwnedSemaphorePermit;
 /// the work ends and not when the deadline gives up on it. Otherwise
 /// deploys that outlive their deadline would pile up past the cap.
 #[derive(Clone)]
-pub(crate) struct Held(#[allow(dead_code)] pub(crate) Arc<Option<OwnedSemaphorePermit>>);
+pub(crate) struct Held(Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>);
+
+impl Held {
+    pub(crate) fn new(permit: Option<OwnedSemaphorePermit>) -> Held {
+        Held(Arc::new(std::sync::Mutex::new(permit)))
+    }
+
+    /// Gives the seat up now, whoever else still holds this.
+    fn release(&self) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    }
+}
+
+tokio::task_local! {
+    /// The seat the request in hand was admitted on.
+    static SEAT: Held;
+}
+
+/// Gives up the seat this request was admitted on, before it is
+/// answered: for a handler that has found its work is of another class
+/// and has taken a seat there, so a long wait does not hold a seat
+/// meant for quick work.
+pub(crate) fn release_seat() {
+    let _ = SEAT.try_with(Held::release);
+}
 
 pub(crate) async fn guard(State(app): State<Shared>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let class = admission::classify(req.uri().path());
@@ -30,13 +54,13 @@ pub(crate) async fn guard(State(app): State<Shared>, req: axum::extract::Request
     // Room to run, or come back later. The permit is held until the
     // handler has finished with it.
     let held = match app.admission.admit(class).await {
-        Ok(p) => Held(Arc::new(p)),
+        Ok(p) => Held::new(p),
         Err(secs) => return busy(secs, class),
     };
     let (mut parts, body) = req.into_parts();
     parts.extensions.insert(held.clone());
     let req = axum::extract::Request::from_parts(parts, body);
-    let response = match tokio::time::timeout(admission::deadline(class), next.run(req)).await {
+    let response = match tokio::time::timeout(admission::deadline(class), SEAT.scope(held.clone(), next.run(req))).await {
         Ok(r) => r,
         Err(_) => retry_later(
             StatusCode::SERVICE_UNAVAILABLE,

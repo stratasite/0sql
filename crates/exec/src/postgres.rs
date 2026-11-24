@@ -400,11 +400,14 @@ impl Registry for Postgres {
         .map(|n| n as usize)
     }
 
-    fn touch(&self, hostname: &str) -> Result<()> {
-        let hostname = hostname.to_string();
+    fn touch(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = ids.to_vec();
         self.with(move |client| async move {
             client
-                .execute("UPDATE zsql_results SET updated_at = now() WHERE hostname = $1 AND status IN ('queued', 'running')", &[&hostname])
+                .execute("UPDATE zsql_results SET updated_at = now() WHERE id = ANY($1) AND status IN ('queued', 'running')", &[&ids])
                 .await
         })
         .map(|_| ())

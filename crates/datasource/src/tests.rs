@@ -1522,6 +1522,9 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
     assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(server.seen.lock().unwrap().iter().filter(|(_, p, _, _)| p == "/oidc/v1/token").count(), 1);
 
+    // A cap with no room above it, as `zsql run --all` gives, is not
+    // added to: it used to overflow.
+    assert_eq!(src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", usize::MAX).expect("reads").rows.len(), 3);
     let err = src.query("SELECT x FROM wide", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
     let err = src.query("SELECT x FROM cut", 2).err().unwrap().to_string();

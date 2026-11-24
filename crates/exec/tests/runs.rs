@@ -227,11 +227,16 @@ fn a_failure_is_recorded_and_a_restart_ends_what_was_in_progress() {
 /// to fail the next statement on whichever of them is asked.
 struct Counted {
     fail_next: Arc<std::sync::atomic::AtomicBool>,
+    /// Fail only after a while, as a statement that ran and failed does.
+    slowly: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl zsql_datasource::Source for Counted {
     fn query(&mut self, _sql: &str, _max_rows: usize) -> zsql_datasource::Result<zsql_datasource::Rows> {
         if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self.slowly.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2_300));
+            }
             return Err(zsql_datasource::Error::Query("wh".into(), "the connection was closed by the server".into()));
         }
         Ok(zsql_datasource::Rows { columns: vec!["n".into()], rows: vec![vec![Some("1".into())]] })
@@ -249,9 +254,9 @@ fn a_connection_is_kept_for_the_next_run_under_its_key() {
     let registry: Arc<dyn Registry> = Arc::new(Local::open(&scratch.0.join("records")).unwrap());
     let limits = Limits { beat: Duration::from_millis(20), pool_idle: Duration::from_millis(400), pool_max: 2, ..Limits::of("node-a") };
     let runs = Runs::open(&scratch.0.join("cache"), registry, None, limits).unwrap();
-    let (opened, fail_next) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let (opened, fail_next, slowly) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let submit = |kind: Kind, key: Option<&str>, n: usize| {
-        let (opened, fail_next) = (opened.clone(), fail_next.clone());
+        let (opened, fail_next, slowly) = (opened.clone(), fail_next.clone(), slowly.clone());
         Submit {
             kind,
             cache_key: None,
@@ -259,7 +264,7 @@ fn a_connection_is_kept_for_the_next_run_under_its_key() {
             close_first: None,
             open: Box::new(move || {
                 opened.fetch_add(1, Ordering::SeqCst);
-                Ok(Box::new(Counted { fail_next }) as Box<dyn zsql_datasource::Source>)
+                Ok(Box::new(Counted { fail_next, slowly }) as Box<dyn zsql_datasource::Source>)
             }),
             ..scratch.submit(&format!("SELECT {n}"))
         }
@@ -290,10 +295,20 @@ fn a_connection_is_kept_for_the_next_run_under_its_key() {
     fail_next.store(true, Ordering::SeqCst);
     let retried = run(Kind::Semantic, Some("wh/ada"), 7);
     assert_eq!((retried.status, opened.load(Ordering::SeqCst)), (Status::Succeeded, 6), "{retried:?}");
+    // Nor is a read that failed after running a while: that was the
+    // statement, a timeout or an error of its own, and running it again
+    // would only wait and bill twice.
+    slowly.store(true, Ordering::SeqCst);
+    fail_next.store(true, Ordering::SeqCst);
+    let ran_and_failed = run(Kind::Semantic, Some("wh/ada"), 70);
+    assert_eq!((ran_and_failed.status, opened.load(Ordering::SeqCst)), (Status::Failed, 6), "{ran_and_failed:?}");
+    slowly.store(false, Ordering::SeqCst);
+    run(Kind::Semantic, Some("wh/ada"), 71);
+    let opened_before = opened.load(Ordering::SeqCst);
     // A statement that may write is not: it may already have.
     fail_next.store(true, Ordering::SeqCst);
     let not_retried = run(Kind::Sql, Some("wh/ada"), 8);
-    assert_eq!((not_retried.status, opened.load(Ordering::SeqCst)), (Status::Failed, 6), "{not_retried:?}");
+    assert_eq!((not_retried.status, opened.load(Ordering::SeqCst)), (Status::Failed, opened_before), "{not_retried:?}");
     assert!(not_retried.error.unwrap().contains("closed by the server"));
     // A connection whose statement failed is not kept.
     let before = runs.idle_connections();
@@ -306,5 +321,31 @@ fn a_connection_is_kept_for_the_next_run_under_its_key() {
     while runs.idle_connections() > 0 {
         assert!(std::time::Instant::now() < deadline, "idle connections were never closed");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A burst after a quiet moment: each run gets a seat of its own while
+/// there are seats, and does not wait behind the one worker that
+/// happened to be idle.
+#[test]
+fn a_burst_of_runs_each_takes_a_seat() {
+    let scratch = Scratch::new("burst");
+    let runs = scratch.runs(4, 10);
+    let (first, _) = runs.submit(scratch.submit("SELECT id FROM t WHERE id < 5")).unwrap();
+    runs.wait(&first.id, Duration::from_secs(20)).unwrap();
+    // One worker is now idle. Three long statements arrive together.
+    let long = |n: u32| format!("WITH RECURSIVE c(x) AS (SELECT {n} UNION ALL SELECT x + 1 FROM c WHERE x < 4000000) SELECT x FROM c");
+    let ids: Vec<String> = (1..=3).map(|n| runs.submit(scratch.submit(&long(n))).unwrap().0.id).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let running = ids.iter().filter(|id| runs.get(id).unwrap().unwrap().status == Status::Running).count();
+        if running == 3 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "only {running} of 3 were running at once, with four seats");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for id in &ids {
+        runs.cancel(id).unwrap();
     }
 }

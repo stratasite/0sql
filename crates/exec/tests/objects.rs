@@ -96,7 +96,19 @@ fn a_result_goes_to_the_store_and_another_node_reads_it_from_there() {
     let (hit, how) = b.submit(cluster.submit("SELECT id, name FROM t ORDER BY id", &["t"], 3600)).unwrap();
     assert_eq!((how, hit.id.as_str()), (How::Hit, made.id.as_str()));
     assert!(!cluster.root.join("node-b").join("r-").join(&made.id).exists(), "nothing is fetched until it is read");
-    let fetched = b.rows(&hit).unwrap();
+    // Two readers ask at once, before either has it: both get the whole file.
+    let fetched = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..4).map(|_| scope.spawn(|| b.rows(&hit))).collect();
+        let paths: Vec<PathBuf> = readers.into_iter().map(|r| r.join().unwrap().expect("each reader gets the rows")).collect();
+        paths[0].clone()
+    });
+    assert_eq!(zsql_exec::page(&fetched, 0, 5_000).unwrap().num_rows(), 2_000, "and it is whole");
+    let leftovers = std::fs::read_dir(fetched.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("part-"))
+        .count();
+    assert_eq!(leftovers, 0, "no half-fetched file is left beside it");
     assert!(fetched.starts_with(cluster.root.join("node-b")));
     let page = zsql_exec::page(&fetched, 1_998, 5).unwrap();
     assert_eq!(

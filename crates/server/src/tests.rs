@@ -1219,6 +1219,9 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     assert_eq!(s.get(&format!("/results/{id}?limit=0")).await.status, StatusCode::BAD_REQUEST);
     assert_eq!(s.get(&format!("/results/{id}?limit=100001")).await.status, StatusCode::BAD_REQUEST);
     assert_eq!(s.post(&run, ask(json!({ "wait": -1 }))).await.status, StatusCode::BAD_REQUEST);
+    // A wait no clock could hold is the longest wait there is, not a crash.
+    assert_eq!(s.get(&format!("/results/{id}?wait=1e30")).await.status, StatusCode::OK);
+    assert_eq!(s.post(&run, ask(json!({ "wait": 1e30 }))).await.status, StatusCode::OK);
     let misspelled = s.post(&run, ask(json!({ "wiat": 1 }))).await;
     assert!(
         misspelled.status.is_client_error() && misspelled.error().contains("wiat"),
@@ -1360,6 +1363,7 @@ async fn sql_exec_runs_one_statement_of_the_callers_and_keeps_nothing_of_it_for_
     // A write, on a connection that may: the database decides, not this.
     let wrote = ask("INSERT INTO sales VALUES ('maps', 'm', 2.00), ('maps', 'm', 3.00)").await;
     assert_eq!((wrote.status, &wrote.body["status"]), (StatusCode::OK, &json!("succeeded")), "{}", wrote.body);
+    assert_eq!(wrote.body["complete"], true, "a statement that wrote has nothing more to page through: {}", wrote.body);
     assert_eq!(ask("SELECT count(*) AS n FROM sales").await.body["rows"], json!([[6]]));
     assert_eq!(s.app.runs.idle_connections(), 0, "a writable connection to a file is not kept, nor the readers it displaced");
     // The plan, asked fresh, sees what was written.

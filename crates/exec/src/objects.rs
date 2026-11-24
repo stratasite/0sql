@@ -134,7 +134,11 @@ impl Objects {
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.display().to_string(), e))?;
         }
-        let tmp = to.with_extension(format!("part-{}", std::process::id()));
+        // A file of this fetch's own: two readers of one result at once
+        // each write a whole file, and the later rename replaces the
+        // earlier with the same bytes.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = to.with_extension(format!("part-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let fetched = self.on(async {
             let mut body = self.store.get(&at).await.map_err(|e| failed(key, e))?.into_stream();
             let mut file = std::fs::File::create(&tmp).map_err(|e| Error::Io(tmp.display().to_string(), e))?;

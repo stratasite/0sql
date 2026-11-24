@@ -522,8 +522,22 @@ fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, Ap
 /// admitted this request as a plan: take an explore seat too.
 async fn admit_explore(app: &App) -> Result<Held, Fail> {
     match app.admission.admit(Class::Explore).await {
-        Ok(p) => Ok(Held(Arc::new(p))),
+        Ok(p) => Ok(Held::new(p)),
         Err(secs) => Err(Fail::Http(busy(secs, Class::Explore))),
+    }
+}
+
+/// The tools that run a statement mostly wait on a warehouse, and the
+/// guard admitted this request as a plan: take a seat among the runs,
+/// and give the plan's back, so twenty seconds of waiting does not hold
+/// a seat meant for a plan that takes microseconds.
+async fn admit_run(app: &App) -> Result<Held, Fail> {
+    match app.admission.admit(Class::Run).await {
+        Ok(p) => {
+            crate::guard::release_seat();
+            Ok(Held::new(p))
+        }
+        Err(secs) => Err(Fail::Http(busy(secs, Class::Run))),
     }
 }
 
@@ -624,6 +638,7 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
         }
         "run" => {
             let a: RunArgs = args(arguments)?;
+            let _seat = admit_run(app).await?;
             match (branch_for(app, &a.project, a.branch), tool_page(a.offset, a.limit)) {
                 (Ok(branch), Ok(page)) => {
                     let asked = crate::exec::ToolRun { uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
@@ -634,6 +649,7 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
         }
         "result" => {
             let a: ResultArgs = args(arguments)?;
+            let _seat = admit_run(app).await?;
             match tool_page(a.offset, a.limit) {
                 Ok(page) => crate::exec::result_for_tool(app, a.id, TOOL_WAIT, page).await,
                 Err(e) => Err(e),

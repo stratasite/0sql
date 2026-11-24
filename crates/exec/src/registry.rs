@@ -35,9 +35,10 @@ pub trait Registry: Send + Sync {
     /// running survived. How many it ended.
     fn fail_unfinished(&self, hostname: &str, why: &str) -> Result<usize>;
 
-    /// Says this node is alive: every run it has queued or running is
-    /// marked as seen now.
-    fn touch(&self, hostname: &str) -> Result<()>;
+    /// Says these runs are alive: each is marked as seen now. A node
+    /// names the runs a thread of its own actually holds, so a record
+    /// left unfinished by anything else stops being marked and is ended.
+    fn touch(&self, ids: &[String]) -> Result<()>;
 
     /// Ends, as failed with `why`, every run that is queued or running
     /// and has not been seen for `quiet_for`: its node stopped, or was
@@ -121,9 +122,12 @@ impl Registry for Local {
         // What an invalidation set, a run saving itself does not unset.
         let mut record = record.clone();
         record.dirty |= records.get(&record.id).is_some_and(|kept| kept.dirty);
-        self.write(&record)?;
+        // What this process knows first, the file after: a run that
+        // ended is ended here even when the disk would not take it, so
+        // nothing attaches to a run nobody is running.
+        let written = self.write(&record);
         records.insert(record.id.clone(), record);
-        Ok(())
+        written
     }
 
     fn get(&self, id: &str) -> Result<Option<Record>> {
@@ -158,12 +162,15 @@ impl Registry for Local {
         Ok(unfinished.len())
     }
 
-    fn touch(&self, hostname: &str) -> Result<()> {
+    fn touch(&self, ids: &[String]) -> Result<()> {
         // In memory only: nobody else reads this node's records, and a
         // restart ends what was unfinished whatever the time on it.
         let now = rfc3339(unix_now());
-        for record in self.lock().values_mut().filter(|r| r.hostname == hostname && !r.status.is_final()) {
-            record.updated_at = now.clone();
+        let mut records = self.lock();
+        for id in ids {
+            if let Some(record) = records.get_mut(id).filter(|r| !r.status.is_final()) {
+                record.updated_at = now.clone();
+            }
         }
         Ok(())
     }
@@ -234,5 +241,73 @@ impl Registry for Local {
             records.remove(id);
         }
         Ok(old.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Kind;
+
+    /// A run that ended is ended in this process even when its record
+    /// could not be written: otherwise an identical request would join
+    /// a run nobody is running.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_ended_is_ended_here_even_when_the_disk_refuses_the_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zsql-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let local = Local::open(&dir).unwrap();
+        let mut record = Record {
+            id: "r-1".into(),
+            kind: Kind::Semantic,
+            status: Status::Running,
+            error: None,
+            row_count: None,
+            cache_key: Some("k".into()),
+            dirty: false,
+            tables: vec![],
+            org_uid: "default".into(),
+            project_uid: "p".into(),
+            branch: "main".into(),
+            datasource_uid: "wh".into(),
+            sql: "SELECT 1".into(),
+            spec: None,
+            expr: None,
+            row_limit: None,
+            hostname: "node-a".into(),
+            object_store_path: None,
+            created_at: rfc3339(unix_now()),
+            queued_at: rfc3339(unix_now()),
+            started_at: None,
+            finished_at: None,
+            updated_at: rfc3339(unix_now()),
+            cancelled_at: None,
+            expires_at: None,
+        };
+        local.insert(&record).unwrap();
+        assert!(local.in_flight("k").unwrap().is_some());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        record.status = Status::Failed;
+        let refused = local.save(&record);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if refused.is_ok() {
+            // Whoever runs this may write anywhere; nothing was refused to check.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(local.get("r-1").unwrap().unwrap().status, Status::Failed);
+        assert!(local.in_flight("k").unwrap().is_none(), "nothing joins it");
+        // Only the runs named are marked alive.
+        let mut live = record.clone();
+        live.id = "r-2".into();
+        live.status = Status::Running;
+        live.cache_key = None;
+        live.updated_at = "2020-01-01T00:00:00Z".into();
+        local.insert(&live).unwrap();
+        local.touch(&[]).unwrap();
+        assert_eq!(local.fail_abandoned(std::time::Duration::from_secs(60), RESTARTED).unwrap(), 1, "left unnamed, it is ended");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
