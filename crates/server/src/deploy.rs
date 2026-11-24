@@ -189,7 +189,9 @@ pub(crate) async fn remove(
         }
         let _ = std::fs::remove_dir_all(app.dir(&org, &uid, &branch));
         tracing::info!("removed {org}/{uid}/{branch}");
-        Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
+        // Named as the log names it, with the org when it is not the default.
+        let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
+        Ok(Json(json!({ "removed": format!("{within}{uid}/{branch}") })))
     })
     .await
 }

@@ -14,6 +14,9 @@ const NAME_LIMIT: usize = 100;
 /// its projects are under.
 pub(crate) const DEFAULT_ORG: &str = zsql_exec::DEFAULT_ORG;
 
+/// The file in the data directory a running server holds.
+pub(crate) const LOCK_FILE: &str = "lock";
+
 /// Whether a name is a slug: lower-case letters, digits, `-` and `_`.
 pub(crate) fn is_slug(name: &str) -> bool {
     !name.is_empty()
@@ -26,6 +29,11 @@ pub(crate) fn is_slug(name: &str) -> bool {
 /// is. It never starts with a dot, which keeps the server's own
 /// directories there apart from an org's.
 pub(crate) fn check_org(org: &str) -> Result<(), ApiError> {
+    // The server's lock is a file of this name where an org's directory
+    // would be, so no org can have it.
+    if org == LOCK_FILE {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{org}' is not an org: the server keeps a file of that name")));
+    }
     if is_slug(org) {
         Ok(())
     } else {
@@ -105,7 +113,7 @@ mod tests {
         for org in ["default", "acme", "acme_eu-1"] {
             assert!(check_org(org).is_ok(), "{org}");
         }
-        for org in ["", "Acme", ".cache", "..", "a/b", "a.b", "a b", &"x".repeat(NAME_LIMIT + 1)] {
+        for org in ["", "Acme", "lock", ".cache", "..", "a/b", "a.b", "a b", &"x".repeat(NAME_LIMIT + 1)] {
             assert!(check_org(org).is_err(), "{org:?}");
         }
         for branch in ["main", "master", "probe-holder-loan", "release_1.2", "v1.2.3", "RC1"] {

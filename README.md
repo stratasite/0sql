@@ -168,7 +168,7 @@ has to be meant, with `--open`.
 
 **Deploy.** `zsql deploy` sends the checked-out branch as an archive.
 The server compiles it, runs its tests, and holds the compiled model in
-memory and on disk, one per project and branch. A restart reloads them.
+memory and on disk, one per org, project and branch. A restart reloads them.
 
 **Plan.** `POST .../sql` takes a spec or an expression and a security
 context and returns the statement, the datasource and the dialect.
@@ -201,6 +201,15 @@ the credential. `fresh: true` runs anyway, `cache_ttl: 0` on a
 datasource keeps nothing, and `POST /cache/invalidate` with a
 datasource and the tables that changed stops every result that read
 them from answering.
+
+**Orgs.** A project belongs to an org, and a server may keep the
+projects of several. Every route above is also served under
+`/orgs/{org}`; without the prefix the org is `default`. Nothing
+crosses: a listing, a stored result, an invalidation and a warehouse
+connection are one org's. An org is a directory of the data directory
+and nothing more, and `zsql` reads it from `org:` in `project.yml` or
+`--org`. The credentials the server holds are the default org's; a run
+in a named org connects with what its request sends.
 
 **More than one node.** With `ZSQL_DB` the records of runs live in a
 Postgres table every node shares, and with `ZSQL_OBJECT_STORE` the

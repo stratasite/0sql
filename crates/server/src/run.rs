@@ -373,7 +373,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 /// the address and the public URL, so `zsql server status` can say where.
 fn lock_data_dir(dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
     use std::io::{Read, Write};
-    let path = dir.join("lock");
+    let path = dir.join(crate::names::LOCK_FILE);
     let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
     #[cfg(unix)]
     {

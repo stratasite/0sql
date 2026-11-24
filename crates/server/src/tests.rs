@@ -1546,6 +1546,14 @@ async fn an_org_is_its_own_set_of_projects() {
     }
     let a = s.deploy_to("..%2F..", CS, "main", archive(CS, "evil")).await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+    // The server's lock is a file where an org of that name would be:
+    // refused as a name, not as a failure of the disk.
+    let a = s.deploy_to("lock", CS, "main", archive(CS, "lock")).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Invalid"), "{}", a.error());
+    // What was removed is named with its org, unless that is the default.
+    assert_eq!(s.deploy_to("passing", CS, "main", archive(CS, "passing")).await.status, StatusCode::OK);
+    let a = s.send(Method::DELETE, &format!("/orgs/passing/projects/{CS}/branches/main"), &[], None).await;
+    assert_eq!(a.body["removed"], format!("passing/{CS}/main"), "{}", a.body);
 
     // A route under an org takes the body its twin takes: an archive
     // may be larger than any JSON request, and is refused for what it
