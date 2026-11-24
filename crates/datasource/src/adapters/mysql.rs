@@ -9,7 +9,8 @@
 //! the bundle the crate carries plus `ca_file`, not the platform's
 //! store, because the crate takes certificate files and not a store.
 
-use crate::{read_only, Connection, Error, Result, Rows, Secret, Source, SslMode};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{read_only, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 use mysql_async::prelude::Queryable;
 
 pub struct MySql {
@@ -79,8 +80,9 @@ impl MySql {
     }
 }
 
-impl Source for MySql {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+impl MySql {
+    /// The statement's rows to `out` as the server sends them.
+    fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         read_only(sql)?;
         let uid = self.uid.clone();
         let fail = |e: mysql_async::Error| Error::Query(uid.clone(), crate::chain(&e));
@@ -94,18 +96,33 @@ impl Source for MySql {
                 .columns()
                 .map(|c| c.iter().map(|c| c.column_type() == mysql_async::consts::ColumnType::MYSQL_TYPE_DATE).collect())
                 .unwrap_or_default();
-            let rows: Vec<mysql_async::Row> = result.collect().await.map_err(fail)?;
-            if rows.len() > max_rows {
-                return Err(Error::TooManyRows(uid.clone(), max_rows));
+            let mut taken = out.columns(&columns);
+            while taken.is_ok() {
+                let Some(row) = result.next().await.map_err(fail)? else { break };
+                taken =
+                    out.row(row.unwrap().into_iter().enumerate().map(|(i, v)| cell(v, dates.get(i).copied().unwrap_or(false))).collect());
             }
-            Ok(Rows {
-                columns,
-                rows: rows
-                    .into_iter()
-                    .map(|r| r.unwrap().into_iter().enumerate().map(|(i, v)| cell(v, dates.get(i).copied().unwrap_or(false))).collect())
-                    .collect(),
-            })
+            if taken.is_err() {
+                // Stopped early: the rows still on the wire are read past
+                // here, so the connection is good for the next statement.
+                let _ = result.drop_result().await;
+            }
+            taken
         })
+    }
+}
+
+impl Source for MySql {
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        let mut kept = Capped::new(&self.uid, max_rows);
+        self.read(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let mut batcher = Batcher::new(sink);
+        self.read(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

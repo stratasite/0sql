@@ -12,7 +12,8 @@
 //! later with it. tiberius's rustls brings aws-lc in beside ring, which
 //! costs 2.7 MB of binary and is why `ring` is installed as the process
 //! default once, in `tls`.
-use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Source, SslMode};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type Client = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -130,41 +131,81 @@ enum Trust {
     Roots,
 }
 
-impl Source for SqlServer {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+/// Why a read ended before its statement did.
+enum Stopped {
+    TimedOut,
+    /// Whoever takes the rows had enough: a cap, or anything else.
+    Refused(Error),
+    Failed(String),
+}
+
+impl SqlServer {
+    /// The first result set's rows to `out` as the server sends them,
+    /// the whole read under the timeout.
+    fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
+        use futures_util::TryStreamExt;
         read_only(sql)?;
         let uid = self.uid.clone();
         let timeout = self.timeout;
         if self.client.is_none() {
+            // The new connection's sockets belong to the runtime it was
+            // opened on, so that runtime is kept with it: a client moved
+            // here without it would find its runtime shut down.
             let fresh = SqlServer::open(&self.conn, self.secret.clone(), self.token.clone())?;
             self.client = fresh.client;
+            self.runtime = fresh.runtime;
         }
         let client = self.client.as_mut().expect("reopened");
-        let timed_out = format!("no answer within {}s", timeout.as_secs());
-        let sets = self.runtime.block_on(async {
-            tokio::time::timeout(timeout, async {
-                let stream = client.simple_query(sql).await.map_err(|e| e.to_string())?;
-                stream.into_results().await.map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|_| timed_out.clone())?
-        });
-        let sets = match sets {
-            Ok(s) => s,
-            Err(e) => {
-                if e == timed_out {
-                    self.client = None;
+        let outcome = self.runtime.block_on(async {
+            let read = async {
+                let failed = |e: tiberius::error::Error| Stopped::Failed(e.to_string());
+                let mut stream = client.simple_query(sql).await.map_err(failed)?;
+                while let Some(item) = stream.try_next().await.map_err(failed)? {
+                    match item {
+                        tiberius::QueryItem::Metadata(meta) if meta.result_index() == 0 => {
+                            out.columns(&meta.columns().iter().map(|c| c.name().to_string()).collect::<Vec<_>>())
+                                .map_err(Stopped::Refused)?;
+                        }
+                        tiberius::QueryItem::Row(row) if row.result_index() == 0 => {
+                            out.row(row.cells().map(|(_, d)| cell(d)).collect()).map_err(Stopped::Refused)?;
+                        }
+                        // A later result set is read past, not kept.
+                        _ => {}
+                    }
                 }
-                return Err(Error::Query(uid, e));
+                Ok(())
+            };
+            tokio::time::timeout(timeout, read).await.unwrap_or(Err(Stopped::TimedOut))
+        });
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(Stopped::Failed(why)) => Err(Error::Query(uid, why)),
+            // Rows the read did not take are still on the stream, and
+            // nothing sends an attention when it is dropped: the
+            // connection is given up and the next statement opens one.
+            Err(Stopped::TimedOut) => {
+                self.client = None;
+                Err(Error::Query(uid, format!("no answer within {}s", timeout.as_secs())))
             }
-        };
-        let rows_in = sets.into_iter().next().unwrap_or_default();
-        if rows_in.len() > max_rows {
-            return Err(Error::TooManyRows(uid, max_rows));
+            Err(Stopped::Refused(e)) => {
+                self.client = None;
+                Err(e)
+            }
         }
-        let columns: Vec<String> = rows_in.first().map(|r| r.columns().iter().map(|c| c.name().to_string()).collect()).unwrap_or_default();
-        let rows = rows_in.into_iter().map(|r| r.cells().map(|(_, d)| cell(d)).collect()).collect();
-        Ok(Rows { columns, rows })
+    }
+}
+
+impl Source for SqlServer {
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        let mut kept = Capped::new(&self.uid, max_rows);
+        self.read(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let mut batcher = Batcher::new(sink);
+        self.read(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

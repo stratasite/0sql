@@ -261,6 +261,19 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
 
     let err = src.query("SELECT * FROM generate_series(1, 100)", 10).unwrap_err().to_string();
     assert!(err.contains("more than the 10 rows"), "the cap refuses rather than truncates: {err}");
+    // Read as it arrives: the same rows as the capped read, in more
+    // than one batch, the columns even when nothing is under them, and a
+    // read that was stopped early leaves a connection that still answers.
+    crate::rows::batch_rows_for_tests(2);
+    assert!(streams_as_it_queries(&mut src, "SELECT n, n::text AS t FROM generate_series(1, 7) AS n ORDER BY n").batches.len() > 1);
+    assert_eq!(streams_as_it_queries(&mut src, "SELECT n FROM generate_series(1, 7) AS n WHERE n > 99").num_rows(), 0);
+    let mut full = Kept { stop_after: Some(1), ..Default::default() };
+    assert!(src
+        .stream("SELECT n, n::text AS t FROM generate_series(1, 7) AS n ORDER BY n", &mut full)
+        .unwrap_err()
+        .to_string()
+        .contains("enough"));
+    assert_eq!(src.query("SELECT 1 AS one", 10).unwrap().rows.len(), 1, "after a read stopped early");
 }
 
 /// SQLite needs no server, so this is the one transport the ordinary test
@@ -484,6 +497,24 @@ fn a_real_mysql_answers_and_its_catalog_reads() {
     assert!(src.query("CREATE TABLE zsql_no (a INT)", 1).is_err());
     let err = src.query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
+    // Read as it arrives: the same rows as the capped read, in more
+    // than one batch, the columns even when nothing is under them, and a
+    // read that was stopped early leaves a connection that still answers.
+    crate::rows::batch_rows_for_tests(2);
+    assert!(
+        streams_as_it_queries(src.as_mut(), "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5")
+            .batches
+            .len()
+            > 1
+    );
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT 1 AS n FROM DUAL WHERE 1 = 0").num_rows(), 0);
+    let mut full = Kept { stop_after: Some(1), ..Default::default() };
+    assert!(src
+        .stream("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5", &mut full)
+        .unwrap_err()
+        .to_string()
+        .contains("enough"));
+    assert_eq!(src.query("SELECT 1 AS one", 10).unwrap().rows.len(), 1, "after a read stopped early");
     // The container makes itself a self-signed certificate, which is
     // exactly what `require` accepts and `verify-full` refuses.
     let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
@@ -546,6 +577,19 @@ fn a_real_sqlserver_answers_and_its_catalog_reads() {
     // TOP, since this is the dialect with no LIMIT, and the cap still refuses.
     let err = src.query("SELECT TOP (5) object_id FROM sys.objects", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "{err}");
+    // Read as it arrives: the same rows as the capped read, in more
+    // than one batch, the columns even when nothing is under them, and a
+    // read that was stopped early leaves a connection that still answers.
+    crate::rows::batch_rows_for_tests(2);
+    assert!(streams_as_it_queries(src.as_mut(), "SELECT TOP (5) object_id FROM sys.objects ORDER BY object_id").batches.len() > 1);
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT TOP (5) object_id FROM sys.objects WHERE 1 = 0").num_rows(), 0);
+    let mut full = Kept { stop_after: Some(1), ..Default::default() };
+    assert!(src
+        .stream("SELECT TOP (5) object_id FROM sys.objects ORDER BY object_id", &mut full)
+        .unwrap_err()
+        .to_string()
+        .contains("enough"));
+    assert_eq!(src.query("SELECT 1 AS one", 10).unwrap().rows.len(), 1, "after a read stopped early");
     // SQL Server also makes itself a self-signed certificate.
     let tls = |mode: SslMode| Connection { sslmode: mode, ..conn.clone() };
     let pw = || Some(Secret(std::env::var("ZSQL_TEST_MSSQL_PASSWORD").unwrap()));

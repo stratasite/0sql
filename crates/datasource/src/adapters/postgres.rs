@@ -7,7 +7,8 @@
 //! being async. The crate stays free to grow an async twin if the server
 //! ever needs one.
 
-use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Source, SslMode};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 
 pub struct Postgres {
     runtime: tokio::runtime::Runtime,
@@ -100,8 +101,11 @@ impl Postgres {
     }
 }
 
-impl Source for Postgres {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+impl Postgres {
+    /// The statement's rows to `out` as the server sends them, the whole
+    /// read under the timeout.
+    fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
+        use futures_util::TryStreamExt;
         read_only(sql)?;
         // The simple-query protocol: every value arrives as the server's
         // own text, whatever its type, which is what a catalog and a
@@ -110,32 +114,51 @@ impl Source for Postgres {
         // which is how every non-text cell was null until a test asked
         // pg_stat_ssl a yes-or-no question.
         let uid = self.uid.clone();
-        let messages = self
-            .runtime
-            .block_on(async { tokio::time::timeout(self.timeout, self.client.simple_query(sql)).await })
-            .map_err(|_| Error::Query(uid.clone(), format!("no answer within {}s", self.timeout.as_secs())))?
-            .map_err(|e| Error::Query(uid.clone(), crate::chain(&e)))?;
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-        for m in messages {
-            match m {
-                tokio_postgres::SimpleQueryMessage::RowDescription(cols) => {
-                    columns = cols.iter().map(|c| c.name().to_string()).collect();
-                }
-                tokio_postgres::SimpleQueryMessage::Row(row) => {
-                    if rows.len() == max_rows {
-                        // Past the cap: refuse rather than trim.
-                        return Err(Error::TooManyRows(uid, max_rows));
+        let fail = |e: tokio_postgres::Error| Error::Query(uid.clone(), crate::chain(&e));
+        let (client, timeout) = (&self.client, self.timeout);
+        self.runtime.block_on(async {
+            let read = async {
+                let mut messages = std::pin::pin!(client.simple_query_raw(sql).await.map_err(fail)?);
+                let mut named = false;
+                // A read that stops early drops the stream; the
+                // connection reads past what is left of the answer and
+                // is good for the next statement.
+                while let Some(m) = messages.try_next().await.map_err(fail)? {
+                    match m {
+                        tokio_postgres::SimpleQueryMessage::RowDescription(cols) => {
+                            out.columns(&cols.iter().map(|c| c.name().to_string()).collect::<Vec<_>>())?;
+                            named = true;
+                        }
+                        tokio_postgres::SimpleQueryMessage::Row(row) => {
+                            if !named {
+                                out.columns(&row.columns().iter().map(|c| c.name().to_string()).collect::<Vec<_>>())?;
+                                named = true;
+                            }
+                            out.row((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect())?;
+                        }
+                        _ => {}
                     }
-                    if columns.is_empty() {
-                        columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-                    }
-                    rows.push((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect());
                 }
-                _ => {}
-            }
-        }
-        Ok(Rows { columns, rows })
+                Ok(())
+            };
+            tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| Error::Query(uid.clone(), format!("no answer within {}s", timeout.as_secs())))?
+        })
+    }
+}
+
+impl Source for Postgres {
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        let mut kept = Capped::new(&self.uid, max_rows);
+        self.read(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let mut batcher = Batcher::new(sink);
+        self.read(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {
