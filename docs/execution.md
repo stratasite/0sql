@@ -243,9 +243,17 @@ exposed on the old understanding.
 
 ## To verify before or while building
 
-- **Streaming, adapter by adapter.** Every adapter collects a whole
-  result today. Which can hand over batches as they arrive without a
-  rewrite has not been looked at.
+- **Large Databricks results.** Streaming was done for every adapter
+  (below), and Databricks is the one whose transport cannot carry a
+  large result: its inline answer has a size limit, past which it
+  truncates and the read fails saying so. External links are what a
+  large result needs there.
+- **The timeout while rows are still arriving.** Postgres, SQL Server,
+  DuckDB, SQLite and the drivers put the whole read under
+  `query_timeout`, the fetch included. The paged REST adapters put the
+  statement under it and each page under the HTTP call's own limit, so
+  a long result can take longer than `query_timeout` to arrive. MySQL
+  has only the server's limit. One rule for all of them is not chosen.
 - **Go inside a long-lived server**: `docs/exec-layer.md` has the note.
 - **The `object_store` crate's option names**, against its
   documentation, and reading an Arrow file from a store without
@@ -264,9 +272,16 @@ exposed on the old understanding.
 
 ## Order of work
 
-1. **Streaming reads.** `Source` hands over batches as they arrive;
-   the store writes them as they come. The investigation above comes
-   first.
+1. **Streaming reads. Done, 2026-11-24.** `Source::stream` hands a
+   result to a `Sink` a batch at a time, and every adapter fetches
+   incrementally: DuckDB and the drivers give Arrow batches, SQLite
+   steps, Postgres, MySQL and SQL Server follow the wire, the paged REST
+   adapters hand over each page, and ClickHouse is read a line a row.
+   `Store::begin` gives a `Writing`, a sink that puts each batch on disk
+   as it comes and is a result only once committed. Nothing calls it
+   from a server yet, and `zsql run` reads as it did. Run against real
+   Postgres, MySQL, SQL Server, ClickHouse and Trino; the fakes for the
+   rest; the driver tests by hand.
 2. **A run, on one node.** The record and the `Registry` trait with
    its local implementation; `run`, `GET` and `DELETE /results/{id}`;
    seats and the queue; `query_timeout`, `query_wait_time`, attach;
