@@ -125,6 +125,20 @@ impl Databricks {
         http::call(&self.conn, &self.agent, method, url, &headers, body.as_deref().map(str::as_bytes))
     }
 
+    /// The rows behind one external link. The link carries its own
+    /// credentials, so it is fetched with none of ours: the workspace's
+    /// token is not for wherever the link points.
+    fn linked(&self, link: &str) -> Result<Vec<Vec<serde_json::Value>>> {
+        // A link without a host is this workspace's.
+        let url = if link.starts_with('/') { format!("{}{link}", self.base) } else { link.to_string() };
+        let (status, text) = http::call(&self.conn, &self.agent, http::Method::Get, &url, &[("User-Agent", USER_AGENT)], None)?;
+        if status != 200 {
+            let why: String = text.trim().chars().take(200).collect();
+            return Err(Error::Query(self.conn.uid.clone(), format!("fetching a chunk of the result: {status}: {why}")));
+        }
+        serde_json::from_str(&text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected chunk of the result: {e}")))
+    }
+
     fn refused(&self, status: u16, text: &str) -> Error {
         Error::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
@@ -145,7 +159,11 @@ impl Databricks {
             "wait_timeout": wait,
             "on_wait_timeout": "CONTINUE",
             "format": "JSON_ARRAY",
-            "disposition": "INLINE",
+            // A capped read is small and comes inline. A streamed one
+            // may be any size, which inline cannot carry: Databricks
+            // aborts a statement whose inline result passes 25 MiB. So
+            // it is asked for as links to the result's chunks.
+            "disposition": if out.limit().is_some() { "INLINE" } else { "EXTERNAL_LINKS" },
         });
         // A capped read asks for one row past its cap, enough to know
         // there were more; a streamed one asks for everything.
@@ -210,11 +228,11 @@ impl Databricks {
             return Err(match out.limit() {
                 // Cut at the one row past the cap that was asked for.
                 Some(max_rows) => Error::TooManyRows(self.conn.uid.clone(), max_rows),
-                // Nothing was asked to be cut, so Databricks cut it: an
-                // inline result has a size it does not go past.
+                // Nothing was asked to be cut, so Databricks cut it, at
+                // the most it returns for one statement.
                 None => Error::Query(
                     self.conn.uid.clone(),
-                    "the result is larger than Databricks returns inline, and was truncated; add a LIMIT, or select fewer columns".into(),
+                    "the result is larger than Databricks returns for one statement (100 GiB), and was truncated; add a LIMIT, or select fewer columns".into(),
                 ),
             });
         }
@@ -230,7 +248,17 @@ impl Databricks {
             for row in r.data_array {
                 out.row(row.into_iter().map(http::cell).collect())?;
             }
-            let Some(next) = r.next_chunk_index else { break };
+            // A chunk given as links: each is fetched from where it
+            // points and is the chunk's rows.
+            let mut after = r.next_chunk_index;
+            for link in r.external_links {
+                arriving.check()?;
+                for row in self.linked(&link.external_link)? {
+                    out.row(row.into_iter().map(http::cell).collect())?;
+                }
+                after = link.next_chunk_index.or(after);
+            }
+            let Some(next) = after else { break };
             arriving.check()?;
             let url = format!("{}{STATEMENTS}/{}/result/chunks/{next}", self.base, answer.statement_id);
             let (status, text) = self.request(http::Method::Get, &url, None)?;
@@ -290,6 +318,15 @@ struct SchemaColumn {
 struct Chunk {
     #[serde(default)]
     data_array: Vec<Vec<serde_json::Value>>,
+    /// The chunk as links to it, when the result was asked for that way.
+    #[serde(default)]
+    external_links: Vec<Link>,
+    next_chunk_index: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct Link {
+    external_link: String,
     next_chunk_index: Option<i64>,
 }
 

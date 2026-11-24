@@ -1427,6 +1427,26 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
         ("POST", "/api/2.0/sql/statements") if body.contains("broken") => {
             (200, serde_json::json!({"statement_id": "s2", "status": {"state": "FAILED", "error": {"error_code": "BAD_REQUEST", "message": "TABLE_OR_VIEW_NOT_FOUND: nope"}}}).to_string())
         }
+        // Streamed, a result is asked for as links to its chunks: the
+        // first in the answer, the second behind the chunk it names.
+        ("POST", "/api/2.0/sql/statements") if body.contains("EXTERNAL_LINKS") && body.contains("cut") => {
+            (200, dbx_result("s4", "SUCCEEDED", &["x"], serde_json::json!([]), 2, None, true))
+        }
+        ("POST", "/api/2.0/sql/statements") if body.contains("EXTERNAL_LINKS") => (
+            200,
+            serde_json::json!({
+                "statement_id": "s7",
+                "status": { "state": "SUCCEEDED" },
+                "manifest": { "schema": { "columns": [{"name": "status", "position": 0}, {"name": "n", "position": 1}] }, "total_row_count": 3 },
+                "result": { "external_links": [{ "chunk_index": 0, "external_link": "/files/s7-0", "next_chunk_index": 1 }] },
+            })
+            .to_string(),
+        ),
+        ("GET", "/files/s7-0") => (200, serde_json::json!([["paid", "3"], [null, "1"]]).to_string()),
+        ("GET", "/api/2.0/sql/statements/s7/result/chunks/1") => {
+            (200, serde_json::json!({ "external_links": [{ "chunk_index": 1, "external_link": "/files/s7-1" }] }).to_string())
+        }
+        ("GET", "/files/s7-1") => (200, serde_json::json!([["open", "1"]]).to_string()),
         ("POST", "/api/2.0/sql/statements") if body.contains("wide") => {
             (200, dbx_result("s3", "SUCCEEDED", &["x"], serde_json::json!([["1"], ["2"], ["3"]]), 3, None, true))
         }
@@ -1509,7 +1529,16 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
     // Streamed there is no cap to have cut it, so a truncated answer is
     // Databricks' own limit on an inline result, and is said to be.
     let err = src.stream("SELECT x FROM cut", &mut Kept::default()).unwrap_err().to_string();
-    assert!(err.contains("larger than Databricks returns inline"), "{err}");
+    assert!(err.contains("larger than Databricks returns for one statement"), "{err}");
+    // The links are fetched with no credential of ours: each carries
+    // its own, and the workspace's token is not for where it points.
+    {
+        let seen = server.seen.lock().unwrap();
+        let files: Vec<&(String, String, String, String)> = seen.iter().filter(|r| r.1.starts_with("/files/")).collect();
+        assert_eq!(files.len(), 2, "both chunks were fetched");
+        assert!(files.iter().all(|r| !r.2.to_lowercase().contains("authorization")), "{files:?}");
+        assert!(seen.iter().any(|r| r.1.ends_with("/result/chunks/1") && r.2.to_lowercase().contains("authorization: bearer")));
+    }
     let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
     assert!(err.contains("failed") && err.contains("TABLE_OR_VIEW_NOT_FOUND"), "{err}");
     assert!(src.query("DELETE FROM orders", 1).is_err());

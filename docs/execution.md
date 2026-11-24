@@ -247,11 +247,6 @@ exposed on the old understanding.
 
 ## To verify before or while building
 
-- **Large Databricks results.** Streaming was done for every adapter,
-  and Databricks is the one whose transport cannot carry a large
-  result: its inline answer has a size limit, past which it truncates
-  and the read fails saying so. External links are what a large result
-  needs there, and are their own phase below.
 - **Go inside a long-lived server**: `docs/exec-layer.md` has the note.
 - **The `object_store` crate's option names**, against its
   documentation, and reading an Arrow file from a store without
@@ -359,8 +354,12 @@ exposed on the old understanding.
    driver libraries loaded and an account, which this work could not
    do. What was asked for: The MCP tool, `docs/operating.md`, and the
    Go drivers under load.
-8. **Large results from Databricks.** Its external-links mode, so a
-   result past the inline limit is fetched rather than refused.
+8. **Large results from Databricks. Done, 2026-11-24.** A streamed
+   read asks for the result as external links and fetches each chunk
+   from where its link points, with no credential of ours, since the
+   link carries its own. A capped read is still inline. Run against a
+   stand-in for the API, written from Databricks' reference; not
+   against a workspace.
 9. **The command line, last.** Everything of the command line's waits
    for this phase: `zsql run -r`, aligning `ZSQL_RUN_CAP` with
    `ZSQL_DEFAULT_SQL_LIMIT`, and the deferred list in
