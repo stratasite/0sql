@@ -9,7 +9,7 @@
 //! matches exactly. Getting that wrong would be a wall of false positives
 //! on the first run, which is how a checker gets turned off.
 
-use crate::generate::{map_type, Mapped};
+use crate::commands::generate::{map_type, Mapped};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use zsql_core::Model;
@@ -26,7 +26,7 @@ pub fn findings(model: &Model) -> Value {
     let mut out: Vec<Value> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
     for ds in &s.datasources {
-        let path = crate::catalog::path(dir, &ds.uid);
+        let path = crate::commands::catalog::path(dir, &ds.uid);
         let Ok(text) = std::fs::read_to_string(&path) else {
             unchecked.push(ds.uid.clone());
             continue;
@@ -103,12 +103,12 @@ pub fn findings(model: &Model) -> Value {
                 continue;
             }
             let complete = !s.expressions.iter().any(|e| e.field_id == *id && unseen.contains(&(e.table_id)));
-            let widest = crate::generate::widest(mapped.iter().copied());
+            let widest = crate::commands::generate::widest(mapped.iter().copied());
             match widest {
                 Some(w) if w == declared => {}
                 // Wider than every column seen, and a table was not seen:
                 // the declaration may be right for that one.
-                Some(w) if !complete && crate::generate::widen(&declared, w) == Some(name_static(&declared)) => {}
+                Some(w) if !complete && crate::commands::generate::widen(&declared, w) == Some(name_static(&declared)) => {}
                 _ => type_mismatches.push(json!({
                     "field": f.name, "declared": declared, "should_be": widest, "columns": columns, "complete": complete,
                 })),

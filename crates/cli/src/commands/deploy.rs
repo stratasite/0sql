@@ -1,8 +1,9 @@
 //! `zsql deploy`: the checked-out branch to a server, once or on every
 //! change.
 
+use crate::cli::{Target, Where};
 use crate::side::Side;
-use crate::{project, remote, show, Target, Where};
+use crate::{project, remote, show};
 use anyhow::{bail, Result};
 
 pub fn deploy(at: Where, dry_run: bool, watch: bool, skip_check: bool) -> Result<()> {

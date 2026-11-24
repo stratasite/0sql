@@ -211,7 +211,7 @@ pub fn run(project_dir: Option<&Path>, opts: Options<'_>) -> Result<()> {
         .datasources
         .iter()
         .filter_map(|ds| {
-            let text = std::fs::read_to_string(crate::catalog::path(&project.dir, &ds.uid)).ok()?;
+            let text = std::fs::read_to_string(crate::commands::catalog::path(&project.dir, &ds.uid)).ok()?;
             Some((ds.uid.clone(), serde_json::from_str(&text).ok()?))
         })
         .collect();

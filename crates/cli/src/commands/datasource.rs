@@ -254,7 +254,7 @@ fn tier_of(all: &serde_yaml::Value, uid: &str) -> Option<String> {
 }
 
 fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin: bool) -> Result<()> {
-    let conn = crate::catalog::choose(dir, datasource)?;
+    let conn = crate::commands::catalog::choose(dir, datasource)?;
     let usual = shape(&conn.adapter).1.or(if conn.adapter == "athena" { Some("secret_access_key") } else { None });
     let field = match (field, usual) {
         (Some(f), _) => f.to_string(),
@@ -290,7 +290,7 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
 }
 
 fn test(dir: &Path, datasource: Option<&str>) -> Result<()> {
-    let conn = crate::catalog::choose(dir, datasource)?;
+    let conn = crate::commands::catalog::choose(dir, datasource)?;
     let secrets = zsql_datasource::secrets(Some(dir), &conn.uid);
     let t0 = std::time::Instant::now();
     let mut src = zsql_datasource::open(&conn, secrets).with_context(|| format!("opening datasource {}", conn.uid))?;

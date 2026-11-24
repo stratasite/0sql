@@ -3,10 +3,11 @@
 //! model. Every read a command or the repl makes goes through here, so
 //! the two cannot drift apart.
 
+use crate::cli::Target;
 use crate::failure::Refusal;
 use crate::local::{self, Local};
 use crate::project::{stamps, stamps_under, Stamp};
-use crate::{remote, Target};
+use crate::remote;
 use anyhow::Result;
 use serde_json::Value;
 use std::time::Instant;
@@ -272,11 +273,17 @@ impl Side for Session {
     }
 
     fn run(&mut self, query: &Query, context: Option<&Value>, fresh: bool) -> Result<()> {
-        crate::run::run(&self.local.project, &self.model, query, context, crate::run::Options { fresh, ..Default::default() })
+        crate::commands::run::run(
+            &self.local.project,
+            &self.model,
+            query,
+            context,
+            crate::commands::run::Options { fresh, ..Default::default() },
+        )
     }
 
     fn results(&mut self) -> Result<()> {
-        crate::run::results(&self.local.project, crate::run::ResultsCommand::List { json: false })
+        crate::commands::run::results(&self.local.project, crate::commands::run::ResultsCommand::List { json: false })
     }
 
     fn check(&mut self) -> Result<Value> {

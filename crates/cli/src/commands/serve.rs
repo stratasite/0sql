@@ -12,7 +12,8 @@
 //! with flags overriding what they name; this is the one place in the
 //! product a `ZSQL_*` variable is read.
 
-use crate::{config, project, remote, show, Where};
+use crate::cli::Where;
+use crate::{config, project, remote, show};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::ffi::OsString;
