@@ -7,6 +7,46 @@ use super::*;
 use crate::catalog::{self, Column, ForeignKey, Table};
 use std::path::{Path, PathBuf};
 
+/// A sink that keeps what it is handed, and can be told to have had
+/// enough after so many batches.
+#[derive(Default)]
+struct Kept {
+    schema: Option<arrow_schema::SchemaRef>,
+    batches: Vec<arrow_array::RecordBatch>,
+    stop_after: Option<usize>,
+}
+
+impl Sink for Kept {
+    fn schema(&mut self, schema: &arrow_schema::SchemaRef) -> Result<()> {
+        assert!(self.schema.is_none() && self.batches.is_empty(), "the schema comes once, and first");
+        self.schema = Some(schema.clone());
+        Ok(())
+    }
+
+    fn batch(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
+        assert_eq!(Some(&batch.schema()), self.schema.as_ref(), "every batch is of the schema that was announced");
+        assert!(batch.num_rows() > 0, "an empty batch is not sent");
+        if self.stop_after == Some(self.batches.len()) {
+            return Err(Error::Query("sink".into(), "enough".into()));
+        }
+        self.batches.push(batch);
+        Ok(())
+    }
+}
+
+/// A streamed read says exactly what the capped read says, however it
+/// is cut into batches. Returns what was streamed.
+fn streams_as_it_queries(src: &mut dyn Source, sql: &str) -> Batches {
+    let asked = src.query(sql, 1_000_000).expect("the capped read");
+    let mut kept = Kept::default();
+    src.stream(sql, &mut kept).expect("the streamed read");
+    let streamed = Batches { schema: kept.schema.expect("a schema, rows or none"), batches: kept.batches };
+    let text = streamed.to_text().unwrap();
+    assert_eq!(text.columns, asked.columns, "{sql}");
+    assert_eq!(text.rows, asked.rows, "{sql}");
+    streamed
+}
+
 fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zsql-datasource-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -242,6 +282,20 @@ fn sqlite_reads_its_file_and_cannot_write_it() {
     let rows = src.query("SELECT id, name, note FROM t ORDER BY id", 10).unwrap();
     assert_eq!(rows.columns, ["id", "name", "note"]);
     assert_eq!(rows.rows.len(), 3);
+
+    // The same read streamed: the same rows, a batch at a time, the
+    // columns announced even when there is nothing under them, and a
+    // sink that has had enough ends the read with its own error.
+    crate::rows::batch_rows_for_tests(2);
+    let streamed = streams_as_it_queries(src.as_mut(), "SELECT id, name, note FROM t ORDER BY id");
+    assert_eq!(streamed.batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [2, 1], "three rows, two to a batch");
+    let none = streams_as_it_queries(src.as_mut(), "SELECT id, name FROM t WHERE id > 99");
+    assert_eq!((none.columns(), none.num_rows()), (vec!["id".to_string(), "name".to_string()], 0));
+    let mut full = Kept { stop_after: Some(1), ..Default::default() };
+    let err = src.stream("SELECT id FROM t ORDER BY id", &mut full).unwrap_err();
+    assert!(err.to_string().contains("enough"), "{err}");
+    assert_eq!(full.batches.len(), 1, "what arrived before it stopped is what it has");
+    assert_eq!(src.query("SELECT count(*) FROM t", 10).unwrap().rows[0][0].as_deref(), Some("3"), "and the connection is still good");
     assert_eq!(rows.get(&rows.rows[0], "name"), Some("a"));
     assert_eq!(rows.get(&rows.rows[0], "note"), None, "null is none, not the word null");
     assert_eq!(rows.get(&rows.rows[1], "id"), Some("2"), "numbers come back as text");
@@ -2056,6 +2110,11 @@ fn duckdb_reads_its_file_renders_every_type_as_text_and_cannot_write_it() {
     let conn = Connection { uid: "local".into(), adapter: "duckdb".into(), file: Some(path.clone()), ..Default::default() };
     let mut src = open(&conn, Secrets::default()).expect("opens read-only");
     assert_eq!(src.adapter(), "duckdb");
+    // Streamed, the engine's own batches with their types, and the same
+    // text as the capped read.
+    let streamed = streams_as_it_queries(src.as_mut(), "SELECT id, placed, total, paid, tags, seen FROM orders ORDER BY id");
+    assert_eq!(streamed.schema.field(2).data_type(), &arrow_schema::DataType::Decimal128(12, 2));
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT id FROM orders WHERE id > 99").num_rows(), 0);
     let rows = src.query("SELECT id, placed, total, paid, tags, seen FROM orders ORDER BY id", 10).expect("reads");
     assert_eq!(rows.columns, ["id", "placed", "total", "paid", "tags", "seen"]);
     assert_eq!(rows.rows.len(), 3);

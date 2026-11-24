@@ -39,7 +39,7 @@ pub use connection::{Connection, SslMode, CONNECTION_KEYS};
 pub use error::{chain, Error, Result};
 pub use rows::Rows;
 pub use secret::{secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};
-pub use source::{read_only, Source};
+pub use source::{read_only, Sink, Source};
 
 /// Whether this adapter can be opened with [`Secrets::oauth_token`]: an
 /// access token obtained elsewhere and sent as the credential. The ones

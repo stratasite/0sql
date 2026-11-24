@@ -2,7 +2,8 @@
 //! file's: the database is opened with the read-only flag, so a write is
 //! refused by SQLite itself before the guard in [`read_only`] is reached.
 
-use crate::{read_only, Connection, Error, Result, Rows, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{read_only, Connection, Error, Result, Rows, Sink, Source};
 
 pub struct Sqlite {
     db: rusqlite::Connection,
@@ -21,8 +22,10 @@ impl Sqlite {
     }
 }
 
-impl Source for Sqlite {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+impl Sqlite {
+    /// The statement stepped to its end, each row to `out`, under the
+    /// timeout.
+    fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         read_only(sql)?;
         let fail = |e: rusqlite::Error| Error::Query(self.uid.clone(), e.to_string());
         // SQLite has no statement timeout; a progress handler fires every so
@@ -37,12 +40,9 @@ impl Source for Sqlite {
             let mut stmt = self.db.prepare(sql).map_err(fail)?;
             let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
             let width = columns.len();
-            let mut out = Vec::new();
+            out.columns(&columns)?;
             let mut rows = stmt.query([]).map_err(fail)?;
             while let Some(row) = rows.next().map_err(fail)? {
-                if out.len() == max_rows {
-                    return Err(Error::TooManyRows(self.uid.clone(), max_rows));
-                }
                 let mut cells = Vec::with_capacity(width);
                 for i in 0..width {
                     cells.push(match row.get_ref(i).map_err(fail)? {
@@ -53,16 +53,30 @@ impl Source for Sqlite {
                         rusqlite::types::ValueRef::Blob(b) => Some(format!("<{} bytes>", b.len())),
                     });
                 }
-                out.push(cells);
+                out.row(cells)?;
             }
-            Ok(Rows { columns, rows: out })
+            Ok(())
         })();
         // Cleared whatever the query did. A handler left behind would
         // call off the next statement against this one's spent deadline,
         // so failing to clear it is reported when the query itself was
         // fine, and the query's own error wins when it was not.
         let cleared = self.db.progress_handler(0, None::<fn() -> bool>).map_err(fail);
-        result.and_then(|rows| cleared.map(|()| rows))
+        result.and(cleared)
+    }
+}
+
+impl Source for Sqlite {
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        let mut kept = Capped::new(&self.uid, max_rows);
+        self.read(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let mut batcher = Batcher::new(sink);
+        self.read(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

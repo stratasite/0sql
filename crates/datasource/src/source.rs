@@ -1,4 +1,23 @@
 use crate::{Batches, Connection, Error, Result, Rows};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+
+/// Where a result goes as it arrives: a file being written, a response
+/// being sent. A read hands over one batch at a time and holds no more
+/// than that, so what bounds a result is where it is going and not the
+/// memory of whoever fetched it.
+pub trait Sink {
+    /// Once, before any batch, and for a result with no rows too: the
+    /// columns and their types.
+    fn schema(&mut self, schema: &SchemaRef) -> Result<()>;
+
+    /// Each batch, in order. An error ends the read: the transport stops
+    /// fetching and the error is the read's.
+    fn batch(&mut self, batch: RecordBatch) -> Result<()>;
+}
+
+/// The row cap a read is given when it is to have none.
+const UNBOUNDED: usize = usize::MAX - 1;
 
 /// One read-only statement in, rows out. Implemented once per transport,
 /// which is three implementations for thirteen adapters.
@@ -13,6 +32,21 @@ pub trait Source {
     /// with `Utf8` columns, which is what this default does.
     fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
         Ok(Batches::from_text(&self.query(sql, max_rows)?))
+    }
+
+    /// The same read handed over as it arrives, a batch at a time, with
+    /// no row cap of its own: a statement that should return fewer rows
+    /// says so in its SQL, and a sink that has had enough answers with an
+    /// error. Every adapter here fetches incrementally; this default,
+    /// which reads the whole result first, is for an implementation that
+    /// has nothing better.
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let all = self.batches(sql, UNBOUNDED)?;
+        sink.schema(&all.schema)?;
+        for batch in all.batches {
+            sink.batch(batch)?;
+        }
+        Ok(())
     }
 
     /// The adapter's name, for an error that says where it happened.

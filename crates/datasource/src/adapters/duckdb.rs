@@ -9,7 +9,7 @@
 //! `READ_ONLY` mode, so a write fails inside the engine. A statement
 //! past the timeout is interrupted through the engine's own handle.
 
-use crate::{read_only, Batches, Connection, Error, Result, Rows, Source};
+use crate::{read_only, Batches, Connection, Error, Result, Rows, Sink, Source};
 use std::path::PathBuf;
 
 // Why this crate names a symbol it never calls.
@@ -73,6 +73,18 @@ impl DuckDb {
     /// The statement's batches as the engine made them, under the row
     /// cap and the timeout.
     fn run(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
+        let uid = self.uid.clone();
+        self.execute(sql, |schema, batches| crate::batch::collect(&uid, schema, batches.map(Ok::<_, duckdb::Error>), max_rows))
+    }
+
+    /// The statement executed and its batches given to `each` as the
+    /// engine produces them, all under the timeout: the watcher stays
+    /// until the last batch has been taken.
+    fn execute<T>(
+        &mut self,
+        sql: &str,
+        each: impl FnOnce(arrow_schema::SchemaRef, &mut dyn Iterator<Item = arrow_array::RecordBatch>) -> Result<T>,
+    ) -> Result<T> {
         read_only(sql)?;
         let uid = self.uid.clone();
         let fail = |e: duckdb::Error| Error::Query(uid.clone(), e.to_string());
@@ -88,11 +100,11 @@ impl DuckDb {
         });
         let outcome = (|| {
             let mut stmt = self.conn.prepare(sql).map_err(fail)?;
-            let batches = stmt.query_arrow([]).map_err(fail)?;
+            let mut batches = stmt.query_arrow([]).map_err(fail)?;
             // The schema comes from the executed statement: before
             // execution the statement has none to give.
             let schema = batches.get_schema();
-            crate::batch::collect(&uid, schema, batches.map(Ok::<_, duckdb::Error>), max_rows)
+            each(schema, &mut batches)
         })();
         let _ = stop_tx.send(());
         let _ = watcher.join();
@@ -114,6 +126,18 @@ impl Source for DuckDb {
 
     fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
         self.run(sql, max_rows)
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        self.execute(sql, |schema, batches| {
+            sink.schema(&schema)?;
+            for batch in batches {
+                if batch.num_rows() > 0 {
+                    sink.batch(batch)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn adapter(&self) -> &str {
