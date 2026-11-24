@@ -115,6 +115,27 @@ fn the_records_of_runs_in_postgres() {
     db.save(&gone).unwrap();
     assert!(db.cached(&key).unwrap().is_none(), "nor does an expired one");
 
+    // Invalidation by table, and what cleanup is told still sits in the store.
+    let other = run_cache_key(DEFAULT_ORG, "shop", "SELECT 2");
+    let mut kept = record("r-20261124-kept", Some(&other), Status::Succeeded, "node-a", "2026-11-24T11:00:00Z");
+    kept.finished_at = Some("2026-11-24T11:00:01Z".into());
+    kept.expires_at = Some("2999-01-01T00:00:00Z".into());
+    kept.object_store_path = Some("cache/r-20261124-kept/rows.arrow".into());
+    db.insert(&kept).unwrap();
+    assert!(db.stale_objects(10).unwrap().iter().all(|r| r.id != "r-20261124-kept"), "it still answers");
+    assert_eq!(db.mark_dirty(DEFAULT_ORG, Some("elsewhere"), "wh", &["sales.items".into()]).unwrap(), 0);
+    assert_eq!(db.mark_dirty(DEFAULT_ORG, None, "other-wh", &["sales.items".into()]).unwrap(), 0);
+    assert_eq!(db.mark_dirty(DEFAULT_ORG, None, "wh", &["nothing.read".into()]).unwrap(), 0);
+    assert!(db.mark_dirty(DEFAULT_ORG, Some("shop"), "wh", &["sales.items".into()]).unwrap() >= 1);
+    assert!(db.cached(&other).unwrap().is_none());
+    let stale = db.stale_objects(10).unwrap();
+    assert_eq!(stale.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["r-20261124-kept"], "dirty, and still in the store");
+    let mut cleared = stale[0].clone();
+    cleared.object_store_path = None;
+    db.save(&cleared).unwrap();
+    assert!(db.stale_objects(10).unwrap().is_empty());
+    assert_eq!(db.prune().unwrap(), 0, "the table is the application's to trim");
+
     // Two nodes, one table, a disk each.
     admin.batch_execute("DELETE FROM zsql_results").unwrap();
     let root = std::env::temp_dir().join(format!("zsql-pg-runs-{}", std::process::id()));
@@ -124,7 +145,7 @@ fn the_records_of_runs_in_postgres() {
     rusqlite::Connection::open(&file).unwrap().execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1), (2), (3);").unwrap();
     let node = |name: &str, beat: Duration| {
         let registry: Arc<dyn Registry> = Arc::new(Postgres::open(&settings()).unwrap());
-        Runs::open(&root.join(name), registry, Limits { beat, ..Limits::of(name) }).unwrap()
+        Runs::open(&root.join(name), registry, None, Limits { beat, ..Limits::of(name) }).unwrap()
     };
     let submit = |sql: &str| {
         let file: PathBuf = file.clone();

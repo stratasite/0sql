@@ -30,6 +30,13 @@ arrow-cast = "60"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
+# Where a result is kept for every node to read: S3, GCS, Azure, or a
+# directory, behind one interface.
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+url = "2"
+futures-util = { version = "0.3", default-features = false }
+# The size of the disk results are kept on.
+libc = "0.2"
 
 [dev-dependencies]
 # A warehouse in a file, for a read that really arrives a batch at a time.

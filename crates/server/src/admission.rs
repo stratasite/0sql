@@ -59,7 +59,7 @@ pub(crate) fn classify(path: &str) -> Class {
         // Below a datasource is the warehouse; the list of datasources
         // itself is the model's, and cheap.
         ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
-        ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] => Class::Run,
+        ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] | ["cache", "invalidate"] => Class::Run,
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route

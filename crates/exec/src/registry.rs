@@ -43,6 +43,20 @@ pub trait Registry: Send + Sync {
     /// and has not been seen for `quiet_for`: its node stopped, or was
     /// replaced under another name, and nothing is running it. How many.
     fn fail_abandoned(&self, quiet_for: std::time::Duration, why: &str) -> Result<usize>;
+
+    /// Marks as dirty every result of `datasource_uid` in `org_uid`
+    /// that read any of `tables`, in one project or, with `None`, in
+    /// all of them. A run still in flight is marked too, so what it
+    /// returns does not answer either. How many were marked.
+    fn mark_dirty(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize>;
+
+    /// Results that no longer answer, dirty or expired, and are still
+    /// in the object store: at most `limit` of them.
+    fn stale_objects(&self, limit: usize) -> Result<Vec<Record>>;
+
+    /// Forgets records nobody will ask about again, where the records
+    /// are this registry's own to forget. How many.
+    fn prune(&self) -> Result<usize>;
 }
 
 /// Records on this node's disk: a file each, read when the server
@@ -104,8 +118,11 @@ impl Registry for Local {
 
     fn save(&self, record: &Record) -> Result<()> {
         let mut records = self.lock();
-        self.write(record)?;
-        records.insert(record.id.clone(), record.clone());
+        // What an invalidation set, a run saving itself does not unset.
+        let mut record = record.clone();
+        record.dirty |= records.get(&record.id).is_some_and(|kept| kept.dirty);
+        self.write(&record)?;
+        records.insert(record.id.clone(), record);
         Ok(())
     }
 
@@ -168,5 +185,54 @@ impl Registry for Local {
             self.save(&record)?;
         }
         Ok(quiet.len())
+    }
+
+    fn mark_dirty(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize> {
+        let mut records = self.lock();
+        let mut marked = 0;
+        for record in records.values_mut() {
+            let theirs = record.org_uid == org_uid
+                && record.datasource_uid == datasource_uid
+                && project_uid.is_none_or(|p| record.project_uid == p)
+                && record.tables.iter().any(|t| tables.contains(t));
+            if theirs && !record.dirty {
+                record.dirty = true;
+                self.write(record)?;
+                marked += 1;
+            }
+        }
+        Ok(marked)
+    }
+
+    fn stale_objects(&self, limit: usize) -> Result<Vec<Record>> {
+        let now = unix_now();
+        Ok(self
+            .lock()
+            .values()
+            .filter(|r| r.status == Status::Succeeded && r.object_store_path.is_some())
+            .filter(|r| r.dirty || r.expires_at.as_deref().and_then(parse_rfc3339).is_none_or(|until| until <= now))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    /// A run that ended a day ago and whose result, if it had one, no
+    /// longer answers is forgotten: these files are this node's own,
+    /// and nothing else would ever remove them.
+    fn prune(&self) -> Result<usize> {
+        let now = unix_now();
+        let mut records = self.lock();
+        let old: Vec<String> = records
+            .values()
+            .filter(|r| r.status.is_final())
+            .filter(|r| r.finished_at.as_deref().and_then(parse_rfc3339).is_some_and(|ended| ended + 86_400 <= now))
+            .filter(|r| r.dirty || r.expires_at.as_deref().and_then(parse_rfc3339).is_none_or(|until| until <= now))
+            .map(|r| r.id.clone())
+            .collect();
+        for id in &old {
+            let _ = std::fs::remove_file(self.dir.join(format!("{id}.json")));
+            records.remove(id);
+        }
+        Ok(old.len())
     }
 }

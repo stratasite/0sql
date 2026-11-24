@@ -1234,6 +1234,24 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     assert_eq!(read.schema().field(1).data_type().to_string(), "Decimal128(38, 2)");
     assert_eq!(read.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
 
+    // A table the result read has changed: it stops answering.
+    let invalidate = |body: Value| s.post("/cache/invalidate", body);
+    assert_eq!(invalidate(json!({ "datasource": "dw", "tables": ["elsewhere"] })).await.body, json!({ "invalidated": 0 }));
+    assert_eq!(invalidate(json!({ "datasource": "dw", "tables": ["sales"], "project": "another" })).await.body["invalidated"], 0);
+    let marked = invalidate(json!({ "datasource": "dw", "tables": ["sales"], "project": CS })).await;
+    assert_eq!(
+        (marked.status, &marked.body["invalidated"]),
+        (StatusCode::OK, &json!(2)),
+        "the result and the fresh one after it: {}",
+        marked.body
+    );
+    assert_eq!(s.get(&format!("/results/{id}")).await.body["dirty"], true);
+    let after = s.post(&run, ask(json!({}))).await;
+    assert_eq!(after.body["cache"], "miss", "a dirty result does not answer");
+    assert_eq!(invalidate(json!({ "datasource": "dw", "tables": [] })).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(invalidate(json!({ "datasource": "", "tables": ["sales"] })).await.status, StatusCode::BAD_REQUEST);
+    assert!(invalidate(json!({ "tables": ["sales"] })).await.status.is_client_error());
+
     // What a request may not ask for, and an id nobody has.
     assert_eq!(s.get(&format!("/results/{id}?limit=0")).await.status, StatusCode::BAD_REQUEST);
     assert_eq!(s.get(&format!("/results/{id}?limit=100001")).await.status, StatusCode::BAD_REQUEST);

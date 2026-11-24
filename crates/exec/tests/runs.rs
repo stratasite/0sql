@@ -4,7 +4,7 @@
 //! cancelled, when it fails, when the queue is full, and when the
 //! server it was running on stops.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use zsql_exec::{run_cache_key, How, Kind, Limits, Local, Record, Registry, Runs, Status, Submit, DEFAULT_ORG, RESTARTED};
@@ -27,7 +27,7 @@ impl Scratch {
 
     fn runs(&self, concurrent: usize, queue_max: usize) -> Runs {
         let registry: Arc<dyn Registry> = Arc::new(Local::open(&self.0.join("records")).unwrap());
-        Runs::open(&self.0.join("cache"), registry, Limits { concurrent, queue_max, ..Limits::of("node-a") }).unwrap()
+        Runs::open(&self.0.join("cache"), registry, None, Limits { concurrent, queue_max, ..Limits::of("node-a") }).unwrap()
     }
 
     fn submit(&self, sql: &str) -> Submit {
@@ -76,10 +76,6 @@ fn until(runs: &Runs, id: &str, status: Status) -> Record {
     }
 }
 
-fn rows_exist(path: &Path) -> bool {
-    path.exists()
-}
-
 #[test]
 fn a_run_is_recorded_first_then_runs_and_its_rows_are_paged() {
     let scratch = Scratch::new("basic");
@@ -97,13 +93,13 @@ fn a_run_is_recorded_first_then_runs_and_its_rows_are_paged() {
     assert_eq!(runs.get(&queued.id).unwrap().unwrap(), done, "what is kept is what was returned");
 
     // A page from the middle, read without the rest.
-    let page = zsql_exec::page(&runs.rows_path(&done), 4_998, 10).unwrap();
+    let page = zsql_exec::page(&runs.rows(&done).unwrap(), 4_998, 10).unwrap();
     assert_eq!(page.num_rows(), 2, "the last two rows, however many were asked for");
     assert_eq!(zsql_exec::json::rows(&page).unwrap(), vec![serde_json::json!(["4998", null]), serde_json::json!(["4999", "row 4999"])]);
     assert_eq!(zsql_exec::json::columns(&page.schema)[0], serde_json::json!({"name": "id", "type": "string", "arrow_type": "Utf8"}));
-    assert_eq!(zsql_exec::page(&runs.rows_path(&done), 9_000, 10).unwrap().num_rows(), 0, "past the end is no rows");
+    assert_eq!(zsql_exec::page(&runs.rows(&done).unwrap(), 9_000, 10).unwrap().num_rows(), 0, "past the end is no rows");
     let mut seen = 0;
-    zsql_exec::each_batch(&runs.rows_path(&done), |_, batch| {
+    zsql_exec::each_batch(&runs.rows(&done).unwrap(), |_, batch| {
         seen += batch.map(|b| b.num_rows()).unwrap_or(0);
         Ok(())
     })
@@ -176,7 +172,7 @@ fn seats_a_queue_with_an_end_and_cancelling() {
     let stopped = runs.wait(&running.id, Duration::from_secs(20)).unwrap().unwrap();
     assert_eq!(stopped.status, Status::Cancelled, "{stopped:?}");
     assert!(stopped.cancelled_at.is_some() && stopped.error.is_none());
-    assert!(!rows_exist(&runs.rows_path(&stopped)), "what it had written is gone");
+    assert!(runs.rows(&stopped).is_err(), "what it had written is gone");
     assert!(runs.cancel("r-none").unwrap().is_none());
 
     // The seat is free again, and a cancelled run is not an answer.
@@ -221,6 +217,6 @@ fn a_failure_is_recorded_and_a_restart_ends_what_was_in_progress() {
     assert_eq!((lost.status, lost.error.as_deref()), (Status::Failed, Some(RESTARTED)));
     let (hit, how) = reopened.submit(scratch.submit("SELECT id FROM t WHERE id < 3")).unwrap();
     assert_eq!((how, hit.id.as_str()), (How::Hit, good.id.as_str()));
-    assert_eq!(zsql_exec::page(&reopened.rows_path(&hit), 0, 10).unwrap().num_rows(), 3);
+    assert_eq!(zsql_exec::page(&reopened.rows(&hit).unwrap(), 0, 10).unwrap().num_rows(), 3);
     runs.cancel(&long.id).unwrap();
 }

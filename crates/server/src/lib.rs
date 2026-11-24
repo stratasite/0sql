@@ -161,8 +161,22 @@ pub(crate) fn open_runs(data_dir: &std::path::Path, limits: &RunLimits) -> anyho
         }
         None => Arc::new(zsql_exec::Local::open(&cache.join("records"))?),
     };
-    let limits = zsql_exec::Limits { concurrent: limits.concurrent, queue_max: limits.queue_max, ..zsql_exec::Limits::of(&hostname()) };
-    Ok(zsql_exec::Runs::open(&cache.join("results"), registry, limits)?)
+    let objects = match &limits.object_store {
+        Some((url, options)) => {
+            let objects = zsql_exec::Objects::open(url, options)?;
+            tracing::info!("results are kept in the object store {url}, under {}/", zsql_exec::PREFIX);
+            Some(Arc::new(objects))
+        }
+        None => None,
+    };
+    let limits = zsql_exec::Limits {
+        concurrent: limits.concurrent,
+        queue_max: limits.queue_max,
+        local_max_percent: limits.local_cache_max_percent,
+        sweep: limits.cache_sweep,
+        ..zsql_exec::Limits::of(&hostname())
+    };
+    Ok(zsql_exec::Runs::open(&cache.join("results"), registry, objects, limits)?)
 }
 
 /// This machine's name, as it calls itself.

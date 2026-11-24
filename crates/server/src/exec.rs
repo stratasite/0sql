@@ -93,6 +93,8 @@ fn invalid(message: impl Into<String>) -> ApiError {
 fn internal(e: zsql_exec::Error) -> ApiError {
     match e {
         zsql_exec::Error::Busy(_) => ApiError(StatusCode::SERVICE_UNAVAILABLE, "Busy", format!("{e}; try again shortly")),
+        zsql_exec::Error::NotFound(why) => ApiError(StatusCode::NOT_FOUND, "NotFound", why),
+        zsql_exec::Error::DiskFull(why) => ApiError(StatusCode::INSUFFICIENT_STORAGE, "DiskFull", why),
         other => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", other.to_string()),
     }
 }
@@ -188,7 +190,9 @@ fn wants_arrow(headers: &HeaderMap) -> bool {
 async fn answer(app: &Shared, record: Record, how: Option<How>, page: (u64, u64), arrow: bool) -> Result<Response, ApiError> {
     let status = if record.status.is_final() { StatusCode::OK } else { StatusCode::ACCEPTED };
     if record.status == Status::Succeeded && arrow {
-        return Ok(arrow_stream(app, &record));
+        let (runs, read) = (app.runs.clone(), record.clone());
+        let path = blocking(move || runs.rows(&read).map_err(internal)).await?;
+        return Ok(arrow_stream(path, &record));
     }
     let mut body = serde_json::to_value(&record).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
     if let Some(how) = how {
@@ -199,10 +203,12 @@ async fn answer(app: &Shared, record: Record, how: Option<How>, page: (u64, u64)
         });
     }
     if record.status == Status::Succeeded {
-        let path = app.runs.rows_path(&record);
+        let (runs, read) = (app.runs.clone(), record.clone());
         let (offset, limit) = page;
         let total = record.row_count.unwrap_or(0);
         let (columns, rows) = blocking(move || {
+            // Fetched from the object store first, when another node made it.
+            let path = runs.rows(&read).map_err(internal)?;
             let page = zsql_exec::page(&path, offset, limit).map_err(internal)?;
             Ok((zsql_exec::json::columns(&page.schema), zsql_exec::json::rows(&page).map_err(internal)?))
         })
@@ -219,8 +225,7 @@ async fn answer(app: &Shared, record: Record, how: Option<How>, page: (u64, u64)
 
 /// The whole result as an Arrow stream, read from its file and sent a
 /// batch at a time: neither end holds more than the batch in hand.
-fn arrow_stream(app: &Shared, record: &Record) -> Response {
-    let path = app.runs.rows_path(record);
+fn arrow_stream(path: std::path::PathBuf, record: &Record) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
     tokio::task::spawn_blocking(move || {
         let sent = zsql_exec::arrow_stream(&path, |bytes| {
@@ -284,4 +289,33 @@ pub(crate) async fn cancel(State(app): State<Shared>, Params(id): Params<String>
     // moment, so the usual answer says `cancelled` and not `running`.
     let record = settled(&app, record, Duration::from_secs(2)).await?;
     answer(&app, record, None, (0, 1), false).await
+}
+
+/// What changed, for results that read it to stop answering.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Invalidate {
+    /// The datasource the tables are on.
+    datasource: String,
+    /// Physical names, as the model's `physical_name` has them.
+    tables: Vec<String>,
+    /// One project's results, or every project's when not said.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// Marks as dirty every result that read one of the tables: it stops
+/// answering, the next request runs again, and cleanup removes it.
+pub(crate) async fn invalidate(State(app): State<Shared>, Input(req): Input<Invalidate>) -> Result<Json<Value>, ApiError> {
+    if req.datasource.trim().is_empty() || req.tables.is_empty() || req.tables.iter().any(|t| t.trim().is_empty()) {
+        return Err(invalid("an invalidation names a datasource and at least one table"));
+    }
+    if let Some(project) = &req.project {
+        crate::names::check_uid(project)?;
+    }
+    let runs = app.runs.clone();
+    let marked =
+        blocking(move || runs.invalidate(DEFAULT_ORG, req.project.as_deref(), req.datasource.trim(), &req.tables).map_err(internal))
+            .await?;
+    Ok(Json(json!({ "invalidated": marked })))
 }

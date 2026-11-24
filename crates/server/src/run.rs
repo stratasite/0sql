@@ -92,6 +92,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
         .route("/projects/{uid}/branches/{branch}/run", post(exec::run))
         .route("/results/{id}", get(exec::result).delete(exec::cancel))
+        .route("/cache/invalidate", post(exec::invalidate))
         .route(mcp::PATH, post(mcp::endpoint))
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive
@@ -146,11 +147,26 @@ pub struct RunLimits {
     /// `None` is no limit: a query with no limit of its own returns
     /// every row.
     pub default_sql_limit: Option<u64>,
+    /// The object store results are kept in, as a URL and its options
+    /// by name; with `None`, a result is only on this node's disk.
+    pub object_store: Option<(String, Vec<(String, String)>)>,
+    /// The share of the disk, in percent, this node's results may take.
+    pub local_cache_max_percent: u8,
+    /// How often results that no longer answer are cleared away.
+    pub cache_sweep: Duration,
 }
 
 impl Default for RunLimits {
     fn default() -> Self {
-        RunLimits { concurrent: 100, queue_max: 5_000, db: None, default_sql_limit: None }
+        RunLimits {
+            concurrent: 100,
+            queue_max: 5_000,
+            db: None,
+            default_sql_limit: None,
+            object_store: None,
+            local_cache_max_percent: 60,
+            cache_sweep: Duration::from_secs(300),
+        }
     }
 }
 

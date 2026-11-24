@@ -104,6 +104,27 @@ impl ServeArgs {
                 password: zsql_datasource::Secret::new(need("ZSQL_DB_PASSWORD")?),
             });
         }
+        // Where results are kept for every node to read. Its options are
+        // its own variables, named for the store's and handed to it by
+        // name: the cloud's own variables are a warehouse login to two
+        // adapters, and are never read for this.
+        if let Some(url) = var("ZSQL_OBJECT_STORE") {
+            let options = std::env::vars()
+                .filter_map(|(name, value)| Some((name.strip_prefix("ZSQL_OBJECT_STORE_")?.to_lowercase(), value)))
+                .filter(|(_, value)| !value.is_empty())
+                .collect();
+            cfg.runs.object_store = Some((url, options));
+        }
+        if let Some(v) = var("ZSQL_LOCAL_CACHE_MAX_PERCENT") {
+            let percent = number(&v, "ZSQL_LOCAL_CACHE_MAX_PERCENT")?;
+            if !(1..=100).contains(&percent) {
+                bail!("ZSQL_LOCAL_CACHE_MAX_PERCENT is a share of the disk, 1 to 100; it is {percent}");
+            }
+            cfg.runs.local_cache_max_percent = percent as u8;
+        }
+        if let Some(v) = var("ZSQL_CACHE_SWEEP_SECS") {
+            cfg.runs.cache_sweep = Duration::from_secs(number(&v, "ZSQL_CACHE_SWEEP_SECS")?.max(1) as u64);
+        }
         // The credential the server holds for a datasource, for a run
         // whose request sends none: ZSQL_DS_<UID>_<FIELD>, read when it
         // is asked for, from the environment and nowhere else.

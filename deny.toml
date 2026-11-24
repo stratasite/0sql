@@ -24,6 +24,11 @@ ignore = [
   # could move to jiff or time, but that alone would not clear this.
   # Revisit when arrow drops it or a real advisory lands against it.
   { id = "RUSTSEC-2026-0543", reason = "chrono under arrow (via duckdb) and in the planner's date arithmetic; unmaintained, not a vulnerability" },
+  # humantime is marked unmaintained for one reason, that it wraps
+  # chrono, which is the entry above. object_store needs it to read
+  # durations in its options, and has no version without it. It goes
+  # when chrono's entry does.
+  { id = "RUSTSEC-2026-0542", reason = "humantime under object_store; unmaintained only because chrono is, not a vulnerability" },
 ]
 
 [licenses]

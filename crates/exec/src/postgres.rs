@@ -423,6 +423,40 @@ impl Registry for Postgres {
         })
         .map(|n| n as usize)
     }
+    fn mark_dirty(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize> {
+        let (org, project, datasource, tables) =
+            (org_uid.to_string(), project_uid.map(str::to_string), datasource_uid.to_string(), tables.to_vec());
+        self.with(move |client| async move {
+            client
+                .execute(
+                    "UPDATE zsql_results SET dirty = true, updated_at = now() \
+                     WHERE NOT dirty AND org_uid = $1 AND datasource_uid = $2 AND tables && $3 AND ($4::text IS NULL OR project_uid = $4)",
+                    &[&org, &datasource, &tables, &project],
+                )
+                .await
+        })
+        .map(|n| n as usize)
+    }
+
+    fn stale_objects(&self, limit: usize) -> Result<Vec<Record>> {
+        let limit = limit as i64;
+        let rows = self.with(move |client| async move {
+            client
+                .query(
+                    &format!(
+                        "{SELECT} WHERE status = 'succeeded' AND object_store_path IS NOT NULL AND (dirty OR expires_at IS NULL OR expires_at <= now()) LIMIT $1"
+                    ),
+                    &[&limit],
+                )
+                .await
+        })?;
+        rows.iter().map(record).collect()
+    }
+
+    /// The table is the application's, and so is what it keeps of it.
+    fn prune(&self) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

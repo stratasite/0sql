@@ -282,6 +282,24 @@ exposed on the old understanding.
   connection made, when the project and the statement are the same.
   `fresh` asks the warehouse.
 
+## What the fourth phase found
+
+- **Cleanup deletes a result's rows, not its record.** In Postgres
+  the row stays, with `object_store_path` emptied: the table is the
+  application's, and so is how much of its history it keeps. On a
+  node's own disk a record is forgotten a day after its run ended,
+  once its result no longer answers, since nothing else would ever
+  remove the file.
+- **A result is fetched from the store when it is read**, not when it
+  is found: a cache hit on another node costs nothing until its rows
+  are asked for.
+- **Without a store, a full disk is cleared of what no longer answers
+  before a run is refused**: an invalidated or expired result does not
+  hold a place.
+- **The store was run against a directory**, which the same crate
+  serves through the same interface. S3, GCS and Azure are that
+  crate's; none was run against here.
+
 ## Not yet decided
 
 - Credentials, after execution exists.
@@ -317,7 +335,8 @@ exposed on the old understanding.
    rows. What was asked for:
    The registry over `ZSQL_DB`, the reference DDL, the
    startup check, the refresh and abandoned runs.
-4. **The object store.** Upload and download, the local percentage and
+4. **The object store. Done, 2026-11-24.** What was asked for:
+   Upload and download, the local percentage and
    eviction, cleanup, `tables`, `dirty` and the invalidation endpoint.
 5. **Connections.** Writable opens, no statement check, DuckDB's two
    modes, the pool.

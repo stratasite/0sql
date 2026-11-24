@@ -25,6 +25,12 @@ pub enum Error {
     InFlight(String),
     #[error("{0}")]
     Registry(String),
+    #[error("{0}")]
+    Objects(String),
+    /// The node's disk has no room for another result and there is
+    /// nowhere else to put one.
+    #[error("{0}")]
+    DiskFull(String),
     /// A unique constraint refused a write: this is its name.
     #[error("the unique constraint {0} refused the write")]
     Taken(String),

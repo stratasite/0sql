@@ -10,6 +10,7 @@
 
 use crate::engine::{rfc3339, unix_now};
 use crate::error::{Error, Result};
+use crate::objects::Objects;
 use crate::record::{Kind, Record, Status};
 use crate::registry::{Registry, RESTARTED};
 use crate::store::{rows_file, Store};
@@ -32,12 +33,28 @@ pub struct Limits {
     /// How often this node says its runs are alive. A run not seen for
     /// six of these is nobody's, and is ended as failed.
     pub beat: Duration,
+    /// The share of the disk, in percent, this node's results may take.
+    pub local_max_percent: u8,
+    /// How often expired and dirty results are cleared away.
+    pub sweep: Duration,
+    /// The share as a number of bytes, in place of a share of the disk:
+    /// for a test, which cannot fill a disk to see what happens.
+    #[doc(hidden)]
+    pub local_max_bytes: Option<u64>,
 }
 
 impl Limits {
     /// A hundred at once, five thousand waiting, a beat every ten seconds.
     pub fn of(hostname: &str) -> Limits {
-        Limits { concurrent: 100, queue_max: 5_000, hostname: hostname.to_string(), beat: Duration::from_secs(10) }
+        Limits {
+            concurrent: 100,
+            queue_max: 5_000,
+            hostname: hostname.to_string(),
+            beat: Duration::from_secs(10),
+            local_max_percent: 60,
+            sweep: Duration::from_secs(300),
+            local_max_bytes: None,
+        }
     }
 }
 
@@ -99,6 +116,9 @@ struct State {
 struct Inner {
     registry: Arc<dyn Registry>,
     store: Store,
+    /// Where results are kept for every node, when there is such a
+    /// place; without one, a result is only on this node's disk.
+    objects: Option<Arc<Objects>>,
     limits: Limits,
     state: Mutex<State>,
     /// A job was queued.
@@ -120,22 +140,30 @@ impl Runs {
     /// Opens the runs whose results live under `dir`. Whatever this node
     /// had in progress when it last stopped is ended as failed: nothing
     /// of it survived.
-    pub fn open(dir: &Path, registry: Arc<dyn Registry>, limits: Limits) -> Result<Runs> {
+    pub fn open(dir: &Path, registry: Arc<dyn Registry>, objects: Option<Arc<Objects>>, limits: Limits) -> Result<Runs> {
         let store = Store::open(dir)?;
         let ended = registry.fail_unfinished(&limits.hostname, RESTARTED)?;
         if ended > 0 {
             tracing::warn!(runs = ended as u64, "runs that were in progress when the server stopped were ended as failed");
         }
-        let inner = Arc::new(Inner { registry, store, limits, state: Mutex::default(), queued: Condvar::new(), changed: Condvar::new() });
+        let inner =
+            Arc::new(Inner { registry, store, objects, limits, state: Mutex::default(), queued: Condvar::new(), changed: Condvar::new() });
         // The beat: this node's runs are marked alive, and runs no node
         // has marked for a while are ended. It stops with the runs.
         let alive = Arc::downgrade(&inner);
         let beat = inner.limits.beat.max(Duration::from_millis(10));
+        let mut swept = Instant::now();
         std::thread::Builder::new()
             .name("zsql-beat".into())
             .spawn(move || loop {
                 std::thread::sleep(beat);
                 let Some(inner) = alive.upgrade() else { return };
+                if swept.elapsed() >= inner.limits.sweep {
+                    swept = Instant::now();
+                    if let Err(e) = inner.sweep() {
+                        tracing::warn!("expired results could not all be cleared away: {e}");
+                    }
+                }
                 let seen = inner.registry.touch(&inner.limits.hostname).and_then(|()| inner.registry.fail_abandoned(beat * 6, RESTARTED));
                 match seen {
                     Ok(0) => {}
@@ -161,7 +189,7 @@ impl Runs {
             if !submit.fresh {
                 // A result another node made is found here too, and
                 // answers only where its rows can be read.
-                if let Some(hit) = inner.registry.cached(key)?.filter(|hit| rows_file(&inner.store.dir_of(&hit.id)).exists()) {
+                if let Some(hit) = inner.registry.cached(key)?.filter(|hit| inner.readable(hit)) {
                     return Ok((hit, How::Hit));
                 }
             }
@@ -267,9 +295,24 @@ impl Runs {
         Ok(Some(record))
     }
 
-    /// Where a finished run's rows are.
-    pub fn rows_path(&self, record: &Record) -> PathBuf {
-        rows_file(&self.inner.store.dir_of(&record.id))
+    /// Where a finished run's rows are on this node's disk, once they
+    /// are: a result another node made is fetched from the object store
+    /// first, and later readers find it here.
+    pub fn rows(&self, record: &Record) -> Result<PathBuf> {
+        self.inner.rows(record)
+    }
+
+    /// Marks as dirty every result of a datasource that read any of
+    /// `tables`, in a project or in all of them: it no longer answers,
+    /// and the next request runs. How many were marked.
+    pub fn invalidate(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize> {
+        self.inner.registry.mark_dirty(org_uid, project_uid, datasource_uid, tables)
+    }
+
+    /// Clears away what no longer answers, now rather than at the next
+    /// sweep.
+    pub fn sweep(&self) -> Result<()> {
+        self.inner.sweep()
     }
 }
 
@@ -328,6 +371,137 @@ impl Inner {
         }
     }
 
+    /// Whether a stored result can be read from here: its rows are on
+    /// this disk, or in a store this node can fetch them from.
+    fn readable(&self, record: &Record) -> bool {
+        rows_file(&self.store.dir_of(&record.id)).exists() || (self.objects.is_some() && record.object_store_path.is_some())
+    }
+
+    fn rows(&self, record: &Record) -> Result<PathBuf> {
+        let path = rows_file(&self.store.dir_of(&record.id));
+        if !path.exists() {
+            let (Some(objects), Some(key)) = (&self.objects, &record.object_store_path) else {
+                return Err(Error::NotFound(format!(
+                    "{}: its rows are on another node ({}) and there is no object store to read them from",
+                    record.id, record.hostname
+                )));
+            };
+            self.make_room()?;
+            objects.download(key, &path)?;
+        }
+        // Read now: the last to be read is the last to be evicted.
+        if let Ok(file) = std::fs::File::open(&path) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+        Ok(path)
+    }
+
+    /// Each result on this disk: its id, its size and when it was last read.
+    fn on_disk(&self) -> Vec<(String, PathBuf, u64, std::time::SystemTime)> {
+        let mut found = Vec::new();
+        let Ok(shards) = std::fs::read_dir(self.store.root()) else { return found };
+        for shard in shards.flatten().filter(|e| e.path().is_dir()) {
+            let Ok(results) = std::fs::read_dir(shard.path()) else { continue };
+            for dir in results.flatten().filter(|e| e.path().is_dir()) {
+                let id = dir.file_name().to_string_lossy().to_string();
+                // A result still being written is its writer's.
+                if id.contains(".tmp-") {
+                    continue;
+                }
+                let meta = std::fs::metadata(rows_file(&dir.path()));
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let read = meta.and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                found.push((id, dir.path(), size, read));
+            }
+        }
+        found
+    }
+
+    /// Makes sure this node's results are within their share of the
+    /// disk before another is written. With an object store the least
+    /// recently read copies go, since they are only copies; without
+    /// one, what no longer answers is cleared away and, if that is not
+    /// enough, the run is refused.
+    fn make_room(&self) -> Result<()> {
+        let share = disk_bytes(self.store.root()).map(|total| total / 100 * u64::from(self.limits.local_max_percent.min(100)));
+        let Some(allowed) = self.limits.local_max_bytes.or(share) else { return Ok(()) };
+        let used = |found: &[(String, PathBuf, u64, std::time::SystemTime)]| found.iter().map(|f| f.2).sum::<u64>();
+        let mut found = self.on_disk();
+        if used(&found) < allowed {
+            return Ok(());
+        }
+        if self.objects.is_none() {
+            self.sweep()?;
+            found = self.on_disk();
+            if used(&found) < allowed {
+                return Ok(());
+            }
+            return Err(self.disk_full());
+        }
+        found.sort_by_key(|f| f.3);
+        let mut over = used(&found).saturating_sub(allowed);
+        for (id, dir, size, _) in found {
+            if over == 0 {
+                break;
+            }
+            // Only what the store also holds is only a copy.
+            let copied = self.registry.get(&id)?.is_none_or(|r| r.object_store_path.is_some() || r.status != Status::Succeeded);
+            if copied && std::fs::remove_dir_all(&dir).is_ok() {
+                over = over.saturating_sub(size.max(1));
+            }
+        }
+        Ok(())
+    }
+
+    fn disk_full(&self) -> Error {
+        Error::DiskFull(format!(
+            "this server's disk is full of results: they may take {}% of it (ZSQL_LOCAL_CACHE_MAX_PERCENT) and every one still answers. \
+             Configure an object store with ZSQL_OBJECT_STORE, so results are kept there and this disk holds only copies",
+            self.limits.local_max_percent
+        ))
+    }
+
+    /// A failed write that was the disk running out says so, and what
+    /// to do about it.
+    fn or_disk_full(&self, why: Error) -> Error {
+        let text = why.to_string().to_lowercase();
+        if text.contains("no space left") || text.contains("storage full") {
+            return self.disk_full();
+        }
+        why
+    }
+
+    /// Clears away what no longer answers: an expired or dirty result
+    /// is deleted from the object store and from this disk. Each node
+    /// clears its own disk; whichever gets there first clears the store.
+    fn sweep(&self) -> Result<()> {
+        if let Some(objects) = &self.objects {
+            for mut record in self.registry.stale_objects(500)? {
+                if let Some(key) = record.object_store_path.take() {
+                    objects.delete(&key)?;
+                    self.registry.save(&record)?;
+                }
+            }
+        }
+        let now = unix_now();
+        let mut cleared = 0u64;
+        for (id, dir, _, _) in self.on_disk() {
+            let answers = self.registry.get(&id)?.is_some_and(|r| {
+                r.status == Status::Succeeded
+                    && !r.dirty
+                    && r.expires_at.as_deref().and_then(crate::engine::parse_rfc3339).is_some_and(|until| until > now)
+            });
+            if !answers && std::fs::remove_dir_all(&dir).is_ok() {
+                cleared += 1;
+            }
+        }
+        let forgotten = self.registry.prune()?;
+        if cleared > 0 || forgotten > 0 {
+            tracing::info!(results = cleared, records = forgotten as u64, "results that no longer answer were cleared away");
+        }
+        Ok(())
+    }
+
     /// One run, start to finish. The record is saved at each change;
     /// what comes back is how it ended.
     fn run(&self, job: Job) -> Result<Record> {
@@ -343,15 +517,33 @@ impl Inner {
         }
         let t0 = Instant::now();
         let outcome: Result<u64> = (|| {
+            self.make_room()?;
             let mut src = open()?;
             let mut writing = self.store.begin(&record.id)?;
             let streamed = src.stream(&record.sql, &mut Stoppable { sink: &mut writing, cancel: &cancel });
             match (streamed, writing.failure()) {
-                (_, Some(why)) => Err(why),
+                (_, Some(why)) => Err(self.or_disk_full(why)),
                 (Err(e), None) => Err(Error::Source(e)),
                 (Ok(()), None) => {
                     let rows = writing.rows();
-                    writing.finish()?;
+                    let dir = writing.finish().map_err(|e| self.or_disk_full(e))?;
+                    // With a store configured the result is not one
+                    // until it is there: other nodes read it from there,
+                    // and whoever configured it meant it to be used.
+                    if let Some(objects) = &self.objects {
+                        match objects.upload(&record.id, &rows_file(&dir)) {
+                            Ok(key) => record.object_store_path = Some(key),
+                            Err(e) => {
+                                let _ = std::fs::remove_dir_all(&dir);
+                                return Err(Error::Objects(format!(
+                                    "the statement ran and returned {rows} rows, but the result could not be written to the object store {} at {}: {e}. \
+                                     ZSQL_OBJECT_STORE is set, so a result must be stored there; nothing was kept",
+                                    objects.named(),
+                                    objects.key_of(&record.id)
+                                )));
+                            }
+                        }
+                    }
                     Ok(rows)
                 }
             }
@@ -422,4 +614,23 @@ fn new_id(hostname: &str) -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let digest = crate::engine::sha256(&format!("{hostname}\n{}\n{nanos}\n{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     format!("r-{}-{}", rfc3339(unix_now())[..10].replace('-', ""), &digest[..20])
+}
+
+/// The size of the filesystem a directory is on, in bytes.
+#[cfg(unix)]
+fn disk_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is a NUL-terminated string that lives through the
+    // call, and the struct is this function's own.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_blocks as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn disk_bytes(_dir: &Path) -> Option<u64> {
+    None
 }
