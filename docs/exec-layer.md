@@ -173,6 +173,15 @@ side comes first. What is owed to it:
 
 ### The rest
 
+- **Go inside the server, tested properly.** The Snowflake and BigQuery
+  drivers are Go libraries, and a server that runs queries loads them
+  into a process that lives for weeks. Before a driver is trusted
+  there: what a panic or a crash inside one does to the server; how its
+  memory grows over many statements, since the Go heap is outside
+  anything Rust accounts for; and whether the Go runtime's signal
+  handlers leave the server's graceful stop on SIGTERM and its ignoring
+  of SIGPIPE as they are. None of this has been run. Until it has, a
+  server should be able to keep to REST (`ZSQL_ADBC=off`).
 - **The command line's OAuth flow.** `oauth_token` is read from
   `.zsql` and `ZSQL_DS_<UID>_OAUTH_TOKEN` like any secret, which is
   enough to test with. Obtaining one, a browser or device flow and a
