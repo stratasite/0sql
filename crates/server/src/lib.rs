@@ -31,6 +31,10 @@
 //! POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables/{table}  {"connection": {...}}  ?schema=&catalog=
 //! DELETE /projects/{uid}/branches/{branch}
 //! GET  /projects                                       every deployed branch, ?q=text
+//! POST /projects/{uid}/branches/{branch}/run           {"spec": {...}} or {"expr": "..."}: planned, run, and the rows
+//! POST /projects/{uid}/branches/{branch}/sql-exec      {"datasource": "...", "sql": "..."}: one statement, run as written
+//! GET  /results/{id}                                   a run: its record and a page of rows; DELETE cancels it
+//! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! GET  /healthz
 //! ```

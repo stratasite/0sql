@@ -109,7 +109,7 @@ fn wait_of(asked: Option<f64>, default: Duration) -> Result<Duration, ApiError> 
     }
 }
 
-fn page_of(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u64), ApiError> {
+pub(crate) fn page_of(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u64), ApiError> {
     let limit = limit.unwrap_or(PAGE);
     if limit == 0 || limit > PAGE_MAX {
         return Err(invalid(format!("limit is between 1 and {PAGE_MAX} rows a page")));
@@ -291,6 +291,12 @@ async fn answer(app: &Shared, record: Record, how: Option<How>, page: (u64, u64)
         let path = blocking(move || runs.rows(&read).map_err(internal)).await?;
         return Ok(arrow_stream(path, &record));
     }
+    Ok((status, Json(described(app, record, how, page).await?)).into_response())
+}
+
+/// The record as JSON, with how the request was met and, when the run
+/// succeeded, a page of its rows.
+pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, page: (u64, u64)) -> Result<Value, ApiError> {
     let mut body = serde_json::to_value(&record).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
     if let Some(how) = how {
         body["cache"] = json!(match how {
@@ -317,7 +323,37 @@ async fn answer(app: &Shared, record: Record, how: Option<How>, page: (u64, u64)
         body["columns"] = Value::Array(columns);
         body["rows"] = Value::Array(rows);
     }
-    Ok((status, Json(body)).into_response())
+    Ok(body)
+}
+
+/// A run asked for by a tool: a spec under the context the connection
+/// carries, with this server's own credential, since a model has none
+/// to send. What comes back is the record and a page, as `described`
+/// gives them.
+pub(crate) async fn run_for_tool(app: &Shared, asked: ToolRun, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
+    let ToolRun { uid, branch, spec, context, fresh } = asked;
+    let req = RunRequest { spec: Some(spec), context, fresh, wait: Some(wait.as_secs_f64()), ..RunRequest::default() };
+    let planning = app.clone();
+    let (record, how, wait) = blocking(move || submit(&planning, &uid, &branch, req)).await?;
+    let record = settled(app, record, wait).await?;
+    described(app, record, Some(how), page).await
+}
+
+/// What a tool asks to be run.
+pub(crate) struct ToolRun {
+    pub(crate) uid: String,
+    pub(crate) branch: String,
+    pub(crate) spec: Value,
+    pub(crate) context: Option<SecurityContext>,
+    pub(crate) fresh: bool,
+}
+
+/// A result asked after by a tool, by its id.
+pub(crate) async fn result_for_tool(app: &Shared, id: String, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
+    let (runs, asked) = (app.runs.clone(), id.clone());
+    let record = blocking(move || runs.get(&asked).map_err(internal)).await?.ok_or_else(|| gone(&id))?;
+    let record = settled(app, record, wait).await?;
+    described(app, record, None, page).await
 }
 
 /// The whole result as an Arrow stream, read from its file and sent a

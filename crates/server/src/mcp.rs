@@ -90,10 +90,15 @@ impl Settings {
 
     /// Whether a tool is exposed. A call to one that is not is refused
     /// like an unknown tool.
+    ///
+    /// Named, a tool is exposed. With no list, every tool is but the two
+    /// that run a statement: a model that can run what it plans reads
+    /// rows with this server's own credential, which is for whoever
+    /// sets the server up to turn on.
     fn exposed(&self, name: &str) -> bool {
         match &self.tools {
             Some(list) => list.iter().any(|t| t == name),
-            None => true,
+            None => !RUNS.contains(&name),
         }
     }
 }
@@ -322,6 +327,18 @@ fn branch_catalog(d: &Model) -> String {
 
 // ------------------------------------------------------------------ tools
 
+/// The tools that run a statement, exposed only when named.
+const RUNS: [&str; 2] = ["run", "result"];
+
+/// Rows in a tool's answer when it does not say, and the most it may
+/// ask for: a model reads every one of them.
+const TOOL_PAGE: u64 = 200;
+const TOOL_PAGE_MAX: u64 = 1_000;
+
+/// How long a tool waits for rows: short of the deadline a request to
+/// this endpoint has.
+const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The tools, as the client lists them. Every schema refuses unknown
 /// properties, so a `context` can be reported for what it is rather
 /// than silently dropped.
@@ -359,6 +376,18 @@ fn tools(settings: &Settings) -> Vec<Value> {
                 "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
         json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
         json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
+        json!({ "name": "run", "description": describe("run"),
+                "inputSchema": schema(&[&target, &spec_arg, &json!({
+                    "fresh": { "type": "boolean", "description": "run even though a stored result would answer" },
+                    "offset": { "type": "integer", "description": "rows to skip" },
+                    "limit": { "type": "integer", "description": "rows to return, 200 when omitted and 1000 at most" } })],
+                    &["project", "spec"], "a query spec to run", true) }),
+        json!({ "name": "result", "description": describe("result"),
+                "inputSchema": schema(&[&json!({
+                    "id": { "type": "string", "description": "the id a run answered with" },
+                    "offset": { "type": "integer", "description": "rows to skip" },
+                    "limit": { "type": "integer", "description": "rows to return, 200 when omitted and 1000 at most" } })],
+                    &["id"], "which result, and which of its rows", false) }),
     ];
     all.into_iter().filter(|t| settings.exposed(t["name"].as_str().unwrap_or(""))).collect()
 }
@@ -401,6 +430,45 @@ struct ValuesArgs {
     dimension: String,
     #[serde(default)]
     q: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    project: String,
+    #[serde(default)]
+    branch: Option<String>,
+    spec: Value,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultArgs {
+    id: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// The rows a tool asked for: fewer than a request may, by default and
+/// at most.
+fn tool_page(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u64), ApiError> {
+    let limit = limit.unwrap_or(TOOL_PAGE);
+    if limit > TOOL_PAGE_MAX {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            format!("limit is at most {TOOL_PAGE_MAX} rows for a tool; ask for the next page with offset"),
+        ));
+    }
+    crate::exec::page_of(offset, Some(limit))
 }
 
 #[derive(Deserialize)]
@@ -553,6 +621,23 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                 };
                 planned.map_err(|e| with_candidates(app, &a.project, &b, e))
             })
+        }
+        "run" => {
+            let a: RunArgs = args(arguments)?;
+            match (branch_for(app, &a.project, a.branch), tool_page(a.offset, a.limit)) {
+                (Ok(branch), Ok(page)) => {
+                    let asked = crate::exec::ToolRun { uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
+                    crate::exec::run_for_tool(app, asked, TOOL_WAIT, page).await
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        "result" => {
+            let a: ResultArgs = args(arguments)?;
+            match tool_page(a.offset, a.limit) {
+                Ok(page) => crate::exec::result_for_tool(app, a.id, TOOL_WAIT, page).await,
+                Err(e) => Err(e),
+            }
         }
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),
     };

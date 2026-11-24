@@ -24,7 +24,10 @@ security context each plan runs under, and paces its callers.
 
 Do not expose the port to callers you do not trust. Anyone who reaches
 it reads every deployed model's catalog, plans SQL under any context
-they care to claim, and, without a deploy token, deploys and removes.
+they care to claim, **runs that SQL and reads the rows**, runs a
+statement of their own with `sql-exec`, and, without a deploy token,
+deploys and removes. "Running the server's statements", below, says
+what that is worth.
 
 ## The deploy token
 
@@ -95,10 +98,13 @@ What to keep in mind whichever path is used:
   over a VPN means a bind beyond the loopback, and on a host that also
   has a public interface `0.0.0.0` is the internet. Behind an SSH
   tunnel the loopback bind is enough.
-- **Reach is read access.** Any host that can reach the port lists
-  every model and plans under any context it claims. It gets SQL text
-  and the shape of the warehouse, not rows; policies protect data
-  through the application that runs the SQL, not against the network.
+- **Reach is the warehouse.** Any host that can reach the port lists
+  every model, plans under any context it claims, and has the plan
+  run: it gets rows. A context is whatever the caller says it is, so
+  a row policy protects data through the application that sends the
+  context, not against the network. Before the server ran anything,
+  reach was SQL text and the shape of the warehouse; that is no longer
+  so, and a port opened on that understanding should be closed.
 - **A probe connects where the deploy and the request say.** `POST
   .../datasources/{ds}/tables` and `.../tables/{table}` read a
   warehouse's own catalog with the connection the datasource was
@@ -175,6 +181,60 @@ several schemas is refused with the schemas (`Ambiguous`), not answered
 with the first; one found nowhere is `NotFound`. A connection the
 request got wrong is `400 DatasourceError`; a warehouse that would not
 connect or answer is `502 DatasourceError` with what it said.
+
+## Running the server's statements
+
+The server runs what it plans. `POST .../run` plans a request and runs
+the statement on its datasource; `POST .../sql-exec` runs one
+statement the caller wrote; `GET /results/{id}` reads a result again
+and `DELETE /results/{id}` cancels a run. `docs/execution.md` is the
+design.
+
+**Whose credential.** The one the request sends, in `connection`, and
+otherwise the one the server holds for that datasource in
+`ZSQL_DS_<UID>_<FIELD>`. The service in front decides which: it can
+send each user's own, or send none and let every user run as the
+server's account.
+
+- **A credential the server holds is worth whatever the database
+  grants it, to everyone who reaches the port.** With one set, a
+  caller needs nothing but reach to read through `run`, and to do
+  anything that account may do through `sql-exec`.
+- **Nothing here stops a write.** No statement is checked for being a
+  read. What an account may do is the database's to enforce: give the
+  server an account that may only read, unless writing is the point.
+- **`sql-exec` is outside the model.** It runs the caller's SQL as
+  written, so no row policy applies to it. If only planned queries
+  should run, do not forward that route.
+- **The MCP tools `run` and `result` are off** unless `ZSQL_MCP_TOOLS`
+  names them. A model has no credential to send, so it runs as the
+  server's account.
+
+**The cache.** A planned query's result answers the same question
+again until the datasource's `cache_ttl` passes. It is found by the
+project and the statement, nothing else: not the user, the credential,
+the datasource or the branch. Two consequences to plan for:
+
+- 0sql's row policies are in the statement, so two users under
+  different policies never share a result. Policies the *warehouse*
+  applies per user are not seen: two users with their own credentials
+  and the same statement get the first one's rows. Use `cache_ttl: 0`
+  on such a datasource, which keeps nothing.
+- A branch whose datasource points at another database shares results
+  with the others of its project. `cache_ttl: 0` there as well.
+
+`fresh: true` on a request runs the statement whatever is stored.
+`POST /cache/invalidate` with a datasource and the tables that changed
+stops every result that read them from answering.
+
+**Limits are the caller's.** A query with no limit returns every row;
+`ZSQL_DEFAULT_SQL_LIMIT` gives one to requests that have none. Rows go
+to disk as they arrive, so a large result costs disk and time, not
+memory.
+
+**More than one node** needs `ZSQL_DB` for the records and
+`ZSQL_OBJECT_STORE` for the rows. Without the store a result is only
+on the node that ran it, and another node runs the statement again.
 
 ## What is on disk
 

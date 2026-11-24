@@ -352,8 +352,13 @@ exposed on the old understanding.
    On DuckDB a `sql-exec` closes the connections kept for reading
    before it opens its own, and fails if a read is in flight on the
    same file.
-7. **Around it.** The MCP tool, `docs/operating.md`, and the Go
-   drivers under load.
+7. **Around it. Done, 2026-11-24, but for the Go drivers.** The MCP
+   tools are `run` and `result`, off unless `ZSQL_MCP_TOOLS` names
+   them; `docs/operating.md` says what reach means now. The Go drivers
+   inside a long-lived server are still untested: that needs the
+   driver libraries loaded and an account, which this work could not
+   do. What was asked for: The MCP tool, `docs/operating.md`, and the
+   Go drivers under load.
 8. **Large results from Databricks.** Its external-links mode, so a
    result past the inline limit is fetched rather than refused.
 9. **The command line, last.** Everything of the command line's waits

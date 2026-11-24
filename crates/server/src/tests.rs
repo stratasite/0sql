@@ -1428,3 +1428,73 @@ async fn sql_exec_runs_one_statement_of_the_callers_and_keeps_nothing_of_it_for_
     assert_eq!(nowhere.status, StatusCode::NOT_FOUND, "{}", nowhere.body);
     assert!(s.post(&exec, json!({ "sql": "SELECT 1" })).await.status.is_client_error());
 }
+
+/// The two tools that run a statement are not offered unless they are
+/// named: a model that can run what it plans reads rows with the
+/// server's own credential. Named, they run a spec and read a result.
+#[tokio::test]
+async fn the_tools_that_run_are_offered_only_when_named() {
+    let listed = |a: &Answer| -> Vec<String> {
+        a.body["result"]["tools"].as_array().expect("tools").iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let s = server();
+    let offered = listed(&s.mcp(&[], list.clone()).await);
+    assert!(
+        offered.contains(&"sql".to_string()) && !offered.contains(&"run".to_string()) && !offered.contains(&"result".to_string()),
+        "{offered:?}"
+    );
+    let refused = s.tool(&[], "run", json!({ "project": CS, "spec": { "projections": [{ "field": "category" }] } })).await;
+    assert!(refused.body["error"]["message"].as_str().unwrap_or_default().contains("no tool run"), "{}", refused.body);
+
+    // A server told to offer them, with the warehouse deployed whole:
+    // a tool has no connection to send.
+    let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
+    let tools = ["list_projects", "fields", "sql", "run", "result"].map(str::to_string).to_vec();
+    let app: Shared = Arc::new(App {
+        dialects,
+        data_dir: data_dir.clone(),
+        models: RwLock::new(HashMap::new()),
+        admission: Admission::new(&AdmissionCounts::default()),
+        mcp: mcp::Settings::new(None, None, Some(tools)).unwrap(),
+        deploy_token: None,
+        deploying: std::sync::Mutex::new(()),
+        runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
+        default_sql_limit: None,
+        secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
+    });
+    let s = Server { router: router(app.clone()), app, data_dir };
+    let file = sales("tools");
+    let mut files = fixture_files(CS, "one");
+    files[1].1 = format!("dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n  file: {}\n", file.display());
+    assert_eq!(s.deploy(CS, "main", archive_of(&files)).await.status, StatusCode::OK);
+    let offered = listed(&s.mcp(&[], list).await);
+    assert!(offered.contains(&"run".to_string()) && offered.contains(&"result".to_string()), "{offered:?}");
+
+    let spec = json!({ "projections": [{ "field": "category" }, { "field": "revenue" }] });
+    let ran = s.tool(&[], "run", json!({ "project": CS, "spec": spec, "limit": 2 })).await;
+    let answer = &ran.body["result"]["structuredContent"];
+    assert_eq!(
+        (&answer["status"], &answer["row_count"], &answer["complete"], &answer["cache"]),
+        (&json!("succeeded"), &json!(3), &json!(false), &json!("miss")),
+        "{}",
+        ran.body
+    );
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 2, "the rows this answer carries, not the query's limit");
+    let id = answer["id"].as_str().unwrap().to_string();
+    let rest = s.tool(&[], "result", json!({ "id": id, "offset": 2 })).await;
+    let rest = &rest.body["result"]["structuredContent"];
+    assert_eq!((rest["rows"].as_array().unwrap().len(), &rest["complete"]), (1, &json!(true)));
+    let again = s.tool(&[], "run", json!({ "project": CS, "spec": spec })).await;
+    assert_eq!(again.body["result"]["structuredContent"]["cache"], "hit");
+    // A tool reads every row it is handed, so it may ask for fewer.
+    let many = s.tool(&[], "run", json!({ "project": CS, "spec": spec, "limit": 5000 })).await;
+    assert_eq!(many.body["result"]["isError"], true, "{}", many.body);
+    let none = s.tool(&[], "result", json!({ "id": "r-none" })).await;
+    assert_eq!(none.body["result"]["isError"], true);
+    // A model does not choose whose rows it reads.
+    let chosen = s.tool(&[], "run", json!({ "project": CS, "spec": spec, "context": { "email": "a@b.c" } })).await;
+    assert!(chosen.body["error"].is_object() || chosen.body["result"]["isError"] == true, "{}", chosen.body);
+}
