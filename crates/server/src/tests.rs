@@ -1343,6 +1343,17 @@ async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_cre
     let own = s.post(&run, json!({ "expr": "category asc, revenue, limit 1", "connection": { "password": "theirs" } })).await;
     assert_eq!((&own.body["row_limit"], &own.body["row_count"]), (&json!(1), &json!(1)), "{}", own.body);
     assert_eq!(asked.lock().unwrap().len(), 2, "a credential was sent, so the server's was not asked for");
+
+    // The server's credentials are kept by a datasource's uid, and any
+    // org can deploy a datasource of that uid: they are the default
+    // org's, and a run in another org is never handed one.
+    assert_eq!(s.deploy_to("acme", CS, "main", archive_of(&files)).await.status, StatusCode::OK);
+    let theirs = s.post(&format!("/orgs/acme/projects/{CS}/branches/main/run"), json!({ "expr": "category asc, revenue" })).await;
+    assert_eq!((&theirs.body["status"], &theirs.body["org_uid"]), (&json!("succeeded"), &json!("acme")), "{}", theirs.body);
+    let exec = json!({ "datasource": "dw", "sql": "SELECT 1" });
+    let theirs = s.post(&format!("/orgs/acme/projects/{CS}/branches/main/sql-exec"), exec).await;
+    assert_eq!(theirs.body["status"], "succeeded", "{}", theirs.body);
+    assert_eq!(asked.lock().unwrap().len(), 2, "neither asked for the server's credential");
 }
 
 /// The caller's own statement, run as it was written: it may write, it
@@ -1536,6 +1547,15 @@ async fn an_org_is_its_own_set_of_projects() {
     let a = s.deploy_to("..%2F..", CS, "main", archive(CS, "evil")).await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
 
+    // A route under an org takes the body its twin takes: an archive
+    // may be larger than any JSON request, and is refused for what it
+    // is, where a JSON body of that size is refused for its size.
+    let big = vec![0u8; 2 * 1024 * 1024];
+    let a = s.deploy_to("acme", CS, "big", big.clone()).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DeployError"), "{}", a.error());
+    let a = s.send(Method::POST, &format!("/orgs/acme/projects/{CS}/branches/main/sql"), &[], Some(("application/json", big))).await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.error());
+
     let a = s.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}/branches/main"), &[], None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.on_disk(), ["acme/billing/main", "default/customer-service/main", "globex/customer-service/main"]);
@@ -1561,10 +1581,12 @@ async fn a_renamed_directory_is_that_org_and_an_old_layout_is_said() {
     // billing as an old data directory held it, and default renamed.
     std::fs::rename(s.data_dir.join("default").join("billing"), s.data_dir.join("billing")).unwrap();
     std::fs::rename(s.data_dir.join("default"), s.data_dir.join("acme")).unwrap();
+    // And a directory no org could be called: said too, and left alone.
+    std::fs::create_dir_all(s.data_dir.join("Bad.Name").join(CS).join("main")).unwrap();
 
     let again = app_over(&s.data_dir);
     let (n, skipped) = reload(&again).unwrap();
-    assert_eq!((n, skipped), (1, vec!["billing/main".to_string()]));
+    assert_eq!((n, skipped), (1, vec!["Bad.Name".to_string(), "billing/main".to_string()]));
     let keys: Vec<String> = again.models.read().unwrap().keys().cloned().collect();
     assert_eq!(keys, ["acme/customer-service/main"]);
     assert!(s.data_dir.join("billing").join("main").join("snapshot.json.gz").exists(), "nothing is moved");
@@ -1643,7 +1665,7 @@ async fn a_result_is_its_orgs_alone() {
         let a = s.send(Method::DELETE, &path, &[], None).await;
         assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}");
     }
-    assert_eq!(s.get(&format!("/orgs/acme/results/{theirs}")).await.body["status"], "succeeded", "and nothing was cancelled");
+    assert_eq!(s.get(&format!("/orgs/acme/results/{theirs}")).await.body["status"], "succeeded", "and it is still its org's to read");
 
     // What changed in one org's warehouse is said for that org.
     let a = s.post("/cache/invalidate", json!({ "datasource": "dw", "tables": ["sales"] })).await;

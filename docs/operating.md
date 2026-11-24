@@ -255,6 +255,11 @@ it. Two orgs may each have a project of the same uid.
   in the words an unknown id gets. A stored result answers the same
   question in its own org only, an invalidation reaches one org's
   results, and no warehouse connection is reused between two.
+- **The server's own credentials are the default org's.**
+  `ZSQL_DS_<UID>_<FIELD>` is kept by a datasource's uid alone, and any
+  org can deploy a datasource of any uid, pointing anywhere. So a run
+  in a named org connects with what its request sends and is never
+  handed one of the server's.
 - **Who may ask for which org is decided in front**, like everything
   else. A proxy that keeps orgs apart allows each caller the one prefix
   `/orgs/<theirs>/` and nothing outside it; the unprefixed routes are
@@ -307,7 +312,7 @@ same thing. The ones an operator sets:
 | `ZSQL_CONCURRENT_RUNS` | how many statements run at once; 100 |
 | `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
 | `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |
-| `ZSQL_DS_<UID>_<FIELD>` | the credential the server holds for a datasource, used by a run whose request sends none |
+| `ZSQL_DS_<UID>_<FIELD>` | the credential the server holds for a datasource, used by a run in the default org whose request sends none |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 
 `ops/zsqld.service` is a systemd unit to start from: a dedicated user, a

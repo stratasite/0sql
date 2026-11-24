@@ -274,7 +274,8 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         };
         let client = remote::Client::new(&format!("http://{}", SocketAddr::new(reach, addr.port())));
         let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
-        eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
+        let org = p.org.as_deref().filter(|o| *o != remote::DEFAULT_ORG).map(|o| format!("{o}/")).unwrap_or_default();
+        eprintln!("zsql: serving {} as {org}{}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
         let deploy = || -> Result<()> {
             let archive = project::archive(&p.dir)?;
             let v = client.post_bytes(

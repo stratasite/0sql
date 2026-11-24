@@ -138,7 +138,7 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
     // credential it is run with: nothing here checks it.
     conn.access = zsql_datasource::Access::Unchecked;
     // The request's credential when it sent one; this server's otherwise.
-    let secrets = if sent.is_empty() { (app.secrets)(&datasource) } else { sent };
+    let secrets = secrets_for(app, org, &datasource, sent);
     let wait = wait_of(req.wait, conn.wait())?;
     // A datasource that keeps nothing is neither looked up nor found.
     let ttl = conn.cache_ttl.map(|s| Duration::from_secs(s.max(0) as u64)).unwrap_or(zsql_exec::DEFAULT_TTL);
@@ -166,6 +166,22 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
         })
         .map_err(internal)?;
     Ok((record, how, wait))
+}
+
+/// The credential a run connects with: the request's when it sent one,
+/// and otherwise the one this server was given for the datasource.
+///
+/// The server's are kept by a datasource's uid alone, so they are the
+/// default org's and no other's. Any org may deploy a datasource of
+/// any uid, pointing anywhere, and one that named another's would
+/// otherwise be opened with a credential that was never meant for it.
+/// A run in a named org connects with what its request sends.
+fn secrets_for(app: &Shared, org: &str, datasource: &str, sent: zsql_datasource::Secrets) -> zsql_datasource::Secrets {
+    if sent.is_empty() && org == crate::names::DEFAULT_ORG {
+        (app.secrets)(datasource)
+    } else {
+        sent
+    }
 }
 
 /// What a connection may be reused under: everything about where it
@@ -217,7 +233,7 @@ fn submit_sql(app: &Shared, org: &str, uid: &str, branch: &str, req: SqlExecRequ
     }
     let (mut conn, sent) = connection_of(app, (org, uid, branch), req.datasource.trim(), None, &req.connection, None)?;
     conn.access = zsql_datasource::Access::Writable;
-    let secrets = if sent.is_empty() { (app.secrets)(&conn.uid) } else { sent };
+    let secrets = secrets_for(app, org, &conn.uid, sent);
     let wait = wait_of(req.wait, conn.wait())?;
     // DuckDB cannot be open for reading and for writing at once in one
     // process, and a writable connection has its file to itself. So the
