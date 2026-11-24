@@ -8,7 +8,7 @@
 //! ever needs one.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
+use crate::{tls, Access, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 
 pub struct Postgres {
     runtime: tokio::runtime::Runtime,
@@ -17,6 +17,7 @@ pub struct Postgres {
     uid: String,
     timeout: std::time::Duration,
     warnings: Vec<String>,
+    access: Access,
 }
 
 /// How a Postgres connection is made from what a datasource says: the
@@ -83,8 +84,15 @@ impl Postgres {
             let _ = connection.await;
         });
 
-        let mut pg =
-            Postgres { runtime, client, adapter: conn.adapter.clone(), uid: conn.uid.clone(), timeout: conn.timeout(), warnings: vec![] };
+        let mut pg = Postgres {
+            runtime,
+            client,
+            adapter: conn.adapter.clone(),
+            uid: conn.uid.clone(),
+            timeout: conn.timeout(),
+            warnings: vec![],
+            access: conn.access,
+        };
         if redshift {
             let mut session = format!("SET statement_timeout TO {}", conn.timeout().as_millis());
             if let Some(schema) = &conn.schema {
@@ -115,7 +123,7 @@ impl Postgres {
     /// read under the timeout.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         use futures_util::TryStreamExt;
-        read_only(sql)?;
+        self.access.check(sql)?;
         // The simple-query protocol: every value arrives as the server's
         // own text, whatever its type, which is what a catalog and a
         // sample want. The extended protocol sends binary, and reading a

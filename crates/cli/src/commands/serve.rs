@@ -122,6 +122,12 @@ impl ServeArgs {
             }
             cfg.runs.local_cache_max_percent = percent as u8;
         }
+        if let Some(v) = var("ZSQL_POOL_MAX") {
+            cfg.runs.pool_max = number(&v, "ZSQL_POOL_MAX")?;
+        }
+        if let Some(v) = var("ZSQL_POOL_IDLE_SECS") {
+            cfg.runs.pool_idle = Duration::from_secs(number(&v, "ZSQL_POOL_IDLE_SECS")? as u64);
+        }
         if let Some(v) = var("ZSQL_CACHE_SWEEP_SECS") {
             cfg.runs.cache_sweep = Duration::from_secs(number(&v, "ZSQL_CACHE_SWEEP_SECS")?.max(1) as u64);
         }

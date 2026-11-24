@@ -309,6 +309,14 @@ fn sqlite_reads_its_file_and_cannot_write_it() {
     assert!(err.to_string().contains("enough"), "{err}");
     assert_eq!(full.batches.len(), 1, "what arrived before it stopped is what it has");
     assert_eq!(src.query("SELECT count(*) FROM t", 10).unwrap().rows[0][0].as_deref(), Some("3"), "and the connection is still good");
+
+    // Opened by a caller that checks nothing, what may be done is the
+    // database's to say: a write is a statement like any other.
+    let unchecked = Connection { access: Access::Unchecked, ..conn.clone() };
+    let mut trusted = open(&unchecked, Secrets::default()).unwrap();
+    trusted.query("INSERT INTO t VALUES (4, 'd', NULL)", 10).expect("a write, unchecked");
+    assert_eq!(trusted.query("SELECT count(*) FROM t", 10).unwrap().rows[0][0].as_deref(), Some("4"));
+    assert!(matches!(src.query("INSERT INTO t VALUES (5, 'e', NULL)", 10), Err(Error::NotARead(_))), "checked, it is still refused");
     assert_eq!(rows.get(&rows.rows[0], "name"), Some("a"));
     assert_eq!(rows.get(&rows.rows[0], "note"), None, "null is none, not the word null");
     assert_eq!(rows.get(&rows.rows[1], "id"), Some("2"), "numbers come back as text");
@@ -2233,6 +2241,23 @@ fn duckdb_reads_its_file_renders_every_type_as_text_and_cannot_write_it() {
     assert_eq!(streamed.schema.field(2).data_type(), &arrow_schema::DataType::Decimal128(12, 2));
     assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT id FROM orders WHERE id > 99").num_rows(), 0);
     let rows = src.query("SELECT id, placed, total, paid, tags, seen FROM orders ORDER BY id", 10).expect("reads");
+    // Unchecked, nothing here refuses a write, and the engine does: the
+    // file is still opened for reading, since opening it for writing
+    // would take it from every other process. Writable is for a caller
+    // that means to write, and has the file to itself while it does.
+    {
+        let mut unchecked = open(&Connection { access: Access::Unchecked, ..conn.clone() }, Secrets::default()).unwrap();
+        let err = unchecked.query("INSERT INTO customers VALUES (9, 'Cy', NULL)", 10).unwrap_err();
+        assert!(matches!(err, Error::Query(_, _)), "refused by DuckDB, not by the guard: {err}");
+    }
+    drop(src);
+    {
+        let mut writable = open(&Connection { access: Access::Writable, ..conn.clone() }, Secrets::default()).unwrap();
+        writable.query("INSERT INTO customers VALUES (9, 'Cy', NULL)", 10).expect("a write, on a writable connection");
+        assert_eq!(writable.query("SELECT count(*) AS n FROM customers", 10).unwrap().rows[0][0].as_deref(), Some("3"));
+        writable.query("DELETE FROM customers WHERE id = 9", 10).unwrap();
+    }
+    let mut src = open(&conn, Secrets::default()).expect("opens read-only again");
     assert_eq!(rows.columns, ["id", "placed", "total", "paid", "tags", "seen"]);
     assert_eq!(rows.rows.len(), 3);
     let first = &rows.rows[0];

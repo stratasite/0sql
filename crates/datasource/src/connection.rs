@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::{Access, Error, Result};
 
 // ------------------------------------------------------------------ sslmode
 
@@ -132,6 +132,9 @@ pub struct Connection {
     /// answered with the run's id instead. Ten when not said. Read by a
     /// server that runs statements, ignored by the loader.
     pub query_wait_time: Option<i64>,
+    /// How far the connection is trusted with a statement. Not a key of
+    /// `datasources.yml`: whoever opens the connection says.
+    pub access: Access,
 }
 
 impl Connection {
@@ -188,6 +191,7 @@ impl Connection {
             profile: s("profile"),
             cache_ttl: i("cache_ttl"),
             query_wait_time: i("query_wait_time"),
+            access: Access::default(),
         })
     }
 

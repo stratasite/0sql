@@ -3,22 +3,30 @@
 //! refused by SQLite itself before the guard in [`read_only`] is reached.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{read_only, Connection, Error, Result, Rows, Sink, Source};
+use crate::{Access, Connection, Error, Result, Rows, Sink, Source};
 
 pub struct Sqlite {
     db: rusqlite::Connection,
     uid: String,
     timeout: std::time::Duration,
+    access: Access,
 }
 
 impl Sqlite {
     pub fn open(conn: &Connection) -> Result<Sqlite> {
         let file = conn.file.clone().ok_or_else(|| Error::Missing(conn.uid.clone(), "file"))?;
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // Read-only when statements are checked, so a write is refused
+        // by SQLite itself; otherwise as the file allows. Never created:
+        // a datasource names a database that is there.
+        let mode = match conn.access {
+            Access::ReadOnly => rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            Access::Unchecked | Access::Writable => rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        };
+        let flags = mode | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let db = rusqlite::Connection::open_with_flags(&file, flags)
             .map_err(|e| Error::Connect(conn.uid.clone(), format!("{}: {e}", file.display())))?;
         db.busy_timeout(conn.timeout()).map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
-        Ok(Sqlite { db, uid: conn.uid.clone(), timeout: conn.timeout() })
+        Ok(Sqlite { db, uid: conn.uid.clone(), timeout: conn.timeout(), access: conn.access })
     }
 }
 
@@ -26,7 +34,7 @@ impl Sqlite {
     /// The statement stepped to its end, each row to `out`, under the
     /// timeout.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
-        read_only(sql)?;
+        self.access.check(sql)?;
         let fail = |e: rusqlite::Error| Error::Query(self.uid.clone(), e.to_string());
         // SQLite has no statement timeout; a progress handler fires every so
         // many VM steps and can call the statement off. The budget is

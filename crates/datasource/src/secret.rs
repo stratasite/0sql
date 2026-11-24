@@ -124,6 +124,33 @@ pub const SECRET_FIELDS: [&str; 9] = [
 ];
 
 impl Secrets {
+    /// A digest of every secret here, for telling one credential from
+    /// another without keeping either: the same secrets give the same
+    /// digest, and nothing of them can be read back from it.
+    pub fn fingerprint(&self) -> String {
+        let fields = [
+            &self.password,
+            &self.personal_access_token,
+            &self.private_key,
+            &self.oauth_client_id,
+            &self.oauth_client_secret,
+            &self.access_key_id,
+            &self.secret_access_key,
+            &self.session_token,
+            &self.oauth_token,
+        ];
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        for field in fields {
+            // Each field framed by its length, so two fields can never
+            // read as one longer one.
+            let value = field.as_ref().map(Secret::expose).unwrap_or_default();
+            hash.update(&(value.len() as u64).to_be_bytes());
+            hash.update(&[u8::from(field.is_some())]);
+            hash.update(value.as_bytes());
+        }
+        hash.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Whether nothing was given: no field of it holds a secret.
     pub fn is_empty(&self) -> bool {
         self.password.is_none()

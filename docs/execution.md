@@ -338,7 +338,12 @@ exposed on the old understanding.
 4. **The object store. Done, 2026-11-24.** What was asked for:
    Upload and download, the local percentage and
    eviction, cleanup, `tables`, `dirty` and the invalidation endpoint.
-5. **Connections.** Writable opens, no statement check, DuckDB's two
+5. **Connections. Done, 2026-11-24.** A connection says how far it
+   is trusted: a command still checks each statement and opens
+   read-only, so `zsql` is as it was; the server's runs check nothing.
+   A kept connection that fails a read before handing anything over is
+   tried once more on a new one; a statement that may write never is.
+   What was asked for: Writable opens, no statement check, DuckDB's two
    modes, the pool.
 6. **`sql-exec`.**
 7. **Around it.** The MCP tool, `docs/operating.md`, and the Go

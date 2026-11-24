@@ -41,6 +41,11 @@ pub struct Limits {
     /// for a test, which cannot fill a disk to see what happens.
     #[doc(hidden)]
     pub local_max_bytes: Option<u64>,
+    /// Connections kept for reuse, across every datasource: one more
+    /// and the one unused longest is closed.
+    pub pool_max: usize,
+    /// How long a connection nothing uses is kept.
+    pub pool_idle: Duration,
 }
 
 impl Limits {
@@ -54,6 +59,8 @@ impl Limits {
             local_max_percent: 60,
             sweep: Duration::from_secs(300),
             local_max_bytes: None,
+            pool_max: 200,
+            pool_idle: Duration::from_secs(60),
         }
     }
 }
@@ -82,6 +89,11 @@ pub struct Submit {
     pub cache_ttl: Duration,
     /// Run even though a stored result would answer.
     pub fresh: bool,
+    /// What a connection this run opens may be reused under: the
+    /// datasource, where it points, how far it is trusted and whose
+    /// credential opened it, as a digest. `None` and it is closed
+    /// when the run ends.
+    pub pool_key: Option<String>,
     pub open: Opener,
 }
 
@@ -98,6 +110,7 @@ pub enum How {
 
 struct Job {
     record: Record,
+    pool_key: Option<String>,
     open: Opener,
     cache_ttl: Duration,
     cancel: Arc<AtomicBool>,
@@ -119,6 +132,8 @@ struct Inner {
     /// Where results are kept for every node, when there is such a
     /// place; without one, a result is only on this node's disk.
     objects: Option<Arc<Objects>>,
+    /// Connections that are open and not in use, oldest first.
+    pool: Mutex<Vec<Idle>>,
     limits: Limits,
     state: Mutex<State>,
     /// A job was queued.
@@ -146,8 +161,16 @@ impl Runs {
         if ended > 0 {
             tracing::warn!(runs = ended as u64, "runs that were in progress when the server stopped were ended as failed");
         }
-        let inner =
-            Arc::new(Inner { registry, store, objects, limits, state: Mutex::default(), queued: Condvar::new(), changed: Condvar::new() });
+        let inner = Arc::new(Inner {
+            registry,
+            store,
+            objects,
+            pool: Mutex::default(),
+            limits,
+            state: Mutex::default(),
+            queued: Condvar::new(),
+            changed: Condvar::new(),
+        });
         // The beat: this node's runs are marked alive, and runs no node
         // has marked for a while are ended. It stops with the runs.
         let alive = Arc::downgrade(&inner);
@@ -158,6 +181,7 @@ impl Runs {
             .spawn(move || loop {
                 std::thread::sleep(beat);
                 let Some(inner) = alive.upgrade() else { return };
+                inner.close_idle();
                 if swept.elapsed() >= inner.limits.sweep {
                     swept = Instant::now();
                     if let Err(e) = inner.sweep() {
@@ -239,7 +263,13 @@ impl Runs {
             }
             Err(e) => return Err(e),
         }
-        state.queue.push_back(Job { record: record.clone(), open: submit.open, cache_ttl: submit.cache_ttl, cancel: Arc::default() });
+        state.queue.push_back(Job {
+            record: record.clone(),
+            pool_key: submit.pool_key,
+            open: submit.open,
+            cache_ttl: submit.cache_ttl,
+            cancel: Arc::default(),
+        });
         if state.idle == 0 && state.workers < inner.limits.concurrent.max(1) {
             state.workers += 1;
             let worker = inner.clone();
@@ -314,6 +344,11 @@ impl Runs {
     pub fn sweep(&self) -> Result<()> {
         self.inner.sweep()
     }
+
+    /// How many connections are open and not in use.
+    pub fn idle_connections(&self) -> usize {
+        self.inner.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+    }
 }
 
 impl Inner {
@@ -369,6 +404,38 @@ impl Inner {
             let _held = self.lock();
             self.changed.notify_all();
         }
+    }
+
+    /// A kept connection under `key`, the one most recently used.
+    fn take(&self, key: &str) -> Option<Box<dyn Source>> {
+        let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = pool.iter().rposition(|idle| idle.key == key && idle.since.elapsed() < self.limits.pool_idle)?;
+        Some(pool.remove(at).source)
+    }
+
+    /// Keeps a connection for the next run under `key`. One more than
+    /// the pool holds, and the one unused longest is closed.
+    fn keep(&self, key: &str, source: Box<dyn Source>) {
+        if self.limits.pool_max == 0 {
+            return;
+        }
+        let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.push(Idle { key: key.to_string(), source, since: Instant::now() });
+        while pool.len() > self.limits.pool_max {
+            pool.remove(0);
+        }
+    }
+
+    /// Closes connections nothing has used for a while.
+    fn close_idle(&self) {
+        let stale: Vec<Idle> = {
+            let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (stale, fresh) = std::mem::take(&mut *pool).into_iter().partition(|idle| idle.since.elapsed() >= self.limits.pool_idle);
+            *pool = fresh;
+            stale
+        };
+        // Closed outside the lock: a connection may take a moment to go.
+        drop(stale);
     }
 
     /// Whether a stored result can be read from here: its rows are on
@@ -505,7 +572,7 @@ impl Inner {
     /// One run, start to finish. The record is saved at each change;
     /// what comes back is how it ended.
     fn run(&self, job: Job) -> Result<Record> {
-        let Job { mut record, open, cache_ttl, cancel } = job;
+        let Job { mut record, pool_key, open, cache_ttl, cancel } = job;
         let started = unix_now();
         record.status = Status::Running;
         record.started_at = Some(rfc3339(started));
@@ -518,9 +585,32 @@ impl Inner {
         let t0 = Instant::now();
         let outcome: Result<u64> = (|| {
             self.make_room()?;
-            let mut src = open()?;
+            // A connection kept from an earlier run under the same key,
+            // or a new one.
+            let kept = pool_key.as_deref().and_then(|key| self.take(key));
+            let (mut src, mut open) = match kept {
+                Some(src) => (src, Some(open)),
+                None => (open()?, None),
+            };
             let mut writing = self.store.begin(&record.id)?;
-            let streamed = src.stream(&record.sql, &mut Stoppable { sink: &mut writing, cancel: &cancel });
+            let mut streamed = src.stream(&record.sql, &mut Stoppable { sink: &mut writing, cancel: &cancel });
+            // A kept connection may have gone stale while it waited. A
+            // read that failed on one before it handed anything over is
+            // asked again on a new connection. Never a statement that
+            // might write: it may already have.
+            let nothing_yet = writing.result_schema().is_none() && writing.rows() == 0;
+            if let (Err(_), Some(reopen), true, Kind::Semantic) = (&streamed, open.take(), nothing_yet, record.kind) {
+                if !cancel.load(Ordering::SeqCst) {
+                    drop(src);
+                    src = reopen()?;
+                    writing = self.store.begin(&record.id)?;
+                    streamed = src.stream(&record.sql, &mut Stoppable { sink: &mut writing, cancel: &cancel });
+                }
+            }
+            // A connection whose statement ran clean is good for another.
+            if let (Ok(()), Some(key)) = (&streamed, &pool_key) {
+                self.keep(key, src);
+            }
             match (streamed, writing.failure()) {
                 (_, Some(why)) => Err(self.or_disk_full(why)),
                 (Err(e), None) => Err(Error::Source(e)),
@@ -578,6 +668,13 @@ impl Inner {
         self.registry.save(&record)?;
         Ok(record)
     }
+}
+
+/// A connection that is open and not in use.
+struct Idle {
+    key: String,
+    source: Box<dyn Source>,
+    since: Instant,
 }
 
 /// A sink that stops taking rows once its run is cancelled.

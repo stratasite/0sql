@@ -11,7 +11,7 @@
 //! in the shared config file.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, sigv4, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
+use crate::{http, sigv4, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -271,14 +271,14 @@ fn ini_value(path: &std::path::Path, sections: &[&str], key: &str) -> Option<Str
 
 impl Source for Athena {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut kept = Capped::new(&self.conn.uid, max_rows);
         self.send(sql, &mut kept)?;
         Ok(kept.finish())
     }
 
     fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut batcher = Batcher::new(sink);
         self.send(sql, &mut batcher)?;
         batcher.finish()

@@ -154,6 +154,10 @@ pub struct RunLimits {
     pub local_cache_max_percent: u8,
     /// How often results that no longer answer are cleared away.
     pub cache_sweep: Duration,
+    /// Warehouse connections kept for reuse, across every datasource.
+    pub pool_max: usize,
+    /// How long a connection nothing uses is kept.
+    pub pool_idle: Duration,
 }
 
 impl Default for RunLimits {
@@ -166,6 +170,8 @@ impl Default for RunLimits {
             object_store: None,
             local_cache_max_percent: 60,
             cache_sweep: Duration::from_secs(300),
+            pool_max: 200,
+            pool_idle: Duration::from_secs(60),
         }
     }
 }

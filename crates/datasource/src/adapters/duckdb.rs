@@ -9,7 +9,7 @@
 //! `READ_ONLY` mode, so a write fails inside the engine. A statement
 //! past the timeout is interrupted through the engine's own handle.
 
-use crate::{read_only, Batches, Connection, Error, Result, Rows, Sink, Source};
+use crate::{Access, Batches, Connection, Error, Result, Rows, Sink, Source};
 use std::path::PathBuf;
 
 // Why this crate names a symbol it never calls.
@@ -53,6 +53,7 @@ pub struct DuckDb {
     conn: duckdb::Connection,
     uid: String,
     timeout: std::time::Duration,
+    access: Access,
 }
 
 impl DuckDb {
@@ -62,10 +63,12 @@ impl DuckDb {
             return Err(Error::Connect(conn.uid.clone(), format!("{} does not exist", file.display())));
         }
         let config = duckdb::Config::default()
-            .access_mode(duckdb::AccessMode::ReadOnly)
+            // A writable open takes the file from every other process,
+            // so it is only for a caller that means to write.
+            .access_mode(if conn.access == Access::Writable { duckdb::AccessMode::ReadWrite } else { duckdb::AccessMode::ReadOnly })
             .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
         let db = duckdb::Connection::open_with_flags(&file, config).map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
-        Ok(DuckDb { conn: db, uid: conn.uid.clone(), timeout: conn.timeout() })
+        Ok(DuckDb { conn: db, uid: conn.uid.clone(), timeout: conn.timeout(), access: conn.access })
     }
 }
 
@@ -85,7 +88,7 @@ impl DuckDb {
         sql: &str,
         each: impl FnOnce(arrow_schema::SchemaRef, &mut dyn Iterator<Item = arrow_array::RecordBatch>) -> Result<T>,
     ) -> Result<T> {
-        read_only(sql)?;
+        self.access.check(sql)?;
         let uid = self.uid.clone();
         let fail = |e: duckdb::Error| Error::Query(uid.clone(), e.to_string());
         // The timeout: a watcher interrupts the engine, which then answers

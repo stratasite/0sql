@@ -13,7 +13,7 @@
 //! where gcloud leaves it.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, jwt, read_only, Connection, Deadline, Error, Result, Rows, Secrets, Sink, Source};
+use crate::{http, jwt, Connection, Deadline, Error, Result, Rows, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -348,14 +348,14 @@ struct ApiError {
 
 impl Source for BigQuery {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut kept = Capped::new(&self.conn.uid, max_rows);
         self.send(sql, &mut kept)?;
         Ok(kept.finish())
     }
 
     fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut batcher = Batcher::new(sink);
         self.send(sql, &mut batcher)?;
         batcher.finish()

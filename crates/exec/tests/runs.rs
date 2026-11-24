@@ -46,6 +46,7 @@ impl Scratch {
             cache_key: Some(run_cache_key(DEFAULT_ORG, "shop", sql)),
             cache_ttl: Duration::from_secs(3600),
             fresh: false,
+            pool_key: None,
             open: Box::new(move || {
                 let conn =
                     zsql_datasource::Connection { uid: "wh".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
@@ -219,4 +220,89 @@ fn a_failure_is_recorded_and_a_restart_ends_what_was_in_progress() {
     assert_eq!((how, hit.id.as_str()), (How::Hit, good.id.as_str()));
     assert_eq!(zsql_exec::page(&reopened.rows(&hit).unwrap(), 0, 10).unwrap().num_rows(), 3);
     runs.cancel(&long.id).unwrap();
+}
+
+/// A connection that counts how often one was opened, and can be told
+/// to fail the next statement on whichever of them is asked.
+struct Counted {
+    fail_next: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl zsql_datasource::Source for Counted {
+    fn query(&mut self, _sql: &str, _max_rows: usize) -> zsql_datasource::Result<zsql_datasource::Rows> {
+        if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(zsql_datasource::Error::Query("wh".into(), "the connection was closed by the server".into()));
+        }
+        Ok(zsql_datasource::Rows { columns: vec!["n".into()], rows: vec![vec![Some("1".into())]] })
+    }
+
+    fn adapter(&self) -> &str {
+        "counted"
+    }
+}
+
+#[test]
+fn a_connection_is_kept_for_the_next_run_under_its_key() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let scratch = Scratch::new("pool");
+    let registry: Arc<dyn Registry> = Arc::new(Local::open(&scratch.0.join("records")).unwrap());
+    let limits = Limits { beat: Duration::from_millis(20), pool_idle: Duration::from_millis(400), pool_max: 2, ..Limits::of("node-a") };
+    let runs = Runs::open(&scratch.0.join("cache"), registry, None, limits).unwrap();
+    let (opened, fail_next) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let submit = |kind: Kind, key: Option<&str>, n: usize| {
+        let (opened, fail_next) = (opened.clone(), fail_next.clone());
+        Submit {
+            kind,
+            cache_key: None,
+            pool_key: key.map(str::to_string),
+            open: Box::new(move || {
+                opened.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Counted { fail_next }) as Box<dyn zsql_datasource::Source>)
+            }),
+            ..scratch.submit(&format!("SELECT {n}"))
+        }
+    };
+    let run = |kind: Kind, key: Option<&str>, n: usize| {
+        let (record, _) = runs.submit(submit(kind, key, n)).unwrap();
+        runs.wait(&record.id, Duration::from_secs(20)).unwrap().unwrap()
+    };
+
+    // Three runs under one key open one connection.
+    for n in 0..3 {
+        assert_eq!(run(Kind::Semantic, Some("wh/ada"), n).status, Status::Succeeded);
+    }
+    assert_eq!((opened.load(Ordering::SeqCst), runs.idle_connections()), (1, 1));
+    // Another credential is another connection, and a run with no key
+    // keeps none.
+    run(Kind::Semantic, Some("wh/bo"), 3);
+    run(Kind::Semantic, None, 4);
+    assert_eq!((opened.load(Ordering::SeqCst), runs.idle_connections()), (3, 2));
+    // One more than the pool holds, and the one unused longest is closed.
+    run(Kind::Semantic, Some("wh/cy"), 5);
+    assert_eq!(runs.idle_connections(), 2);
+    run(Kind::Semantic, Some("wh/ada"), 6);
+    assert_eq!(opened.load(Ordering::SeqCst), 5, "ada's had been closed to make room, so a new one was opened");
+
+    // A kept connection that has gone stale: a read is asked again on a
+    // new one, and nobody is told.
+    fail_next.store(true, Ordering::SeqCst);
+    let retried = run(Kind::Semantic, Some("wh/ada"), 7);
+    assert_eq!((retried.status, opened.load(Ordering::SeqCst)), (Status::Succeeded, 6), "{retried:?}");
+    // A statement that may write is not: it may already have.
+    fail_next.store(true, Ordering::SeqCst);
+    let not_retried = run(Kind::Sql, Some("wh/ada"), 8);
+    assert_eq!((not_retried.status, opened.load(Ordering::SeqCst)), (Status::Failed, 6), "{not_retried:?}");
+    assert!(not_retried.error.unwrap().contains("closed by the server"));
+    // A connection whose statement failed is not kept.
+    let before = runs.idle_connections();
+    fail_next.store(true, Ordering::SeqCst);
+    assert_eq!(run(Kind::Sql, Some("wh/new"), 9).status, Status::Failed);
+    assert_eq!(runs.idle_connections(), before);
+
+    // Left unused, a connection is closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while runs.idle_connections() > 0 {
+        assert!(std::time::Instant::now() < deadline, "idle connections were never closed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

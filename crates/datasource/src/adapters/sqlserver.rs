@@ -13,7 +13,7 @@
 //! costs 2.7 MB of binary and is why `ring` is installed as the process
 //! default once, in `tls`.
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{read_only, tls, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
+use crate::{tls, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type Client = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -144,7 +144,7 @@ impl SqlServer {
     /// the whole read under the timeout.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         use futures_util::TryStreamExt;
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let uid = self.uid.clone();
         let timeout = self.timeout;
         if self.client.is_none() {

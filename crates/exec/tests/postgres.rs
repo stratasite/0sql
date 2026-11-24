@@ -163,6 +163,7 @@ fn the_records_of_runs_in_postgres() {
             cache_key: Some(run_cache_key(DEFAULT_ORG, "shop", sql)),
             cache_ttl: Duration::from_secs(3600),
             fresh: false,
+            pool_key: None,
             open: Box::new(move || {
                 let conn =
                     zsql_datasource::Connection { uid: "wh".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };

@@ -5,7 +5,7 @@
 //! own transport; it is not reached this way.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
+use crate::{http, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
 use base64::Engine;
 use serde_json::Value;
 
@@ -74,7 +74,7 @@ impl Trino {
     /// The statement followed page by page, each row to `out` as its
     /// page arrives.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let fail = |e: ureq::Error| Error::Query(self.conn.uid.clone(), crate::chain(&e));
         let first = self.headers(self.agent.post(&format!("{}/v1/statement", self.base))).send(sql.as_bytes()).map_err(fail)?;
         let mut v = self.page(http::text(&self.conn, first)?)?;

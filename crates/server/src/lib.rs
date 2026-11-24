@@ -174,6 +174,8 @@ pub(crate) fn open_runs(data_dir: &std::path::Path, limits: &RunLimits) -> anyho
         queue_max: limits.queue_max,
         local_max_percent: limits.local_cache_max_percent,
         sweep: limits.cache_sweep,
+        pool_max: limits.pool_max,
+        pool_idle: limits.pool_idle,
         ..zsql_exec::Limits::of(&hostname())
     };
     Ok(zsql_exec::Runs::open(&cache.join("results"), registry, objects, limits)?)

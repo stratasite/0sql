@@ -21,7 +21,7 @@ const UNBOUNDED: usize = usize::MAX - 1;
 
 /// One read-only statement in, rows out. Implemented once per transport,
 /// which is three implementations for thirteen adapters.
-pub trait Source {
+pub trait Source: Send {
     /// Runs `sql` and returns at most `max_rows` rows, refusing rather
     /// than truncating past it so a caller never averages a partial
     /// answer. Implementations call [`read_only`] first.
@@ -70,6 +70,37 @@ pub trait Source {
     /// needs more than the adapter's name: BigQuery's project and location.
     fn connection(&self) -> Option<&Connection> {
         None
+    }
+}
+
+/// How far a connection is trusted with a statement.
+///
+/// A command reading a catalog or sampling values is handed statements
+/// this crate wrote or an author typed, and checks each for being a
+/// read. A server that runs statements for the service in front of it
+/// checks nothing: what may be done to a database is the database's to
+/// say, through the credential it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Access {
+    /// Each statement is checked for being a read, and an engine that
+    /// can be opened read-only is.
+    #[default]
+    ReadOnly,
+    /// No statement is checked. An engine in this process is still
+    /// opened for reading where opening it for writing would lock its
+    /// file against everyone else, which is DuckDB.
+    Unchecked,
+    /// No statement is checked, and every engine is opened for writing.
+    Writable,
+}
+
+impl Access {
+    /// Refuses a statement that is not a read, when statements are checked.
+    pub fn check(self, sql: &str) -> Result<()> {
+        match self {
+            Access::ReadOnly => read_only(sql),
+            Access::Unchecked | Access::Writable => Ok(()),
+        }
     }
 }
 

@@ -13,7 +13,7 @@
 //! is checked here; under 2 the caps go up; under 0 so does `readonly=2`.
 
 use crate::rows::{Batcher, RowSink};
-use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
+use crate::{http, Access, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
 
 pub struct ClickHouse {
     agent: ureq::Agent,
@@ -54,7 +54,8 @@ impl ClickHouse {
         match self.readonly {
             1 => String::new(),
             2 => caps,
-            _ => format!("&readonly=2{caps}"),
+            _ if self.conn.access == Access::ReadOnly => format!("&readonly=2{caps}"),
+            _ => caps,
         }
     }
 
@@ -140,12 +141,12 @@ struct Meta {
 
 impl Source for ClickHouse {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         self.send(sql, &self.settings(Some(max_rows)), max_rows)
     }
 
     fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut batcher = Batcher::new(sink);
         self.lines(sql, &mut batcher)?;
         batcher.finish()

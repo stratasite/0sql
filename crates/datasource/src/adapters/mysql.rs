@@ -10,7 +10,7 @@
 //! store, because the crate takes certificate files and not a store.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{read_only, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
+use crate::{Access, Connection, Error, Result, Rows, Secret, Sink, Source, SslMode};
 use mysql_async::prelude::Queryable;
 
 pub struct MySql {
@@ -23,6 +23,7 @@ pub struct MySql {
     /// the timeout leaves the connection mid-answer.
     again: (Connection, Option<Secret>),
     abandoned: bool,
+    access: Access,
 }
 
 impl MySql {
@@ -82,14 +83,23 @@ impl MySql {
         runtime
             .block_on(c.query_drop(format!("SET SESSION max_execution_time = {}", conn.timeout().as_millis())))
             .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
-        Ok(MySql { runtime, conn: c, uid: conn.uid.clone(), warnings, timeout: conn.timeout(), again, abandoned: false })
+        Ok(MySql {
+            runtime,
+            conn: c,
+            uid: conn.uid.clone(),
+            warnings,
+            timeout: conn.timeout(),
+            again,
+            abandoned: false,
+            access: conn.access,
+        })
     }
 }
 
 impl MySql {
     /// The statement's rows to `out` as the server sends them.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
-        read_only(sql)?;
+        self.access.check(sql)?;
         if self.abandoned {
             // Whole, runtime and all: a connection's sockets belong to
             // the runtime it was opened on.

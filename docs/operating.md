@@ -212,6 +212,8 @@ same thing. The ones an operator sets:
 | `ZSQL_OBJECT_STORE_<OPTION>` | the store's options, by the store's own names: `ZSQL_OBJECT_STORE_AWS_ACCESS_KEY_ID`, `ZSQL_OBJECT_STORE_AWS_SECRET_ACCESS_KEY`, `ZSQL_OBJECT_STORE_AWS_REGION`, `ZSQL_OBJECT_STORE_AWS_ENDPOINT` and so on. An option the store does not have stops the server at startup. `AWS_*` and `GOOGLE_APPLICATION_CREDENTIALS` are never read for the store: the Athena and BigQuery adapters fall back to them, and a storage credential there would become a warehouse login |
 | `ZSQL_LOCAL_CACHE_MAX_PERCENT` | the share of the disk this node's results may take; 60. Past it, with an object store, the least recently read local copies are removed; without one, a run fails saying the disk is full |
 | `ZSQL_CACHE_SWEEP_SECS` | how often results that no longer answer, expired or invalidated, are deleted from the store and the disk; 300 |
+| `ZSQL_POOL_MAX` | warehouse connections kept open for reuse, across every datasource; 200. A connection is reused only by a run with the same datasource, settings and credential |
+| `ZSQL_POOL_IDLE_SECS` | how long a connection nothing uses is kept; 60 |
 | `ZSQL_CONCURRENT_RUNS` | how many statements run at once; 100 |
 | `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
 | `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |

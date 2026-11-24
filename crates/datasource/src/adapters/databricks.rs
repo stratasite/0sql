@@ -14,7 +14,7 @@
 //! the manifest says the total and whether it was cut.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
+use crate::{http, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use base64::Engine;
 use std::time::{Duration, Instant};
 
@@ -295,14 +295,14 @@ struct Chunk {
 
 impl Source for Databricks {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut kept = Capped::new(&self.conn.uid, max_rows);
         self.send(sql, &mut kept)?;
         Ok(kept.finish())
     }
 
     fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
-        read_only(sql)?;
+        self.conn.access.check(sql)?;
         let mut batcher = Batcher::new(sink);
         self.send(sql, &mut batcher)?;
         batcher.finish()

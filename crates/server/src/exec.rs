@@ -132,7 +132,10 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
     let sql = planned.plan.sql_with_limit(row_limit, &dialect).map_err(zsql_core::Error::from)?;
     let datasource = planned.plan.datasource_uid.clone();
 
-    let (conn, sent) = connection_of(app, uid, branch, &datasource, None, &req.connection, None)?;
+    let (mut conn, sent) = connection_of(app, uid, branch, &datasource, None, &req.connection, None)?;
+    // What a statement may do is the database's to say, through the
+    // credential it is run with: nothing here checks it.
+    conn.access = zsql_datasource::Access::Unchecked;
     // The request's credential when it sent one; this server's otherwise.
     let secrets = if sent.is_empty() { (app.secrets)(&datasource) } else { sent };
     let wait = wait_of(req.wait, conn.wait())?;
@@ -156,10 +159,18 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
             cache_key,
             cache_ttl: ttl,
             fresh: req.fresh,
+            pool_key: Some(pool_key(&conn, &secrets)),
             open: Box::new(move || zsql_datasource::open(&conn, secrets)),
         })
         .map_err(internal)?;
     Ok((record, how, wait))
+}
+
+/// What a connection may be reused under: everything about where it
+/// points and how far it is trusted, and whose credential opened it. A
+/// connection is never handed to a run that would have opened another.
+pub(crate) fn pool_key(conn: &zsql_datasource::Connection, secrets: &zsql_datasource::Secrets) -> String {
+    zsql_exec::sha256(&format!("{conn:?}\n{}", secrets.fingerprint()))
 }
 
 /// The record once the run is over, or as it stands when `wait` is up.

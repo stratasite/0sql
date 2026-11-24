@@ -1212,6 +1212,7 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     assert!(!String::from_utf8_lossy(&a.raw).contains("never-echoed"), "a credential is in no answer");
     let id = a.body["id"].as_str().unwrap().to_string();
 
+    assert_eq!(s.app.runs.idle_connections(), 1, "the connection it opened is kept for the next run");
     // The same question again is the stored result; fresh runs anyway.
     let again = s.post(&run, ask(json!({}))).await;
     assert_eq!((&again.body["cache"], again.body["id"].as_str()), (&json!("hit"), Some(id.as_str())));
@@ -1219,6 +1220,11 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     let fresh = s.post(&run, ask(json!({ "fresh": true }))).await;
     assert_eq!(fresh.body["cache"], "miss");
     assert_ne!(fresh.body["id"], a.body["id"]);
+    assert_eq!(s.app.runs.idle_connections(), 1, "and was used again: the same datasource, settings and credential");
+    // Another credential is another connection.
+    let other = s.post(&run, json!({ "expr": "category asc, revenue", "fresh": true, "connection": { "file": file.to_str().unwrap(), "password": "another" } })).await;
+    assert_eq!(other.body["status"], "succeeded", "{}", other.body);
+    assert_eq!(s.app.runs.idle_connections(), 2);
 
     // By its id: a page from the middle, and the whole of it as Arrow.
     let page = s.get(&format!("/results/{id}?offset=1&limit=1")).await;
@@ -1241,8 +1247,8 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     let marked = invalidate(json!({ "datasource": "dw", "tables": ["sales"], "project": CS })).await;
     assert_eq!(
         (marked.status, &marked.body["invalidated"]),
-        (StatusCode::OK, &json!(2)),
-        "the result and the fresh one after it: {}",
+        (StatusCode::OK, &json!(3)),
+        "the result and the two fresh ones after it: {}",
         marked.body
     );
     assert_eq!(s.get(&format!("/results/{id}")).await.body["dirty"], true);
