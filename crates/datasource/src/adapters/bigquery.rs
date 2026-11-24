@@ -13,7 +13,7 @@
 //! where gcloud leaves it.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secrets, Sink, Source};
+use crate::{http, jwt, read_only, Connection, Deadline, Error, Result, Rows, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -202,6 +202,7 @@ impl BigQuery {
         };
         // Not done within the request's own wait: ask again until it is,
         // or until the statement timeout cancels the job.
+        let arriving = Deadline::of(&self.conn);
         let deadline = Instant::now() + self.conn.timeout();
         while !answer.job_complete {
             if Instant::now() >= deadline {
@@ -245,6 +246,7 @@ impl BigQuery {
                 out.row(r.f.into_iter().map(|c| http::cell(c.v)).collect())?;
             }
             let Some(token) = answer.page_token.take() else { break };
+            arriving.check()?;
             let (status, text) = self.request(http::Method::Get, &results_url(Some(&token)), None)?;
             if status != 200 {
                 return Err(self.refused(status, &text));

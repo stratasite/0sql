@@ -11,7 +11,7 @@
 //! in the shared config file.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, sigv4, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
+use crate::{http, read_only, sigv4, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -160,7 +160,11 @@ impl Athena {
         let mut columns: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         let mut first = true;
+        let arriving = Deadline::of(&self.conn);
         loop {
+            if !first {
+                arriving.check()?;
+            }
             let mut req = serde_json::json!({ "QueryExecutionId": id, "MaxResults": PAGE });
             if let Some(t) = &token {
                 req["NextToken"] = serde_json::Value::String(t.clone());

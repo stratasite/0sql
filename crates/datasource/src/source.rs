@@ -161,3 +161,37 @@ fn skeleton(sql: &str) -> String {
     }
     out
 }
+
+/// When a read must be over: `query_timeout` from the moment it began,
+/// the fetch of its rows included. A transport whose warehouse only
+/// times the statement checks this between the pages it fetches, so a
+/// result that is slow to arrive is under the same limit as one that is
+/// slow to compute.
+pub(crate) struct Deadline {
+    uid: String,
+    timeout: std::time::Duration,
+    at: std::time::Instant,
+}
+
+impl Deadline {
+    pub(crate) fn of(conn: &Connection) -> Deadline {
+        Deadline { uid: conn.uid.clone(), timeout: conn.timeout(), at: std::time::Instant::now() + conn.timeout() }
+    }
+
+    pub(crate) fn passed(&self) -> bool {
+        std::time::Instant::now() >= self.at
+    }
+
+    /// Refuses once the deadline has passed, with rows still to come.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.passed() {
+            return Err(self.arriving());
+        }
+        Ok(())
+    }
+
+    /// The error of a read whose rows were still arriving at the deadline.
+    pub(crate) fn arriving(&self) -> Error {
+        Error::Query(self.uid.clone(), format!("the result was still arriving after {}s; stopped (query_timeout)", self.timeout.as_secs()))
+    }
+}

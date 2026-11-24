@@ -128,6 +128,10 @@ pub struct Connection {
     /// Seconds a stored result from this datasource answers for; `0`
     /// keeps nothing. Read by `zsql run`, ignored by the loader.
     pub cache_ttl: Option<i64>,
+    /// Seconds a request for a run waits for its rows before it is
+    /// answered with the run's id instead. Ten when not said. Read by a
+    /// server that runs statements, ignored by the loader.
+    pub query_wait_time: Option<i64>,
 }
 
 impl Connection {
@@ -183,6 +187,7 @@ impl Connection {
             output_location: s("output_location").or_else(|| s("s3_output_location")),
             profile: s("profile"),
             cache_ttl: i("cache_ttl"),
+            query_wait_time: i("query_wait_time"),
         })
     }
 
@@ -218,6 +223,12 @@ impl Connection {
         value.clone().ok_or_else(|| Error::Missing(self.uid.clone(), what))
     }
 
+    /// How long a request for a run waits for its rows, from
+    /// `query_wait_time` or ten seconds.
+    pub fn wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.query_wait_time.filter(|s| *s >= 0).unwrap_or(10) as u64)
+    }
+
     /// The statement timeout, from `query_timeout` or a default that is
     /// generous for a catalog read and short of any warehouse's own.
     pub fn timeout(&self) -> std::time::Duration {
@@ -228,7 +239,7 @@ impl Connection {
 
 /// Every key [`Connection::from_value`] reads, aliases included, for a
 /// caller that refuses a key it would otherwise read past.
-pub const CONNECTION_KEYS: [&str; 35] = [
+pub const CONNECTION_KEYS: [&str; 36] = [
     "adapter",
     "host",
     "port",
@@ -264,4 +275,5 @@ pub const CONNECTION_KEYS: [&str; 35] = [
     "s3_output_location",
     "profile",
     "cache_ttl",
+    "query_wait_time",
 ];

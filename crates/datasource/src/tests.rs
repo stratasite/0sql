@@ -899,6 +899,45 @@ fn sf_result(handle: &str, columns: &[&str], data: serde_json::Value, num_rows: 
     .to_string()
 }
 
+/// `query_timeout` is the whole read's, the arrival of its rows
+/// included: a statement that finished in time and whose pages are slow
+/// to come is stopped at the same limit, and a capped read with it.
+#[test]
+fn the_timeout_covers_rows_that_are_still_arriving() {
+    let server = fake(|method, path, _body| match (method, path) {
+        ("POST", "/api/v2/statements") => (200, sf_result("h0", &["N"], serde_json::json!([["1"]]), 4, 4)),
+        ("GET", p) if p.starts_with("/api/v2/statements/h0?partition=") => {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            (200, serde_json::json!({"data": [["2"]]}).to_string())
+        }
+        _ => (404, format!("{{\"message\":\"no route {method} {path}\"}}")),
+    });
+    let conn = Connection {
+        uid: "snow".into(),
+        adapter: "snowflake".into(),
+        url: Some(server.url.clone()),
+        database: Some("db".into()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(1),
+        ..Default::default()
+    };
+    let token = || Secrets { oauth_token: Some(Secret("t".into())), ..Default::default() };
+    let mut src = crate::adapters::snowflake::Snowflake::open(&conn, token()).unwrap();
+    let started = std::time::Instant::now();
+    let err = src.stream("SELECT n FROM slow_to_arrive", &mut Kept::default()).unwrap_err().to_string();
+    assert!(err.contains("still arriving after 1s") && err.contains("query_timeout"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "it stopped fetching: {:?}", started.elapsed());
+    let err = src.query("SELECT n FROM slow_to_arrive", 100).unwrap_err().to_string();
+    assert!(err.contains("still arriving after 1s"), "the capped read is under the same limit: {err}");
+
+    // What a datasource says about waiting: ten seconds unless it says.
+    assert_eq!(conn.wait(), std::time::Duration::from_secs(10));
+    let said: serde_yaml::Value = serde_yaml::from_str("adapter: snowflake\nquery_wait_time: 3\ncache_ttl: 0\n").unwrap();
+    let read = Connection::from_value("wh", &said).unwrap();
+    assert_eq!((read.wait(), read.cache_ttl), (std::time::Duration::from_secs(3), Some(0)));
+    assert!(CONNECTION_KEYS.contains(&"query_wait_time"));
+}
+
 fn sf_key() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness/sources/snowflake/rsa_key.p8")
 }

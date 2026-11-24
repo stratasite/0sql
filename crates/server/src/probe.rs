@@ -138,7 +138,7 @@ fn refused(e: zsql_datasource::Error) -> ApiError {
 }
 
 /// The settings that are numbers; every other one is text.
-const NUMBERS: [&str; 3] = ["port", "query_timeout", "cache_ttl"];
+const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
 
 /// The settings with more than one spelling. One sent in the request
 /// replaces the deployed one under any of its names.

@@ -14,7 +14,7 @@
 //! the manifest says the total and whether it was cut.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
+use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use base64::Engine;
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,7 @@ impl Databricks {
     }
 
     fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
+        let arriving = Deadline::of(&self.conn);
         // The request's own wait: the statement timeout, within what the
         // API allows, and under the HTTP call's own limit.
         let wait = self.conn.timeout().as_secs().min(MAX_WAIT_SECS);
@@ -170,7 +171,7 @@ impl Databricks {
             let why = answer.status.error.and_then(|e| e.message).unwrap_or_default();
             return Err(Error::Query(self.conn.uid.clone(), format!("{}: {why}", answer.status.state.to_lowercase()).trim().to_string()));
         }
-        self.collect(answer, out)
+        self.collect(answer, out, &arriving)
     }
 
     /// Waits on a pending statement: a second at first, doubling to five,
@@ -203,7 +204,7 @@ impl Databricks {
 
     /// The rows across the chunks. The manifest says the total first, so
     /// a result over the cap is refused before any chunk past the first.
-    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink) -> Result<()> {
+    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink, arriving: &Deadline) -> Result<()> {
         let manifest = answer.manifest.unwrap_or_default();
         if manifest.truncated {
             return Err(match out.limit() {
@@ -230,6 +231,7 @@ impl Databricks {
                 out.row(row.into_iter().map(http::cell).collect())?;
             }
             let Some(next) = r.next_chunk_index else { break };
+            arriving.check()?;
             let url = format!("{}{STATEMENTS}/{}/result/chunks/{next}", self.base, answer.statement_id);
             let (status, text) = self.request(http::Method::Get, &url, None)?;
             if status != 200 {

@@ -13,7 +13,7 @@
 //! is checked here; under 2 the caps go up; under 0 so does `readonly=2`.
 
 use crate::rows::{Batcher, RowSink};
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Sink, Source};
+use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
 
 pub struct ClickHouse {
     agent: ureq::Agent,
@@ -83,8 +83,14 @@ impl ClickHouse {
             return http::text(&self.conn, response).map(|_| ());
         }
         let reader = std::io::BufReader::new(response.into_body().into_reader());
+        let deadline = Deadline::of(&self.conn);
         let mut named = false;
-        for line in reader.lines() {
+        for (at, line) in reader.lines().enumerate() {
+            // The server times the statement; this times the arriving,
+            // looked at every so many rows.
+            if at % 1024 == 1023 {
+                deadline.check()?;
+            }
             let line = line.map_err(|e| Error::Query(uid.clone(), e.to_string()))?;
             if line.trim().is_empty() {
                 continue;

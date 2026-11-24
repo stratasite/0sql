@@ -39,6 +39,7 @@ pub use connection::{Connection, SslMode, CONNECTION_KEYS};
 pub use error::{chain, Error, Result};
 pub use rows::Rows;
 pub use secret::{secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};
+pub(crate) use source::Deadline;
 pub use source::{read_only, Sink, Source};
 
 /// Whether this adapter can be opened with [`Secrets::oauth_token`]: an

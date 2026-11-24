@@ -17,7 +17,7 @@
 //! written.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
+use crate::{http, jwt, read_only, Connection, Deadline, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use std::time::{Duration, Instant};
 
 const STATEMENTS: &str = "/api/v2/statements";
@@ -161,6 +161,7 @@ impl Snowflake {
     }
 
     fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
+        let arriving = Deadline::of(&self.conn);
         let body = serde_json::json!({
             "statement": sql,
             "timeout": self.conn.timeout().as_secs(),
@@ -195,7 +196,7 @@ impl Snowflake {
             }
             _ => return Err(self.refused(status, &text)),
         };
-        self.collect(answer, out)
+        self.collect(answer, out, &arriving)
     }
 
     /// Waits on a statement the server is still running: a quarter second
@@ -231,7 +232,7 @@ impl Snowflake {
     /// The rows of a finished statement, across its partitions. The total
     /// is known before any partition past the first is fetched, so a
     /// result over the cap costs one request, not all of them.
-    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink) -> Result<()> {
+    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink, arriving: &Deadline) -> Result<()> {
         let meta = answer.meta.unwrap_or_default();
         if let Some(total) = meta.num_rows.and_then(|n| u64::try_from(n).ok()) {
             out.total(total)?;
@@ -243,6 +244,7 @@ impl Snowflake {
         }
         if let Some(handle) = answer.handle.filter(|_| meta.partitions.len() > 1) {
             for p in 1..meta.partitions.len() {
+                arriving.check()?;
                 let url = format!("{}{STATEMENTS}/{handle}?partition={p}", self.base);
                 let (status, text) = self.request(http::Method::Get, &url, None)?;
                 if status != 200 {

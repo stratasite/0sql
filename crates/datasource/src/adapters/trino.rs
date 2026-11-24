@@ -5,7 +5,7 @@
 //! own transport; it is not reached this way.
 
 use crate::rows::{Batcher, Capped, RowSink};
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Sink, Source};
+use crate::{http, read_only, Connection, Deadline, Error, Result, Rows, Secret, Sink, Source};
 use base64::Engine;
 use serde_json::Value;
 
@@ -78,6 +78,7 @@ impl Trino {
         let fail = |e: ureq::Error| Error::Query(self.conn.uid.clone(), crate::chain(&e));
         let first = self.headers(self.agent.post(&format!("{}/v1/statement", self.base))).send(sql.as_bytes()).map_err(fail)?;
         let mut v = self.page(http::text(&self.conn, first)?)?;
+        let deadline = Deadline::of(&self.conn);
         let mut named = false;
         loop {
             if !named {
@@ -102,6 +103,10 @@ impl Trino {
                 }
             }
             let Some(next) = v.get("nextUri").and_then(Value::as_str).map(str::to_string) else { break };
+            if deadline.passed() {
+                let _ = self.headers(self.agent.delete(&next)).call();
+                return Err(deadline.arriving());
+            }
             // The protocol says a 503 on nextUri is "try again", not a refusal.
             let mut tries = 0;
             let r = loop {

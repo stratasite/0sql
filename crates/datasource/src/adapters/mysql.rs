@@ -18,10 +18,16 @@ pub struct MySql {
     conn: mysql_async::Conn,
     uid: String,
     warnings: Vec<String>,
+    timeout: std::time::Duration,
+    /// What it was opened from, to open it again: a read abandoned at
+    /// the timeout leaves the connection mid-answer.
+    again: (Connection, Option<Secret>),
+    abandoned: bool,
 }
 
 impl MySql {
     pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<MySql> {
+        let again = (conn.clone(), secret.clone());
         let host = conn.need(&conn.host, "host")?;
         let user = conn.need(&conn.username, "username")?;
         let password =
@@ -76,7 +82,7 @@ impl MySql {
         runtime
             .block_on(c.query_drop(format!("SET SESSION max_execution_time = {}", conn.timeout().as_millis())))
             .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
-        Ok(MySql { runtime, conn: c, uid: conn.uid.clone(), warnings })
+        Ok(MySql { runtime, conn: c, uid: conn.uid.clone(), warnings, timeout: conn.timeout(), again, abandoned: false })
     }
 }
 
@@ -84,10 +90,15 @@ impl MySql {
     /// The statement's rows to `out` as the server sends them.
     fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         read_only(sql)?;
+        if self.abandoned {
+            // Whole, runtime and all: a connection's sockets belong to
+            // the runtime it was opened on.
+            *self = MySql::open(&self.again.0, self.again.1.clone())?;
+        }
         let uid = self.uid.clone();
         let fail = |e: mysql_async::Error| Error::Query(uid.clone(), crate::chain(&e));
-        let conn = &mut self.conn;
-        self.runtime.block_on(async {
+        let (conn, timeout) = (&mut self.conn, self.timeout);
+        let read = async {
             let mut result = conn.query_iter(sql).await.map_err(fail)?;
             let columns: Vec<String> = result.columns().map(|c| c.iter().map(|c| c.name_str().to_string()).collect()).unwrap_or_default();
             // Which columns are dates without a time: the value alone
@@ -108,7 +119,17 @@ impl MySql {
                 let _ = result.drop_result().await;
             }
             taken
-        })
+        };
+        // The server times the statement; this times the whole read,
+        // the rows' arrival included.
+        let outcome = self.runtime.block_on(async { tokio::time::timeout(timeout, read).await });
+        match outcome {
+            Ok(done) => done,
+            Err(_) => {
+                self.abandoned = true;
+                Err(Error::Query(self.uid.clone(), format!("no answer within {}s; stopped (query_timeout)", timeout.as_secs())))
+            }
+        }
     }
 }
 
