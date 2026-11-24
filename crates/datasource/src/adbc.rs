@@ -20,14 +20,15 @@
 //! `ZSQL_ADBC=off` keeps every read on REST, for telling the two apart
 //! when one of them misbehaves.
 
-use crate::batch::{self, Batches};
-use crate::{read_only, Connection, Error, Result, Rows, Secrets, Source};
+use crate::batch::Batches;
+use crate::{read_only, Connection, Error, Result, Rows, Secrets, Sink, Source};
 use adbc_core::error::Status;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
 use adbc_core::{Connection as _, Database as _, Driver as _, Statement as _};
 use adbc_core::{LOAD_FLAG_SEARCH_ENV, LOAD_FLAG_SEARCH_SYSTEM, LOAD_FLAG_SEARCH_USER};
 use adbc_driver_manager::{ManagedConnection, ManagedDatabase, ManagedDriver};
-use arrow_array::RecordBatchReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::SchemaRef;
 use std::time::Duration;
 
 /// What to open: a driver by its registry name and the options it takes.
@@ -82,53 +83,190 @@ impl Adbc {
     }
 
     /// One read, under the row cap and the statement timeout.
-    ///
-    /// The statement runs on a thread of its own and the caller waits no
-    /// longer than the timeout, fetch included. Past it the statement is
-    /// cancelled through the driver's handle. A driver is free not to
-    /// implement that, and the SQLite one does not, so the answer never
-    /// depends on it: the caller is told either way, and told which. A
-    /// statement that could not be cancelled is abandoned, still running
-    /// wherever it runs, which is what the error says.
     pub fn batches(&mut self, sql: &str, max_rows: usize) -> Result<Batches> {
+        let mut kept = Kept { uid: self.uid.clone(), max_rows, rows: 0, got: Batches::empty() };
+        self.stream(sql, &mut kept)?;
+        Ok(kept.got)
+    }
+
+    /// One read handed to `sink` a batch at a time, under the statement
+    /// timeout.
+    ///
+    /// The statement runs on a thread of its own, which hands over each
+    /// batch as the driver produces it and waits for it to be taken
+    /// before reading the next, so nothing piles up between the two. The
+    /// caller waits no longer than the timeout for the whole read. Past
+    /// it, or when the sink has had enough, the statement is cancelled
+    /// through the driver's handle. A driver is free not to implement
+    /// that, and the SQLite one does not, so the answer never depends on
+    /// it: the caller is told either way, and told which. A statement
+    /// that could not be cancelled is abandoned, still running wherever
+    /// it runs, which is what the error says.
+    pub fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
         read_only(sql)?;
         let uid = self.uid.clone();
         let fail = |e: adbc_core::error::Error| Error::Query(uid.clone(), e.message);
         let mut statement = self.connection.new_statement().map_err(fail)?;
         statement.set_sql_query(sql).map_err(fail)?;
         let cancel = statement.get_cancel_handle();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<Batches>>();
+        // Room for one message: the worker reads no further ahead than
+        // the batch that is waiting to be taken.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Message>(1);
         let worker_uid = uid.clone();
-        let scale_is_nominal = self.scale_is_nominal;
         std::thread::spawn(move || {
             let outcome = (|| {
-                let reader = statement.execute().map_err(|e| Error::Query(worker_uid.clone(), e.message))?;
-                let schema = reader.schema();
-                let got = batch::collect(&worker_uid, schema, reader, max_rows)?;
-                Ok(if scale_is_nominal { got.printing_decimals_trimmed() } else { got })
+                let failed = |why: String| Error::Query(worker_uid.clone(), why);
+                let reader = statement.execute().map_err(|e| failed(e.message))?;
+                // A send that fails means nobody is listening any more.
+                if tx.send(Message::Schema(reader.schema())).is_err() {
+                    return Ok(());
+                }
+                for batch in reader {
+                    if tx.send(Message::Batch(batch.map_err(|e| failed(e.to_string()))?)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
             })();
-            // Nobody is listening once the caller has given up.
-            let _ = done_tx.send(outcome);
+            let _ = tx.send(Message::Done(outcome));
         });
-        match done_rx.recv_timeout(self.timeout) {
-            Ok(outcome) => outcome,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::Query(uid, "the driver stopped without an answer".into())),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let secs = self.timeout.as_secs();
-                let why = match cancel.try_cancel() {
-                    // A cancelled statement returns promptly; wait for it
-                    // so the connection is free for the next one.
-                    Ok(()) if done_rx.recv_timeout(CANCEL_GRACE).is_ok() => format!("no answer within {secs}s; cancelled (query_timeout)"),
-                    Ok(()) => format!("no answer within {secs}s; cancellation was sent and the statement has not stopped (query_timeout)"),
-                    // Some drivers refuse with a status and no words.
-                    Err(e) => format!(
-                        "no answer within {secs}s, and the driver could not cancel it ({}); it may still be running (query_timeout)",
-                        if e.message.trim().is_empty() { format!("{:?}", e.status) } else { e.message }
-                    ),
-                };
-                Err(Error::Query(uid, why))
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        let mut schema: Option<SchemaRef> = None;
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Message::Done(outcome)) => return outcome,
+                Ok(Message::Schema(arrived)) => {
+                    // A warehouse whose scale is nominal has its decimal
+                    // columns marked, in the schema every batch carries.
+                    let marked = if self.scale_is_nominal {
+                        Batches { schema: arrived, batches: Vec::new() }.printing_decimals_trimmed().schema
+                    } else {
+                        arrived
+                    };
+                    let taken = sink.schema(&marked);
+                    schema = Some(marked);
+                    if let Err(e) = taken {
+                        let _ = cancel.try_cancel();
+                        return Err(e);
+                    }
+                }
+                Ok(Message::Batch(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let taken = match &schema {
+                        Some(marked) => batch
+                            .with_schema(marked.clone())
+                            .map_err(|e| Error::Query(uid.clone(), e.to_string()))
+                            .and_then(|b| sink.batch(b)),
+                        None => Err(Error::Query(uid.clone(), "the driver sent rows before their schema".into())),
+                    };
+                    if let Err(e) = taken {
+                        // Whoever takes the rows has had enough: stop the
+                        // statement, and stop listening, which stops the
+                        // worker at its next batch.
+                        let _ = cancel.try_cancel();
+                        return Err(e);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Query(uid, "the driver stopped without an answer".into()));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let secs = self.timeout.as_secs();
+                    let stopped = || {
+                        let until = std::time::Instant::now() + CANCEL_GRACE;
+                        loop {
+                            match rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+                                Ok(Message::Done(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+                                Ok(_) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+                            }
+                        }
+                    };
+                    let why = match cancel.try_cancel() {
+                        // A cancelled statement returns promptly; wait for it
+                        // so the connection is free for the next one.
+                        Ok(()) if stopped() => format!("no answer within {secs}s; cancelled (query_timeout)"),
+                        Ok(()) => {
+                            format!("no answer within {secs}s; cancellation was sent and the statement has not stopped (query_timeout)")
+                        }
+                        // Some drivers refuse with a status and no words.
+                        Err(e) => format!(
+                            "no answer within {secs}s, and the driver could not cancel it ({}); it may still be running (query_timeout)",
+                            if e.message.trim().is_empty() { format!("{:?}", e.status) } else { e.message }
+                        ),
+                    };
+                    return Err(Error::Query(uid, why));
+                }
             }
         }
+    }
+}
+
+/// What the statement's thread hands over.
+enum Message {
+    Schema(SchemaRef),
+    Batch(RecordBatch),
+    Done(Result<()>),
+}
+
+/// A read that keeps its batches, and refuses past the cap.
+struct Kept {
+    uid: String,
+    max_rows: usize,
+    rows: usize,
+    got: Batches,
+}
+
+impl Sink for Kept {
+    fn schema(&mut self, schema: &SchemaRef) -> Result<()> {
+        self.got.schema = schema.clone();
+        Ok(())
+    }
+
+    fn batch(&mut self, batch: RecordBatch) -> Result<()> {
+        self.rows += batch.num_rows();
+        if self.rows > self.max_rows {
+            return Err(Error::TooManyRows(self.uid.clone(), self.max_rows));
+        }
+        self.got.batches.push(batch);
+        Ok(())
+    }
+}
+
+/// A sink that says nothing until there is something to say: the schema
+/// is passed on with the first batch, or at the end of a result with no
+/// rows. A read that fails before then has told the real sink nothing,
+/// so another transport can still answer in its place.
+struct Deferred<'a> {
+    sink: &'a mut dyn Sink,
+    schema: Option<SchemaRef>,
+    spoken: bool,
+}
+
+impl Deferred<'_> {
+    fn speak(&mut self) -> Result<()> {
+        if !self.spoken {
+            self.spoken = true;
+            if let Some(schema) = &self.schema {
+                self.sink.schema(schema)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Sink for Deferred<'_> {
+    fn schema(&mut self, schema: &SchemaRef) -> Result<()> {
+        self.schema = Some(schema.clone());
+        Ok(())
+    }
+
+    fn batch(&mut self, batch: RecordBatch) -> Result<()> {
+        self.speak()?;
+        self.sink.batch(batch)
     }
 }
 
@@ -195,6 +333,35 @@ impl WithAdbc {
     }
 }
 
+impl WithAdbc {
+    /// The account cannot open a read session, so the driver is not
+    /// used again on this connection: said in the log and in the
+    /// connection's warnings.
+    fn give_up_on_the_driver(&mut self) {
+        tracing::warn!(
+            datasource = %self.uid,
+            driver = self.plan.driver,
+            missing_permission = NO_READ_SESSION,
+            role = "roles/bigquery.readSessionUser",
+            "the ADBC driver was given up on for this connection: the account cannot open a read session; results are read over REST, as text, and this statement ran twice"
+        );
+        self.state = State::Absent;
+        self.gave_up = Some(vec![format!(
+            "{}: the ADBC driver was not used: this account lacks {NO_READ_SESSION} (the role roles/bigquery.readSessionUser), so results are read over REST, as text",
+            self.uid
+        )]);
+    }
+
+    /// The reason the driver was given up on, then whatever the REST
+    /// transport has to say.
+    fn keep_rest_warnings(&mut self) {
+        if let Some(notes) = &mut self.gave_up {
+            notes.truncate(1);
+            notes.extend_from_slice(self.rest.warnings());
+        }
+    }
+}
+
 impl Source for WithAdbc {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         self.rest.query(sql, max_rows)
@@ -206,29 +373,29 @@ impl Source for WithAdbc {
                 // The statement ran and only its result could not be
                 // fetched, so REST is asked instead, for this statement
                 // and every later one on the connection.
-                Err(Error::Query(_, why)) if why.contains(NO_READ_SESSION) => {
-                    tracing::warn!(
-                        datasource = %self.uid,
-                        driver = self.plan.driver,
-                        missing_permission = NO_READ_SESSION,
-                        role = "roles/bigquery.readSessionUser",
-                        "the ADBC driver was given up on for this connection: the account cannot open a read session; results are read over REST, as text, and this statement ran twice"
-                    );
-                    self.state = State::Absent;
-                    self.gave_up = Some(vec![format!(
-                        "{}: the ADBC driver was not used: this account lacks {NO_READ_SESSION} (the role roles/bigquery.readSessionUser), so results are read over REST, as text",
-                        self.uid
-                    )]);
-                }
+                Err(Error::Query(_, why)) if why.contains(NO_READ_SESSION) => self.give_up_on_the_driver(),
                 other => return other,
             }
         }
         let got = self.rest.batches(sql, max_rows);
-        if let Some(notes) = &mut self.gave_up {
-            notes.truncate(1);
-            notes.extend_from_slice(self.rest.warnings());
-        }
+        self.keep_rest_warnings();
         got
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        if let Some(adbc) = self.driver()? {
+            let mut deferred = Deferred { sink: &mut *sink, schema: None, spoken: false };
+            match adbc.stream(sql, &mut deferred) {
+                Ok(()) => return deferred.speak(),
+                // As for a whole read: REST answers instead, which it can
+                // only when the sink has been told nothing yet.
+                Err(Error::Query(_, why)) if why.contains(NO_READ_SESSION) && !deferred.spoken => self.give_up_on_the_driver(),
+                Err(e) => return Err(e),
+            }
+        }
+        let done = self.rest.stream(sql, sink);
+        self.keep_rest_warnings();
+        done
     }
 
     fn adapter(&self) -> &str {
@@ -488,6 +655,40 @@ mod tests {
         assert!(matches!(db.batches("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3", 2).unwrap_err(), Error::TooManyRows(_, 2)));
         assert!(matches!(db.batches("DELETE FROM t", 2).unwrap_err(), Error::NotARead(_)));
         assert!(matches!(db.batches("SELECT * FROM no_such_table", 2).unwrap_err(), Error::Query(_, _)));
+
+        // Streamed: the schema first, then the driver's batches as it
+        // produces them; a sink that has had enough ends the read, and
+        // the connection answers the next statement.
+        struct Counting {
+            columns: usize,
+            rows: usize,
+            stop_at: usize,
+        }
+        impl Sink for Counting {
+            fn schema(&mut self, schema: &SchemaRef) -> Result<()> {
+                self.columns = schema.fields().len();
+                Ok(())
+            }
+            fn batch(&mut self, batch: RecordBatch) -> Result<()> {
+                self.rows += batch.num_rows();
+                if self.rows >= self.stop_at {
+                    return Err(Error::Query("sink".into(), "enough".into()));
+                }
+                Ok(())
+            }
+        }
+        let many = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 50000) SELECT x, x * 2 AS y FROM c";
+        let mut all = Counting { columns: 0, rows: 0, stop_at: usize::MAX };
+        db.stream(many, &mut all).unwrap();
+        assert_eq!((all.columns, all.rows), (2, 50_000));
+        let mut none = Counting { columns: 0, rows: 0, stop_at: usize::MAX };
+        db.stream("SELECT 1 AS n WHERE 1 = 0", &mut none).unwrap();
+        assert_eq!((none.columns, none.rows), (1, 0), "the columns of a result with no rows");
+        let mut some = Counting { columns: 0, rows: 0, stop_at: 1 };
+        let err = db.stream(many, &mut some).unwrap_err().to_string();
+        assert!(err.contains("enough"), "{err}");
+        assert!(some.rows < 50_000, "it stopped before the end: {}", some.rows);
+        assert_eq!(db.batches("SELECT 7 AS n", 10).unwrap().num_rows(), 1, "after a read stopped early");
     }
 
     /// The SQLite driver cannot cancel, which makes it the case worth

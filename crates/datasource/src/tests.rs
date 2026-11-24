@@ -353,6 +353,17 @@ fn a_real_clickhouse_answers_over_http_and_refuses_a_write_itself() {
     // Past the cap the server throws, which is what result_overflow_mode asks.
     let err = src.query("SELECT number FROM system.numbers LIMIT 100", 10).err().unwrap().to_string();
     assert!(err.contains("ch"), "named: {err}");
+    // Read as it arrives, a line a row: the same rows as the capped
+    // read, the columns even when nothing is under them, and an error
+    // the server raises is the read's.
+    crate::rows::batch_rows_for_tests(2);
+    assert!(
+        streams_as_it_queries(src.as_mut(), "SELECT number, toString(number) AS s, NULL AS z FROM system.numbers LIMIT 7").batches.len()
+            > 1
+    );
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT number FROM system.numbers WHERE number > 5 LIMIT 0").num_rows(), 0);
+    let err = src.stream("SELECT no_such_column FROM system.numbers LIMIT 1", &mut Kept::default()).unwrap_err().to_string();
+    assert!(err.contains("no_such_column"), "{err}");
 
     // The guard refuses first; the server's readonly mode would refuse second.
     assert!(src.query("CREATE TABLE zsql_no (a UInt8) ENGINE = Memory", 1).is_err());

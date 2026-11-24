@@ -12,7 +12,8 @@
 //! that mode permits: under 1 the server already bans writes and the cap
 //! is checked here; under 2 the caps go up; under 0 so does `readonly=2`.
 
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Source};
+use crate::rows::{Batcher, RowSink};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Sink, Source};
 
 pub struct ClickHouse {
     agent: ureq::Agent,
@@ -47,8 +48,9 @@ impl ClickHouse {
     }
 
     /// The settings this session may be sent, as a query-string suffix.
-    fn settings(&self, max_rows: usize) -> String {
-        let caps = format!("&max_result_rows={max_rows}&result_overflow_mode=throw&max_execution_time={}", self.conn.timeout().as_secs());
+    fn settings(&self, max_rows: Option<usize>) -> String {
+        let rows = max_rows.map(|n| format!("&max_result_rows={n}&result_overflow_mode=throw")).unwrap_or_default();
+        let caps = format!("{rows}&max_execution_time={}", self.conn.timeout().as_secs());
         match self.readonly {
             1 => String::new(),
             2 => caps,
@@ -56,8 +58,9 @@ impl ClickHouse {
         }
     }
 
-    fn send(&self, sql: &str, settings: &str, max_rows: usize) -> Result<Rows> {
-        let mut url = format!("{}/?default_format=JSONCompact{settings}", self.base);
+    /// The statement sent, to be answered in `format`.
+    fn post(&self, sql: &str, format: &str, settings: &str) -> Result<ureq::http::Response<ureq::Body>> {
+        let mut url = format!("{}/?default_format={format}{settings}", self.base);
         if let Some(db) = &self.database {
             url.push_str(&format!("&database={}", http::urlencode(db)));
         }
@@ -65,7 +68,43 @@ impl ClickHouse {
         if let Some(p) = &self.password {
             req = req.header("X-ClickHouse-Key", p.expose());
         }
-        let response = req.send(sql.as_bytes()).map_err(|e| Error::Query(self.conn.uid.clone(), crate::chain(&e)))?;
+        req.send(sql.as_bytes()).map_err(|e| Error::Query(self.conn.uid.clone(), crate::chain(&e)))
+    }
+
+    /// The statement answered a line a row, read as the lines arrive:
+    /// the first is the column names, each one after it a row. Nothing
+    /// is held but the line being read.
+    fn lines(&self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
+        use std::io::BufRead;
+        let uid = &self.conn.uid;
+        let response = self.post(sql, "JSONCompactEachRowWithNames", &self.settings(None))?;
+        if !response.status().is_success() {
+            // A refusal's body is where it says why.
+            return http::text(&self.conn, response).map(|_| ());
+        }
+        let reader = std::io::BufReader::new(response.into_body().into_reader());
+        let mut named = false;
+        for line in reader.lines() {
+            let line = line.map_err(|e| Error::Query(uid.clone(), e.to_string()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // A statement that fails after its first rows were sent ends
+            // the body with the exception in place of a row.
+            let cells: Vec<serde_json::Value> =
+                serde_json::from_str(&line).map_err(|_| Error::Query(uid.clone(), line.trim().chars().take(400).collect()))?;
+            if named {
+                out.row(cells.into_iter().map(http::cell).collect())?;
+            } else {
+                out.columns(&cells.into_iter().map(|c| http::cell(c).unwrap_or_default()).collect::<Vec<_>>())?;
+                named = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn send(&self, sql: &str, settings: &str, max_rows: usize) -> Result<Rows> {
+        let response = self.post(sql, "JSONCompact", settings)?;
         let body = http::text(&self.conn, response)?;
         let compact: Compact =
             serde_json::from_str(&body).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))?;
@@ -96,7 +135,14 @@ struct Meta {
 impl Source for ClickHouse {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        self.send(sql, &self.settings(max_rows), max_rows)
+        self.send(sql, &self.settings(Some(max_rows)), max_rows)
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        read_only(sql)?;
+        let mut batcher = Batcher::new(sink);
+        self.lines(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {
