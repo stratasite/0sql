@@ -79,7 +79,11 @@ The server's variables are the ones the command line reads,
 2. It takes one of `ZSQL_CONCURRENT_RUNS` seats, or waits. More than
    `ZSQL_QUEUE_MAX` waiting is refused as busy.
 3. The statement runs for no longer than the datasource's
-   `query_timeout`, then is cancelled.
+   `query_timeout`, then is cancelled. The timeout covers the whole
+   read, the fetch of its rows included, on every transport. That is
+   not yet true of all of them: the paged REST adapters put only the
+   statement under it, and MySQL has only the server's limit. Making
+   it one rule is part of the second phase.
 4. The request waits up to `wait` seconds, by default the datasource's
    `query_wait_time` (10 s). Ready in time, the rows are in the answer.
    Otherwise the answer is 202 and the id, and the caller asks
@@ -243,17 +247,11 @@ exposed on the old understanding.
 
 ## To verify before or while building
 
-- **Large Databricks results.** Streaming was done for every adapter
-  (below), and Databricks is the one whose transport cannot carry a
-  large result: its inline answer has a size limit, past which it
-  truncates and the read fails saying so. External links are what a
-  large result needs there.
-- **The timeout while rows are still arriving.** Postgres, SQL Server,
-  DuckDB, SQLite and the drivers put the whole read under
-  `query_timeout`, the fetch included. The paged REST adapters put the
-  statement under it and each page under the HTTP call's own limit, so
-  a long result can take longer than `query_timeout` to arrive. MySQL
-  has only the server's limit. One rule for all of them is not chosen.
+- **Large Databricks results.** Streaming was done for every adapter,
+  and Databricks is the one whose transport cannot carry a large
+  result: its inline answer has a size limit, past which it truncates
+  and the read fails saying so. External links are what a large result
+  needs there, and are their own phase below.
 - **Go inside a long-lived server**: `docs/exec-layer.md` has the note.
 - **The `object_store` crate's option names**, against its
   documentation, and reading an Arrow file from a store without
@@ -282,8 +280,9 @@ exposed on the old understanding.
    from a server yet, and `zsql run` reads as it did. Run against real
    Postgres, MySQL, SQL Server, ClickHouse and Trino; the fakes for the
    rest; the driver tests by hand.
-2. **A run, on one node.** The record and the `Registry` trait with
-   its local implementation; `run`, `GET` and `DELETE /results/{id}`;
+2. **A run, on one node.** `query_timeout` over the whole read on
+   every transport; the record and the `Registry` trait with its local
+   implementation; `run`, `GET` and `DELETE /results/{id}`;
    seats and the queue; `query_timeout`, `query_wait_time`, attach;
    typed JSON, Arrow and paging.
 3. **Postgres.** The registry over `ZSQL_DB`, the reference DDL, the
@@ -295,7 +294,9 @@ exposed on the old understanding.
 6. **`sql-exec`.**
 7. **Around it.** The MCP tool, `docs/operating.md`, and the Go
    drivers under load.
-8. **The command line, last.** Everything of the command line's waits
+8. **Large results from Databricks.** Its external-links mode, so a
+   result past the inline limit is fetched rather than refused.
+9. **The command line, last.** Everything of the command line's waits
    for this phase: `zsql run -r`, aligning `ZSQL_RUN_CAP` with
    `ZSQL_DEFAULT_SQL_LIMIT`, and the deferred list in
    `docs/exec-layer.md` (ADBC on the Linux release, fetching drivers,
