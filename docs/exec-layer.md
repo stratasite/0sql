@@ -101,9 +101,24 @@ driver and another way without.
   the driver was installed would have stopped answering. `WithAdbc`
   now gives the driver up for the connection on that error, reads over
   REST and says so in its warnings; the first statement runs twice.
-  **Still unknown**: BigQuery's types and cancellation through the
-  driver, which need an account holding that role, and everything
-  about a Snowflake account.
+  Run against that account on 2026-11-23, with the driver installed
+  and the role missing: the statement answered over REST, the
+  transport read `rest`, the warning named the permission and the
+  role, and a second statement went straight to REST.
+  With the role granted, the same day: the driver read through the
+  Storage Read API and every type arrived as itself (`Int64`,
+  `Decimal128(38, 9)` for NUMERIC, `Decimal256(76, 38)` for BIGNUMERIC,
+  `Date32`, `Timestamp(µs, "UTC")`, `Time64`, `List`, `Struct`), where
+  REST gives a TIMESTAMP as `1.767323045123456E9` and an array as its
+  JSON wrapper. A first statement took 2.5 s and 1,000 rows of a table
+  2.3 s; the row cap refused; a statement past a 3 s timeout was
+  cancelled by the driver in 3.25 s. One fault found and fixed: a
+  timestamp labeled `UTC` could not be printed without a time zone
+  database, so it is printed at offset `+00:00`, as `...Z`.
+  A NUMERIC prints at its full scale through the driver
+  (`12.500000000`) and as written over REST (`12.5`): the two result
+  shapes of one datasource, listed below.
+  **Still unknown**: everything about a Snowflake account.
 - [x] **Phase 2 — results stored as Arrow.** A stored result is
   `rows.arrow`, an Arrow IPC file, LZ4-compressed; manifest format 2
   records the transport and each column's Arrow type. Results written
@@ -165,10 +180,10 @@ side comes first. What is owed to it:
   question. The command line's identity does not include a token today
   (`crates/cli/src/run.rs` says so); a server's connector must, from
   what its upstream tells it.
-- **A live run of phase 1** against a Snowflake and a BigQuery account,
-  covering: PAT, key-pair and OAuth logins through the driver; that the
-  timeout cancels a running statement; what `NUMBER` and timestamps
-  arrive as; whether two Go drivers load into one process.
+- **A live run of phase 1 against Snowflake**: PAT, key-pair and OAuth
+  logins through the driver; that the timeout cancels a running
+  statement; what `NUMBER` and timestamps arrive as. BigQuery's run is
+  recorded under phase 1.
 - **Types from the text transports.** Postgres, MySQL, SQL Server,
   SQLite, Trino and Athena know their column types and discard them;
   ClickHouse and Databricks can answer in Arrow outright.

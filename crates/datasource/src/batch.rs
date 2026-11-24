@@ -60,20 +60,15 @@ impl Batches {
         let options = FormatOptions::default();
         let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(self.num_rows());
         for batch in &self.batches {
-            let formatters: Vec<ArrayFormatter> = batch
-                .columns()
+            let columns: Vec<ArrayRef> = batch.columns().iter().map(printable).collect::<std::result::Result<_, _>>().map_err(fail)?;
+            let formatters: Vec<ArrayFormatter> = columns
                 .iter()
                 .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
                 .collect::<std::result::Result<_, _>>()
                 .map_err(fail)?;
             for i in 0..batch.num_rows() {
                 rows.push(
-                    batch
-                        .columns()
-                        .iter()
-                        .zip(&formatters)
-                        .map(|(c, f)| if c.is_null(i) { None } else { Some(f.value(i).to_string()) })
-                        .collect(),
+                    columns.iter().zip(&formatters).map(|(c, f)| if c.is_null(i) { None } else { Some(f.value(i).to_string()) }).collect(),
                 );
             }
         }
@@ -112,6 +107,33 @@ impl Batches {
             left = 0;
         }
         self.batches = kept;
+    }
+}
+
+/// A column as the formatter can print it. A timestamp in a named time
+/// zone (`UTC`, which is how BigQuery's driver labels every TIMESTAMP)
+/// cannot be printed without a time zone database, which is not built
+/// in; it is the same instant at offset `+00:00`, which can, so that is
+/// how it is printed. Wherever it sits: a struct's field, a list's item.
+fn printable(column: &ArrayRef) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    let wanted = printable_type(column.data_type());
+    if &wanted == column.data_type() {
+        return Ok(column.clone());
+    }
+    arrow_cast::cast(column.as_ref(), &wanted)
+}
+
+fn printable_type(t: &DataType) -> DataType {
+    let field = |f: &Arc<Field>| Arc::new(f.as_ref().clone().with_data_type(printable_type(f.data_type())));
+    match t {
+        DataType::Timestamp(unit, Some(zone)) if zone.parse::<arrow_array::timezone::Tz>().is_err() => {
+            DataType::Timestamp(*unit, Some("+00:00".into()))
+        }
+        DataType::List(f) => DataType::List(field(f)),
+        DataType::LargeList(f) => DataType::LargeList(field(f)),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(field(f), *n),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+        other => other.clone(),
     }
 }
 
@@ -175,6 +197,32 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![Some(7), None]))]).unwrap();
         let rows = Batches { schema, batches: vec![batch] }.to_text().unwrap();
         assert_eq!(rows.rows, vec![vec![Some("7".to_string())], vec![None]]);
+    }
+
+    /// What BigQuery's driver hands over for a TIMESTAMP, alone and
+    /// inside a struct: printed as the instant it is, not refused.
+    #[test]
+    fn a_timestamp_in_a_named_zone_prints_at_its_utc_offset() {
+        use arrow_array::{StructArray, TimestampMicrosecondArray};
+        let ts = || TimestampMicrosecondArray::from(vec![Some(1_767_323_045_123_456), None]).with_timezone("UTC");
+        let plain: ArrayRef = Arc::new(ts());
+        let inner = Arc::new(Field::new("at", plain.data_type().clone(), true));
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![(inner, Arc::new(ts()) as ArrayRef)]));
+        let offset: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(0), Some(0)]).with_timezone("+05:30"));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("ts", plain.data_type().clone(), true),
+            Field::new("st", nested.data_type().clone(), true),
+            Field::new("off", offset.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![plain, nested, offset]).unwrap();
+        let b = Batches { schema, batches: vec![batch] };
+        let rows = b.to_text().unwrap().rows;
+        assert_eq!(rows[0][0].as_deref(), Some("2026-01-02T03:04:05.123456Z"));
+        assert_eq!(rows[1][0], None);
+        assert_eq!(rows[0][1].as_deref(), Some("{at: 2026-01-02T03:04:05.123456Z}"));
+        assert_eq!(rows[0][2].as_deref(), Some("1970-01-01T05:30:00+05:30"), "an offset zone is printed as it was");
+        // What is kept is what arrived: only the printing changes.
+        assert_eq!(b.schema.field(0).data_type(), &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())));
     }
 
     #[test]
