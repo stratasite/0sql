@@ -67,7 +67,7 @@ pub(crate) struct Remote {
     /// Project uid on the server (implies -r), when there is no project directory at hand.
     #[arg(long)]
     pub(crate) uid: Option<String>,
-    /// The org on the server; defaults to `org` in project.yml, then the server's default org.
+    /// The org on the server (implies -r); defaults to `org` in project.yml, then the server's default org.
     #[arg(long)]
     pub(crate) org: Option<String>,
 }
@@ -138,7 +138,7 @@ impl Mode {
 
 impl Where {
     pub(crate) fn wants_remote(&self) -> bool {
-        self.remote || self.server.is_some() || self.uid.is_some()
+        self.remote || self.server.is_some() || self.uid.is_some() || self.org.is_some()
     }
 
     /// The project directory at hand, unless the flags ask for a server.
@@ -802,6 +802,11 @@ mod tests {
         assert_eq!(path(&at(None)).0, "/orgs/acme/projects/proj/branches/dev");
         assert_eq!(path(&at(Some("globex"))).0, "/orgs/globex/projects/proj/branches/dev");
         assert_eq!(crate::remote::org_path(at(None).org().as_deref()), "/orgs/acme");
+        // `--org` names a server's org, so alone it asks the server; the
+        // project's own `org:` does not, and plans the files here.
+        let alone = |org: Option<&str>| Where { project: Some(dir.clone()), org: org.map(str::to_string), ..Default::default() };
+        assert!(alone(Some("globex")).wants_remote() && !alone(None).wants_remote());
+        assert!(matches!(alone(None).mode().unwrap(), Mode::Local(_)));
         let _ = std::fs::remove_dir_all(&root);
     }
 

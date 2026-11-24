@@ -45,7 +45,18 @@ pub(crate) fn reload(app: &App) -> anyhow::Result<(usize, Vec<String>)> {
         // The server's own directories start with a dot, and so may
         // anything else a data directory pointed at the wrong place
         // holds: neither is an org.
+        if org.starts_with('.') {
+            continue;
+        }
+        // A directory an org could not be called is said, not passed
+        // over: it is most likely `default` renamed to a name with a
+        // capital or a dot in it, and its projects are not served.
         if !crate::names::is_slug(&org) {
+            tracing::warn!(
+                "{} is not served: '{org}' is not a name an org can have (lower-case letters, digits, - and _)",
+                org_dir.display()
+            );
+            skipped.push(org);
             continue;
         }
         for (uid, project_dir) in dirs_of(&org_dir) {

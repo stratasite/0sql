@@ -188,8 +188,17 @@ mod tests {
             ("/no/such/route", Plan),
             ("/healthz", Exempt),
             ("/", Exempt),
+            ("/orgs", Plan),
+            ("/orgs/acme/projects", Plan),
+            ("/orgs/acme/mcp", Plan),
+            ("/results/r-1", Run),
+            ("/cache/invalidate", Run),
         ] {
             assert_eq!(classify(p), want, "{p}");
+            // Under an org a route costs what it costs without one.
+            if p.starts_with("/projects") || p.starts_with("/results") || p.starts_with("/cache") {
+                assert_eq!(classify(&format!("/orgs/acme{p}")), want, "/orgs/acme{p}");
+            }
         }
     }
 

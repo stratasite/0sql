@@ -296,7 +296,8 @@ fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
     assert!(local.status.success() && remote.status.success(), "{}\n{}", said(&local), said(&remote));
     assert_eq!(String::from_utf8_lossy(&local.stdout), String::from_utf8_lossy(&remote.stdout));
     assert!(said(&run(&["list"])).contains("grocery-store"));
-    assert!(!said(&run(&["list", "--org", "default"])).contains("grocery-store"));
+    let none = run(&["list", "--org", "default"]);
+    assert!(none.status.success() && !said(&none).contains("grocery-store"), "{}", said(&none));
     let elsewhere = run(&["status", "-r", "--branch", "main", "--org", "globex"]);
     assert!(!elsewhere.status.success() && said(&elsewhere).contains("in org globex"), "{}", said(&elsewhere));
 
