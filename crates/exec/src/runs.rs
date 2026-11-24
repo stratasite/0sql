@@ -29,6 +29,16 @@ pub struct Limits {
     pub queue_max: usize,
     /// This node's name, kept with every run it takes.
     pub hostname: String,
+    /// How often this node says its runs are alive. A run not seen for
+    /// six of these is nobody's, and is ended as failed.
+    pub beat: Duration,
+}
+
+impl Limits {
+    /// A hundred at once, five thousand waiting, a beat every ten seconds.
+    pub fn of(hostname: &str) -> Limits {
+        Limits { concurrent: 100, queue_max: 5_000, hostname: hostname.to_string(), beat: Duration::from_secs(10) }
+    }
 }
 
 /// Opens the datasource a run reads, on the thread that runs it: a
@@ -116,9 +126,29 @@ impl Runs {
         if ended > 0 {
             tracing::warn!(runs = ended as u64, "runs that were in progress when the server stopped were ended as failed");
         }
-        Ok(Runs {
-            inner: Arc::new(Inner { registry, store, limits, state: Mutex::default(), queued: Condvar::new(), changed: Condvar::new() }),
-        })
+        let inner = Arc::new(Inner { registry, store, limits, state: Mutex::default(), queued: Condvar::new(), changed: Condvar::new() });
+        // The beat: this node's runs are marked alive, and runs no node
+        // has marked for a while are ended. It stops with the runs.
+        let alive = Arc::downgrade(&inner);
+        let beat = inner.limits.beat.max(Duration::from_millis(10));
+        std::thread::Builder::new()
+            .name("zsql-beat".into())
+            .spawn(move || loop {
+                std::thread::sleep(beat);
+                let Some(inner) = alive.upgrade() else { return };
+                let seen = inner.registry.touch(&inner.limits.hostname).and_then(|()| inner.registry.fail_abandoned(beat * 6, RESTARTED));
+                match seen {
+                    Ok(0) => {}
+                    Ok(ended) => {
+                        tracing::warn!(runs = ended as u64, "runs no node was running any more were ended as failed");
+                        let _held = inner.lock();
+                        inner.changed.notify_all();
+                    }
+                    Err(e) => tracing::warn!("the runs could not be marked alive: {e}"),
+                }
+            })
+            .map_err(|e| Error::Io("a thread for the beat".into(), e))?;
+        Ok(Runs { inner })
     }
 
     /// Takes a statement: answers from a stored result, attaches to an
@@ -129,7 +159,9 @@ impl Runs {
         let mut state = inner.lock();
         if let Some(key) = submit.cache_key.as_deref().filter(|_| submit.kind == Kind::Semantic) {
             if !submit.fresh {
-                if let Some(hit) = inner.registry.cached(key)? {
+                // A result another node made is found here too, and
+                // answers only where its rows can be read.
+                if let Some(hit) = inner.registry.cached(key)?.filter(|hit| rows_file(&inner.store.dir_of(&hit.id)).exists()) {
                     return Ok((hit, How::Hit));
                 }
             }
@@ -169,7 +201,16 @@ impl Runs {
             cancelled_at: None,
             expires_at: None,
         };
-        inner.registry.insert(&record)?;
+        match inner.registry.insert(&record) {
+            Ok(()) => {}
+            // Another node queued the same question between the look
+            // and the insert: this is that run.
+            Err(Error::InFlight(key)) => {
+                let live = inner.registry.in_flight(&key)?.ok_or(Error::InFlight(key))?;
+                return Ok((live, How::Attached));
+            }
+            Err(e) => return Err(e),
+        }
         state.queue.push_back(Job { record: record.clone(), open: submit.open, cache_ttl: submit.cache_ttl, cancel: Arc::default() });
         if state.idle == 0 && state.workers < inner.limits.concurrent.max(1) {
             state.workers += 1;

@@ -19,54 +19,63 @@ pub struct Postgres {
     warnings: Vec<String>,
 }
 
+/// How a Postgres connection is made from what a datasource says: the
+/// settings and the TLS that goes with its `sslmode`. For a caller that
+/// keeps connections of its own to a Postgres it was pointed at.
+pub fn settings(conn: &Connection, password: &Secret) -> Result<(tokio_postgres::Config, tokio_postgres_rustls::MakeRustlsConnect)> {
+    let host = conn.need(&conn.host, "host")?;
+    let user = conn.need(&conn.username, "username")?;
+    let database = conn.need(&conn.database, "database")?;
+    // The statement timeout is the warehouse's to enforce, so it is set
+    // on the session rather than trusted from this side alone. Redshift
+    // takes no `options` at startup, so there the same two are SET on
+    // the session once it is open.
+    let redshift = conn.adapter == "redshift";
+    let mut options = format!("-c statement_timeout={}", conn.timeout().as_millis());
+    if let Some(schema) = &conn.schema {
+        options.push_str(&format!(" -c search_path={schema}"));
+    }
+    if redshift {
+        options.clear();
+    }
+
+    // libpq's ladder maps onto tokio-postgres's three settings with the
+    // verification carried by the rustls configuration: Require with an
+    // unverifying config is libpq's `require`, Require with the roots
+    // is `verify-full`, and the chain-only verifier is `verify-ca`.
+    let ssl = match conn.sslmode {
+        SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+        SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+        _ => tokio_postgres::config::SslMode::Require,
+    };
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&host)
+        .port(conn.port.unwrap_or(if redshift { 5439 } else { 5432 }))
+        .user(&user)
+        .dbname(&database)
+        .password(password.expose())
+        .application_name("zsql")
+        .options(&options)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .ssl_mode(ssl);
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls::client_config(&conn.uid, conn.sslmode, conn.ca_file.as_deref())?);
+    Ok((config, tls))
+}
+
 impl Postgres {
     pub fn open(conn: &Connection, secret: Option<Secret>) -> Result<Postgres> {
-        let host = conn.need(&conn.host, "host")?;
-        let user = conn.need(&conn.username, "username")?;
-        let database = conn.need(&conn.database, "database")?;
         let password =
             secret.ok_or_else(|| Error::NoSecret { uid: conn.uid.clone(), env: crate::secret_env_var(&conn.uid, "password") })?;
 
-        // The statement timeout is the warehouse's to enforce, so it is set
-        // on the session rather than trusted from this side alone. Redshift
-        // takes no `options` at startup, so there the same two are SET on
-        // the session once it is open.
         let redshift = conn.adapter == "redshift";
-        let mut options = format!("-c statement_timeout={}", conn.timeout().as_millis());
-        if let Some(schema) = &conn.schema {
-            options.push_str(&format!(" -c search_path={schema}"));
-        }
-        if redshift {
-            options.clear();
-        }
-
-        // libpq's ladder maps onto tokio-postgres's three settings with the
-        // verification carried by the rustls configuration: Require with an
-        // unverifying config is libpq's `require`, Require with the roots
-        // is `verify-full`, and the chain-only verifier is `verify-ca`.
-        let ssl = match conn.sslmode {
-            SslMode::Disable => tokio_postgres::config::SslMode::Disable,
-            SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
-            _ => tokio_postgres::config::SslMode::Require,
-        };
-        let mut config = tokio_postgres::Config::new();
-        config
-            .host(&host)
-            .port(conn.port.unwrap_or(if redshift { 5439 } else { 5432 }))
-            .user(&user)
-            .dbname(&database)
-            .password(password.expose())
-            .application_name("zsql")
-            .options(&options)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .ssl_mode(ssl);
+        let (config, tls) = settings(conn, &password)?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| Error::Connect(conn.uid.clone(), e.to_string()))?;
 
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls::client_config(&conn.uid, conn.sslmode, conn.ca_file.as_deref())?);
         let (client, connection) = runtime.block_on(config.connect(tls)).map_err(|e| Error::Connect(conn.uid.clone(), crate::chain(&e)))?;
         // The connection drives the socket and must be polled for the
         // client to work; it ends when the client is dropped.

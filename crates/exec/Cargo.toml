@@ -25,6 +25,11 @@ arrow-ipc = { version = "60", features = ["lz4"] }
 arrow-array = "60"
 arrow-schema = "60"
 arrow-cast = "60"
+# The records of runs in Postgres: the client the datasource crate
+# already has, a pool for it, and a runtime thread to drive them.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 
 [dev-dependencies]
 # A warehouse in a file, for a read that really arrives a batch at a time.

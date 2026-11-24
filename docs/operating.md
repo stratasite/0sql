@@ -207,6 +207,7 @@ same thing. The ones an operator sets:
 | `ZSQL_LOG`, `ZSQL_LOG_FORMAT` | what is logged and how; the log, below |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE` | how much of each kind of work runs at once; `docs/admission.md` |
+| `ZSQL_DB`, `ZSQL_DB_USER`, `ZSQL_DB_PASSWORD` | a Postgres to keep the records of runs in, as `host:port/database` with `?sslmode=` when it says; unset, they are kept on this node's disk. The table is `zsql_results`, made from `ops/zsql_results.sql` by whoever runs the database: the server checks for it at startup and never creates it |
 | `ZSQL_CONCURRENT_RUNS` | how many statements run at once; 100 |
 | `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
 | `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |

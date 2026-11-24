@@ -33,6 +33,7 @@ mod tls;
 
 use adapters::{athena, bigquery, clickhouse, databricks, duckdb, mysql, postgres, snowflake, sqlite, sqlserver, trino};
 
+pub use adapters::postgres::settings as postgres_settings;
 pub use batch::Batches;
 pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Listing, Names, Scope, Table};
 pub use connection::{Connection, SslMode, CONNECTION_KEYS};

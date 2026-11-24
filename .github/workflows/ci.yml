@@ -83,6 +83,9 @@ jobs:
           # adbc::tests load ADBC drivers this job does not install; they
           # are run by hand, see docs/exec-layer.md.
           cargo test --locked -p zsql-datasource -- --ignored --skip adbc::tests
+          # The records of runs, in the same Postgres.
+          cargo test --locked -p zsql-exec --test postgres -- --ignored
+          cargo test --locked -p zsql-cli --test serve -- --ignored
           cargo test --locked -p zsql-cli --test generate -- --ignored
           cargo test --locked -p zsql-cli --test sample -- --ignored
       # When a container never comes up, say which and why before it is

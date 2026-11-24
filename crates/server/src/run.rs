@@ -140,6 +140,9 @@ pub struct Config {
 pub struct RunLimits {
     pub concurrent: usize,
     pub queue_max: usize,
+    /// Where the records of runs are kept: a Postgres every node
+    /// shares, or, with `None`, this node's own disk.
+    pub db: Option<zsql_exec::PostgresSettings>,
     /// `None` is no limit: a query with no limit of its own returns
     /// every row.
     pub default_sql_limit: Option<u64>,
@@ -147,7 +150,7 @@ pub struct RunLimits {
 
 impl Default for RunLimits {
     fn default() -> Self {
-        RunLimits { concurrent: 100, queue_max: 5_000, default_sql_limit: None }
+        RunLimits { concurrent: 100, queue_max: 5_000, db: None, default_sql_limit: None }
     }
 }
 
@@ -183,7 +186,10 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let advertised = config.public_url.clone();
     let deploy_token = config.deploy_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-    let runs = crate::open_runs(&config.data_dir, &config.runs)?;
+    // Opening the records may mean a database, whose client waits on
+    // a runtime of its own: not something to do on a thread of this one.
+    let (dir, limits) = (config.data_dir.clone(), config.runs.clone());
+    let runs = tokio::task::spawn_blocking(move || crate::open_runs(&dir, &limits)).await??;
     let app: Shared = Arc::new(App {
         dialects,
         data_dir: config.data_dir,

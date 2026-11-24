@@ -467,6 +467,83 @@ fn a_background_server_is_found_whatever_its_log_says() {
     }
 }
 
+/// A server told to keep its records in a database says what it still
+/// needs, or why it could not reach it, and does not come up keeping
+/// them somewhere else.
+#[test]
+fn a_database_for_the_records_is_all_there_or_the_server_does_not_start() {
+    let root = Scratch::new("db");
+    let serve = |env: &[(&str, &str)]| {
+        let mut cmd = zsql();
+        cmd.args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+            .env("ZSQL_HOME", root.path("home"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, err) = serve(&[("ZSQL_DB", "db.internal/zsql")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB_USER"), "{err}");
+    let (code, err) = serve(&[("ZSQL_DB", "db.internal/zsql"), ("ZSQL_DB_USER", "zsql")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB_PASSWORD"), "{err}");
+    let (code, err) = serve(&[("ZSQL_DB", "ada:pw@db.internal/zsql"), ("ZSQL_DB_USER", "zsql"), ("ZSQL_DB_PASSWORD", "s3cret")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB carries no user or password") && !err.contains("s3cret"), "{err}");
+    // Nothing listens there: the server says so and stops.
+    let (code, err) = serve(&[("ZSQL_DB", "127.0.0.1:1/zsql?sslmode=disable"), ("ZSQL_DB_USER", "zsql"), ("ZSQL_DB_PASSWORD", "s3cret")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB") && !err.contains("listening on") && !err.contains("s3cret"), "{err}");
+}
+
+/// With the table there, the server comes up keeping its records in
+/// it, says so, and stops cleanly.
+#[test]
+#[ignore = "needs the Postgres the Sources step brings up"]
+fn a_server_keeps_its_records_in_postgres() {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+    let url = format!("{}:{}/{}?sslmode=disable", var("ZSQL_TEST_PG_HOST"), var("ZSQL_TEST_PG_PORT"), var("ZSQL_TEST_PG_DB"));
+    let settings = zsql_exec::PostgresSettings {
+        url: url.clone(),
+        user: var("ZSQL_TEST_PG_USER"),
+        password: zsql_datasource::Secret::new(var("ZSQL_TEST_PG_PASSWORD")),
+    };
+    zsql_exec::Postgres::connect(&settings).unwrap().batch_execute(include_str!("../../../ops/zsql_results.sql")).unwrap();
+
+    let root = Scratch::new("db-up");
+    let mut child = zsql()
+        .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+        .env("ZSQL_HOME", root.path("home"))
+        .env("ZSQL_DB", &url)
+        .env("ZSQL_DB_USER", var("ZSQL_TEST_PG_USER"))
+        .env("ZSQL_DB_PASSWORD", var("ZSQL_TEST_PG_PASSWORD"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut said = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "ended early:\n{said}");
+        said.push_str(&line);
+        if line.contains("listening on") {
+            break;
+        }
+    }
+    assert!(said.contains("the records of runs are kept in the zsql_results table of ZSQL_DB"), "{said}");
+    assert!(!root.path("data/.cache/records").exists(), "and so not on this node's disk");
+    terminate(&child);
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    let _ = stderr.read_to_string(&mut rest);
+    assert!(status.success(), "{status}; it said:\n{said}{rest}");
+    assert!(!rest.contains("panicked"), "{rest}");
+}
+
 #[test]
 fn the_environment_is_the_base_and_flags_win() {
     let root = Scratch::new("env");

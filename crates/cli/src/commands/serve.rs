@@ -94,6 +94,16 @@ impl ServeArgs {
         if let Some(v) = var("ZSQL_DEFAULT_SQL_LIMIT") {
             cfg.runs.default_sql_limit = Some(number(&v, "ZSQL_DEFAULT_SQL_LIMIT")? as u64).filter(|n| *n > 0);
         }
+        // Where the records of runs are kept: a Postgres, when one is
+        // named. The password is a variable and never a flag.
+        if let Some(url) = var("ZSQL_DB") {
+            let need = |name: &str| var(name).with_context(|| format!("ZSQL_DB is set, and so {name} must be"));
+            cfg.runs.db = Some(zsql_exec::PostgresSettings {
+                url,
+                user: need("ZSQL_DB_USER")?,
+                password: zsql_datasource::Secret::new(need("ZSQL_DB_PASSWORD")?),
+            });
+        }
         // The credential the server holds for a datasource, for a run
         // whose request sends none: ZSQL_DS_<UID>_<FIELD>, read when it
         // is asked for, from the environment and nowhere else.

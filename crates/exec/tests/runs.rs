@@ -27,7 +27,7 @@ impl Scratch {
 
     fn runs(&self, concurrent: usize, queue_max: usize) -> Runs {
         let registry: Arc<dyn Registry> = Arc::new(Local::open(&self.0.join("records")).unwrap());
-        Runs::open(&self.0.join("cache"), registry, Limits { concurrent, queue_max, hostname: "node-a".into() }).unwrap()
+        Runs::open(&self.0.join("cache"), registry, Limits { concurrent, queue_max, ..Limits::of("node-a") }).unwrap()
     }
 
     fn submit(&self, sql: &str) -> Submit {

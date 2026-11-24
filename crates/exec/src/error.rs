@@ -20,6 +20,14 @@ pub enum Error {
     Busy(usize),
     #[error("a run with the id {0} is already recorded")]
     Duplicate(String),
+    /// A run of the same question is already in flight on another node.
+    #[error("a run of {0} is already in flight")]
+    InFlight(String),
+    #[error("{0}")]
+    Registry(String),
+    /// A unique constraint refused a write: this is its name.
+    #[error("the unique constraint {0} refused the write")]
+    Taken(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

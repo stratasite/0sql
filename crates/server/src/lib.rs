@@ -150,11 +150,18 @@ pub(crate) type Shared = Arc<App>;
 pub(crate) const CACHE_DIR: &str = ".cache";
 
 /// The runs of a server whose data is under `data_dir`, with their
-/// records on this node's disk.
+/// records in the database it was given or on this node's disk.
 pub(crate) fn open_runs(data_dir: &std::path::Path, limits: &RunLimits) -> anyhow::Result<zsql_exec::Runs> {
     let cache = data_dir.join(CACHE_DIR);
-    let registry: Arc<dyn zsql_exec::Registry> = Arc::new(zsql_exec::Local::open(&cache.join("records"))?);
-    let limits = zsql_exec::Limits { concurrent: limits.concurrent, queue_max: limits.queue_max, hostname: hostname() };
+    let registry: Arc<dyn zsql_exec::Registry> = match &limits.db {
+        Some(db) => {
+            let registry = zsql_exec::Postgres::open(db)?;
+            tracing::info!("the records of runs are kept in the {} table of ZSQL_DB", zsql_exec::TABLE);
+            Arc::new(registry)
+        }
+        None => Arc::new(zsql_exec::Local::open(&cache.join("records"))?),
+    };
+    let limits = zsql_exec::Limits { concurrent: limits.concurrent, queue_max: limits.queue_max, ..zsql_exec::Limits::of(&hostname()) };
     Ok(zsql_exec::Runs::open(&cache.join("results"), registry, limits)?)
 }
 

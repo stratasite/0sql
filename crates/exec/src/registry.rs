@@ -34,6 +34,15 @@ pub trait Registry: Send + Sync {
     /// `why`: what a node does when it starts, since nothing it was
     /// running survived. How many it ended.
     fn fail_unfinished(&self, hostname: &str, why: &str) -> Result<usize>;
+
+    /// Says this node is alive: every run it has queued or running is
+    /// marked as seen now.
+    fn touch(&self, hostname: &str) -> Result<()>;
+
+    /// Ends, as failed with `why`, every run that is queued or running
+    /// and has not been seen for `quiet_for`: its node stopped, or was
+    /// replaced under another name, and nothing is running it. How many.
+    fn fail_abandoned(&self, quiet_for: std::time::Duration, why: &str) -> Result<usize>;
 }
 
 /// Records on this node's disk: a file each, read when the server
@@ -130,5 +139,34 @@ impl Registry for Local {
             self.save(&record)?;
         }
         Ok(unfinished.len())
+    }
+
+    fn touch(&self, hostname: &str) -> Result<()> {
+        // In memory only: nobody else reads this node's records, and a
+        // restart ends what was unfinished whatever the time on it.
+        let now = rfc3339(unix_now());
+        for record in self.lock().values_mut().filter(|r| r.hostname == hostname && !r.status.is_final()) {
+            record.updated_at = now.clone();
+        }
+        Ok(())
+    }
+
+    fn fail_abandoned(&self, quiet_for: std::time::Duration, why: &str) -> Result<usize> {
+        let before = unix_now().saturating_sub(quiet_for.as_secs());
+        let quiet: Vec<Record> = self
+            .lock()
+            .values()
+            .filter(|r| !r.status.is_final() && parse_rfc3339(&r.updated_at).is_some_and(|seen| seen < before))
+            .cloned()
+            .collect();
+        let now = rfc3339(unix_now());
+        for mut record in quiet.iter().cloned() {
+            record.status = Status::Failed;
+            record.error = Some(why.to_string());
+            record.finished_at = Some(now.clone());
+            record.updated_at = now.clone();
+            self.save(&record)?;
+        }
+        Ok(quiet.len())
     }
 }

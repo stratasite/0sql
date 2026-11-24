@@ -310,7 +310,12 @@ exposed on the old understanding.
    implementation; `run`, `GET` and `DELETE /results/{id}`;
    seats and the queue; `query_timeout`, `query_wait_time`, attach;
    typed JSON, Arrow and paging.
-3. **Postgres.** The registry over `ZSQL_DB`, the reference DDL, the
+3. **Postgres. Done, 2026-11-24.** `ops/zsql_results.sql` is the
+   table; a second node joins a run in flight through its unique
+   index; a result another node made is found in the table and, until
+   there is an object store, answers only on the node that holds its
+   rows. What was asked for:
+   The registry over `ZSQL_DB`, the reference DDL, the
    startup check, the refresh and abandoned runs.
 4. **The object store.** Upload and download, the local percentage and
    eviction, cleanup, `tables`, `dirty` and the invalidation endpoint.
