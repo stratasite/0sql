@@ -29,13 +29,17 @@ pub(crate) trait RowSink {
 
     /// How many rows the warehouse says there are, when it says before
     /// sending them: a capped read refuses here, before fetching any.
-    // Used by the REST adapters as they are converted.
-    #[allow(dead_code)]
     fn total(&mut self, _rows: u64) -> Result<()> {
         Ok(())
     }
 
     fn row(&mut self, row: Vec<Option<String>>) -> Result<()>;
+
+    /// The most rows this read will take, when it has a cap: what a
+    /// transport that can tell the warehouse to stop early tells it.
+    fn limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A read that keeps its rows, and refuses past a cap rather than
@@ -79,6 +83,10 @@ impl RowSink for Capped {
         }
         self.rows.rows.push(row);
         Ok(())
+    }
+
+    fn limit(&self) -> Option<usize> {
+        Some(self.max_rows)
     }
 }
 

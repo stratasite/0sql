@@ -4,7 +4,8 @@
 //! `information_schema.tables` and mean this catalog's. Athena has its
 //! own transport; it is not reached this way.
 
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Sink, Source};
 use base64::Engine;
 use serde_json::Value;
 
@@ -69,30 +70,35 @@ impl Trino {
     }
 }
 
-impl Source for Trino {
-    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+impl Trino {
+    /// The statement followed page by page, each row to `out` as its
+    /// page arrives.
+    fn read(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         read_only(sql)?;
         let fail = |e: ureq::Error| Error::Query(self.conn.uid.clone(), crate::chain(&e));
         let first = self.headers(self.agent.post(&format!("{}/v1/statement", self.base))).send(sql.as_bytes()).map_err(fail)?;
         let mut v = self.page(http::text(&self.conn, first)?)?;
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut named = false;
         loop {
-            if columns.is_empty() {
+            if !named {
                 if let Some(cols) = v.get("columns").and_then(Value::as_array) {
-                    columns = cols.iter().filter_map(|c| c.get("name").and_then(Value::as_str)).map(str::to_string).collect();
+                    let columns: Vec<String> =
+                        cols.iter().filter_map(|c| c.get("name").and_then(Value::as_str)).map(str::to_string).collect();
+                    out.columns(&columns)?;
+                    named = true;
                 }
             }
             if let Some(data) = v.get("data").and_then(Value::as_array) {
                 for r in data {
-                    if rows.len() == max_rows {
-                        // Tell the coordinator to stop, then refuse.
+                    let row = r.as_array().map(|cells| cells.iter().cloned().map(http::cell).collect()).unwrap_or_default();
+                    if let Err(e) = out.row(row) {
+                        // Whoever takes the rows has had enough, a cap
+                        // or a full disk: tell the coordinator to stop.
                         if let Some(next) = v.get("nextUri").and_then(Value::as_str) {
                             let _ = self.headers(self.agent.delete(next)).call();
                         }
-                        return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+                        return Err(e);
                     }
-                    rows.push(r.as_array().map(|cells| cells.iter().cloned().map(http::cell).collect()).unwrap_or_default());
                 }
             }
             let Some(next) = v.get("nextUri").and_then(Value::as_str).map(str::to_string) else { break };
@@ -109,7 +115,21 @@ impl Source for Trino {
             };
             v = self.page(http::text(&self.conn, r)?)?;
         }
-        Ok(Rows { columns, rows })
+        Ok(())
+    }
+}
+
+impl Source for Trino {
+    fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+        let mut kept = Capped::new(&self.conn.uid, max_rows);
+        self.read(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        let mut batcher = Batcher::new(sink);
+        self.read(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

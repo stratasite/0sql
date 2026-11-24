@@ -13,7 +13,8 @@
 //! over it costs the warehouse one extra row and this side one request:
 //! the manifest says the total and whether it was cut.
 
-use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Secrets, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{http, read_only, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use base64::Engine;
 use std::time::{Duration, Instant};
 
@@ -132,7 +133,7 @@ impl Databricks {
         serde_json::from_str(text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
     }
 
-    fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+    fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         // The request's own wait: the statement timeout, within what the
         // API allows, and under the HTTP call's own limit.
         let wait = self.conn.timeout().as_secs().min(MAX_WAIT_SECS);
@@ -144,8 +145,12 @@ impl Databricks {
             "on_wait_timeout": "CONTINUE",
             "format": "JSON_ARRAY",
             "disposition": "INLINE",
-            "row_limit": max_rows + 1,
         });
+        // A capped read asks for one row past its cap, enough to know
+        // there were more; a streamed one asks for everything.
+        if let Some(max_rows) = out.limit() {
+            body["row_limit"] = serde_json::json!(max_rows + 1);
+        }
         if let Some(c) = &self.conn.catalog {
             body["catalog"] = serde_json::Value::String(c.clone());
         }
@@ -165,7 +170,7 @@ impl Databricks {
             let why = answer.status.error.and_then(|e| e.message).unwrap_or_default();
             return Err(Error::Query(self.conn.uid.clone(), format!("{}: {why}", answer.status.state.to_lowercase()).trim().to_string()));
         }
-        self.collect(answer, max_rows)
+        self.collect(answer, out)
     }
 
     /// Waits on a pending statement: a second at first, doubling to five,
@@ -198,20 +203,31 @@ impl Databricks {
 
     /// The rows across the chunks. The manifest says the total first, so
     /// a result over the cap is refused before any chunk past the first.
-    fn collect(&mut self, answer: Answer, max_rows: usize) -> Result<Rows> {
+    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink) -> Result<()> {
         let manifest = answer.manifest.unwrap_or_default();
-        if manifest.truncated || manifest.total_row_count.is_some_and(|n| n > max_rows as i64) {
-            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+        if manifest.truncated {
+            return Err(match out.limit() {
+                // Cut at the one row past the cap that was asked for.
+                Some(max_rows) => Error::TooManyRows(self.conn.uid.clone(), max_rows),
+                // Nothing was asked to be cut, so Databricks cut it: an
+                // inline result has a size it does not go past.
+                None => Error::Query(
+                    self.conn.uid.clone(),
+                    "the result is larger than Databricks returns inline, and was truncated; add a LIMIT, or select fewer columns".into(),
+                ),
+            });
+        }
+        if let Some(total) = manifest.total_row_count.and_then(|n| u64::try_from(n).ok()) {
+            out.total(total)?;
         }
         let mut columns: Vec<(i64, String)> = manifest.schema.columns.into_iter().map(|c| (c.position.unwrap_or(0), c.name)).collect();
         columns.sort_by_key(|(p, _)| *p);
         let columns: Vec<String> = columns.into_iter().map(|(_, n)| n).collect();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        out.columns(&columns)?;
         let mut result = answer.result;
         while let Some(r) = result.take() {
-            rows.extend(r.data_array.into_iter().map(|row| row.into_iter().map(http::cell).collect::<Vec<_>>()));
-            if rows.len() > max_rows {
-                return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+            for row in r.data_array {
+                out.row(row.into_iter().map(http::cell).collect())?;
             }
             let Some(next) = r.next_chunk_index else { break };
             let url = format!("{}{STATEMENTS}/{}/result/chunks/{next}", self.base, answer.statement_id);
@@ -221,7 +237,7 @@ impl Databricks {
             }
             result = Some(serde_json::from_str(&text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected chunk: {e}")))?);
         }
-        Ok(Rows { columns, rows })
+        Ok(())
     }
 }
 
@@ -278,7 +294,16 @@ struct Chunk {
 impl Source for Databricks {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        self.send(sql, max_rows)
+        let mut kept = Capped::new(&self.conn.uid, max_rows);
+        self.send(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        read_only(sql)?;
+        let mut batcher = Batcher::new(sink);
+        self.send(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

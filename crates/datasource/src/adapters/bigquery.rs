@@ -12,7 +12,8 @@
 //! in `datasources.yml`, by `GOOGLE_APPLICATION_CREDENTIALS`, or found
 //! where gcloud leaves it.
 
-use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secrets, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -164,7 +165,7 @@ impl BigQuery {
         serde_json::from_str(text).map_err(|e| Error::Query(self.conn.uid.clone(), format!("unexpected answer: {e}")))
     }
 
-    fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+    fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         let timeout_ms = self.conn.timeout().as_millis().min(10 * 60 * 1000) as u64;
         let mut body = serde_json::json!({
             "query": sql,
@@ -234,15 +235,14 @@ impl BigQuery {
         }
         // The total is known from the first page, so a result over the cap
         // is refused before any other page is fetched.
-        if answer.total_rows.as_deref().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n > max_rows as i64) {
-            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+        if let Some(total) = answer.total_rows.as_deref().and_then(|n| n.parse::<u64>().ok()) {
+            out.total(total)?;
         }
         let columns: Vec<String> = answer.schema.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        out.columns(&columns)?;
         loop {
-            rows.extend(answer.rows.into_iter().map(|r| r.f.into_iter().map(|c| http::cell(c.v)).collect::<Vec<_>>()));
-            if rows.len() > max_rows {
-                return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+            for r in answer.rows {
+                out.row(r.f.into_iter().map(|c| http::cell(c.v)).collect())?;
             }
             let Some(token) = answer.page_token.take() else { break };
             let (status, text) = self.request(http::Method::Get, &results_url(Some(&token)), None)?;
@@ -251,7 +251,7 @@ impl BigQuery {
             }
             answer = self.parse(&text)?;
         }
-        Ok(Rows { columns, rows })
+        Ok(())
     }
 }
 
@@ -347,7 +347,16 @@ struct ApiError {
 impl Source for BigQuery {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        self.send(sql, max_rows)
+        let mut kept = Capped::new(&self.conn.uid, max_rows);
+        self.send(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        read_only(sql)?;
+        let mut batcher = Batcher::new(sink);
+        self.send(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

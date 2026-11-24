@@ -16,7 +16,8 @@
 //! the value is written in double quotes, in which case it is sent as
 //! written.
 
-use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secret, Secrets, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{http, jwt, read_only, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use std::time::{Duration, Instant};
 
 const STATEMENTS: &str = "/api/v2/statements";
@@ -159,7 +160,7 @@ impl Snowflake {
         Error::Query(self.conn.uid.clone(), format!("{status}: {}", http::reason(text)))
     }
 
-    fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+    fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         let body = serde_json::json!({
             "statement": sql,
             "timeout": self.conn.timeout().as_secs(),
@@ -194,7 +195,7 @@ impl Snowflake {
             }
             _ => return Err(self.refused(status, &text)),
         };
-        self.collect(answer, max_rows)
+        self.collect(answer, out)
     }
 
     /// Waits on a statement the server is still running: a quarter second
@@ -230,14 +231,16 @@ impl Snowflake {
     /// The rows of a finished statement, across its partitions. The total
     /// is known before any partition past the first is fetched, so a
     /// result over the cap costs one request, not all of them.
-    fn collect(&mut self, answer: Answer, max_rows: usize) -> Result<Rows> {
+    fn collect(&mut self, answer: Answer, out: &mut dyn RowSink) -> Result<()> {
         let meta = answer.meta.unwrap_or_default();
-        if meta.num_rows.is_some_and(|n| n > max_rows as i64) {
-            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+        if let Some(total) = meta.num_rows.and_then(|n| u64::try_from(n).ok()) {
+            out.total(total)?;
         }
         let columns: Vec<String> = meta.row_type.into_iter().map(|c| c.name).collect();
-        let mut rows: Vec<Vec<Option<String>>> =
-            answer.data.into_iter().flatten().map(|r| r.into_iter().map(http::cell).collect()).collect();
+        out.columns(&columns)?;
+        for r in answer.data.into_iter().flatten() {
+            out.row(r.into_iter().map(http::cell).collect())?;
+        }
         if let Some(handle) = answer.handle.filter(|_| meta.partitions.len() > 1) {
             for p in 1..meta.partitions.len() {
                 let url = format!("{}{STATEMENTS}/{handle}?partition={p}", self.base);
@@ -246,16 +249,12 @@ impl Snowflake {
                     return Err(self.refused(status, &text));
                 }
                 let part = self.parse(&text)?;
-                rows.extend(part.data.into_iter().flatten().map(|r| r.into_iter().map(http::cell).collect::<Vec<_>>()));
-                if rows.len() > max_rows {
-                    return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
+                for r in part.data.into_iter().flatten() {
+                    out.row(r.into_iter().map(http::cell).collect())?;
                 }
             }
         }
-        if rows.len() > max_rows {
-            return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
-        }
-        Ok(Rows { columns, rows })
+        Ok(())
     }
 }
 
@@ -347,7 +346,16 @@ struct RowType {
 impl Source for Snowflake {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        self.send(sql, max_rows)
+        let mut kept = Capped::new(&self.conn.uid, max_rows);
+        self.send(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        read_only(sql)?;
+        let mut batcher = Batcher::new(sink);
+        self.send(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

@@ -10,7 +10,8 @@
 //! until someone needs them. The region follows the same order, ending
 //! in the shared config file.
 
-use crate::{http, read_only, sigv4, Connection, Error, Result, Rows, Secret, Secrets, Source};
+use crate::rows::{Batcher, Capped, RowSink};
+use crate::{http, read_only, sigv4, Connection, Error, Result, Rows, Secret, Secrets, Sink, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -108,7 +109,7 @@ impl Athena {
         Ok(v)
     }
 
-    fn send(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
+    fn send(&mut self, sql: &str, out: &mut dyn RowSink) -> Result<()> {
         let mut start = serde_json::json!({
             "QueryString": sql,
             "QueryExecutionContext": { "Catalog": self.catalog },
@@ -157,7 +158,6 @@ impl Athena {
         }
 
         let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut token: Option<String> = None;
         let mut first = true;
         loop {
@@ -172,6 +172,9 @@ impl Athena {
                     .and_then(|c| c.as_array())
                     .map(|c| c.iter().filter_map(|i| i.get("Name").and_then(|n| n.as_str()).map(str::to_string)).collect())
                     .unwrap_or_default();
+                if !columns.is_empty() {
+                    out.columns(&columns)?;
+                }
             }
             let page = v.pointer("/ResultSet/Rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
             for (i, row) in page.iter().enumerate() {
@@ -188,10 +191,7 @@ impl Athena {
                 {
                     continue;
                 }
-                rows.push(cells);
-                if rows.len() > max_rows {
-                    return Err(Error::TooManyRows(self.conn.uid.clone(), max_rows));
-                }
+                out.row(cells)?;
             }
             first = false;
             token = v.get("NextToken").and_then(|t| t.as_str()).map(str::to_string);
@@ -199,7 +199,7 @@ impl Athena {
                 break;
             }
         }
-        Ok(Rows { columns, rows })
+        Ok(())
     }
 }
 
@@ -268,7 +268,16 @@ fn ini_value(path: &std::path::Path, sections: &[&str], key: &str) -> Option<Str
 impl Source for Athena {
     fn query(&mut self, sql: &str, max_rows: usize) -> Result<Rows> {
         read_only(sql)?;
-        self.send(sql, max_rows)
+        let mut kept = Capped::new(&self.conn.uid, max_rows);
+        self.send(sql, &mut kept)?;
+        Ok(kept.finish())
+    }
+
+    fn stream(&mut self, sql: &str, sink: &mut dyn Sink) -> Result<()> {
+        read_only(sql)?;
+        let mut batcher = Batcher::new(sink);
+        self.send(sql, &mut batcher)?;
+        batcher.finish()
     }
 
     fn adapter(&self) -> &str {

@@ -590,6 +590,13 @@ fn a_real_trino_answers_follows_next_uri_and_its_catalog_reads() {
     let err = src.query("SELECT name FROM tpch.tiny.nation", 10).err().unwrap().to_string();
     assert!(err.contains("more than the 10 rows"), "{err}");
     let all = src.query("SELECT name FROM tpch.tiny.nation", 100).expect("reads across pages");
+    crate::rows::batch_rows_for_tests(2);
+    assert_eq!(
+        streams_as_it_queries(src.as_mut(), "SELECT name FROM tpch.tiny.nation ORDER BY name").num_rows(),
+        25,
+        "streamed across pages"
+    );
+    streams_as_it_queries(src.as_mut(), "SELECT name FROM tpch.tiny.nation WHERE nationkey < 0");
     assert_eq!(all.rows.len(), 25);
     assert!(src.query("CREATE TABLE memory.default.zsql_no (a INT)", 1).is_err());
     // The catalog is a header, so information_schema alone means tpch's.
@@ -884,6 +891,9 @@ fn snowflake_submits_polls_pages_and_caps_with_a_token() {
 
     // Rows across two partitions, every cell text or null.
     let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    // The same partitions streamed, handed on as each arrives.
+    crate::rows::batch_rows_for_tests(2);
+    streams_as_it_queries(src.as_mut(), "SELECT status, count(*) AS n FROM orders GROUP BY 1");
     assert_eq!(rows.columns, ["STATUS", "N"]);
     assert_eq!(rows.rows.len(), 3);
     assert_eq!(rows.get(&rows.rows[0], "STATUS"), Some("paid"));
@@ -1328,6 +1338,9 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
     assert_eq!(src.adapter(), "databricks");
 
     let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    // The same chunks streamed, handed on as each arrives.
+    crate::rows::batch_rows_for_tests(2);
+    streams_as_it_queries(src.as_mut(), "SELECT status, count(*) AS n FROM orders GROUP BY 1");
     assert_eq!(rows.columns, ["status", "n"]);
     assert_eq!(rows.rows.len(), 3);
     assert_eq!(rows.get(&rows.rows[1], "status"), None);
@@ -1363,6 +1376,10 @@ fn databricks_submits_polls_pages_caps_and_mints_a_service_principal_token() {
     assert!(err.contains("more than the 2 rows"), "{err}");
     let err = src.query("SELECT x FROM cut", 2).err().unwrap().to_string();
     assert!(err.contains("more than the 2 rows"), "truncated alone refuses: {err}");
+    // Streamed there is no cap to have cut it, so a truncated answer is
+    // Databricks' own limit on an inline result, and is said to be.
+    let err = src.stream("SELECT x FROM cut", &mut Kept::default()).unwrap_err().to_string();
+    assert!(err.contains("larger than Databricks returns inline"), "{err}");
     let err = src.query("SELECT * FROM broken", 10).err().unwrap().to_string();
     assert!(err.contains("failed") && err.contains("TABLE_OR_VIEW_NOT_FOUND"), "{err}");
     assert!(src.query("DELETE FROM orders", 1).is_err());
@@ -1555,6 +1572,9 @@ fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
     assert_eq!(src.adapter(), "bigquery");
 
     let rows = src.query("SELECT status, count(*) AS n FROM d.orders GROUP BY 1", 10).expect("reads");
+    // The same pages streamed, handed on as each arrives.
+    crate::rows::batch_rows_for_tests(2);
+    streams_as_it_queries(src.as_mut(), "SELECT status, count(*) AS n FROM d.orders GROUP BY 1");
     assert_eq!(rows.columns, ["status", "n"]);
     assert_eq!(rows.rows.len(), 3);
     assert_eq!(rows.get(&rows.rows[1], "status"), None);
@@ -1851,6 +1871,9 @@ fn athena_starts_polls_pages_drops_the_header_row_and_walks_the_credential_chain
     assert_eq!(src.adapter(), "athena");
 
     let rows = src.query("SELECT status, count(*) AS n FROM orders GROUP BY 1", 10).expect("reads");
+    // The same pages streamed: the header row dropped once, the rows handed on as they come.
+    crate::rows::batch_rows_for_tests(2);
+    streams_as_it_queries(src.as_mut(), "SELECT status, count(*) AS n FROM orders GROUP BY 1");
     assert_eq!(rows.columns, ["status", "n"]);
     assert_eq!(rows.rows.len(), 3, "the header row is dropped: {:?}", rows.rows);
     assert_eq!(rows.get(&rows.rows[0], "status"), Some("paid"));
