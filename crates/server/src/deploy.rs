@@ -2,7 +2,7 @@
 //! tested, written beside the branch and swapped in whole. And the
 //! removal of a branch, which takes the same lock.
 
-use crate::error::{not_found, ApiError, Params};
+use crate::error::{not_found, ApiError, Org, Params};
 use crate::guard::Held;
 use crate::names::{check_branch, check_uid};
 use crate::{blocking, lock, write, Shared};
@@ -18,12 +18,13 @@ use zsql_core::{Model, Trust};
 pub(crate) async fn deploy(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, uid, branch, body, true)
+        deploy_or_validate(app, org, uid, branch, body, true)
     })
     .await
 }
@@ -31,17 +32,18 @@ pub(crate) async fn deploy(
 pub(crate) async fn validate(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, uid, branch, body, false)
+        deploy_or_validate(app, org, uid, branch, body, false)
     })
     .await
 }
 
-fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
+fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
@@ -74,14 +76,14 @@ fn deploy_or_validate(app: Shared, uid: String, branch: String, body: Bytes, kee
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
             let _writing = lock(&app.deploying);
-            let live = app.dir(&uid, &branch);
+            let live = app.dir(&org, &uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
             deployed.write(&staged).and_then(|()| swap_in(&staged, &live)).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&staged);
                 bad(e.to_string())
             })?;
-            write(&app.models).insert(crate::key(&uid, &branch), deployed);
-            tracing::info!("deployed {uid}/{branch}");
+            write(&app.models).insert(crate::key(&org, &uid, &branch), deployed);
+            tracing::info!("deployed {org}/{uid}/{branch}");
         }
         Ok(out)
     })();
@@ -169,7 +171,11 @@ fn project_root(work: &std::path::Path) -> Option<PathBuf> {
     entries.into_iter().find(|p| p.join("project.yml").exists())
 }
 
-pub(crate) async fn remove(State(app): State<Shared>, Params((uid, branch)): Params<(String, String)>) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn remove(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, branch)): Params<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
     check_uid(&uid)?;
     check_branch(&branch)?;
     blocking(move || {
@@ -177,12 +183,12 @@ pub(crate) async fn remove(State(app): State<Shared>, Params((uid, branch)): Par
         // would otherwise swap its directory in between the removal of
         // the model and of the files.
         let _writing = lock(&app.deploying);
-        let removed = write(&app.models).remove(&crate::key(&uid, &branch)).is_some();
+        let removed = write(&app.models).remove(&crate::key(&org, &uid, &branch)).is_some();
         if !removed {
-            return Err(not_found(&uid, &branch));
+            return Err(not_found(&org, &uid, &branch));
         }
-        let _ = std::fs::remove_dir_all(app.dir(&uid, &branch));
-        tracing::info!("removed {uid}/{branch}");
+        let _ = std::fs::remove_dir_all(app.dir(&org, &uid, &branch));
+        tracing::info!("removed {org}/{uid}/{branch}");
         Ok(Json(json!({ "removed": format!("{uid}/{branch}") })))
     })
     .await

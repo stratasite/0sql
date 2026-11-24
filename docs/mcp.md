@@ -63,6 +63,22 @@ gets is what any caller gets over this endpoint: the catalog and SQL
 text, and rows as well where the tools that run a statement have been
 turned on. No tool deploys or removes.
 
+## The org
+
+A server may keep the projects of several orgs. An MCP client is
+connected for one of them, and the org, like the security context, is
+the connection's and not the model's: it is in the endpoint's path.
+
+- **`/orgs/{org}/mcp` is that org's endpoint**, and `/mcp` is the
+  default org's.
+- **Everything a client sees is that org's**: the catalog in the
+  instructions, `list_projects`, the branch a tool falls back to, and
+  the results `result` can read.
+- **No tool takes an org.** One in a tool's arguments is refused as
+  any unknown argument is.
+
+The service in front gives each user the endpoint of their own org.
+
 ## The security context
 
 A row-level policy reads the context a query is planned for. In it,

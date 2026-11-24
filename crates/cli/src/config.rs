@@ -1,7 +1,8 @@
 //! Where the CLI finds the project and the server.
 //!
 //! - `project.yml` in the project directory: `uid`, `name`, `production_branch`,
-//!   and optionally `server` (a self-hosted server).
+//!   and optionally `org` (the org it is deployed under; the server's
+//!   default org without it) and `server` (a self-hosted server).
 //! - `.zsql` in the project directory (or `.strata`, the strata CLI's file,
 //!   when `.zsql` is absent): `server`, and per-datasource secrets. An
 //!   `api_key` left there from when a server took a deploy token is not read.
@@ -24,6 +25,9 @@ pub struct Project {
     pub uid: String,
     pub name: String,
     pub production_branch: String,
+    /// `org:` from project.yml: the org the project is deployed under
+    /// and asked for in. Without it, the server's default org.
+    pub org: Option<String>,
     /// `server:` from project.yml, when set.
     pub server: Option<String>,
 }
@@ -61,6 +65,7 @@ pub fn read_project(dir: &Path) -> Result<Project> {
         uid,
         name,
         production_branch: v.get("production_branch").and_then(|b| b.as_str()).unwrap_or("main").trim().to_string(),
+        org: v.get("org").and_then(|o| o.as_str()).map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty()),
         server: v.get("server").and_then(|s| s.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     })
 }

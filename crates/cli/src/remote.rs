@@ -113,8 +113,21 @@ fn read(mut r: ureq::http::Response<ureq::Body>) -> Result<Value> {
     Ok(value)
 }
 
-pub fn branch_path(uid: &str, branch: &str) -> String {
-    format!("/projects/{}/branches/{}", urlencode(uid), urlencode(branch))
+/// What every path of an org starts with: `/orgs/{org}`, and nothing
+/// for the default org, whose paths are the ones a server had before
+/// it kept orgs.
+pub fn org_path(org: Option<&str>) -> String {
+    match org.map(str::trim).filter(|o| !o.is_empty() && *o != DEFAULT_ORG) {
+        Some(org) => format!("/orgs/{}", urlencode(org)),
+        None => String::new(),
+    }
+}
+
+/// The org a project with no `org:` is deployed under.
+pub const DEFAULT_ORG: &str = "default";
+
+pub fn branch_path(org: Option<&str>, uid: &str, branch: &str) -> String {
+    format!("{}/projects/{}/branches/{}", org_path(org), urlencode(uid), urlencode(branch))
 }
 
 pub fn urlencode(s: &str) -> String {
@@ -142,22 +155,38 @@ fn query_body(query: &Query, context: Option<&Value>) -> Value {
 }
 
 /// `/sql`: `{sql, adapter}`; `/explain`: that plus timings, phases and the node graph.
-pub fn sql(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
-    client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &query_body(query, context))
+pub fn sql(
+    client: &Client,
+    org: Option<&str>,
+    uid: &str,
+    branch: &str,
+    query: &Query,
+    context: Option<&Value>,
+    explain: bool,
+) -> Result<Value> {
+    client.post(&format!("{}/{}", branch_path(org, uid, branch), if explain { "explain" } else { "sql" }), &query_body(query, context))
 }
 
 /// `/explore`: the dimensions and measures the query can take on, narrowed
 /// by a search term.
-pub fn explore(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
+pub fn explore(
+    client: &Client,
+    org: Option<&str>,
+    uid: &str,
+    branch: &str,
+    query: &Query,
+    context: Option<&Value>,
+    q: Option<&str>,
+) -> Result<Value> {
     let mut body = query_body(query, context);
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
         body["q"] = json!(q);
     }
-    client.post(&format!("{}/explore", branch_path(uid, branch)), &body)
+    client.post(&format!("{}/explore", branch_path(org, uid, branch)), &body)
 }
 
 /// A dimension's sampled values by uid, name or unique substring; the
 /// server resolves the name.
-pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result<Value> {
-    client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(dim)))
+pub fn values_for(client: &Client, org: Option<&str>, uid: &str, branch: &str, dim: &str) -> Result<Value> {
+    client.get(&format!("{}/values/{}", branch_path(org, uid, branch), urlencode(dim)))
 }

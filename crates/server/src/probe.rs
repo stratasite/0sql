@@ -15,7 +15,7 @@
 //! These are reads, and as open as the others: who may ask is decided
 //! by the service this server sits behind.
 
-use crate::error::{ApiError, Params, Search};
+use crate::error::{ApiError, Org, Params, Search};
 use crate::guard::Held;
 use crate::reads::{check_term, too_big, ListQuery};
 use crate::{blocking, Shared};
@@ -172,16 +172,17 @@ fn scalar(key: &str, value: &Value) -> Option<Value> {
 /// `datasources.yml` is, past whatever is not a connection setting; the
 /// request is checked key by key, so a misspelled setting is named and
 /// not read past into a confusing refusal from the warehouse.
+///
+/// `(org, uid, branch)` is the branch the datasource is one of.
 pub(crate) fn connection_of(
     app: &Shared,
-    uid: &str,
-    branch: &str,
+    (org, uid, branch): (&str, &str, &str),
     datasource: &str,
     catalog: Option<&str>,
     sent: &Map<String, Value>,
     longest: Option<i64>,
 ) -> Result<(Connection, Secrets), ApiError> {
-    let d = app.model(uid, branch)?;
+    let d = app.model(org, uid, branch)?;
     check_term(datasource)?;
     let Some(deployed) = d.datasource(datasource) else {
         let known: Vec<String> = d.datasources("")["datasources"]
@@ -240,10 +241,11 @@ pub(crate) fn connection_of(
 /// The model's datasources: what there is to probe.
 pub(crate) async fn datasources(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let d = app.model(&uid, &branch)?;
+    let d = app.model(&org, &uid, &branch)?;
     check_term(&q.q)?;
     Ok(Json(d.datasources(&q.q)))
 }
@@ -256,6 +258,7 @@ pub(crate) async fn datasources(
 pub(crate) async fn tables(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch, datasource)): Params<(String, String, String)>,
     Search(p): Search<TablesQuery>,
     Sent(req): Sent,
@@ -272,7 +275,8 @@ pub(crate) async fn tables(
         return Err(too_big("tables in one page", limit, PAGE));
     }
     let offset = p.offset.unwrap_or(0);
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
+    let (conn, secrets) =
+        connection_of(&app, (&org, &uid, &branch), &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
         let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
@@ -334,13 +338,15 @@ fn split(path: &str, schema: Option<String>, catalog: Option<String>) -> Result<
 pub(crate) async fn table(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch, datasource, table)): Params<(String, String, String, String)>,
     Search(p): Search<TableQuery>,
     Sent(req): Sent,
 ) -> Result<Json<Value>, ApiError> {
     check_term(&table)?;
     let (catalog, schema, name) = split(&table, named(p.schema)?, named(p.catalog)?)?;
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
+    let (conn, secrets) =
+        connection_of(&app, (&org, &uid, &branch), &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
         let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;

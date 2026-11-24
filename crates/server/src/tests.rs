@@ -141,18 +141,37 @@ impl Server {
             .collect()
     }
 
-    /// Deployment directories on disk, relative to the data directory.
+    /// Deployment directories on disk, relative to the data directory:
+    /// `org/project/branch`.
     fn on_disk(&self) -> Vec<String> {
+        let dirs = |p: &std::path::Path| -> Vec<PathBuf> {
+            std::fs::read_dir(p).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()
+        };
+        let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().to_string();
         let mut out = Vec::new();
-        for project in std::fs::read_dir(&self.data_dir).unwrap().flatten().filter(|e| e.path().is_dir()) {
-            for branch in std::fs::read_dir(project.path()).unwrap().flatten().filter(|e| e.path().is_dir()) {
-                if branch.path().join("snapshot.json.gz").exists() {
-                    out.push(format!("{}/{}", project.file_name().to_string_lossy(), branch.file_name().to_string_lossy()));
+        for org in dirs(&self.data_dir) {
+            for project in dirs(&org) {
+                for branch in dirs(&project) {
+                    if branch.join("snapshot.json.gz").exists() {
+                        out.push(format!("{}/{}/{}", name(&org), name(&project), name(&branch)));
+                    }
                 }
             }
         }
         out.sort();
         out
+    }
+
+    /// A deploy under an org.
+    async fn deploy_to(&self, org: &str, uid: &str, branch: &str, archive: Vec<u8>) -> Answer {
+        self.send(Method::POST, &format!("/orgs/{org}/projects/{uid}/branches/{branch}/deploy"), &[], Some(("application/gzip", archive)))
+            .await
+    }
+
+    /// A tool call on an org's MCP endpoint; answers the JSON-RPC envelope.
+    async fn tool_of(&self, org: &str, name: &str, args: Value) -> Answer {
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
+        self.send(Method::POST, &format!("/orgs/{org}/mcp"), &[], Some(("application/json", serde_json::to_vec(&msg).unwrap()))).await
     }
 
     fn keys_in_memory(&self) -> Vec<String> {
@@ -293,7 +312,7 @@ async fn every_route_is_open() {
     let a = s.deploy(CS, "main", archive(CS, "one")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.listing().await, ["customer-service/main"]);
-    assert_eq!(s.on_disk(), ["customer-service/main"]);
+    assert_eq!(s.on_disk(), ["default/customer-service/main"]);
     let a = s.send(Method::POST, &format!("/projects/{CS}/branches/main/test"), &[], None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/main"), &[], None).await;
@@ -358,7 +377,7 @@ async fn names_that_could_leave_the_data_directory_are_refused() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let a = s.deploy("billing", "main", archive("billing", "two")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let other = s.data_dir.join("billing").join("main").join("snapshot.json.gz");
+    let other = s.data_dir.join("default").join("billing").join("main").join("snapshot.json.gz");
     let before = std::fs::read(&other).unwrap();
 
     let traversal = "..%2F..%2Fbilling%2Fmain";
@@ -379,8 +398,8 @@ async fn names_that_could_leave_the_data_directory_are_refused() {
         assert_eq!(a.class(), "Invalid", "{method} {path}");
     }
     assert_eq!(std::fs::read(&other).unwrap(), before, "the other deployment is untouched");
-    assert_eq!(s.on_disk(), ["billing/main", "customer-service/main"]);
-    assert_eq!(s.keys_in_memory(), ["billing/main", "customer-service/main"]);
+    assert_eq!(s.on_disk(), ["default/billing/main", "default/customer-service/main"]);
+    assert_eq!(s.keys_in_memory(), ["default/billing/main", "default/customer-service/main"]);
 }
 
 /// What is inside an archive cannot reach outside it: no links, no
@@ -437,8 +456,8 @@ async fn an_archive_cannot_reach_outside_itself() {
     assert_eq!(a.body["validated_only"], true);
 
     assert_eq!(s.listing().await, ["billing/main"]);
-    assert_eq!(s.on_disk(), ["billing/main"]);
-    assert_eq!(s.keys_in_memory(), ["billing/main"]);
+    assert_eq!(s.on_disk(), ["default/billing/main"]);
+    assert_eq!(s.keys_in_memory(), ["default/billing/main"]);
 }
 
 /// An archive entry that would land above the project is refused and
@@ -1456,4 +1475,181 @@ async fn the_tools_that_run_are_offered_only_when_named() {
     // A model does not choose whose rows it reads.
     let chosen = s.tool(&[], "run", json!({ "project": CS, "spec": spec, "context": { "email": "a@b.c" } })).await;
     assert!(chosen.body["error"].is_object() || chosen.body["result"]["isError"] == true, "{}", chosen.body);
+}
+
+// -------------------------------------------------------------------- orgs
+
+/// The same project and branch under two orgs and under none are three
+/// deployments, each in its org's directory: one answers for itself, a
+/// listing is one org's, and removing one leaves the others. With no
+/// org in the path a request is for `default`, which is also an org by
+/// name.
+#[tokio::test]
+async fn an_org_is_its_own_set_of_projects() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "plain")).await.status, StatusCode::OK);
+    for org in ["acme", "globex"] {
+        let a = s.deploy_to(org, CS, "main", archive(CS, org)).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    }
+    let a = s.deploy_to("acme", "billing", "main", archive("billing", "acme-billing")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let all = ["acme/billing/main", "acme/customer-service/main", "default/customer-service/main", "globex/customer-service/main"];
+    assert_eq!(s.on_disk(), all);
+    assert_eq!(s.keys_in_memory(), all);
+
+    let marker = |a: Answer| -> Vec<String> {
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+        let names = a.body["fields"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str());
+        names.filter(|n| n.starts_with("Marker")).map(str::to_string).collect()
+    };
+    let fields = format!("projects/{CS}/branches/main/fields?hidden=true");
+    assert_eq!(marker(s.get(&format!("/{fields}")).await), ["Marker plain"]);
+    assert_eq!(marker(s.get(&format!("/orgs/default/{fields}")).await), ["Marker plain"], "default is the org of a path with none");
+    assert_eq!(marker(s.get(&format!("/orgs/acme/{fields}")).await), ["Marker acme"]);
+    assert_eq!(marker(s.get(&format!("/orgs/globex/{fields}")).await), ["Marker globex"]);
+
+    let listed = |a: Answer| -> Vec<String> {
+        let rows = a.body["deployments"].as_array().unwrap().iter();
+        rows.map(|d| format!("{}/{}", d["project"].as_str().unwrap(), d["branch"].as_str().unwrap())).collect()
+    };
+    assert_eq!(s.listing().await, ["customer-service/main"]);
+    assert_eq!(listed(s.get("/orgs/acme/projects").await), ["billing/main", "customer-service/main"]);
+    assert_eq!(listed(s.get("/orgs/nobody/projects").await), Vec::<String>::new(), "an org with nothing deployed has nothing");
+    assert_eq!(
+        s.get("/orgs").await.body["orgs"],
+        json!([{ "org": "acme", "deployments": 2 }, { "org": "default", "deployments": 1 }, { "org": "globex", "deployments": 1 }])
+    );
+
+    // What one org has, another does not, and is told so by name.
+    let a = s.get("/orgs/globex/projects/billing/branches/main").await;
+    assert_eq!((a.status, a.class()), (StatusCode::NOT_FOUND, "NotFound"));
+    assert!(a.error().ends_with("in org globex"), "{}", a.error());
+    assert_eq!(s.get("/projects/billing/branches/main").await.status, StatusCode::NOT_FOUND);
+
+    // An org is a directory's name: nothing that could leave the data
+    // directory, reach the server's own, or spell an org two ways.
+    for path in ["/orgs/Acme/projects", "/orgs/.cache/projects", "/orgs/..%2Fdefault/projects", "/orgs/a.b/projects"] {
+        let a = s.get(path).await;
+        assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Invalid"), "{path}: {}", a.error());
+    }
+    let a = s.deploy_to("..%2F..", CS, "main", archive(CS, "evil")).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.error());
+
+    let a = s.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}/branches/main"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(s.on_disk(), ["acme/billing/main", "default/customer-service/main", "globex/customer-service/main"]);
+
+    // A restart finds each under its org.
+    let again = app_over(&s.data_dir);
+    assert_eq!(reload(&again).unwrap(), (3, vec![]));
+    let mut keys: Vec<String> = again.models.read().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, s.on_disk());
+}
+
+/// An org is what its directory is called. `default` renamed while the
+/// server is down is that org when it starts again, and what was
+/// deployed with no org is the new org's. A deployment laid out as
+/// `<project>/<branch>`, from before there were orgs, is neither moved
+/// nor served: it is said.
+#[tokio::test]
+async fn a_renamed_directory_is_that_org_and_an_old_layout_is_said() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy("billing", "main", archive("billing", "two")).await.status, StatusCode::OK);
+    // billing as an old data directory held it, and default renamed.
+    std::fs::rename(s.data_dir.join("default").join("billing"), s.data_dir.join("billing")).unwrap();
+    std::fs::rename(s.data_dir.join("default"), s.data_dir.join("acme")).unwrap();
+
+    let again = app_over(&s.data_dir);
+    let (n, skipped) = reload(&again).unwrap();
+    assert_eq!((n, skipped), (1, vec!["billing/main".to_string()]));
+    let keys: Vec<String> = again.models.read().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["acme/customer-service/main"]);
+    assert!(s.data_dir.join("billing").join("main").join("snapshot.json.gz").exists(), "nothing is moved");
+
+    let renamed = Server { router: router(again.clone()), app: again, data_dir: s.data_dir.clone() };
+    assert_eq!(renamed.get(&format!("/orgs/acme/projects/{CS}/branches/main")).await.status, StatusCode::OK);
+    assert_eq!(renamed.get(&format!("/projects/{CS}/branches/main")).await.status, StatusCode::NOT_FOUND);
+    // And default is somewhere to deploy to again.
+    assert_eq!(renamed.deploy(CS, "main", archive(CS, "new")).await.status, StatusCode::OK);
+    assert_eq!(renamed.on_disk(), ["acme/customer-service/main", "default/customer-service/main"]);
+    std::mem::forget(renamed);
+}
+
+/// An agent is connected for one org: the catalog it is handed, the
+/// projects it lists and the branch a tool falls back to are that
+/// org's, and no tool takes an org.
+#[tokio::test]
+async fn an_orgs_agent_is_told_of_no_other_org() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "plain")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy(CS, "dev", archive(CS, "plain-dev")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy_to("acme", CS, "dev", archive(CS, "acme")).await.status, StatusCode::OK);
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
+    let told = |a: Answer| a.body["result"]["instructions"].as_str().unwrap().to_string();
+
+    let acme = told(s.send(Method::POST, "/orgs/acme/mcp", &[], Some(("application/json", serde_json::to_vec(&init).unwrap()))).await);
+    assert!(acme.contains("Marker acme") && !acme.contains("Marker plain"), "{acme}");
+    let plain = told(s.mcp(&[], init).await);
+    assert!(plain.contains("Marker plain") && !plain.contains("Marker acme"), "{plain}");
+
+    let a = s.tool_of("acme", "list_projects", json!({})).await;
+    let listed = a.body["result"]["structuredContent"]["deployments"].as_array().unwrap();
+    assert_eq!((listed.len(), &listed[0]["branch"]), (1, &json!("dev")));
+    // acme has one branch of the project, so that is the one meant;
+    // default has two and falls back to the production branch.
+    let a = s.tool_of("acme", "fields", json!({ "project": CS, "q": "marker" })).await;
+    assert!(a.body["result"]["content"][0]["text"].as_str().unwrap().contains("Marker acme"), "{}", a.body);
+    let a = s.tool(&[], "fields", json!({ "project": CS, "q": "marker" })).await;
+    let text = a.body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Marker plain") && !text.contains("Marker plain-dev") && !text.contains("Marker acme"), "{text}");
+    // An org is not a tool's to name.
+    let a = s.tool(&[], "fields", json!({ "project": CS, "org": "acme" })).await;
+    assert!(a.body["error"].is_object(), "{}", a.body);
+    let a = s.tool_of("nobody", "fields", json!({ "project": CS })).await;
+    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+}
+
+/// A result is its org's alone. The same question in two orgs is two
+/// runs; a result asked for or cancelled from another org is not
+/// there, in the words an unknown id gets; and an invalidation reaches
+/// one org's results.
+#[tokio::test]
+async fn a_result_is_its_orgs_alone() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy_to("acme", CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    let file = sales("orgs");
+    let ask = || json!({ "expr": "category asc, revenue", "connection": { "file": file.to_str().unwrap() } });
+    let run = format!("projects/{CS}/branches/main/run");
+
+    let theirs = s.post(&format!("/orgs/acme/{run}"), ask()).await;
+    assert_eq!((&theirs.body["status"], &theirs.body["org_uid"]), (&json!("succeeded"), &json!("acme")), "{}", theirs.body);
+    let ours = s.post(&format!("/{run}"), ask()).await;
+    assert_eq!((&ours.body["cache"], &ours.body["org_uid"]), (&json!("miss"), &json!("default")), "another org's result answers nothing");
+    assert_ne!(ours.body["id"], theirs.body["id"]);
+    assert_eq!(s.post(&format!("/orgs/acme/{run}"), ask()).await.body["cache"], "hit");
+    let (theirs, ours) = (theirs.body["id"].as_str().unwrap().to_string(), ours.body["id"].as_str().unwrap().to_string());
+
+    assert_eq!(s.get(&format!("/orgs/acme/results/{theirs}")).await.status, StatusCode::OK);
+    assert_eq!(s.get(&format!("/results/{ours}")).await.status, StatusCode::OK);
+    let unknown = s.get("/results/r-none").await;
+    for path in [format!("/results/{theirs}"), format!("/orgs/globex/results/{theirs}"), format!("/orgs/acme/results/{ours}")] {
+        let a = s.get(&path).await;
+        assert_eq!((a.status, a.class()), (StatusCode::NOT_FOUND, "NotFound"), "{path}");
+        assert_eq!(a.error().replace(&theirs, "X").replace(&ours, "X"), unknown.error().replace("r-none", "X"), "{path}");
+        let a = s.send(Method::DELETE, &path, &[], None).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    assert_eq!(s.get(&format!("/orgs/acme/results/{theirs}")).await.body["status"], "succeeded", "and nothing was cancelled");
+
+    // What changed in one org's warehouse is said for that org.
+    let a = s.post("/cache/invalidate", json!({ "datasource": "dw", "tables": ["sales"] })).await;
+    assert_eq!(a.body["invalidated"], 1, "{}", a.body);
+    assert_eq!(s.post(&format!("/orgs/acme/{run}"), ask()).await.body["cache"], "hit");
+    assert_eq!(s.post(&format!("/{run}"), ask()).await.body["cache"], "miss");
+    let a = s.post("/orgs/acme/cache/invalidate", json!({ "datasource": "dw", "tables": ["sales"] })).await;
+    assert_eq!(a.body["invalidated"], 1, "{}", a.body);
 }

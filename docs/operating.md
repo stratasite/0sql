@@ -230,6 +230,42 @@ memory.
 `ZSQL_OBJECT_STORE` for the rows. Without the store a result is only
 on the node that ran it, and another node runs the statement again.
 
+## Orgs
+
+A project belongs to an org, and a server may keep the projects of
+several. An org is a name and a directory, and nothing else: the
+server has no list of orgs, no settings for one and no idea who is in
+it. Two orgs may each have a project of the same uid.
+
+- **The org is in the path.** Every route that is about a project, a
+  result or the cache, and the MCP endpoint, is served under
+  `/orgs/{org}`: `/orgs/acme/projects/shop/branches/main/sql`,
+  `/orgs/acme/results/{id}`, `/orgs/acme/cache/invalidate`,
+  `/orgs/acme/mcp`.
+- **With no org in the path, the org is `default`.**
+  `/projects/shop/branches/main/sql` and
+  `/orgs/default/projects/shop/branches/main/sql` are the same request.
+- **A name** is lower-case letters, digits, `-` and `_`, as a project's
+  uid is. An org exists once something is deployed to it.
+- **`zsql` takes the org from `org:` in `project.yml`**, or from
+  `--org`, which wins. With neither, the default org.
+- **Nothing crosses.** A listing, the catalog an MCP client is handed
+  and the branch a tool falls back to are one org's. A result is its
+  org's alone: asked for or cancelled under another org it answers 404,
+  in the words an unknown id gets. A stored result answers the same
+  question in its own org only, an invalidation reaches one org's
+  results, and no warehouse connection is reused between two.
+- **Who may ask for which org is decided in front**, like everything
+  else. A proxy that keeps orgs apart allows each caller the one prefix
+  `/orgs/<theirs>/` and nothing outside it; the unprefixed routes are
+  the default org's, and `GET /orgs`, which lists every org with
+  something deployed, is for whoever runs the server.
+- **To give the default org's projects to a named one**, stop the
+  server, rename `default` in the data directory to the org's name,
+  and start it: the directory's name is the org. An empty `default` is
+  made again at startup. Results stored before the rename stay the
+  default org's and are run again when next asked for.
+
 ## What is on disk
 
 Everything the server keeps lives in one data directory: `--data-dir`,
@@ -237,7 +273,7 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 
 | | |
 |---|---|
-| `<project>/<branch>/` | a deployed branch: the compiled model (`snapshot.json.gz`), its tests and sampled values |
+| `<org>/<project>/<branch>/` | a deployed branch: the compiled model (`snapshot.json.gz`), its tests and sampled values. `default/` is the org of a deploy that names none, and is made at startup |
 | `lock` | held by the running server; its pid, address and public URL, which `zsql server status` reads |
 | `.cache/results/` | the rows of each run the server made, an Arrow file each |
 | `.cache/records/` | the record of each run, when the records are not in a database |
@@ -358,6 +394,14 @@ sign-up, a web app, rate limits, all in the server. That is gone.
   `/projects/{uid}/access` answer 404.
 
 ## What changes shape between releases
+
+**The data directory.** A deployed branch is kept at
+`<org>/<project>/<branch>/`. A server from before orgs kept it at
+`<project>/<branch>/`, and nothing moves it: a newer server leaves
+such a directory where it is, does not serve it, and names it at
+startup. Stop the server and move each `<project>` directory into
+`default/`, or deploy each branch again. The paths with no org in them
+answer as they did, for the default org.
 
 **The compiled model.** `snapshot.json.gz` carries a `version`, and
 `zsql_semantic::snapshot::FORMAT` is the newest a build writes and

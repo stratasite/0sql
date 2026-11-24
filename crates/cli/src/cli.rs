@@ -67,6 +67,9 @@ pub(crate) struct Remote {
     /// Project uid on the server (implies -r), when there is no project directory at hand.
     #[arg(long)]
     pub(crate) uid: Option<String>,
+    /// The org on the server; defaults to `org` in project.yml, then the server's default org.
+    #[arg(long)]
+    pub(crate) org: Option<String>,
 }
 
 /// Which project a command works on, and whether here or on a server.
@@ -77,6 +80,7 @@ pub(crate) struct Where {
     pub(crate) branch: Option<String>,
     pub(crate) server: Option<String>,
     pub(crate) uid: Option<String>,
+    pub(crate) org: Option<String>,
 }
 
 impl Where {
@@ -85,16 +89,35 @@ impl Where {
     }
 
     pub(crate) fn with(project: Option<PathBuf>, r: Remote) -> Where {
-        Where { project, remote: r.remote, branch: r.branch, server: r.server, uid: r.uid }
+        Where { project, remote: r.remote, branch: r.branch, server: r.server, uid: r.uid, org: r.org }
     }
+}
+
+/// The org to ask a server for: the flag's, else the project's own.
+fn org_of(flag: Option<&str>, project: Option<&Project>) -> Option<String> {
+    let flag = flag.map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty());
+    flag.or_else(|| project.and_then(|p| p.org.clone()))
 }
 
 /// A server's copy of a project's branch.
 pub(crate) struct Target {
     pub(crate) project: Option<Project>,
+    /// The org asked for, or none for the server's default one.
+    pub(crate) org: Option<String>,
     pub(crate) uid: String,
     pub(crate) branch: String,
     pub(crate) client: Client,
+}
+
+impl Target {
+    /// What the branch is called on the server: `project/branch`, with
+    /// the org in front when it is not the default one.
+    pub(crate) fn name(&self) -> String {
+        match self.org.as_deref().filter(|o| *o != crate::remote::DEFAULT_ORG) {
+            Some(org) => format!("{org}/{}/{}", self.uid, self.branch),
+            None => format!("{}/{}", self.uid, self.branch),
+        }
+    }
 }
 
 /// Where a command runs.
@@ -136,6 +159,12 @@ impl Where {
         }
     }
 
+    /// The org a command about a server asks for: `--org`, else the
+    /// project's, else none, which is the server's default.
+    pub(crate) fn org(&self) -> Option<String> {
+        org_of(self.org.as_deref(), self.project_dir().ok().as_ref())
+    }
+
     /// The server a command about a server talks to, with the project's
     /// key when a project is at hand. No git is read for this.
     pub(crate) fn client(&self) -> Client {
@@ -171,7 +200,8 @@ impl Where {
             (None, None) => "main".into(),
         };
         let server = config::server(self.server.as_deref(), project.as_ref());
-        Ok(Target { project, uid, branch, client: Client::new(&server) })
+        let org = org_of(self.org.as_deref(), project.as_ref());
+        Ok(Target { project, org, uid, branch, client: Client::new(&server) })
     }
 }
 
@@ -452,7 +482,7 @@ pub(crate) enum Command {
         #[command(flatten)]
         remote: Remote,
     },
-    /// Every deployment on the server.
+    /// Every deployment of the org on the server.
     #[command(display_order = 34, alias = "list")]
     Deployments {
         #[command(flatten)]
@@ -743,6 +773,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("project.yml"), "name: Proj\nuid: proj\n").unwrap();
         dir
+    }
+
+    /// The org a server is asked for is project.yml's `org`, unless
+    /// `--org` names another; with neither there is none, and the paths
+    /// are the ones with no org in them, as they are for `default`.
+    #[test]
+    fn the_org_is_the_projects_unless_a_flag_names_one() {
+        let root = std::env::temp_dir().join(format!("zsql-org-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = project_in(&root);
+        let at = |org: Option<&str>| Where {
+            project: Some(dir.clone()),
+            remote: true,
+            branch: Some("dev".into()),
+            org: org.map(str::to_string),
+            ..Default::default()
+        };
+        let path = |w: &Where| {
+            let t = w.target(false).unwrap();
+            (crate::remote::branch_path(t.org.as_deref(), &t.uid, &t.branch), t.name())
+        };
+        assert_eq!(path(&at(None)), ("/projects/proj/branches/dev".to_string(), "proj/dev".to_string()));
+        assert_eq!(path(&at(Some("default"))).0, "/projects/proj/branches/dev");
+        assert_eq!(path(&at(Some("Globex"))), ("/orgs/globex/projects/proj/branches/dev".to_string(), "globex/proj/dev".to_string()));
+
+        std::fs::write(dir.join("project.yml"), "name: Proj\nuid: proj\norg: acme\n").unwrap();
+        assert_eq!(path(&at(None)).0, "/orgs/acme/projects/proj/branches/dev");
+        assert_eq!(path(&at(Some("globex"))).0, "/orgs/globex/projects/proj/branches/dev");
+        assert_eq!(crate::remote::org_path(at(None).org().as_deref()), "/orgs/acme");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The rule: here unless a flag names a server. `--server` and
