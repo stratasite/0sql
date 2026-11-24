@@ -125,10 +125,6 @@ pub struct Config {
     pub public_url: Option<String>,
     pub admission: AdmissionCounts,
     pub mcp: mcp::Settings,
-    /// With a token, a deploy, a validate, a test run and a removal each
-    /// need `Authorization: Bearer <token>`. Without one they are as
-    /// open as the reads, which is right on a loopback and nowhere else.
-    pub deploy_token: Option<String>,
     /// How many statements run at once, how many may wait, and the row
     /// limit a run is given when its request has none.
     pub runs: RunLimits,
@@ -178,7 +174,7 @@ impl Default for RunLimits {
 }
 
 impl Config {
-    /// A server on its own machine: no deploy token, the compiled-in
+    /// A server on its own machine: the compiled-in
     /// MCP wording.
     pub fn local(data_dir: PathBuf, bind: String) -> Config {
         Config {
@@ -187,7 +183,6 @@ impl Config {
             public_url: None,
             admission: AdmissionCounts::default(),
             mcp: mcp::Settings::builtin(),
-            deploy_token: None,
             runs: RunLimits::default(),
             secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
         }
@@ -208,7 +203,6 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let mut lock = lock_data_dir(&config.data_dir)?;
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     let advertised = config.public_url.clone();
-    let deploy_token = config.deploy_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     // Opening the records may mean a database, whose client waits on
     // a runtime of its own: not something to do on a thread of this one.
     let (dir, limits) = (config.data_dir.clone(), config.runs.clone());
@@ -222,18 +216,13 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
             ..config.admission.clone()
         }),
         mcp: config.mcp,
-        deploy_token,
         deploying: std::sync::Mutex::new(()),
         runs,
         default_sql_limit: config.runs.default_sql_limit,
         secrets: config.secrets,
     });
     let (n, skipped) = reload(&app)?;
-    tracing::info!(
-        "{n} deployment(s) loaded from {}; deploys {}",
-        app.data_dir.display(),
-        if app.deploy_token.is_some() { "need the deploy token" } else { "are open to whoever reaches this address" }
-    );
+    tracing::info!("{n} deployment(s) loaded from {}", app.data_dir.display());
     if !skipped.is_empty() {
         // Said again, together, after the per-branch lines above: the
         // one line someone watching a restart will actually read.

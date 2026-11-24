@@ -258,8 +258,13 @@ fn inside_a_project_it_serves_that_project_and_minus_r_reaches_it() {
     assert_eq!(names, vec!["main"]);
 }
 
+/// The server asks nobody who they are, so a bind beyond this machine
+/// has to be meant. Meant, it deploys its own project and takes a
+/// deploy and a removal from whoever reaches it, with nothing sent to
+/// say who they are: that is for the service in front to decide.
+#[cfg(unix)]
 #[test]
-fn a_bind_beyond_the_loopback_needs_a_deploy_token_or_to_be_meant() {
+fn a_bind_beyond_the_loopback_has_to_be_meant_and_then_anyone_who_reaches_it_deploys() {
     let root = Scratch::new("open");
     let out = zsql()
         .args(["serve", "--bind", "0.0.0.0:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
@@ -268,69 +273,45 @@ fn a_bind_beyond_the_loopback_needs_a_deploy_token_or_to_be_meant() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--open") && err.contains("ZSQL_DEPLOY_TOKEN"), "{err}");
-}
+    assert!(err.contains("--open") && err.contains("anyone who reaches it"), "{err}");
 
-/// With a deploy token the server may listen beyond the loopback, it
-/// deploys its own project with its own token, reads stay open, and
-/// `zsql deploy` and `zsql remove` work for whoever holds the token
-/// and for nobody else.
-#[cfg(unix)]
-#[test]
-fn the_deploy_token_keeps_deploys_to_whoever_holds_it() {
-    const TOKEN: &str = "zdt_the-token-of-this-test";
-    let root = Scratch::new("token");
     let project = root.path("grocery-store");
     copy_dir(&fixture(), &project);
     let data = root.path("data");
+    // A token in the environment, left from a server that took one, changes nothing.
     let s = Server::start_with(
         &project,
         &root.path("home"),
-        &["--bind", "0.0.0.0:0", "--data-dir", data.to_str().unwrap()],
-        &[("ZSQL_DEPLOY_TOKEN", TOKEN)],
+        &["--bind", "0.0.0.0:0", "--open", "--data-dir", data.to_str().unwrap()],
+        &[("ZSQL_DEPLOY_TOKEN", "zdt_left-over")],
     );
     let addr = format!("127.0.0.1:{}", s.addr.rsplit(':').next().unwrap());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !get(&addr, "/projects").1.contains("\"grocery-store\"") {
-        assert!(std::time::Instant::now() < deadline, "the server did not deploy its own project with its own token");
+        assert!(std::time::Instant::now() < deadline, "the server did not deploy its own project");
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    let run = |args: &[&str], key: Option<&str>| {
-        let mut cmd = zsql();
-        cmd.args(args).current_dir(&project).env("ZSQL_HOME", root.path("home")).env("ZSQL_SERVER", format!("http://{addr}"));
-        if let Some(k) = key {
-            cmd.env("ZSQL_API_KEY", k);
-        }
-        cmd.output().unwrap()
+    let run = |args: &[&str]| {
+        zsql()
+            .args(args)
+            .current_dir(&project)
+            .env("ZSQL_HOME", root.path("home"))
+            .env("ZSQL_SERVER", format!("http://{addr}"))
+            .output()
+            .unwrap()
     };
-    // Reads need nothing.
-    let read = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"], None);
+    let read = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"]);
     assert!(read.status.success(), "{}", String::from_utf8_lossy(&read.stderr));
-
-    // A deploy without the token, and with a wrong one, is refused and says what is wanted.
-    for key in [None, Some("zdt_not-it")] {
-        let out = run(&["deploy", "--branch", "staging"], key);
-        assert!(!out.status.success(), "a deploy with {key:?} went through");
-        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(said.contains("deploy token"), "{said}");
-    }
-    assert!(!get(&addr, "/projects").1.contains("\"staging\""));
-
-    // With it, the deploy lands and the removal takes it away again.
-    let out = run(&["deploy", "--branch", "staging"], Some(TOKEN));
+    let out = run(&["deploy", "--branch", "staging"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(get(&addr, "/projects").1.contains("\"staging\""));
-    let out = run(&["remove", "--branch", "staging", "--yes"], None);
-    assert!(!out.status.success(), "a removal without the token went through");
-    let out = run(&["remove", "--branch", "staging", "--yes"], Some(TOKEN));
+    let out = run(&["remove", "--branch", "staging", "--yes"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!get(&addr, "/projects").1.contains("\"staging\""));
 
     let (status, said) = s.stop();
     assert!(status.success());
-    assert!(said.contains("deploys need the deploy token"), "{said}");
-    assert!(!said.contains(TOKEN), "the token is never logged:\n{said}");
+    assert!(!said.contains("token") && !said.contains("zdt_left-over"), "nothing about a token is said or kept:\n{said}");
 }
 
 /// The background form: start records where it listens (a bind of
@@ -582,7 +563,7 @@ fn the_environment_is_the_base_and_flags_win() {
     };
     let (child, stderr, banner) = listen(&[]);
     assert!(root.path("elsewhere/lock").exists(), "ZSQL_DATA_DIR was not the data directory");
-    assert!(banner.contains("deploys are open"), "{banner}");
+    assert!(banner.contains("0 deployment(s) loaded from") && !banner.contains("token"), "{banner}");
     finish(child, stderr, banner);
 
     let (child, stderr, banner) = listen(&["--data-dir", root.path("here").to_str().unwrap()]);

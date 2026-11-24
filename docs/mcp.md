@@ -59,9 +59,9 @@ two places:
   they are editing.
 
 A browser page can reach a loopback server by DNS rebinding. What it
-gets is what any caller gets: the catalog and SQL text, and, on a
-server with no deploy token, nothing more over this endpoint, since no
-tool writes.
+gets is what any caller gets over this endpoint: the catalog and SQL
+text, and rows as well where the tools that run a statement have been
+turned on. No tool deploys or removes.
 
 ## The security context
 

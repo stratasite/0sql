@@ -10,10 +10,10 @@
 //! connects with that and whatever the request sends over it; what a
 //! request sends is dropped with the answer. `zsql deploy` strips
 //! secrets from the entry, so a secret is kept only when a deployer
-//! put one there on purpose, and it is never served. The server's own
-//! credential is the optional deploy token: with one set, a deploy, a validate, a test
-//! run and a removal each need `Authorization: Bearer <token>`, so a
-//! server that is read from more widely than it is written to can be.
+//! put one there on purpose, and it is never served. The server has no
+//! credential of its own to check: a deploy, a validate, a test run
+//! and a removal are as open as a read, and whoever may do any of them
+//! is decided by the service in front.
 //!
 //! ```text
 //! POST /projects/{uid}/branches/{branch}/deploy        body: tar.gz of the project; tests run, results in the answer
@@ -41,7 +41,7 @@
 //!
 //! The crate is one module per concern:
 //!
-//! - `guard`: the deploy token, the admission cap and the deadline
+//! - `guard`: the admission cap and the deadline
 //!   every request meets
 //! - `admission`: how much of each kind of work runs at once
 //! - `names`: the project and branch names that become directories
@@ -104,10 +104,6 @@ pub(crate) struct App {
     admission: Admission,
     /// What MCP clients are told, and which tools they may call.
     mcp: mcp::Settings,
-    /// What a deploy, a validate, a test run and a removal must present,
-    /// when the server was given one. `None` leaves them as open as the
-    /// reads.
-    deploy_token: Option<String>,
     /// One deploy writes at a time: two for the same branch would race
     /// each other's renames while swapping in.
     deploying: std::sync::Mutex<()>,

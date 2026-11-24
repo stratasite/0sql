@@ -55,9 +55,6 @@ An MCP request is one tool call and is admitted as a plan by the guard;
 the two explore-class tools take an explore seat as well, inside the
 dispatcher. See `docs/mcp.md`.
 
-A write that lacks the deploy token is refused before it takes a seat,
-so it costs nothing and never waits behind a deploy to be told no.
-
 ## Deadlines
 
 90 s for heavy and for a probe, 30 s for everything else. A deadline that passes

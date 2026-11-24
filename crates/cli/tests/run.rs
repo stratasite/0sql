@@ -9,11 +9,7 @@ use std::process::Command;
 
 fn zsql(home: &Path, project: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
-    cmd.env("ZSQL_HOME", home)
-        .env_remove("ZSQL_SERVER")
-        .env_remove("ZSQL_API_KEY")
-        .env_remove("ZSQL_RESULTS")
-        .env_remove("ZSQL_RESULTS_DIR");
+    cmd.env("ZSQL_HOME", home).env_remove("ZSQL_SERVER").env_remove("ZSQL_RESULTS").env_remove("ZSQL_RESULTS_DIR");
     cmd.current_dir(project);
     cmd
 }

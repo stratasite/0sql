@@ -11,8 +11,7 @@ description: \n\
 # branch, so this is the branch to merge into when a change is ready.\n\
 production_branch: main\n\
 \n\
-# The server `zsql deploy` sends to, when it is not the local one; the\n\
-# server's deploy token, if it has one, lives in .zsql, never here.\n\
+# The server `zsql deploy` sends to, when it is not the local one.\n\
 # server: http://127.0.0.1:3699\n"
     )
 }

@@ -1,5 +1,5 @@
 # The server on the host: `zsql serve`, configured by /etc/zsqld.env
-# (ZSQL_* variables, ZSQL_DEPLOY_TOKEN among them; mode 0600) and the
+# (ZSQL_* variables, a datasource's credentials among them; mode 0600) and the
 # data directory systemd owns.
 # Installed as /etc/systemd/system/zsqld.service; the unit, its
 # environment file and its user keep the name zsqld.

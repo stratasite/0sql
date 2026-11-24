@@ -8,7 +8,7 @@ leaves to the operator.
 
 ## Where it belongs
 
-The server has no accounts, no users and no keys. It answers whoever
+The server has no accounts, no users, no keys and no token. It answers whoever
 can reach it, the way a database on a private network does, and it is
 meant to be used like one: behind your own service, which authenticates
 your users, decides which projects each may ask about, sends the
@@ -20,42 +20,41 @@ security context each plan runs under, and paces its callers.
 | the security context of a plan | the caller sends it: `context` in the body, the `Zsql-Context` header on `/mcp` |
 | rate limits | the proxy or the service in front |
 | TLS | the proxy |
-| who may deploy | the deploy token, below |
+| who may deploy, validate, test and remove | the service in front, or the network: the server asks nobody |
 
 Do not expose the port to callers you do not trust. Anyone who reaches
 it reads every deployed model's catalog, plans SQL under any context
 they care to claim, **runs that SQL and reads the rows**, runs a
-statement of their own with `sql-exec`, and, without a deploy token,
-deploys and removes. "Running the server's statements", below, says
+statement of their own with `sql-exec`, and deploys and removes. "Running the server's statements", below, says
 what that is worth.
 
-## The deploy token
+## No credential of its own
 
-`ZSQL_DEPLOY_TOKEN` in the server's environment. With it set, four
-routes need `Authorization: Bearer <token>`: deploy, validate, test and
-remove. Every read stays open. Without it those four are as open as the
-reads, which is right on a loopback and nowhere else, so `zsql serve`
-refuses a bind beyond the loopback unless the token is set or `--open`
-says the exposure is meant.
+The server checks nothing a request carries. A deploy, a validate, a
+test and a removal are as open as a read, on every address it listens
+on, and an `Authorization` header is not read. Releases before this
+one took a deploy token (`ZSQL_DEPLOY_TOKEN`, sent by the CLI as
+`ZSQL_API_KEY` or `zsql auth --api-key`). That is gone: the variable
+is ignored, `zsql auth` no longer exists, and an `api_key` left in a
+`.zsql` is not read.
 
-The CLI sends the token as it always sent a key: `zsql auth --api-key
-<token>` saves it in the project's `.zsql`, and `ZSQL_API_KEY` in the
-environment wins over that. A server serving its own project
-(`zsql serve` inside one) deploys it with its own token.
+So who may deploy is decided where every other question of who is
+decided: by the service in front, or by who can reach the address.
+`zsql serve` refuses a bind beyond the loopback unless `--open` says
+the exposure is meant, since nothing else stands in the way.
 
-The token is one shared secret: a long random string
-(`openssl rand -hex 32`), in the environment file at mode 0600, never
-on a command line. It is compared in constant time and never logged.
-To rotate it, change the variable and restart; there is one token at a
-time.
+**Coming from a server that had a token:** it now takes a deploy from
+anyone who reaches it. Before upgrading, make sure the write routes
+are not forwarded to callers who should not deploy, or that the port
+is not reachable by them at all.
 
 ## Deploying to it
 
 Deploy to the server directly, the way migrations are run against a
 database: on a path of its own, not through whatever the application's
 queries pass through. `zsql deploy` goes wherever `server` in
-`project.yml` or `ZSQL_SERVER` points, with the token from `.zsql` or
-`ZSQL_API_KEY`.
+`project.yml` or `ZSQL_SERVER` points, and sends nothing to say who it
+is.
 
 | where you deploy from | how it reaches the server |
 |---|---|
@@ -69,31 +68,21 @@ and should refuse the four write routes outright: `POST
 /projects/{uid}/branches/{branch}`. A proxy that forwards a fixed list
 of read routes does this without trying.
 
-A proxy may carry deploys too, in one of two ways:
-
-- **It passes `Authorization` through** on the write routes, and the
-  server checks the token as if the caller had come direct. The proxy
-  cannot use `Authorization` for a credential of its own on those
-  routes: the CLI sends one such header.
-- **It holds the token and adds it itself**, so its users deploy
-  through the interface they already have. The proxy's own check is
-  then the only thing between a caller and a deploy. It must add the
-  token on the write routes alone, and only for a caller it has decided
-  may deploy; added to every forwarded request, the token gives a
-  deploy to everyone who can read.
+A proxy may carry deploys too. Its own check is then the only thing
+between a caller and a deploy: it forwards the write routes only for a
+caller it has decided may deploy, and to no one else.
 
 What to keep in mind whichever path is used:
 
-- **The token is worth what the warehouse credentials are worth.** A
-  model carries SQL expressions the application will run with its own
+- **A deploy is worth what the warehouse credentials are worth.** A
+  model carries SQL expressions that are run with a datasource's
   credentials, and the row policies. Whoever can deploy can drop the
   policies or choose that SQL.
-- **One token is every project.** It is not scoped: its holder may
-  overwrite or remove any branch of any project, and the log does not
-  say which holder did.
+- **Reach is every project.** Nothing scopes a caller: whoever
+  reaches the write routes may overwrite or remove any branch of any
+  project, and the log does not say who did.
 - **The direct path is plain HTTP.** A tailnet or an SSH tunnel
-  encrypts it. A flat VPN or VPC may not, and then the token crosses it
-  in the clear on every deploy.
+  encrypts it. A flat VPN or VPC may not.
 - **Bind the private address, not every address.** Reaching the server
   over a VPN means a bind beyond the loopback, and on a host that also
   has a public interface `0.0.0.0` is the internet. Behind an SSH
@@ -113,8 +102,8 @@ What to keep in mind whichever path is used:
   server keeps nothing a request sends, on disk or in a log, and holds
   no connection open afterwards. But it does open the connection, from
   its own network position, to whatever host the body names, and a
-  `file`, `ca_file` or `key_file` there is a path on the server. These
-  routes are reads and take no token, so the service in front decides
+  `file`, `ca_file` or `key_file` there is a path on the server. The
+  server asks nobody who they are, so the service in front decides
   who may send them and with what: forward them only for a caller it
   would trust with that reach, and build the connection itself rather
   than pass a client's through.
@@ -263,7 +252,6 @@ same thing. The ones an operator sets:
 |---|---|
 | `ZSQL_BIND` | the address; `127.0.0.1:3699` by default, and a proxy in front is the usual arrangement |
 | `ZSQL_DATA_DIR` | the data directory |
-| `ZSQL_DEPLOY_TOKEN` | what a deploy, a validate, a test and a removal must present; a variable only, never a flag |
 | `ZSQL_LOG`, `ZSQL_LOG_FORMAT` | what is logged and how; the log, below |
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE` | how much of each kind of work runs at once; `docs/admission.md` |
@@ -314,13 +302,12 @@ environment it is started in.
 ## The first lines it logs
 
 ```
-zsqld: 9 deployment(s) loaded from /var/lib/zsqld; deploys need the deploy token
+zsqld: 9 deployment(s) loaded from /var/lib/zsqld
 zsqld: listening on http://127.0.0.1:3699
 ```
 
 After a restart, compare the first line with the previous one: the
-number of deployments, and whether deploys need the token or `are open
-to whoever reaches this address`. A branch this build cannot load is
+number of deployments. A branch this build cannot load is
 logged by name with its reason, left out, and counted in a line after
 the summary saying what is not being served; everything else comes up.
 The fix for one is to deploy that branch again from its repository,
@@ -328,7 +315,7 @@ since the compiled model is never migrated.
 
 Each deploy and each removal writes a line naming the project and
 branch. That line is the only record of who changed what, and it does
-not say who: everyone who deploys holds the same token.
+not say who: the server asks nobody.
 
 ## Backups
 
@@ -349,7 +336,8 @@ sign-up, a web app, rate limits, all in the server. That is gone.
   file, with `ZSQL_SIGNUP`, `ZSQL_LIMITS`, `ZSQL_LIMIT_*`, `ZSQL_MAIL_*`,
   `ZSQL_TRUSTED_PROXY`, `ZSQL_AUTH_CACHE_TTL`, `ZSQL_MAX_BRANCHES_*`,
   `ZSQL_ADMIT_MANAGE` and `ZSQL_ADMIT_PASSWORD`, which are no longer
-  read. Set `ZSQL_DEPLOY_TOKEN`.
+  read. `ZSQL_DEPLOY_TOKEN`, which that release introduced, is not
+  read either: see "No credential of its own", above.
 - Deployments lived under `<account>/<project>/<branch>/` and are now
   looked for at `<project>/<branch>/`. Deploy each again, or move each
   `<account>/<project>` directory up one level; two accounts with a
@@ -375,8 +363,8 @@ cannot read is to deploy that branch again, and startup says which.
 
 A deployed model is held in memory for the life of the process and
 nothing evicts it: about 5 MB for a model of the TPC-DS sample's size.
-Nothing caps how many are deployed either, so whoever holds the deploy
-token can fill memory, and a process killed for memory restarts into
+Nothing caps how many are deployed either, so whoever can deploy can
+fill memory, and a process killed for memory restarts into
 the same reload. Size the machine for the branches it serves, or set
 `MemoryMax` and watch the journal. Lazy loading with an LRU is the open
 design here.

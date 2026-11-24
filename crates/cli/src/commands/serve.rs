@@ -34,8 +34,7 @@ pub struct ServeArgs {
     /// Where deployed models live; $ZSQL_HOME/data when neither this nor the variable says.
     #[arg(long, env = "ZSQL_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Allow listening beyond the loopback with no deploy token, which lets anyone who can reach the port deploy and remove.
-    /// With ZSQL_DEPLOY_TOKEN set this is not needed: only the reads are open then.
+    /// Allow listening beyond the loopback. The server asks nobody who they are: anyone who can reach the port deploys, removes and runs statements.
     #[arg(long)]
     pub open: bool,
     /// Serve only the data directory, even inside a project.
@@ -64,14 +63,9 @@ impl ServeArgs {
 
     /// The whole configuration: the environment's settings, with the
     /// flags over them.
-    ///
-    /// The deploy token is a variable and never a flag: a flag is in
-    /// the process list for anyone on the machine to read, and the
-    /// background form would have to pass it on in one.
     fn config(&self) -> Result<Config> {
         let mut cfg = Config::local(self.data_dir()?, self.bind());
         cfg.public_url = self.public_url.clone();
-        cfg.deploy_token = var("ZSQL_DEPLOY_TOKEN");
         let a = &mut cfg.admission;
         for (name, slot) in [
             ("ZSQL_ADMIT_PLAN", &mut a.plan),
@@ -240,9 +234,10 @@ fn loopback(bind: &str) -> bool {
 pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
     let bind = args.bind();
     let cfg = args.config()?;
-    let token = cfg.deploy_token.clone();
-    if token.is_none() && !args.open && !loopback(&bind) {
-        bail!("{bind} is not a loopback address, and with no deploy token anyone who reaches it may deploy and remove; set ZSQL_DEPLOY_TOKEN, or add --open to mean it");
+    // The server asks nobody who they are, so where it listens is who
+    // may use it. Beyond this machine, that has to be meant.
+    if !args.open && !loopback(&bind) {
+        bail!("{bind} is not a loopback address, and anyone who reaches it may deploy, remove and run statements; add --open to mean it");
     }
     // A project named explicitly must be there; one looked for is optional.
     let project = match (args.no_project, at.project.is_some()) {
@@ -277,8 +272,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
             IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
             ip => ip,
         };
-        // The server's own token: it is this process that set it.
-        let client = remote::Client::new(&format!("http://{}", SocketAddr::new(reach, addr.port())), token);
+        let client = remote::Client::new(&format!("http://{}", SocketAddr::new(reach, addr.port())));
         let branch = config::git_branch(&p.dir).unwrap_or_else(|_| "main".into());
         eprintln!("zsql: serving {} as {}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
         let deploy = || -> Result<()> {
@@ -416,8 +410,7 @@ pub fn server(command: ServerCommand, at: Where) -> Result<()> {
         ServerCommand::Stop => stop(),
         ServerCommand::Health { server } => {
             let project = at.project_dir().ok();
-            let client =
-                crate::remote::Client::new(&config::server(server.as_deref(), project.as_ref()), config::api_key(project.as_ref()));
+            let client = crate::remote::Client::new(&config::server(server.as_deref(), project.as_ref()));
             let v = client.get("/healthz")?;
             println!("{} {}", client.server, v.as_str().unwrap_or("ok"));
             Ok(())
@@ -609,7 +602,7 @@ fn status(data_dir: Option<PathBuf>, json: bool) -> Result<()> {
 /// reached on the loopback from here.
 /// Whether the server at the bind answers `/healthz`.
 fn answering(bind: &str) -> bool {
-    remote::Client::new(&url_of(bind), None).get("/healthz").is_ok()
+    remote::Client::new(&url_of(bind)).get("/healthz").is_ok()
 }
 
 fn url_of(bind: &str) -> String {
@@ -629,7 +622,7 @@ fn public_note(public: Option<&str>) -> String {
 /// boolean form is [`answering`]: deriving one by comparing against this
 /// string would turn into `false` the day the wording changes.
 fn answers(bind: &str) -> String {
-    match remote::Client::new(&url_of(bind), None).get("/healthz") {
+    match remote::Client::new(&url_of(bind)).get("/healthz") {
         Ok(_) => "it answers".to_string(),
         Err(e) => format!("it does not answer: {e}"),
     }

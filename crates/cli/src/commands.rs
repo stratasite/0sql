@@ -15,7 +15,7 @@ pub(crate) mod serve;
 
 use crate::cli::{read_json, CatalogWhat, Cli, Command, Mode, ResultsWhat, Where};
 use crate::side::Session;
-use crate::{config, failure, remote, show, tty};
+use crate::{failure, remote, show, tty};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -35,15 +35,6 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Init { dir, name, uid, no_git } => scaffold::init(dir, name, uid, no_git),
         Command::Datasource { what } => datasource::run(dir, what),
-        Command::Auth { api_key, server } => {
-            let project = here.project_dir()?;
-            config::write_secret(&project.dir, "api_key", &api_key)?;
-            if let Some(s) = server {
-                config::write_secret(&project.dir, "server", &s)?;
-            }
-            println!("saved to {}", project.dir.join(config::LOCAL_FILE).display());
-            Ok(())
-        }
         Command::Deploy { dry_run, watch, skip_check, remote } => deploy::deploy(Where::with(project, remote), dry_run, watch, skip_check),
         Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
             let format = format.or_else(|| tty::agent().then(|| "json".to_string()));

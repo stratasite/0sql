@@ -127,8 +127,9 @@ and a deploy that is the checked-out branch.
 The server is a component, used the way a database is: it sits behind
 your own service, which signs your users in, sends the security context
 each plan runs under, and paces its callers. It has no accounts or keys
-of its own and answers whoever can reach it; an optional deploy token
-keeps deploys to whoever holds it. `docs/operating.md` has the detail.
+or token of its own and answers whoever can reach it, a deploy
+included: who may do what is your service's to decide.
+`docs/operating.md` has the detail.
 
 ## Where to go
 
@@ -196,7 +197,7 @@ docs/             design notes: admission, MCP, operating and releasing
 ```
 
 `docs/operating.md` is for whoever runs a server for others: the data
-directory, the deploy token, the settings, what changes shape on disk
+directory, who may reach it, the settings, what changes shape on disk
 and when.
 `docs/releasing.md` is how a release is cut.
 

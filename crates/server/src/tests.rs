@@ -1,5 +1,5 @@
 //! The server, end to end, through the real router: the guard, the
-//! deploy token, the names that become directories, the archive, the
+//! names that become directories, the archive, the
 //! models map, the data directory, and the MCP endpoint.
 //!
 //! Each test gets its own server over a scratch data directory. The
@@ -23,8 +23,6 @@ use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
 use zsql_dialect::Dialects;
 
-const TOKEN: &str = "zdt_a-deploy-token-for-the-tests";
-
 struct Server {
     app: Shared,
     router: Router,
@@ -37,19 +35,15 @@ impl Drop for Server {
     }
 }
 
-/// A server with no deploy token: every route is open.
+/// A server over a scratch data directory: every route is open, as it always is.
 fn server() -> Server {
-    server_with(None)
-}
-
-fn server_with(deploy_token: Option<&str>) -> Server {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&data_dir).unwrap();
-    let app = app_over(&data_dir, deploy_token);
+    let app = app_over(&data_dir);
     Server { router: router(app.clone()), app, data_dir }
 }
 
-fn app_over(data_dir: &std::path::Path, deploy_token: Option<&str>) -> Shared {
+fn app_over(data_dir: &std::path::Path) -> Shared {
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     Arc::new(App {
         dialects,
@@ -57,7 +51,6 @@ fn app_over(data_dir: &std::path::Path, deploy_token: Option<&str>) -> Shared {
         models: RwLock::new(HashMap::new()),
         admission: Admission::new(&AdmissionCounts::default()),
         mcp: mcp::Settings::builtin(),
-        deploy_token: deploy_token.map(str::to_string),
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,
@@ -295,7 +288,7 @@ fn spec_of(expr: &str) -> Value {
 /// With no token the server is as open to writes as to reads: the mode
 /// a developer's own machine runs in.
 #[tokio::test]
-async fn without_a_token_every_route_is_open() {
+async fn every_route_is_open() {
     let s = server();
     let a = s.deploy(CS, "main", archive(CS, "one")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
@@ -308,63 +301,28 @@ async fn without_a_token_every_route_is_open() {
     assert!(s.listing().await.is_empty() && s.on_disk().is_empty());
 }
 
-/// With a token, the four routes that change a deployment or spend
-/// seconds on one need it, and every read stays open. Asked through the
-/// router, so a write route the guard does not know about fails here.
+/// Nothing a request carries is read as a credential: a deploy, a
+/// validate, a test and a removal are answered the same with no
+/// `Authorization` header, with one, and with one left over from a
+/// server that used to ask for a token.
 #[tokio::test]
-async fn the_deploy_token_stands_in_front_of_the_writes_and_only_the_writes() {
-    let s = server_with(Some(TOKEN));
-    let bearer = format!("Bearer {TOKEN}");
-    let good: &[(&str, &str)] = &[("authorization", &bearer)];
+async fn an_authorization_header_is_neither_needed_nor_read() {
+    let s = server();
     let branch = format!("/projects/{CS}/branches/main");
-    let writes = || {
-        [
-            (Method::POST, format!("{branch}/deploy"), Some(("application/gzip", archive(CS, "one")))),
+    for sent in [None, Some("Bearer zdt_a-token-from-an-older-server"), Some("Basic bm9wZQ=="), Some("nonsense")] {
+        let headers: Vec<(&str, &str)> = sent.iter().map(|v| ("authorization", *v)).collect();
+        for (method, path, body) in [
             (Method::POST, format!("{branch}/validate"), Some(("application/gzip", archive(CS, "one")))),
+            (Method::POST, format!("{branch}/deploy"), Some(("application/gzip", archive(CS, "one")))),
             (Method::POST, format!("{branch}/test"), None),
             (Method::DELETE, branch.clone(), None),
-        ]
-    };
-
-    // No token, a wrong one, the right one under another scheme, the
-    // right one with a character more or less: all refused, with the
-    // challenge, and nothing lands.
-    let (longer, shorter) = (format!("Bearer {TOKEN}x"), format!("Bearer {}", &TOKEN[..TOKEN.len() - 1]));
-    let basic = format!("Basic {TOKEN}");
-    for wrong in [None, Some("Bearer nope"), Some(basic.as_str()), Some(TOKEN), Some(longer.as_str()), Some(shorter.as_str())] {
-        for (method, path, body) in writes() {
-            let headers: Vec<(&str, &str)> = wrong.iter().map(|w| ("authorization", *w)).collect();
+        ] {
             let a = s.send(method.clone(), &path, &headers, body).await;
-            assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{method} {path} with {wrong:?}: {}", a.body);
-            assert_eq!(a.class(), "Unauthorized");
-            assert_eq!(a.headers.get("www-authenticate").unwrap().to_str().unwrap(), "Bearer realm=\"0sql\"");
+            assert_eq!(a.status, StatusCode::OK, "{method} {path} with {sent:?}: {}", a.body);
+            assert!(a.headers.get("www-authenticate").is_none(), "nothing is asked for");
         }
     }
-    assert!(s.on_disk().is_empty() && s.keys_in_memory().is_empty());
-
-    // With it, each works.
-    for (method, path, body) in writes() {
-        let a = s.send(method.clone(), &path, good, body).await;
-        assert_eq!(a.status, StatusCode::OK, "{method} {path}: {}", a.error());
-    }
     assert!(s.on_disk().is_empty(), "the last of them was the removal");
-    let a = s.send(Method::POST, &format!("{branch}/deploy"), good, Some(("application/gzip", archive(CS, "one")))).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-
-    // The reads need nothing, over REST and over MCP.
-    for path in ["/projects".to_string(), branch.clone(), format!("{branch}/fields"), format!("{branch}/tables")] {
-        let a = s.get(&path).await;
-        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.error());
-    }
-    for verb in ["sql", "explain", "explore"] {
-        let a = s.post(&format!("{branch}/{verb}"), json!({ "expr": "Category, Revenue" })).await;
-        assert_eq!(a.status, StatusCode::OK, "{verb}: {}", a.error());
-    }
-    let a = s.tool(&[], "sql", json!({ "project": CS, "spec": spec_of("Category, Revenue") })).await;
-    assert!(a.body["result"]["structuredContent"]["sql"].is_string(), "{}", a.body);
-    // And a token sent where none is needed is not an error.
-    let a = s.send(Method::GET, "/projects", good, None).await;
-    assert_eq!(a.status, StatusCode::OK);
 }
 
 /// Two projects, and two branches of one, are each their own
@@ -386,7 +344,7 @@ async fn each_branch_is_its_own_deployment() {
     assert_eq!(s.fields(CS, "dev").await.unwrap_err().status, StatusCode::NOT_FOUND);
 
     // A restart finds what is on disk and nothing else.
-    let again = app_over(&s.data_dir, None);
+    let again = app_over(&s.data_dir);
     let (n, skipped) = reload(&again).unwrap();
     assert_eq!((n, skipped.len()), (2, 0));
 }
@@ -855,7 +813,7 @@ async fn the_catalog_the_default_branch_and_a_refusal_with_the_nearest_fields() 
 /// model.
 #[tokio::test]
 async fn liveness_needs_nothing() {
-    let s = server_with(Some(TOKEN));
+    let s = server();
     let res = s.router.clone().oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(&axum::body::to_bytes(res.into_body(), 1024).await.unwrap()[..], b"ok");
@@ -947,8 +905,7 @@ fn warehouse(name: &str) -> std::path::PathBuf {
 /// comes back.
 #[tokio::test]
 async fn a_probe_reads_the_warehouse_the_request_points_at() {
-    // With a deploy token set: a probe is a read, and needs none.
-    let s = server_with(Some("s3cret"));
+    let s = server();
     let a = s
         .send(
             Method::POST,
@@ -1146,7 +1103,7 @@ async fn a_datasource_is_kept_as_it_was_deployed_and_probed_with_it() {
     assert!(!a.error().contains("hunter3"), "{}", a.error());
 
     // It is in the snapshot, so a restart has it too.
-    let again = app_over(&s.data_dir, None);
+    let again = app_over(&s.data_dir);
     reload(&again).unwrap();
     let again = Server { router: router(again.clone()), app: again, data_dir: s.data_dir.clone() };
     let a = again.send(Method::POST, &format!("{base}/tables?schema=main"), &[], None).await;
@@ -1331,7 +1288,6 @@ async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_cre
         models: RwLock::new(HashMap::new()),
         admission: Admission::new(&AdmissionCounts::default()),
         mcp: mcp::Settings::builtin(),
-        deploy_token: None,
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: Some(2),
@@ -1459,7 +1415,6 @@ async fn the_tools_that_run_are_offered_only_when_named() {
         models: RwLock::new(HashMap::new()),
         admission: Admission::new(&AdmissionCounts::default()),
         mcp: mcp::Settings::new(None, None, Some(tools)).unwrap(),
-        deploy_token: None,
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,

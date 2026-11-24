@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 
 pub struct Client {
     pub server: String,
-    pub api_key: Option<String>,
     /// For every call but a deploy: a server that accepts and never
     /// answers must not hang the command.
     agent: ureq::Agent,
@@ -17,7 +16,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(server: &str, api_key: Option<String>) -> Self {
+    pub fn new(server: &str) -> Self {
         let agent = |whole: u64| {
             ureq::Agent::new_with_config(
                 ureq::config::Config::builder()
@@ -27,18 +26,11 @@ impl Client {
                     .build(),
             )
         };
-        Client { server: server.trim_end_matches('/').to_string(), api_key, agent: agent(60), slow: agent(600) }
+        Client { server: server.trim_end_matches('/').to_string(), agent: agent(60), slow: agent(600) }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.server, path)
-    }
-
-    fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
-        match &self.api_key {
-            Some(k) => req.header("authorization", &format!("Bearer {k}")),
-            None => req,
-        }
     }
 
     /// Sends, and waits the server out if it says it has not started
@@ -61,22 +53,22 @@ impl Client {
 
     pub fn get(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("GET {url}"), || self.auth(self.agent.get(&url)).call())
+        self.send(&format!("GET {url}"), || self.agent.get(&url).call())
     }
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.agent.post(&url)).send_json(body))
+        self.send(&format!("POST {url}"), || self.agent.post(&url).send_json(body))
     }
 
     pub fn post_bytes(&self, path: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.slow.post(&url)).header("content-type", content_type).send(bytes))
+        self.send(&format!("POST {url}"), || self.slow.post(&url).header("content-type", content_type).send(bytes))
     }
 
     pub fn delete(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("DELETE {url}"), || self.auth(self.agent.delete(&url)).call())
+        self.send(&format!("DELETE {url}"), || self.agent.delete(&url).call())
     }
 }
 

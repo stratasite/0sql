@@ -68,19 +68,6 @@ pub(crate) fn classify(path: &str) -> Class {
     }
 }
 
-/// Whether a request changes what is deployed, or spends seconds of CPU
-/// on an archive or a test run: a deploy, a validate, a test, a
-/// removal. These are the requests a deploy token gates; every other
-/// route is a read.
-pub(crate) fn writes(method: &str, path: &str) -> bool {
-    let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match p.as_slice() {
-        ["projects", _, "branches", _, "deploy" | "validate" | "test"] => true,
-        ["projects", _, "branches", _] => method != "GET" && method != "HEAD",
-        _ => false,
-    }
-}
-
 /// How long a class waits for a permit before the server says it is busy.
 fn patience(class: Class) -> Duration {
     match class {
@@ -198,40 +185,6 @@ mod tests {
             ("/", Exempt),
         ] {
             assert_eq!(classify(p), want, "{p}");
-        }
-    }
-
-    /// The deploy token stands in front of exactly these. A route added
-    /// to the router that changes a deployment belongs in this list and
-    /// in `writes`; the server's own tests ask each one without a token.
-    #[test]
-    fn the_writes_are_the_deploy_the_validate_the_test_and_the_removal() {
-        for (m, p) in [
-            ("POST", "/projects/a/branches/main/deploy"),
-            ("POST", "/projects/a/branches/main/validate"),
-            ("POST", "/projects/a/branches/main/test"),
-            ("DELETE", "/projects/a/branches/main"),
-            ("POST", "/projects/a/branches/main/deploy/"),
-            ("PUT", "/projects/a/branches/main"),
-        ] {
-            assert!(writes(m, p), "{m} {p}");
-        }
-        for (m, p) in [
-            ("GET", "/projects/a/branches/main"),
-            ("POST", "/projects/a/branches/main/sql"),
-            ("POST", "/projects/a/branches/main/explain"),
-            ("POST", "/projects/a/branches/main/explore"),
-            ("GET", "/projects/a/branches/main/fields"),
-            ("GET", "/projects/a/branches/main/tables"),
-            ("GET", "/projects/a/branches/main/values/dim"),
-            ("GET", "/projects/a/branches/main/datasources"),
-            ("POST", "/projects/a/branches/main/datasources/dw/tables"),
-            ("POST", "/projects/a/branches/main/datasources/dw/tables/dse.cs_contact_f"),
-            ("GET", "/projects"),
-            ("POST", "/mcp"),
-            ("GET", "/healthz"),
-        ] {
-            assert!(!writes(m, p), "{m} {p}");
         }
     }
 

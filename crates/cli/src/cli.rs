@@ -140,7 +140,7 @@ impl Where {
     /// key when a project is at hand. No git is read for this.
     pub(crate) fn client(&self) -> Client {
         let project = self.project_dir().ok();
-        Client::new(&config::server(self.server.as_deref(), project.as_ref()), config::api_key(project.as_ref()))
+        Client::new(&config::server(self.server.as_deref(), project.as_ref()))
     }
 
     /// The server target, for commands that are about a server's copy.
@@ -171,8 +171,7 @@ impl Where {
             (None, None) => "main".into(),
         };
         let server = config::server(self.server.as_deref(), project.as_ref());
-        let api_key = config::api_key(project.as_ref());
-        Ok(Target { project, uid, branch, client: Client::new(&server, api_key) })
+        Ok(Target { project, uid, branch, client: Client::new(&server) })
     }
 }
 
@@ -431,16 +430,6 @@ pub(crate) enum Command {
         json: bool,
         #[command(flatten)]
         remote: Remote,
-    },
-    /// Save the server's deploy token, and optionally the server, in .zsql for this project.
-    #[command(display_order = 31)]
-    Auth {
-        /// The deploy token the server was started with (its ZSQL_DEPLOY_TOKEN). A server without one needs none.
-        #[arg(long)]
-        api_key: String,
-        /// The server the token is for; the default server when unsaid.
-        #[arg(long)]
-        server: Option<String>,
     },
     /// Deploy the checked-out branch: the model files, tests and sampled values (never secrets).
     #[command(display_order = 32)]
