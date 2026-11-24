@@ -431,6 +431,42 @@ fn the_background_server_starts_reports_and_stops() {
 /// variable is honored when no flag names the setting, and a flag
 /// wins over its variable.
 #[cfg(unix)]
+/// The background server is found where it listens whatever its log was
+/// told: the address is read from the line it logs, or, when the log is
+/// quieter than that line or is JSON, from the lock it writes.
+#[test]
+fn a_background_server_is_found_whatever_its_log_says() {
+    for (name, variable, value) in [("quiet", "ZSQL_LOG", "warn"), ("json", "ZSQL_LOG_FORMAT", "json")] {
+        let root = Scratch::new(&format!("log-{name}"));
+        let home = root.path("home");
+        let run = |args: &[&str]| zsql().args(args).current_dir(&root.0).env("ZSQL_HOME", &home).env(variable, value).output().unwrap();
+        let started = std::time::Instant::now();
+        let out = run(&["server", "start", "--bind", "127.0.0.1:0", "--no-project"]);
+        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let addr = said.split(" on ").nth(1).and_then(|rest| rest.split(';').next()).unwrap_or_default().to_string();
+        assert!(addr.starts_with("127.0.0.1:") && !addr.ends_with(":0"), "{name}: the port it was given, not the one asked for: {said}");
+        assert!(started.elapsed() < Duration::from_secs(8), "{name}: found, not waited out: {:?}", started.elapsed());
+        assert!(get(&addr, "/healthz").0 == 200, "{name}: and it answers there");
+
+        let log = std::fs::read_to_string(home.join("server.log")).unwrap_or_default();
+        match name {
+            "quiet" => assert!(!log.contains("listening on"), "the line was not logged, so the lock answered: {log}"),
+            _ => {
+                let lines: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).expect("every line is JSON")).collect();
+                assert!(
+                    lines
+                        .iter()
+                        .any(|v| v["level"] == "info" && v["message"].as_str().is_some_and(|m| m.starts_with("listening on http://"))),
+                    "{log}"
+                );
+            }
+        }
+        let out = run(&["server", "stop"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("stopped process"), "{name}: {}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
 #[test]
 fn the_environment_is_the_base_and_flags_win() {
     let root = Scratch::new("env");

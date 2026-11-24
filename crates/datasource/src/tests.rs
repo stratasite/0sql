@@ -2259,6 +2259,14 @@ fn a_connection_sent_whole_is_read_as_the_file_is_and_a_catalog_lands_where_the_
     assert_eq!(secrets.password.as_ref().map(Secret::expose), Some("hunter2"));
     assert!(secrets.session_token.is_none(), "an empty secret is no secret");
     assert!(!format!("{secrets:?}").contains("hunter2"), "a secret never prints");
+    // Every secret a caller may name is one that is read: a field added
+    // to the list and not to the reader would be dropped without a word.
+    let every: serde_yaml::Value =
+        serde_yaml::from_str(&SECRET_FIELDS.iter().map(|f| format!("{f}: s3cret-{f}\n")).collect::<String>()).unwrap();
+    let all = Secrets::from_value(&every);
+    assert_eq!(format!("{all:?}").matches("Some(").count(), SECRET_FIELDS.len(), "{all:?}");
+    assert_eq!(all.oauth_token.as_ref().map(Secret::expose), Some("s3cret-oauth_token"), "a token an upstream obtained");
+    assert!(!format!("{all:?}").contains("s3cret"), "and none of them prints");
     for key in sent.as_mapping().unwrap().keys().filter_map(|k| k.as_str()) {
         assert!(CONNECTION_KEYS.contains(&key) || SECRET_FIELDS.contains(&key), "{key} is a key a caller may send");
     }
