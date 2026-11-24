@@ -21,10 +21,17 @@
 
 mod engine;
 mod error;
+pub mod json;
 mod manifest;
+mod record;
+mod registry;
+mod runs;
 mod store;
 
 pub use engine::{cache_key, CacheStatus, Connector, Engine, Limit, Outcome, RunRequest, DEFAULT_CAP, DEFAULT_TTL};
 pub use error::{Error, Result};
 pub use manifest::{Column, Lineage, Manifest, Timings, MANIFEST_FORMAT, ROWS_FORMAT, ROWS_FORMAT_TEXT};
-pub use store::{Store, Stored, Writing};
+pub use record::{run_cache_key, Kind, Record, Status, DEFAULT_ORG};
+pub use registry::{Local, Registry, RESTARTED};
+pub use runs::{How, Limits, Opener, Runs, Submit};
+pub use store::{each_batch, page, rows_file, Store, Stored, Writing};

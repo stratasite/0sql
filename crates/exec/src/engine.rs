@@ -229,7 +229,7 @@ pub fn cache_key(datasource_uid: &str, adapter: &str, identity: Option<&str>, sq
     sha256(&format!("{datasource_uid}\n{adapter}\n{}\n{sql}\n{}", identity.unwrap_or(""), context_digest.unwrap_or("")))
 }
 
-fn sha256(text: &str) -> String {
+pub(crate) fn sha256(text: &str) -> String {
     let digest = sha2::Sha256::digest(text.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }

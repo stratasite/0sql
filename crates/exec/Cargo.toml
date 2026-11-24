@@ -24,6 +24,7 @@ sha2 = "0.10"
 arrow-ipc = { version = "60", features = ["lz4"] }
 arrow-array = "60"
 arrow-schema = "60"
+arrow-cast = "60"
 
 [dev-dependencies]
 # A warehouse in a file, for a read that really arrives a batch at a time.

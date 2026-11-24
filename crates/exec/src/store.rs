@@ -32,7 +32,7 @@ impl Store {
         &self.root
     }
 
-    fn dir_of(&self, key: &str) -> PathBuf {
+    pub(crate) fn dir_of(&self, key: &str) -> PathBuf {
         self.root.join(&key[..2]).join(key)
     }
 
@@ -167,6 +167,18 @@ impl Writing {
     /// Finishes the rows, writes the manifest beside them, and moves
     /// the whole into place with one rename.
     pub fn commit(mut self, manifest: &Manifest) -> Result<Stored> {
+        let dir = self.land(Some(manifest))?;
+        Ok(Stored { manifest: manifest.clone(), dir })
+    }
+
+    /// Finishes the rows and moves them into place with one rename, with
+    /// no manifest: for a result whose record is kept somewhere else.
+    /// The directory it lands in comes back.
+    pub fn finish(mut self) -> Result<PathBuf> {
+        self.land(None)
+    }
+
+    fn land(&mut self, manifest: Option<&Manifest>) -> Result<PathBuf> {
         let io = |p: &Path, e: std::io::Error| Error::Io(p.display().to_string(), e);
         let rows_path = self.tmp.join(ROWS_FILE);
         let Some(mut writer) = self.writer.take() else {
@@ -174,10 +186,12 @@ impl Writing {
         };
         writer.finish().map_err(|e| Error::Arrow(rows_path.display().to_string(), e))?;
         drop(writer);
-        let manifest_path = self.tmp.join("manifest.json");
-        let mut text = serde_json::to_string_pretty(manifest)?;
-        text.push('\n');
-        std::fs::write(&manifest_path, text).map_err(|e| io(&manifest_path, e))?;
+        if let Some(manifest) = manifest {
+            let manifest_path = self.tmp.join("manifest.json");
+            let mut text = serde_json::to_string_pretty(manifest)?;
+            text.push('\n');
+            std::fs::write(&manifest_path, text).map_err(|e| io(&manifest_path, e))?;
+        }
         if let Some(parent) = self.dir.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
         }
@@ -185,7 +199,7 @@ impl Writing {
         // that overlapped this one or by --fresh: this one replaces it.
         let _ = std::fs::remove_dir_all(&self.dir);
         std::fs::rename(&self.tmp, &self.dir).map_err(|e| io(&self.dir, e))?;
-        Ok(Stored { manifest: manifest.clone(), dir: self.dir.clone() })
+        Ok(self.dir.clone())
     }
 }
 
@@ -233,6 +247,54 @@ impl Sink for Writing {
             Err(why) => Err(self.fail(why)),
         }
     }
+}
+
+/// The rows file of a result that was written into `dir`.
+pub fn rows_file(dir: &Path) -> PathBuf {
+    dir.join(ROWS_FILE)
+}
+
+/// Rows `offset..offset + limit` of a result's file, and its schema,
+/// read without the rest: a batch that holds none of the page is
+/// skipped where it lies, and nothing past the page is read.
+pub fn page(path: &Path, offset: u64, limit: u64) -> Result<Batches> {
+    let arrow = |e: arrow_schema::ArrowError| Error::Arrow(path.display().to_string(), e);
+    let file = std::fs::File::open(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+    let mut reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None).map_err(arrow)?;
+    let schema = reader.schema();
+    let (mut skip, mut left) = (offset, limit);
+    let mut batches = Vec::new();
+    while left > 0 {
+        let Some(batch) = reader.next() else { break };
+        let batch = batch.map_err(arrow)?;
+        let rows = batch.num_rows() as u64;
+        if skip >= rows {
+            skip -= rows;
+            continue;
+        }
+        let take = (rows - skip).min(left);
+        batches.push(batch.slice(skip as usize, take as usize));
+        left -= take;
+        skip = 0;
+    }
+    Ok(Batches { schema, batches })
+}
+
+/// Every batch of a result's file to `each`, one at a time, after its
+/// schema: for handing a whole result on without holding it.
+pub fn each_batch(
+    path: &Path,
+    mut each: impl FnMut(&arrow_schema::SchemaRef, Option<arrow_array::RecordBatch>) -> Result<()>,
+) -> Result<()> {
+    let arrow = |e: arrow_schema::ArrowError| Error::Arrow(path.display().to_string(), e);
+    let file = std::fs::File::open(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+    let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None).map_err(arrow)?;
+    let schema = reader.schema();
+    each(&schema, None)?;
+    for batch in reader {
+        each(&schema, Some(batch.map_err(arrow)?))?;
+    }
+    Ok(())
 }
 
 impl Stored {

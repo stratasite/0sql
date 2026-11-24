@@ -16,6 +16,10 @@ pub enum Error {
     Arrow(String, arrow_schema::ArrowError),
     #[error("{0}: rows in a format this build does not read: {1}")]
     RowsFormat(String, String),
+    #[error("busy: {0} runs are already waiting")]
+    Busy(usize),
+    #[error("a run with the id {0} is already recorded")]
+    Duplicate(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
