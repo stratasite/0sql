@@ -345,7 +345,13 @@ exposed on the old understanding.
    tried once more on a new one; a statement that may write never is.
    What was asked for: Writable opens, no statement check, DuckDB's two
    modes, the pool.
-6. **`sql-exec`.**
+6. **`sql-exec`. Done, 2026-11-24.** `row_count` is the rows a
+   statement changed where the transport says: SQLite, Postgres,
+   MySQL, BigQuery and Trino do; DuckDB answers a write with a row
+   holding the count, and the others say nothing, so it is 0 there.
+   On DuckDB a `sql-exec` closes the connections kept for reading
+   before it opens its own, and fails if a read is in flight on the
+   same file.
 7. **Around it.** The MCP tool, `docs/operating.md`, and the Go
    drivers under load.
 8. **Large results from Databricks.** Its external-links mode, so a

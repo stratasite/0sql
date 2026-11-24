@@ -1366,3 +1366,65 @@ async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_cre
     assert_eq!((&own.body["row_limit"], &own.body["row_count"]), (&json!(1), &json!(1)), "{}", own.body);
     assert_eq!(asked.lock().unwrap().len(), 2, "a credential was sent, so the server's was not asked for");
 }
+
+/// The caller's own statement, run as it was written: it may write, it
+/// is never looked up or found again, and it is one statement.
+#[tokio::test]
+async fn sql_exec_runs_one_statement_of_the_callers_and_keeps_nothing_of_it_for_reuse() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    let file = sales("sql-exec");
+    let conn = json!({ "file": file.to_str().unwrap() });
+    let exec = format!("/projects/{CS}/branches/main/sql-exec");
+    let run = format!("/projects/{CS}/branches/main/run");
+    let ask = |sql: &str| s.post(&exec, json!({ "datasource": "dw", "sql": sql, "connection": conn }));
+
+    // A plan runs first and leaves a connection kept for reading.
+    let before = s.post(&run, json!({ "expr": "category asc, revenue", "connection": conn })).await;
+    assert_eq!(before.body["row_count"], 3, "{}", before.body);
+    assert_eq!(s.app.runs.idle_connections(), 1);
+
+    // A read: typed as the engine typed it, and never an answer for later.
+    let count = ask("SELECT count(*) AS n, sum(revenue) AS total FROM sales").await;
+    assert_eq!(
+        (count.status, &count.body["status"], &count.body["type"]),
+        (StatusCode::OK, &json!("succeeded"), &json!("sql")),
+        "{}",
+        count.body
+    );
+    assert_eq!(count.body["rows"], json!([[4, "36.75"]]), "an integer is a number");
+    assert_eq!(
+        (&count.body["columns"][0]["type"], &count.body["cache_key"], &count.body["tables"]),
+        (&json!("integer"), &Value::Null, &json!([]))
+    );
+    assert!(count.body.get("cache").is_none() && count.body["spec"].is_null());
+    let again = ask("SELECT count(*) AS n, sum(revenue) AS total FROM sales").await;
+    assert_ne!(again.body["id"], count.body["id"], "two of the same are two runs");
+
+    // A write, on a connection that may: the database decides, not this.
+    let wrote = ask("INSERT INTO sales VALUES ('maps', 'm', 2.00), ('maps', 'm', 3.00)").await;
+    assert_eq!((wrote.status, &wrote.body["status"]), (StatusCode::OK, &json!("succeeded")), "{}", wrote.body);
+    assert_eq!(ask("SELECT count(*) AS n FROM sales").await.body["rows"], json!([[6]]));
+    assert_eq!(s.app.runs.idle_connections(), 0, "a writable connection to a file is not kept, nor the readers it displaced");
+    // The plan, asked fresh, sees what was written.
+    let after = s.post(&run, json!({ "expr": "category asc, revenue", "fresh": true, "connection": conn })).await;
+    assert_eq!(after.body["row_count"], 4, "{}", after.body);
+    assert_eq!(after.body["rows"][2], json!(["maps", "5.00"]));
+    // By its id, like any run.
+    let id = wrote.body["id"].as_str().unwrap();
+    assert_eq!(s.get(&format!("/results/{id}")).await.body["status"], "succeeded");
+
+    // A statement the engine refuses is a run that failed.
+    let bad = ask("SELECT nope FROM sales").await;
+    assert_eq!((bad.status, &bad.body["status"]), (StatusCode::OK, &json!("failed")));
+    assert!(bad.body["error"].as_str().unwrap().contains("nope"), "{}", bad.body);
+    // What is not one statement, or names no datasource of the branch.
+    let two = ask("SELECT 1; DELETE FROM sales").await;
+    assert_eq!(two.status, StatusCode::BAD_REQUEST);
+    assert!(two.error().contains("one statement"), "{}", two.error());
+    assert_eq!(ask("   ").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(ask("SELECT count(*) AS n FROM sales").await.body["rows"], json!([[6]]), "and none of the two ran");
+    let nowhere = s.post(&exec, json!({ "datasource": "elsewhere", "sql": "SELECT 1" })).await;
+    assert_eq!(nowhere.status, StatusCode::NOT_FOUND, "{}", nowhere.body);
+    assert!(s.post(&exec, json!({ "sql": "SELECT 1" })).await.status.is_client_error());
+}

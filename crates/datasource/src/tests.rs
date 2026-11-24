@@ -14,6 +14,8 @@ struct Kept {
     schema: Option<arrow_schema::SchemaRef>,
     batches: Vec<arrow_array::RecordBatch>,
     stop_after: Option<usize>,
+    /// What a statement that returned no rows said it changed.
+    affected: Option<u64>,
 }
 
 impl Sink for Kept {
@@ -30,6 +32,11 @@ impl Sink for Kept {
             return Err(Error::Query("sink".into(), "enough".into()));
         }
         self.batches.push(batch);
+        Ok(())
+    }
+
+    fn affected(&mut self, rows: u64) -> Result<()> {
+        self.affected = Some(rows);
         Ok(())
     }
 }
@@ -241,6 +248,7 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
         ..Default::default()
     };
     let password = std::env::var("ZSQL_TEST_PG_PASSWORD").expect("ZSQL_TEST_PG_PASSWORD");
+    let secret = Secret(password.clone());
     let mut src = postgres::Postgres::open(&conn, Some(Secret(password))).expect("connects");
 
     let rows = src
@@ -274,6 +282,18 @@ fn a_real_postgres_answers_a_read_and_refuses_a_write() {
         .to_string()
         .contains("enough"));
     assert_eq!(src.query("SELECT 1 AS one", 10).unwrap().rows.len(), 1, "after a read stopped early");
+    // Trusted by whoever opened it, a write is a statement like any
+    // other, and says how many rows it changed.
+    let mut trusted =
+        postgres::Postgres::open(&Connection { access: Access::Unchecked, ..conn.clone() }, Some(secret.clone())).expect("connects");
+    trusted.query("CREATE TEMP TABLE zsql_w (id int, note text)", 10).expect("a write, unchecked");
+    let mut wrote = Kept::default();
+    trusted.stream("INSERT INTO zsql_w VALUES (1, 'a'), (2, 'b'), (3, 'c')", &mut wrote).unwrap();
+    assert_eq!((wrote.affected, wrote.batches.len()), (Some(3), 0));
+    let mut changed = Kept::default();
+    trusted.stream("UPDATE zsql_w SET note = 'x' WHERE id > 1", &mut changed).unwrap();
+    assert_eq!(changed.affected, Some(2));
+    assert_eq!(trusted.query("SELECT count(*) FROM zsql_w", 10).unwrap().rows[0][0].as_deref(), Some("3"));
 }
 
 /// SQLite needs no server, so this is the one transport the ordinary test
@@ -316,6 +336,14 @@ fn sqlite_reads_its_file_and_cannot_write_it() {
     let mut trusted = open(&unchecked, Secrets::default()).unwrap();
     trusted.query("INSERT INTO t VALUES (4, 'd', NULL)", 10).expect("a write, unchecked");
     assert_eq!(trusted.query("SELECT count(*) FROM t", 10).unwrap().rows[0][0].as_deref(), Some("4"));
+    // A statement that returns no rows says how many it changed, and
+    // has a schema all the same: no columns.
+    let mut wrote = Kept::default();
+    trusted.stream("UPDATE t SET note = 'seen' WHERE id > 1", &mut wrote).unwrap();
+    assert_eq!((wrote.affected, wrote.batches.len(), wrote.schema.map(|s| s.fields().len())), (Some(3), 0, Some(0)));
+    let mut read = Kept::default();
+    trusted.stream("SELECT id FROM t", &mut read).unwrap();
+    assert_eq!(read.affected, None, "a read changed nothing, and says nothing about it");
     assert!(matches!(src.query("INSERT INTO t VALUES (5, 'e', NULL)", 10), Err(Error::NotARead(_))), "checked, it is still refused");
     assert_eq!(rows.get(&rows.rows[0], "name"), Some("a"));
     assert_eq!(rows.get(&rows.rows[0], "note"), None, "null is none, not the word null");
@@ -2533,4 +2561,21 @@ fn a_search_is_spelled_for_the_engine_it_runs_on() {
     assert_eq!(both.tables.len(), 2);
     let one = Catalog::list(&mut *src, &Filter::like(None, "cs_contact"), 100, 0).unwrap();
     assert_eq!(one.tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["cs_contact_f"], "csxcontact is not cs_contact");
+}
+
+#[test]
+fn one_statement_is_told_from_several() {
+    for one in [
+        "SELECT 1",
+        "SELECT 1;",
+        "  INSERT INTO t VALUES ('a;b')  ;\n",
+        "SELECT 1 -- ; not this\n",
+        "SELECT /* ; */ 1",
+        "UPDATE t SET a = \"x;y\"",
+    ] {
+        assert!(single_statement(one), "{one}");
+    }
+    for several in ["SELECT 1; SELECT 2", "SELECT 1;; DROP TABLE t", "", "  ;  ", "-- only a comment"] {
+        assert!(!single_statement(several), "{several:?}");
+    }
 }

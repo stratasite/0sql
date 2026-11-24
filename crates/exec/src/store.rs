@@ -126,7 +126,7 @@ impl Store {
         let tmp = dir.with_extension(format!("tmp-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).map_err(|e| Error::Io(tmp.display().to_string(), e))?;
-        Ok(Writing { dir, tmp, writer: None, schema: None, rows: 0, failure: None })
+        Ok(Writing { dir, tmp, writer: None, schema: None, rows: 0, affected: None, failure: None })
     }
 }
 
@@ -137,6 +137,9 @@ pub struct Writing {
     writer: Option<arrow_ipc::writer::FileWriter<std::io::BufWriter<std::fs::File>>>,
     schema: Option<arrow_schema::SchemaRef>,
     rows: u64,
+    /// Rows a statement that returned none changed, when its
+    /// transport said.
+    affected: Option<u64>,
     /// Why a write failed, in full: the read is told only that it did,
     /// in the terms a read has, and whoever started it asks here.
     failure: Option<Error>,
@@ -146,6 +149,12 @@ impl Writing {
     /// How many rows have been written.
     pub fn rows(&self) -> u64 {
         self.rows
+    }
+
+    /// How many rows the statement changed, when it returned none and
+    /// its transport said.
+    pub fn affected(&self) -> Option<u64> {
+        self.affected
     }
 
     /// The result's columns and types, once the read has said them.
@@ -246,6 +255,11 @@ impl Sink for Writing {
             }
             Err(why) => Err(self.fail(why)),
         }
+    }
+
+    fn affected(&mut self, rows: u64) -> zsql_datasource::Result<()> {
+        self.affected = Some(rows);
+        Ok(())
     }
 }
 

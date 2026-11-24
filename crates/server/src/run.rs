@@ -91,6 +91,7 @@ pub(crate) fn router(app: Shared) -> Router {
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables", post(probe::tables))
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
         .route("/projects/{uid}/branches/{branch}/run", post(exec::run))
+        .route("/projects/{uid}/branches/{branch}/sql-exec", post(exec::sql_exec))
         .route("/results/{id}", get(exec::result).delete(exec::cancel))
         .route("/cache/invalidate", post(exec::invalidate))
         .route(mcp::PATH, post(mcp::endpoint))

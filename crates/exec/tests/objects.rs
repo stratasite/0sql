@@ -54,6 +54,7 @@ impl Cluster {
             cache_ttl: Duration::from_secs(ttl),
             fresh: false,
             pool_key: None,
+            close_first: None,
             open: Box::new(move || {
                 let conn =
                     zsql_datasource::Connection { uid: "wh".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };

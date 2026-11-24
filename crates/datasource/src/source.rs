@@ -14,6 +14,20 @@ pub trait Sink {
     /// Each batch, in order. An error ends the read: the transport stops
     /// fetching and the error is the read's.
     fn batch(&mut self, batch: RecordBatch) -> Result<()>;
+
+    /// How many rows a statement that returned none changed, from a
+    /// transport whose warehouse says. Not every one does.
+    fn affected(&mut self, _rows: u64) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether `sql` is one statement: nothing follows a semicolon but
+/// space, with what is inside a string or a comment not counted.
+pub fn single_statement(sql: &str) -> bool {
+    let text = skeleton(sql);
+    let trimmed = text.trim().trim_end_matches(';').trim();
+    !trimmed.is_empty() && !trimmed.contains(';')
 }
 
 /// The row cap a read is given when it is to have none.

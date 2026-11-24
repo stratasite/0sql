@@ -63,6 +63,10 @@ impl Sqlite {
                 }
                 out.row(cells)?;
             }
+            drop(rows);
+            if width == 0 {
+                out.affected(self.db.changes())?;
+            }
             Ok(())
         })();
         // Cleared whatever the query did. A handler left behind would

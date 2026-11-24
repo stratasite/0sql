@@ -117,7 +117,11 @@ impl MySql {
                 .columns()
                 .map(|c| c.iter().map(|c| c.column_type() == mysql_async::consts::ColumnType::MYSQL_TYPE_DATE).collect())
                 .unwrap_or_default();
+            let changed = result.affected_rows();
             let mut taken = out.columns(&columns);
+            if columns.is_empty() && taken.is_ok() {
+                taken = out.affected(changed);
+            }
             while taken.is_ok() {
                 let Some(row) = result.next().await.map_err(fail)? else { break };
                 taken =

@@ -153,6 +153,7 @@ impl Postgres {
                             }
                             out.row((0..row.len()).map(|i| row.get(i).map(str::to_string)).collect())?;
                         }
+                        tokio_postgres::SimpleQueryMessage::CommandComplete(changed) if !named => out.affected(changed)?,
                         _ => {}
                     }
                 }

@@ -89,6 +89,10 @@ pub struct Submit {
     pub cache_ttl: Duration,
     /// Run even though a stored result would answer.
     pub fresh: bool,
+    /// Connections kept under a key that starts with this are closed
+    /// before this run opens its own: for an engine that cannot be
+    /// open two ways at once in one process.
+    pub close_first: Option<String>,
     /// What a connection this run opens may be reused under: the
     /// datasource, where it points, how far it is trusted and whose
     /// credential opened it, as a digest. `None` and it is closed
@@ -111,6 +115,7 @@ pub enum How {
 struct Job {
     record: Record,
     pool_key: Option<String>,
+    close_first: Option<String>,
     open: Opener,
     cache_ttl: Duration,
     cancel: Arc<AtomicBool>,
@@ -266,6 +271,7 @@ impl Runs {
         state.queue.push_back(Job {
             record: record.clone(),
             pool_key: submit.pool_key,
+            close_first: submit.close_first,
             open: submit.open,
             cache_ttl: submit.cache_ttl,
             cancel: Arc::default(),
@@ -426,6 +432,17 @@ impl Inner {
         }
     }
 
+    /// Closes every kept connection whose key starts with `prefix`.
+    fn close_under(&self, prefix: &str) {
+        let closed: Vec<Idle> = {
+            let mut pool = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (closed, kept) = std::mem::take(&mut *pool).into_iter().partition(|idle| idle.key.starts_with(prefix));
+            *pool = kept;
+            closed
+        };
+        drop(closed);
+    }
+
     /// Closes connections nothing has used for a while.
     fn close_idle(&self) {
         let stale: Vec<Idle> = {
@@ -572,7 +589,7 @@ impl Inner {
     /// One run, start to finish. The record is saved at each change;
     /// what comes back is how it ended.
     fn run(&self, job: Job) -> Result<Record> {
-        let Job { mut record, pool_key, open, cache_ttl, cancel } = job;
+        let Job { mut record, pool_key, close_first, open, cache_ttl, cancel } = job;
         let started = unix_now();
         record.status = Status::Running;
         record.started_at = Some(rfc3339(started));
@@ -585,6 +602,9 @@ impl Inner {
         let t0 = Instant::now();
         let outcome: Result<u64> = (|| {
             self.make_room()?;
+            if let Some(prefix) = &close_first {
+                self.close_under(prefix);
+            }
             // A connection kept from an earlier run under the same key,
             // or a new one.
             let kept = pool_key.as_deref().and_then(|key| self.take(key));
@@ -615,7 +635,9 @@ impl Inner {
                 (_, Some(why)) => Err(self.or_disk_full(why)),
                 (Err(e), None) => Err(Error::Source(e)),
                 (Ok(()), None) => {
-                    let rows = writing.rows();
+                    // Rows returned; for a statement that returned none,
+                    // the rows it changed, when its transport said.
+                    let rows = if writing.rows() == 0 { writing.affected().unwrap_or(0) } else { writing.rows() };
                     let dir = writing.finish().map_err(|e| self.or_disk_full(e))?;
                     // With a store configured the result is not one
                     // until it is there: other nodes read it from there,
@@ -701,6 +723,10 @@ impl Sink for Stoppable<'_> {
     fn batch(&mut self, batch: arrow_array::RecordBatch) -> zsql_datasource::Result<()> {
         self.check()?;
         self.sink.batch(batch)
+    }
+
+    fn affected(&mut self, rows: u64) -> zsql_datasource::Result<()> {
+        self.sink.affected(rows)
     }
 }
 

@@ -159,7 +159,8 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
             cache_key,
             cache_ttl: ttl,
             fresh: req.fresh,
-            pool_key: Some(pool_key(&conn, &secrets)),
+            pool_key: Some(pool_key(uid, &conn, &secrets)),
+            close_first: None,
             open: Box::new(move || zsql_datasource::open(&conn, secrets)),
         })
         .map_err(internal)?;
@@ -169,8 +170,93 @@ fn submit(app: &Shared, uid: &str, branch: &str, req: RunRequest) -> Result<(Rec
 /// What a connection may be reused under: everything about where it
 /// points and how far it is trusted, and whose credential opened it. A
 /// connection is never handed to a run that would have opened another.
-pub(crate) fn pool_key(conn: &zsql_datasource::Connection, secrets: &zsql_datasource::Secrets) -> String {
-    zsql_exec::sha256(&format!("{conn:?}\n{}", secrets.fingerprint()))
+///
+/// The key starts with [`pool_scope`], the project and the datasource,
+/// so every connection to one datasource can be found together.
+pub(crate) fn pool_key(project: &str, conn: &zsql_datasource::Connection, secrets: &zsql_datasource::Secrets) -> String {
+    format!("{}{}", pool_scope(project, &conn.uid), zsql_exec::sha256(&format!("{conn:?}\n{}", secrets.fingerprint())))
+}
+
+/// What every pool key of one project's datasource starts with.
+fn pool_scope(project: &str, datasource: &str) -> String {
+    format!("{}#", &zsql_exec::sha256(&format!("{project}\n{datasource}"))[..16])
+}
+
+/// One statement, the caller's own, for a datasource of a branch.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SqlExecRequest {
+    /// The datasource to run it on, by its uid.
+    datasource: String,
+    sql: String,
+    #[serde(default)]
+    connection: Map<String, Value>,
+    #[serde(default)]
+    wait: Option<f64>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+impl std::fmt::Debug for SqlExecRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SqlExecRequest(…)")
+    }
+}
+
+/// Hands the caller's statement to the runs, as it was written. It is
+/// never looked up and never found again; two of the same are two
+/// runs, since a statement may write. Nothing here reads it beyond
+/// counting that it is one: what it may do is the database's to say.
+fn submit_sql(app: &Shared, uid: &str, branch: &str, req: SqlExecRequest) -> Result<(Record, Duration), ApiError> {
+    if !zsql_datasource::single_statement(&req.sql) {
+        return Err(invalid("sql is one statement: send each of several in a request of its own"));
+    }
+    let (mut conn, sent) = connection_of(app, uid, branch, req.datasource.trim(), None, &req.connection, None)?;
+    conn.access = zsql_datasource::Access::Writable;
+    let secrets = if sent.is_empty() { (app.secrets)(&conn.uid) } else { sent };
+    let wait = wait_of(req.wait, conn.wait())?;
+    // DuckDB cannot be open for reading and for writing at once in one
+    // process, and a writable connection has its file to itself. So the
+    // connections kept for reading are closed first, and this one is
+    // not kept: the next run opens for reading again.
+    let in_process = conn.adapter == "duckdb";
+    let (record, _) = app
+        .runs
+        .submit(Submit {
+            kind: Kind::Sql,
+            org_uid: DEFAULT_ORG.into(),
+            project_uid: uid.into(),
+            branch: branch.into(),
+            datasource_uid: conn.uid.clone(),
+            tables: Vec::new(),
+            sql: req.sql,
+            spec: None,
+            expr: None,
+            row_limit: None,
+            cache_key: None,
+            cache_ttl: zsql_exec::DEFAULT_TTL,
+            fresh: true,
+            pool_key: (!in_process).then(|| pool_key(uid, &conn, &secrets)),
+            close_first: in_process.then(|| pool_scope(uid, &conn.uid)),
+            open: Box::new(move || zsql_datasource::open(&conn, secrets)),
+        })
+        .map_err(internal)?;
+    Ok((record, wait))
+}
+
+pub(crate) async fn sql_exec(
+    State(app): State<Shared>,
+    Params((uid, branch)): Params<(String, String)>,
+    headers: HeaderMap,
+    Input(req): Input<SqlExecRequest>,
+) -> Result<Response, ApiError> {
+    let page = page_of(req.offset, req.limit)?;
+    let running = app.clone();
+    let (record, wait) = blocking(move || submit_sql(&running, &uid, &branch, req)).await?;
+    let record = settled(&app, record, wait).await?;
+    answer(&app, record, None, page, wants_arrow(&headers)).await
 }
 
 /// The record once the run is over, or as it stands when `wait` is up.

@@ -35,6 +35,12 @@ pub(crate) trait RowSink {
 
     fn row(&mut self, row: Vec<Option<String>>) -> Result<()>;
 
+    /// How many rows a statement that returned none changed, when the
+    /// warehouse says.
+    fn affected(&mut self, _rows: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// The most rows this read will take, when it has a cap: what a
     /// transport that can tell the warehouse to stop early tells it.
     fn limit(&self) -> Option<usize> {
@@ -141,6 +147,10 @@ impl RowSink for Batcher<'_> {
             self.sink.schema(&Batches::from_text(&Rows { columns: columns.to_vec(), rows: Vec::new() }).schema)?;
         }
         Ok(())
+    }
+
+    fn affected(&mut self, rows: u64) -> Result<()> {
+        self.sink.affected(rows)
     }
 
     fn row(&mut self, row: Vec<Option<String>>) -> Result<()> {

@@ -89,6 +89,11 @@ impl Trino {
                     named = true;
                 }
             }
+            // What a statement that returns no rows changed, said once
+            // the coordinator knows.
+            if let Some(changed) = v.get("updateCount").and_then(Value::as_u64) {
+                out.affected(changed)?;
+            }
             if let Some(data) = v.get("data").and_then(Value::as_array) {
                 for r in data {
                     let row = r.as_array().map(|cells| cells.iter().cloned().map(http::cell).collect()).unwrap_or_default();

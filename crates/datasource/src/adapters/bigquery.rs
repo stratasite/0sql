@@ -241,6 +241,9 @@ impl BigQuery {
         }
         let columns: Vec<String> = answer.schema.as_ref().map(|s| s.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default();
         out.columns(&columns)?;
+        if let Some(changed) = answer.num_dml_affected_rows.as_deref().and_then(|n| n.parse::<u64>().ok()) {
+            out.affected(changed)?;
+        }
         loop {
             for r in answer.rows {
                 out.row(r.f.into_iter().map(|c| http::cell(c.v)).collect())?;
@@ -303,6 +306,8 @@ struct Answer {
     job_reference: Option<JobReference>,
     schema: Option<Schema>,
     total_rows: Option<String>,
+    /// Rows a DML statement changed, as BigQuery counts them.
+    num_dml_affected_rows: Option<String>,
     page_token: Option<String>,
     #[serde(default)]
     rows: Vec<Row>,

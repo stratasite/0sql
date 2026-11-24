@@ -47,6 +47,7 @@ impl Scratch {
             cache_ttl: Duration::from_secs(3600),
             fresh: false,
             pool_key: None,
+            close_first: None,
             open: Box::new(move || {
                 let conn =
                     zsql_datasource::Connection { uid: "wh".into(), adapter: "sqlite".into(), file: Some(file), ..Default::default() };
@@ -255,6 +256,7 @@ fn a_connection_is_kept_for_the_next_run_under_its_key() {
             kind,
             cache_key: None,
             pool_key: key.map(str::to_string),
+            close_first: None,
             open: Box::new(move || {
                 opened.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(Counted { fail_next }) as Box<dyn zsql_datasource::Source>)
