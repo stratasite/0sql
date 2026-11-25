@@ -47,7 +47,7 @@ const HOW_IT_IS_SECURED: [&str; 5] = ["sslmode", "ssl_mode", "ca_file", "sslroot
 /// use alone. They are often written in `datasources.yml`, in git, with
 /// the secret beside them kept in `.zsql`; an entry that carries only
 /// these has not carried a credential.
-const IDENTIFIERS: [&str; 2] = ["oauth_client_id", "access_key_id"];
+const IDENTIFIERS: [&str; 3] = ["oauth_client_id", "access_key_id", "client_email"];
 
 /// Whether two deploys of a datasource point at the same place as the
 /// same user: the adapter and every setting but the ones above.

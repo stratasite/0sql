@@ -60,10 +60,9 @@ pub fn watch(dir: &Path, done: impl Fn() -> bool, mut on_change: impl FnMut()) {
     }
 }
 
-/// Each datasource's entry with its secrets in it: the ones written
-/// there, and over them the ones this machine holds for it in `.zsql`,
-/// the environment or the home config, which are what a query run here
-/// connects with. A deploy carries them, and on the server they are the
+/// Each datasource's entry as a query run here reads it: what is
+/// written there, and over it what this machine holds for it in `.zsql`,
+/// the environment or the home config, secrets and settings alike. A deploy carries them, and on the server they are the
 /// datasource's credential for that branch, kept apart from the model.
 /// `.zsql` itself is never sent: it holds more than one project's.
 fn with_secrets(project: &Path, v: &mut serde_yaml::Value) -> Vec<String> {
@@ -73,7 +72,9 @@ fn with_secrets(project: &Path, v: &mut serde_yaml::Value) -> Vec<String> {
         let (Some(uid), Some(entry)) = (uid.as_str(), entry.as_mapping_mut()) else { continue };
         // Under the uid as everything else spells it: `Warehouse:` here
         // is `warehouse` in `.zsql` and to a query run on this machine.
-        let held = zsql_datasource::secrets(Some(project), &uid.trim().to_lowercase());
+        let key = uid.trim().to_lowercase();
+        zsql_datasource::overlay(entry, zsql_datasource::local_entry(Some(project), &key));
+        let held = zsql_datasource::secrets(Some(project), &key);
         for (field, secret) in held.fields() {
             entry.insert(field.into(), secret.into());
         }
@@ -205,6 +206,12 @@ mod tests {
         assert_eq!(with_secrets(&dir, &mut v), ["Wh"]);
         assert_eq!((v["Wh"]["password"].as_str(), v["Wh"]["oauth_token"].as_str()), (Some("from-dot-zsql"), Some("tok")));
         assert_eq!((v["Wh"]["host"].as_str(), v["lake"].get("password")), (Some("db"), None));
+        // A setting kept in `.zsql` goes too, over the one written here.
+        std::fs::write(dir.join(".zsql"), "wh:\n  password: from-dot-zsql\n  host: hidden\n  username: analyst\n").unwrap();
+        let mut over: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(dir.join("datasources.yml")).unwrap()).unwrap();
+        with_secrets(&dir, &mut over);
+        assert_eq!((over["Wh"]["host"].as_str(), over["Wh"]["username"].as_str()), (Some("hidden"), Some("analyst")));
+        std::fs::write(dir.join(".zsql"), "wh:\n  password: from-dot-zsql\n  oauth_token: tok\n").unwrap();
         assert_eq!(carries_secrets_for(&dir), ["Wh"]);
         assert!(stamps_under(&dir).iter().any(|(path, seen)| path.ends_with(".zsql") && seen.is_some()), "a changed .zsql is a change");
         // And the archive holds them, and not the file they came from.

@@ -57,7 +57,7 @@ pub enum DatasourceWhat {
         /// BigQuery's project.
         #[arg(long)]
         project_id: Option<String>,
-        /// BigQuery's service-account key file.
+        /// BigQuery's service-account JSON key file; or leave it out and save the key with `zsql datasource auth`.
         #[arg(long)]
         key_file: Option<String>,
         /// Athena's region.
@@ -66,7 +66,7 @@ pub enum DatasourceWhat {
         /// Athena's result location on S3.
         #[arg(long)]
         output_location: Option<String>,
-        /// Read the password or token from stdin, for scripts.
+        /// Read the password or token from stdin, all of it, for scripts.
         #[arg(long)]
         secret_stdin: bool,
     },
@@ -75,10 +75,10 @@ pub enum DatasourceWhat {
         /// Which datasource, by its key in datasources.yml; the only one when there is one.
         #[arg(short = 'd', long)]
         datasource: Option<String>,
-        /// Which secret: password, personal_access_token, private_key, oauth_client_secret, access_key_id, secret_access_key, session_token. The adapter's usual one when unsaid.
+        /// Which one, of those the adapter takes. Most: password. snowflake: personal_access_token, private_key. databricks: personal_access_token, oauth_client_id, oauth_client_secret. bigquery: private_key, client_email (a service account's). athena: access_key_id, secret_access_key, session_token. The adapter's usual one when unsaid.
         #[arg(long)]
         field: Option<String>,
-        /// Read the secret from stdin, for scripts.
+        /// Read the secret from stdin, all of it, so a PEM key arrives whole. For scripts.
         #[arg(long)]
         secret_stdin: bool,
     },
@@ -106,6 +106,29 @@ fn shape(adapter: &str) -> (&'static [&'static str], Option<&'static str>) {
         "athena" => (&["region", "database", "output_location"], None),
         _ => (&[], None),
     }
+}
+
+/// What `datasource auth` saves for an adapter: the secrets it logs in
+/// with, and for BigQuery the address its key signs for. Nothing for
+/// one that opens a file.
+fn takes(adapter: &str) -> &'static [&'static str] {
+    match adapter {
+        "postgres" | "redshift" | "mysql" | "clickhouse" => &["password"],
+        "sqlserver" | "trino" => &["password", "oauth_token"],
+        "snowflake" => &["personal_access_token", "private_key", "oauth_token"],
+        "databricks" => &["personal_access_token", "oauth_client_id", "oauth_client_secret", "oauth_token"],
+        "bigquery" => &["private_key", "client_email", "oauth_token"],
+        "athena" => &["secret_access_key", "access_key_id", "session_token"],
+        _ => &[],
+    }
+}
+
+/// Everything on stdin, less the line ending a shell adds: a PEM key is
+/// many lines and all of them are the secret.
+fn secret_from_stdin() -> Result<String> {
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+    Ok(s.trim().to_string())
 }
 
 const ADAPTERS: [&str; 12] = [
@@ -220,23 +243,15 @@ fn where_of(c: &Connection) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the secret this adapter needs is at hand.
+/// Whether what this adapter logs in with is at hand: the same look
+/// the connection takes, so `yes` here is not `missing` there.
 fn secret_state(dir: &Path, c: &Connection) -> &'static str {
     let secrets = zsql_datasource::secrets(Some(dir), &c.uid);
-    let has = secrets.password.is_some()
-        || secrets.personal_access_token.is_some()
-        || secrets.private_key.is_some()
-        || secrets.oauth_client_secret.is_some()
-        || secrets.secret_access_key.is_some()
-        || c.private_key_file.is_some()
-        || c.key_file.is_some();
-    let needs = shape(&c.adapter).1.is_some() || matches!(c.adapter.as_str(), "bigquery" | "athena");
-    if !needs {
-        "none needed"
-    } else if has {
-        "yes"
-    } else {
-        "missing: .zsql or ZSQL_DS_*"
+    match zsql_datasource::credentials_at_hand(c, &secrets) {
+        None => "none needed",
+        Some(true) => "yes",
+        Some(false) if c.adapter == "bigquery" => "missing: .zsql, key_file or gcloud",
+        Some(false) => "missing: .zsql or ZSQL_DS_*",
     }
 }
 
@@ -255,36 +270,64 @@ fn tier_of(all: &serde_yaml::Value, uid: &str) -> Option<String> {
 
 fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin: bool) -> Result<()> {
     let conn = crate::commands::catalog::choose(dir, datasource)?;
-    let usual = shape(&conn.adapter).1.or(if conn.adapter == "athena" { Some("secret_access_key") } else { None });
-    let field = match (field, usual) {
-        (Some(f), _) => f.to_string(),
-        (None, Some(f)) => f.to_string(),
-        (None, None) => bail!(
-            "{}: {} takes no secret in .zsql ({})",
-            conn.uid,
-            conn.adapter,
-            if conn.adapter == "bigquery" { "its key file is named by key_file in datasources.yml" } else { "it opens a file" }
-        ),
+    let takes = takes(&conn.adapter);
+    let Some(usual) = takes.first() else {
+        bail!("{}: {} takes no secret in .zsql (it opens a file)", conn.uid, conn.adapter);
     };
-    if !zsql_datasource::SECRET_FIELDS.contains(&field.as_str()) {
-        bail!("{field} is not a secret field; one of {}", zsql_datasource::SECRET_FIELDS.join(", "));
+    let field = field.unwrap_or(usual).trim().to_lowercase();
+    if !takes.contains(&field.as_str()) {
+        bail!("{}: {} does not take {field}; it takes {}", conn.uid, conn.adapter, takes.join(", "));
     }
     let value = if secret_stdin {
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
-        s.trim_end_matches(['\n', '\r']).to_string()
+        secret_from_stdin()?
+    } else if field == "client_email" {
+        tty::ask(&format!("{field} for {}", conn.uid), None, "--secret-stdin reads it from stdin")?.trim().to_string()
     } else {
-        tty::ask_secret(&format!("{field} for {}", conn.uid), "--secret-stdin reads it from stdin")?
+        let what = if field == "private_key" {
+            "private_key (the path of its PEM file, which is read now; --secret-stdin takes the PEM itself)"
+        } else {
+            field.as_str()
+        };
+        tty::ask_secret(&format!("{what} for {}", conn.uid), "--secret-stdin reads it from stdin")?.trim().to_string()
     };
     if value.is_empty() {
         bail!("nothing entered; nothing saved");
     }
+    // A key named by its file is saved as the key: a path means one
+    // thing from this directory and another from the next, and nothing
+    // at all to a server a deploy carries it to.
+    let value = if field == "private_key" && !value.contains("-----BEGIN") {
+        let pem = std::fs::read_to_string(&value).with_context(|| format!("{value}: neither a PEM nor a file that can be read"))?;
+        if !pem.contains("-----BEGIN") {
+            bail!("{value} is not a PEM; a service account's JSON key file is named by key_file in datasources.yml");
+        }
+        pem.trim().to_string()
+    } else {
+        value
+    };
     config::write_secret(dir, &format!("{}_{field}", conn.uid), &value)?;
     println!("saved   {field} for {} in .zsql", conn.uid);
-    if field == "access_key_id" {
-        eprintln!("next: zsql datasource auth -d {} --field secret_access_key", conn.uid);
-    } else {
-        eprintln!("next: zsql datasource test -d {}", conn.uid);
+    // What a connection would now read, which is what was just saved
+    // unless something nearer holds another.
+    let read = zsql_datasource::local_entry(Some(dir), &conn.uid).get(field.as_str()).and_then(|v| v.as_str()).map(str::to_string);
+    if read.as_deref() != Some(value.as_str()) {
+        eprintln!("warning: .zsql holds another {field} nested under `{}:`, and that one is read first; remove it there", conn.uid);
+    }
+    let after = Connection::read(dir, &conn.uid).unwrap_or(conn);
+    let secrets = zsql_datasource::secrets(Some(dir), &after.uid);
+    let next = match (after.adapter.as_str(), field.as_str()) {
+        ("athena", "access_key_id") => Some("secret_access_key"),
+        ("bigquery", "private_key") if after.client_email.is_none() => Some("client_email"),
+        ("bigquery", "client_email") if secrets.private_key.is_none() => Some("private_key"),
+        ("snowflake", "private_key") if after.username.is_none() => {
+            eprintln!("note: a key pair signs for a user; say which as username in datasources.yml");
+            None
+        }
+        _ => None,
+    };
+    match next {
+        Some(field) => eprintln!("next: zsql datasource auth -d {} --field {field}", after.uid),
+        None => eprintln!("next: zsql datasource test -d {}", after.uid),
     }
     Ok(())
 }
@@ -372,7 +415,7 @@ fn add(
                         _ => None,
                     },
                     "schema" => Some(""),
-                    "warehouse" | "catalog" => Some(""),
+                    "warehouse" | "catalog" | "key_file" => Some(""),
                     _ => None,
                 };
                 tty::ask(k, default, &format!("--{k} is needed for {adapter}; {flags}"))?
@@ -391,9 +434,7 @@ fn add(
         None => None,
         Some(field) => {
             let v = if secret_stdin {
-                let mut s = String::new();
-                std::io::stdin().read_line(&mut s)?;
-                s.trim_end_matches(['\n', '\r']).to_string()
+                secret_from_stdin()?
             } else {
                 tty::ask_secret(
                     &format!("{field} (kept in .zsql, never deployed; leave empty to add later)"),
@@ -422,6 +463,9 @@ fn add(
         println!("saved   {field} for {key} in .zsql");
     } else if let Some(field) = secret_field {
         println!("note    no {field} yet: put it in .zsql under {key}, or in {}", zsql_datasource::secret_env_var(&key, field));
+    }
+    if adapter == "bigquery" && !values.iter().any(|(k, _)| k == "key_file") {
+        println!("note    no key_file: `zsql datasource auth -d {key}` saves a service account's private_key and client_email in .zsql, or gcloud's own login is used");
     }
     eprintln!("next: zsql datasource test -d {key}, then zsql catalog read -d {key} --schema <name>");
     Ok(())
