@@ -11,8 +11,11 @@ description: \n\
 # branch, so this is the branch to merge into when a change is ready.\n\
 production_branch: main\n\
 \n\
-# The server `zsql deploy` sends to, when it is not the local one; the\n\
-# server's deploy token, if it has one, lives in .zsql, never here.\n\
+# The org the project is deployed under, on a server that keeps several.\n\
+# Without it, the server's default org.\n\
+# org: acme\n\
+\n\
+# The server `zsql deploy` sends to, when it is not the local one.\n\
 # server: http://127.0.0.1:3699\n"
     )
 }
@@ -38,15 +41,17 @@ pub const DATASOURCES_YML: &str = "\
 #\n\
 # Everything else here (host, port, database, username, schema, file and\n\
 # the keys each warehouse adds) is for the zsql command and for your own\n\
-# tools. A deploy does upload this file, with the secrets taken out, but\n\
-# every one of those keys is ignored and none of them is kept: the\n\
-# deployed model holds the adapter, the tier and the name.\n\
+# tools. A deploy sends this file, and the server keeps every key of an\n\
+# entry: what it plans with, and what it connects with to run a query.\n\
 #\n\
-# Secrets never leave this machine. Passwords, tokens and keys go in\n\
-# .zsql under the same datasource key, or in ZSQL_DS_<KEY>_<FIELD>:\n\
+# Secrets stay out of git. Passwords, tokens and keys go in .zsql under\n\
+# the same datasource key, or in ZSQL_DS_<KEY>_<FIELD>:\n\
 # ZSQL_DS_WAREHOUSE_PASSWORD, ZSQL_DS_SNOW_PERSONAL_ACCESS_TOKEN,\n\
-# ZSQL_DS_SNOW_PRIVATE_KEY. `zsql deploy` strips them from what it sends,\n\
-# and .zsql is gitignored and never deployed.\n\
+# ZSQL_DS_SNOW_PRIVATE_KEY. .zsql is gitignored and is never sent, but\n\
+# `zsql deploy` does send the secrets it holds for each datasource here:\n\
+# on the server they are that datasource's credential for the branch,\n\
+# used by a run whose request sends none. Use an account you mean the\n\
+# server to run as, or have your own service send one with each request.\n\
 #\n\
 # warehouse:\n\
 #   name: Warehouse\n\

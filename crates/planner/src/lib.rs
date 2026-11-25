@@ -1,22 +1,22 @@
-//! The planner: a universe, a query definition and an optional principal in,
+//! The planner: a semantic model, a query definition and an optional principal in,
 //! SQL for the datasource the query resolves to out.
 //!
 //! The pipeline: resolve a universe, build the DAG, run the visitors in
 //! order, then assemble the final statement. A shape the planner does not
-//! plan is refused with [`PlanError::Unimplemented`] rather than planned
+//! plan is refused with [`Error::Unimplemented`] rather than planned
 //! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
-pub mod model;
 pub mod profile;
 pub mod pruner;
+pub mod resolved;
 pub mod resolver;
 pub mod sql;
 pub mod universe;
 pub mod visitors;
 
 use zsql_dialect::Dialects;
-use zsql_semantic::Universe;
+use zsql_semantic::SemanticModel;
 use zsql_spec::SecurityContext;
 
 #[derive(Debug, Clone)]
@@ -122,7 +122,7 @@ impl Plan {
 /// goldens hold the Rails names they were captured under, which
 /// `zsql_golden` translates when it compares.
 #[derive(Debug, thiserror::Error)]
-pub enum PlanError {
+pub enum Error {
     #[error("not implemented: {0}")]
     Unimplemented(&'static str),
     #[error("{0}")]
@@ -133,56 +133,56 @@ pub enum PlanError {
     #[error("{0}")]
     SegmentDatasource(String),
     #[error("{0}")]
-    Dialect(#[from] zsql_dialect::DialectError),
+    Dialect(#[from] zsql_dialect::Error),
 }
 
-impl PlanError {
+impl Error {
     /// The Rails exception class this error corresponds to.
-    /// The `class` an API error carries; see `SpecError::error_class`.
+    /// The `class` an API error carries; see `zsql_spec::Error::error_class`.
     pub fn error_class(&self) -> &'static str {
         match self {
-            PlanError::Resolution(_) => "Unresolvable",
-            PlanError::SegmentDatasource(_) => "SegmentDatasource",
-            PlanError::SecurityPolicy(_) => "SecurityPolicy",
-            PlanError::Unimplemented(_) => "Unimplemented",
-            PlanError::Dialect(_) => "Dialect",
+            Error::Resolution(_) => "Unresolvable",
+            Error::SegmentDatasource(_) => "SegmentDatasource",
+            Error::SecurityPolicy(_) => "SecurityPolicy",
+            Error::Unimplemented(_) => "Unimplemented",
+            Error::Dialect(_) => "Dialect",
         }
     }
 }
 
-pub type Result<T> = std::result::Result<T, PlanError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Plans a typed query, as spec lowering or a stored model produces it.
 pub fn plan_query_with<'a>(
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     paths: Option<&'a [zsql_semantic::Path]>,
     dialects: &Dialects,
     query: zsql_spec::Query,
     principal: Option<&SecurityContext>,
 ) -> Result<Plan> {
-    Planner::new(universe, dialects, paths).plan_query(query, principal)
+    Planner::new(semantic, dialects, paths).plan_query(query, principal)
 }
 
-/// A planner over one universe: the per-root path indexes are built once
+/// A planner over one semantic model: the per-root universes are built once
 /// and every plan reuses them. A server keeps one per loaded branch.
 pub struct Planner<'a> {
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     dialects: &'a Dialects,
     universes: universe::Universes<'a>,
 }
 
 impl<'a> Planner<'a> {
     /// Over the given join paths, or the snapshot's stored ones when `None`.
-    pub fn new(universe: &'a Universe, dialects: &'a Dialects, paths: Option<&'a [zsql_semantic::Path]>) -> Self {
+    pub fn new(semantic: &'a SemanticModel, dialects: &'a Dialects, paths: Option<&'a [zsql_semantic::Path]>) -> Self {
         let universes = match paths {
-            Some(p) => universe::Universes::build_from(universe, p),
-            None => universe::Universes::build(universe),
+            Some(p) => universe::Universes::build_from(semantic, p),
+            None => universe::Universes::build(semantic),
         };
-        Planner { universe, dialects, universes }
+        Planner { semantic, dialects, universes }
     }
 
-    pub fn universe(&self) -> &'a Universe {
-        self.universe
+    pub fn semantic(&self) -> &'a SemanticModel {
+        self.semantic
     }
 
     /// The per-root path indexes this planner resolves over.
@@ -203,9 +203,9 @@ impl<'a> Planner<'a> {
     /// Without measures, one universe must reach every dimension.
     pub fn explore(&self, query: zsql_spec::Query) -> Result<Exploration<'a>> {
         use zsql_semantic::Id;
-        let rquery = model::RQuery::resolve(self.universe, query)?;
-        let measures = resolver::measures(self.universe, &rquery);
-        let dimensions = resolver::dimensions(self.universe, &rquery);
+        let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
+        let measures = resolver::measures(self.semantic, &rquery);
+        let dimensions = resolver::dimensions(self.semantic, &rquery);
         let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
         let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
         let bases: Vec<&universe::Base<'a>> = self.universes.bases.iter().map(|b| b.as_ref()).collect();
@@ -216,14 +216,14 @@ impl<'a> Planner<'a> {
             }
         }
         // A datasource holds a measure when one of its root tables does.
-        let holds = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && self.universe.expression_for(b.root.id, m).is_some());
+        let holds = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && self.semantic.expression_for(b.root.id, m).is_some());
         // Every measure resolves in a datasource when a base there reaching
         // the query's dimensions carries it.
         let resolves = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && b.all_dimensions(&dim_ids) && b.has_measure(m));
         let ds_with_all: Vec<Id> = ds_ids.iter().copied().filter(|ds| msr_ids.iter().all(|m| holds(*ds, *m))).collect();
 
         let dimensions = self
-            .universe
+            .semantic
             .fields()
             .iter()
             .filter(|f| f.is_dimension() && !dim_ids.contains(&f.id))
@@ -242,7 +242,7 @@ impl<'a> Planner<'a> {
             })
             .collect();
         let measures = self
-            .universe
+            .semantic
             .fields()
             .iter()
             .filter(|f| f.is_measure() && !msr_ids.contains(&f.id))
@@ -254,13 +254,13 @@ impl<'a> Planner<'a> {
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
-        let rquery = model::RQuery::resolve(self.universe, query)?;
-        model::check_supported(&rquery, self.universe, principal)?;
-        match run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, vec![], explain) {
+        let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
+        resolved::check_supported(&rquery, self.semantic, principal)?;
+        match run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, vec![], explain) {
             // A segment keyed in another datasource: resolve again with every key required.
-            Err(PlanError::SegmentDatasource(_)) => {
+            Err(Error::SegmentDatasource(_)) => {
                 let required = visitors::segmentation::all_key_dimensions(&rquery);
-                run_plan(self.universe, &self.universes, self.dialects, &rquery, principal, required, explain)
+                run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, required, explain)
             }
             other => other,
         }
@@ -269,10 +269,10 @@ impl<'a> Planner<'a> {
 
 /// Rails `Planner.run_plan`: resolve, then the visitors in order.
 fn run_plan<'a>(
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &universe::Universes<'a>,
     dialects: &Dialects,
-    rquery: &model::RQuery<'a>,
+    rquery: &resolved::ResolvedQuery<'a>,
     principal: Option<&SecurityContext>,
     required_dims: Vec<&'a zsql_semantic::Field>,
     explain: bool,
@@ -290,7 +290,7 @@ fn run_plan<'a>(
             out
         }};
     }
-    let mut graph = phase!("resolve", resolver::resolve_with(universe, universes, dialects, rquery, &opts)?);
+    let mut graph = phase!("resolve", resolver::resolve_with(semantic, universes, dialects, rquery, &opts)?);
 
     // A segment planned directly is a population preview: a criteria-only
     // segment resolves to a plain query node whose keys would repeat.
@@ -301,21 +301,21 @@ fn run_plan<'a>(
         }
     }
 
-    phase!("segment_fork", visitors::segment_fork::run(&mut graph, universe, universes, rquery)?);
-    phase!("complex_measure", visitors::complex_measure::run(&mut graph, universe, universes, dialects, rquery)?);
-    phase!("exclusion", visitors::exclusion::run(&mut graph, universe, rquery)?);
-    phase!("inclusion", visitors::inclusion::run(&mut graph, universe, rquery)?);
-    phase!("snapshot", visitors::snapshot::run(&mut graph, universe, rquery)?);
-    phase!("contribution", visitors::contribution::run(&mut graph, universe, rquery)?);
-    phase!("temporal", visitors::temporal::run(&mut graph, universe, rquery)?);
-    phase!("top_n", visitors::top_n::run(&mut graph, universe, universes, dialects, rquery)?);
-    phase!("segment", visitors::segment::run(&mut graph, universe, universes, dialects, rquery)?);
+    phase!("segment_fork", visitors::segment_fork::run(&mut graph, semantic, universes, rquery)?);
+    phase!("complex_measure", visitors::complex_measure::run(&mut graph, semantic, universes, dialects, rquery)?);
+    phase!("exclusion", visitors::exclusion::run(&mut graph, semantic, rquery)?);
+    phase!("inclusion", visitors::inclusion::run(&mut graph, semantic, rquery)?);
+    phase!("snapshot", visitors::snapshot::run(&mut graph, semantic, rquery)?);
+    phase!("contribution", visitors::contribution::run(&mut graph, semantic, rquery)?);
+    phase!("temporal", visitors::temporal::run(&mut graph, semantic, rquery)?);
+    phase!("top_n", visitors::top_n::run(&mut graph, semantic, universes, dialects, rquery)?);
+    phase!("segment", visitors::segment::run(&mut graph, semantic, universes, dialects, rquery)?);
     if let Some(user) = principal {
-        phase!("security", visitors::security::run(&mut graph, universe, user)?);
+        phase!("security", visitors::security::run(&mut graph, semantic, user)?);
     }
-    phase!("reference", visitors::reference::run(&mut graph, universe, rquery)?);
+    phase!("reference", visitors::reference::run(&mut graph, semantic, rquery)?);
     phase!("alias", visitors::alias::run(&mut graph)?);
-    phase!("sql", visitors::sql::run(&graph, universe, rquery)?);
+    phase!("sql", visitors::sql::run(&graph, semantic, rquery)?);
     let (sql, root_at) = phase!("final_query", visitors::final_query::to_sql(&graph)?);
     let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
 
@@ -343,29 +343,29 @@ fn explain_nodes(graph: &dag::Graph) -> Vec<ExplainNode> {
                 root: n.is_root(),
                 table: base.map(|b| b.root.name.clone()),
                 datasource: base.map(|b| b.datasource.uid.clone()),
-                paths: n.subtrees.iter().map(universe::Model::to_s).collect(),
+                paths: n.subtrees.iter().map(universe::Model::identity).collect(),
                 purpose: n.purpose,
                 transform: n.transform.clone(),
                 segment: n.owner.is_some(),
-                projections: n.projections.iter().map(|p| format!("{} AS {}", p.to_s(), p.alias)).collect(),
-                filters: n.filters.iter().map(|f| f.to_s()).collect(),
+                projections: n.projections.iter().map(|p| format!("{} AS {}", p.identity(), p.alias)).collect(),
+                filters: n.filters.iter().map(|f| f.identity()).collect(),
                 inputs: n.plain_inputs(),
                 strategies: n.strategies.iter().map(|s| ExplainStrategy { node: s.node, kind: s.kind.name().to_string() }).collect(),
                 join_type: if n.is_merge() { n.join_type.clone() } else { String::new() },
                 group_by: n.should_group_by.unwrap_or(false),
-                security_filters: n.security_filters.iter().map(|(f, allowed)| security_to_s(f, allowed)).collect(),
+                security_filters: n.security_filters.iter().map(|(f, allowed)| security_identity(f, allowed)).collect(),
                 security_masks: n
                     .security_masks
                     .iter()
-                    .map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_to_s(f, allowed)))
+                    .map(|(_, f, allowed, mask)| format!("{} mask {mask:?}", security_identity(f, allowed)))
                     .collect(),
-                identity: n.to_s(graph),
+                identity: n.identity(graph),
             }
         })
         .collect()
 }
 
-fn security_to_s(f: &zsql_semantic::Field, allowed: &Option<Vec<String>>) -> String {
+fn security_identity(f: &zsql_semantic::Field, allowed: &Option<Vec<String>>) -> String {
     match allowed {
         Some(v) => format!("[{}] in {v:?}", f.name),
         None => format!("[{}] denied", f.name),

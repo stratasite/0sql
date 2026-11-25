@@ -31,7 +31,7 @@ measured budgets rather than built first.
 
 ## Shape
 
-### One new crate, `crates/service` (`zsql-service`)
+### One new crate, `crates/core` (`zsql-core`)
 
 The word "engine" stays reserved for the planner, as the README uses it.
 The service crate is the layer between a loaded model and a caller,
@@ -113,7 +113,7 @@ prints the error. `.reload` forces it. With `-r` the repl is unchanged.
 ### Loader efficiency, measured before cached
 
 Budget on the TPC-DS fixture: local `zsql sql` under 25 ms end to end,
-repl reload under 15 ms. `zsql-dev load-bench --project DIR` reports
+repl reload under 15 ms. `cargo xtask load-bench --project DIR` reports
 the loader step by step (`Loaded.phases`), which is what decided the
 work below. A compiled snapshot cache under `$XDG_CACHE_HOME/zsql/<uid>/`,
 keyed on `Loaded.sources` plus the snapshot format, is built only if the
@@ -207,7 +207,7 @@ Each is one PR that leaves the tree releasable.
 
 | # | contents | done when |
 |---|---|---|
-| 1 | `zsql-service` extracted; server refactored onto it; `Trust` enum; `Send + Sync` assertion; determinism test planning one spec on two threads and in two processes | isolation tests, handler tests and goldens pass unchanged; the thread-local counter is proven not to reach any alias, or fixed in the planner if it does |
+| 1 | `zsql-core` extracted; server refactored onto it; `Trust` enum; `Send + Sync` assertion; determinism test planning one spec on two threads and in two processes | isolation tests, handler tests and goldens pass unchanged; the thread-local counter is proven not to reach any alias, or fixed in the planner if it does |
 | 2 | `-r` and the implication rules; local reads; `show.rs` split; lazy git; per-command SIGPIPE; `ZSQL_HOME`; `--json` error contract; TPC-DS and grocery-store fixtures; parity test against an in-process server via `tower::oneshot` | byte-identical SQL and identical error JSON, local versus server, over the fixtures |
 | 3 | Local repl with the held model, `Loaded.sources`, mtime reload, `.reload` | reload after an edit, and a broken edit keeps the old model |
 | 4 | measure the loader step by step, fix what is slow, bench numbers in the PR; cache only if budgets missed | TPC-DS under 25 ms for `sql`, under 15 ms for reload |
@@ -227,7 +227,7 @@ licenses, and Dependabot for crates and actions.
 ## Decisions register
 
 - Local is the default; `-r` is the exception; `check` and `test` follow the rule.
-- The shared crate is `zsql-service`; "engine" means the planner.
+- The shared crate is `zsql-core`; "engine" means the planner.
 - Shape limits are a server policy; a local caller may plan any size of spec.
 - Confinement is a type, never a default argument.
 - The server's configuration is one struct; the library never reads the environment.

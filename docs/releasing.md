@@ -40,7 +40,7 @@ release is built with; rustup reads it on its own.
    until CI does.
 
 3. **Run the tests.** `cargo test --workspace` and `cargo run --release
-   -p zsql-devtool -- golden --strict`. CI runs them on the push, but a
+   -p xtask -- golden --strict`. CI runs them on the push, but a
    tag does not wait for CI, so nothing else stands between a broken
    commit and a tag.
 

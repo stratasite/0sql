@@ -27,6 +27,11 @@ pub(crate) enum Class {
     /// someone else's machine, so it has seats of its own: a slow
     /// warehouse fills them and leaves planning and deploys alone.
     Probe,
+    /// a run, or a question about one: a request that mostly waits for
+    /// a statement another thread is running. How many statements run
+    /// and how many wait is the runs' own business; a seat here is
+    /// only a request in the server.
+    Run,
     /// liveness and the root: no admission.
     Exempt,
 }
@@ -38,6 +43,7 @@ impl Class {
             Class::Explore => "explore",
             Class::Heavy => "heavy",
             Class::Probe => "probe",
+            Class::Run => "run",
             Class::Exempt => "exempt",
         }
     }
@@ -46,31 +52,24 @@ impl Class {
 /// A request's class, from its method and path alone.
 pub(crate) fn classify(path: &str) -> Class {
     let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match p.as_slice() {
+    // A route under an org costs what it costs without one.
+    let p = match p.as_slice() {
+        ["orgs", _, rest @ ..] => rest,
+        whole => whole,
+    };
+    match p {
         [] | ["healthz"] => Class::Exempt,
         ["projects", _, "branches", _, "deploy" | "validate" | "test"] => Class::Heavy,
         ["projects", _, "branches", _, "explore" | "fields"] => Class::Explore,
         // Below a datasource is the warehouse; the list of datasources
         // itself is the model's, and cheap.
         ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
+        ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] | ["cache", "invalidate"] => Class::Run,
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route
         // included, is cheap.
         _ => Class::Plan,
-    }
-}
-
-/// Whether a request changes what is deployed, or spends seconds of CPU
-/// on an archive or a test run: a deploy, a validate, a test, a
-/// removal. These are the requests a deploy token gates; every other
-/// route is a read.
-pub(crate) fn writes(method: &str, path: &str) -> bool {
-    let p: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match p.as_slice() {
-        ["projects", _, "branches", _, "deploy" | "validate" | "test"] => true,
-        ["projects", _, "branches", _] => method != "GET" && method != "HEAD",
-        _ => false,
     }
 }
 
@@ -93,7 +92,7 @@ fn patience(class: Class) -> Duration {
 pub(crate) fn deadline(class: Class) -> Duration {
     match class {
         // A probe waits on a warehouse, which can take its time to wake.
-        Class::Heavy | Class::Probe => Duration::from_secs(90),
+        Class::Heavy | Class::Probe | Class::Run => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
@@ -105,6 +104,9 @@ pub struct AdmissionCounts {
     pub explore: usize,
     pub heavy: usize,
     pub probe: usize,
+    /// Requests for a run in the server at once: every statement that
+    /// may run or wait, and as many again asking after them.
+    pub run: usize,
 }
 
 impl Default for AdmissionCounts {
@@ -112,7 +114,7 @@ impl Default for AdmissionCounts {
     /// is neither.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2 }
+        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2, run: 2 * (100 + 5_000) }
     }
 }
 
@@ -121,6 +123,7 @@ pub(crate) struct Admission {
     explore: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
     probe: Arc<Semaphore>,
+    run: Arc<Semaphore>,
 }
 
 impl Admission {
@@ -130,6 +133,7 @@ impl Admission {
             explore: Arc::new(Semaphore::new(counts.explore)),
             heavy: Arc::new(Semaphore::new(counts.heavy)),
             probe: Arc::new(Semaphore::new(counts.probe)),
+            run: Arc::new(Semaphore::new(counts.run)),
         }
     }
 
@@ -139,6 +143,7 @@ impl Admission {
             Class::Explore => &self.explore,
             Class::Heavy => &self.heavy,
             Class::Probe => &self.probe,
+            Class::Run => &self.run,
             Class::Exempt => return None,
         })
     }
@@ -183,42 +188,17 @@ mod tests {
             ("/no/such/route", Plan),
             ("/healthz", Exempt),
             ("/", Exempt),
+            ("/orgs", Plan),
+            ("/orgs/acme/projects", Plan),
+            ("/orgs/acme/mcp", Plan),
+            ("/results/r-1", Run),
+            ("/cache/invalidate", Run),
         ] {
             assert_eq!(classify(p), want, "{p}");
-        }
-    }
-
-    /// The deploy token stands in front of exactly these. A route added
-    /// to the router that changes a deployment belongs in this list and
-    /// in `writes`; the server's own tests ask each one without a token.
-    #[test]
-    fn the_writes_are_the_deploy_the_validate_the_test_and_the_removal() {
-        for (m, p) in [
-            ("POST", "/projects/a/branches/main/deploy"),
-            ("POST", "/projects/a/branches/main/validate"),
-            ("POST", "/projects/a/branches/main/test"),
-            ("DELETE", "/projects/a/branches/main"),
-            ("POST", "/projects/a/branches/main/deploy/"),
-            ("PUT", "/projects/a/branches/main"),
-        ] {
-            assert!(writes(m, p), "{m} {p}");
-        }
-        for (m, p) in [
-            ("GET", "/projects/a/branches/main"),
-            ("POST", "/projects/a/branches/main/sql"),
-            ("POST", "/projects/a/branches/main/explain"),
-            ("POST", "/projects/a/branches/main/explore"),
-            ("GET", "/projects/a/branches/main/fields"),
-            ("GET", "/projects/a/branches/main/tables"),
-            ("GET", "/projects/a/branches/main/values/dim"),
-            ("GET", "/projects/a/branches/main/datasources"),
-            ("POST", "/projects/a/branches/main/datasources/dw/tables"),
-            ("POST", "/projects/a/branches/main/datasources/dw/tables/dse.cs_contact_f"),
-            ("GET", "/projects"),
-            ("POST", "/mcp"),
-            ("GET", "/healthz"),
-        ] {
-            assert!(!writes(m, p), "{m} {p}");
+            // Under an org a route costs what it costs without one.
+            if p.starts_with("/projects") || p.starts_with("/results") || p.starts_with("/cache") {
+                assert_eq!(classify(&format!("/orgs/acme{p}")), want, "/orgs/acme{p}");
+            }
         }
     }
 

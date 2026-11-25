@@ -2,7 +2,7 @@
 //! subqueries) around the root statement.
 
 use crate::dag::Graph;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 
 /// The statement, and the offset in it where the root's own statement
 /// begins: zero, or past the common table expressions wrapped around it.
@@ -47,6 +47,6 @@ pub fn to_sql(graph: &Graph) -> Result<(String, usize)> {
         }
         Ok((sql, 0))
     } else {
-        Err(PlanError::Resolution("The datasource doesn't support cross universe joins. Could not produce final SQL query.".into()))
+        Err(Error::Resolution("The datasource doesn't support cross universe joins. Could not produce final SQL query.".into()))
     }
 }

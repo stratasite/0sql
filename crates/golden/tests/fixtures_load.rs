@@ -10,7 +10,7 @@ fn every_snapshot_builds_a_universe() {
     let hashes = fx.snapshot_hashes().unwrap();
     assert!(!hashes.is_empty(), "no snapshots under {}", fx.root().display());
     for hash in &hashes {
-        let u = fx.universe(hash).unwrap_or_else(|e| panic!("{hash}: {e:#}"));
+        let u = fx.semantic(hash).unwrap_or_else(|e| panic!("{hash}: {e:#}"));
         assert!(!u.tables().is_empty(), "{hash} has no tables");
         assert!(!u.fields().is_empty(), "{hash} has no fields");
     }

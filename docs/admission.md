@@ -23,7 +23,7 @@ TPC-DS sample:
 |---|---|
 | plan (`sql`, `explain`) | ~70 µs |
 | explore, fields search | a walk or a trigram scoring pass over every visible field; milliseconds, grows with the model |
-| deploy, validate, test | untar, load YAML, build the universe and the per-root index, run the tests; seconds for a real model |
+| deploy, validate, test | untar, load YAML, build the semantic model and the per-root universes, run the tests; seconds for a real model |
 
 ## Admission: concurrency caps per cost class
 
@@ -54,9 +54,6 @@ error.
 An MCP request is one tool call and is admitted as a plan by the guard;
 the two explore-class tools take an explore seat as well, inside the
 dispatcher. See `docs/mcp.md`.
-
-A write that lacks the deploy token is refused before it takes a seat,
-so it costs nothing and never waits behind a deploy to be told no.
 
 ## Deadlines
 

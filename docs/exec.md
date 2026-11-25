@@ -501,7 +501,7 @@ thirteen dialect files are right, which is the actual moat.
   today. With a local engine in the dev build, every golden runs
   against fixture data and is compared as **numbers**. Goldens are
   never edited, so this is an additive expectation file beside the
-  existing ones, and `zsql-devtool golden` grows a `--run` mode.
+  existing ones, and `cargo xtask golden` grows a `--run` mode.
 - **Cross-dialect equivalence in CI.** The same spec against DuckDB,
   Postgres, MySQL, ClickHouse and Trino in containers, results compared
   across dialects. This finds the bugs text goldens structurally
@@ -577,7 +577,7 @@ be its own commit on this branch before any executor exists.
       `Executor` trait (connect, run with a deadline and caps, stream
       batches, cancel), the Arrow result type, the JSON encoder with
       its decimal and big-integer rules, SQLite and DuckDB behind cargo
-      features off by default. `zsql-devtool golden --run` against
+      features off by default. `cargo xtask golden --run` against
       fixture data, compared as numbers. The dialect-rendered row limit
       and its goldens. No endpoint, no credentials, no promise spent.
       *Gates:* release binary and clean build time unchanged; the

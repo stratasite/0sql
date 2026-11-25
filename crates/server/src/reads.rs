@@ -3,15 +3,15 @@
 //! handler is a thin wrapper over a plain function so the MCP tools run
 //! the same code.
 
-use crate::error::{ApiError, Input, Params, Search};
+use crate::error::{ApiError, Input, Org, Params, Search};
 use crate::guard::Held;
-use crate::{blocking, read, Shared};
+use crate::{blocking, Shared};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use zsql_service::{ExplainResponse, ExploreRequest, ExploreResponse, ServiceError, SqlRequest, SqlResponse};
+use zsql_core::{ExplainResponse, ExploreRequest, ExploreResponse, SqlRequest, SqlResponse};
 
 /// What one request may ask for. A spec is JSON the caller wrote and
 /// the cost of planning grows with it, so its shape is bounded before
@@ -108,7 +108,7 @@ pub(crate) fn check_term(term: &str) -> Result<(), ApiError> {
 }
 
 /// A shorthand line long enough to be slow to parse.
-fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
+pub(crate) fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
     if let Some(line) = expr {
         if line.len() > shape::EXPR {
             return Err(too_big("characters in this expression", line.len(), shape::EXPR));
@@ -118,8 +118,8 @@ fn check_expr(expr: Option<&str>) -> Result<(), ApiError> {
 }
 
 /// The shape bound, as the service takes it.
-fn shape_check(v: &Value) -> Result<(), ServiceError> {
-    check_shape(v).map_err(|ApiError(_, class, message)| ServiceError::invalid(class, message))
+pub(crate) fn shape_check(v: &Value) -> Result<(), zsql_core::Error> {
+    check_shape(v).map_err(|ApiError(_, class, message)| zsql_core::Error::invalid(class, message))
 }
 
 // The read handlers are each a thin wrapper over a plain function, so
@@ -130,42 +130,45 @@ fn shape_check(v: &Value) -> Result<(), ServiceError> {
 
 pub(crate) async fn sql(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
-    Ok(Json(sql_of(&app, &uid, &branch, req)?))
+    Ok(Json(sql_of(&app, &org, &uid, &branch, req)?))
 }
 
-pub(crate) fn sql_of(app: &Shared, uid: &str, branch: &str, req: SqlRequest) -> Result<SqlResponse, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn sql_of(app: &Shared, org: &str, uid: &str, branch: &str, req: SqlRequest) -> Result<SqlResponse, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_expr(req.expr.as_deref())?;
     Ok(d.sql(req, &shape_check)?)
 }
 
 pub(crate) async fn explain(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<SqlRequest>,
 ) -> Result<Json<ExplainResponse>, ApiError> {
-    Ok(Json(explain_of(&app, &uid, &branch, req)?))
+    Ok(Json(explain_of(&app, &org, &uid, &branch, req)?))
 }
 
-pub(crate) fn explain_of(app: &Shared, uid: &str, branch: &str, req: SqlRequest) -> Result<ExplainResponse, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn explain_of(app: &Shared, org: &str, uid: &str, branch: &str, req: SqlRequest) -> Result<ExplainResponse, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_expr(req.expr.as_deref())?;
     Ok(d.explain(req, &shape_check)?)
 }
 
 pub(crate) async fn explore(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Input(req): Input<ExploreRequest>,
 ) -> Result<Json<ExploreResponse>, ApiError> {
-    Ok(Json(explore_of(&app, &uid, &branch, req)?))
+    Ok(Json(explore_of(&app, &org, &uid, &branch, req)?))
 }
 
-pub(crate) fn explore_of(app: &Shared, uid: &str, branch: &str, req: ExploreRequest) -> Result<ExploreResponse, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn explore_of(app: &Shared, org: &str, uid: &str, branch: &str, req: ExploreRequest) -> Result<ExploreResponse, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_expr(req.expr.as_deref())?;
     if let Some(term) = &req.q {
         check_term(term)?;
@@ -186,14 +189,15 @@ pub(crate) struct FieldsQuery {
 /// `score` (1 for a containing match).
 pub(crate) async fn fields(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<FieldsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(fields_of(&app, &uid, &branch, q)?))
+    Ok(Json(fields_of(&app, &org, &uid, &branch, q)?))
 }
 
-pub(crate) fn fields_of(app: &Shared, uid: &str, branch: &str, q: FieldsQuery) -> Result<Value, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn fields_of(app: &Shared, org: &str, uid: &str, branch: &str, q: FieldsQuery) -> Result<Value, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_term(&q.q)?;
     Ok(d.fields(&q.q, q.hidden))
 }
@@ -208,28 +212,30 @@ pub(crate) struct ListQuery {
 
 pub(crate) async fn tables(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(tables_of(&app, &uid, &branch, &q.q)?))
+    Ok(Json(tables_of(&app, &org, &uid, &branch, &q.q)?))
 }
 
-pub(crate) fn tables_of(app: &Shared, uid: &str, branch: &str, q: &str) -> Result<Value, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn tables_of(app: &Shared, org: &str, uid: &str, branch: &str, q: &str) -> Result<Value, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_term(q)?;
     Ok(d.tables(q))
 }
 
 pub(crate) async fn values(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch, dim)): Params<(String, String, String)>,
     Search(q): Search<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(values_of(&app, &uid, &branch, &dim, &q.q)?))
+    Ok(Json(values_of(&app, &org, &uid, &branch, &dim, &q.q)?))
 }
 
-pub(crate) fn values_of(app: &Shared, uid: &str, branch: &str, dim: &str, q: &str) -> Result<Value, ApiError> {
-    let d = app.model(uid, branch)?;
+pub(crate) fn values_of(app: &Shared, org: &str, uid: &str, branch: &str, dim: &str, q: &str) -> Result<Value, ApiError> {
+    let d = app.model(org, uid, branch)?;
     check_term(q)?;
     Ok(d.values_of(dim, q)?)
 }
@@ -237,9 +243,10 @@ pub(crate) fn values_of(app: &Shared, uid: &str, branch: &str, dim: &str, q: &st
 pub(crate) async fn test(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let d = app.model(&uid, &branch)?;
+    let d = app.model(&org, &uid, &branch)?;
     blocking(move || {
         let _held = held;
         Ok(Json(d.run_tests()?))
@@ -249,21 +256,30 @@ pub(crate) async fn test(
 
 pub(crate) async fn branch_summary(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(app.model(&uid, &branch)?.summary()))
+    Ok(Json(app.model(&org, &uid, &branch)?.summary()))
 }
 
-/// Every deployed branch; with `q`, the ones whose project or branch
-/// holds it.
-pub(crate) async fn projects(State(app): State<Shared>, Search(q): Search<ListQuery>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(projects_of(&app, &q.q)?))
+/// Every deployed branch of the org; with `q`, the ones whose project
+/// or branch holds it.
+pub(crate) async fn projects(State(app): State<Shared>, Org(org): Org, Search(q): Search<ListQuery>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(projects_of(&app, &org, &q.q)?))
 }
 
-pub(crate) fn projects_of(app: &Shared, q: &str) -> Result<Value, ApiError> {
+pub(crate) fn projects_of(app: &Shared, org: &str, q: &str) -> Result<Value, ApiError> {
     check_term(q)?;
-    let wanted = zsql_service::holds(q);
-    let mut out: Vec<Value> = read(&app.models).values().filter(|d| wanted(&d.uid) || wanted(&d.branch)).map(|d| d.summary()).collect();
-    out.sort_by_key(|v| (v["project"].as_str().unwrap_or("").to_string(), v["branch"].as_str().unwrap_or("").to_string()));
+    let wanted = zsql_core::holds(q);
+    // Already by project and branch.
+    let out: Vec<Value> = app.of_org(org).iter().filter(|d| wanted(&d.uid) || wanted(&d.branch)).map(|d| d.summary()).collect();
     Ok(json!({ "deployments": out }))
+}
+
+/// The orgs with something deployed, and the default one, each with
+/// how many branches it has. For whoever runs the server: a service in
+/// front that keeps orgs apart does not pass this one on.
+pub(crate) async fn orgs(State(app): State<Shared>) -> Json<Value> {
+    let orgs: Vec<Value> = app.orgs().iter().map(|org| json!({ "org": org, "deployments": app.of_org(org).len() })).collect();
+    Json(json!({ "orgs": orgs }))
 }

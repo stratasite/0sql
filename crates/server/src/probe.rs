@@ -15,7 +15,7 @@
 //! These are reads, and as open as the others: who may ask is decided
 //! by the service this server sits behind.
 
-use crate::error::{ApiError, Params, Search};
+use crate::error::{ApiError, Org, Params, Search};
 use crate::guard::Held;
 use crate::reads::{check_term, too_big, ListQuery};
 use crate::{blocking, Shared};
@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use zsql_source::{Catalog, Connection, Filter, Secrets, SourceError, CONNECTION_KEYS, SECRET_FIELDS};
+use zsql_datasource::{Catalog, Connection, Filter, Secrets, CONNECTION_KEYS, SECRET_FIELDS};
 
 /// The most tables one page holds, and how many it holds when the
 /// request does not say. A warehouse can have tens of thousands, so a
@@ -116,28 +116,29 @@ fn named(v: Option<String>) -> Result<Option<String>, ApiError> {
 /// What the warehouse or the connection said, as the API reports it. A
 /// connection that cannot be made from what was sent is the caller's to
 /// fix (400); a warehouse that would not answer is upstream (502). The
-/// source crate words some of these for a project directory, so the
+/// datasource crate words some of these for a project directory, so the
 /// ones that name a file are said again for a request.
-fn refused(e: SourceError) -> ApiError {
+fn refused(e: zsql_datasource::Error) -> ApiError {
     let (status, message) = match &e {
-        SourceError::Connect(..) | SourceError::Query(..) | SourceError::TooManyRows(..) | SourceError::Io(..) => {
-            (StatusCode::BAD_GATEWAY, e.to_string())
-        }
-        SourceError::Missing(uid, what) => {
+        zsql_datasource::Error::Connect(..)
+        | zsql_datasource::Error::Query(..)
+        | zsql_datasource::Error::TooManyRows(..)
+        | zsql_datasource::Error::Io(..) => (StatusCode::BAD_GATEWAY, e.to_string()),
+        zsql_datasource::Error::Missing(uid, what) => {
             (StatusCode::BAD_REQUEST, format!("datasource {uid} has no {what}; deploy it in datasources.yml or send it in the connection"))
         }
-        SourceError::NoSecret { uid, .. } => (
+        zsql_datasource::Error::NoSecret { uid, .. } => (
             StatusCode::BAD_REQUEST,
-            format!("datasource {uid} needs a password; deploy it in datasources.yml or send it in the connection"),
+            format!("datasource {uid} needs a password; deploy the datasource with its secret or send one in the connection"),
         ),
-        SourceError::NoSchemas(engine) => (StatusCode::BAD_REQUEST, format!("{engine} has no schemas; ask without one")),
+        zsql_datasource::Error::NoSchemas(engine) => (StatusCode::BAD_REQUEST, format!("{engine} has no schemas; ask without one")),
         _ => (StatusCode::BAD_REQUEST, e.to_string()),
     };
     ApiError(status, "DatasourceError", message)
 }
 
 /// The settings that are numbers; every other one is text.
-const NUMBERS: [&str; 3] = ["port", "query_timeout", "cache_ttl"];
+const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
 
 /// The settings with more than one spelling. One sent in the request
 /// replaces the deployed one under any of its names.
@@ -166,20 +167,24 @@ fn scalar(key: &str, value: &Value) -> Option<Value> {
     }
 }
 
-/// The connection for one probe: what the datasource was deployed with,
-/// and over it what the request sent. The deployed entry is read as
+/// The connection for one probe or run: what the datasource was
+/// deployed with, and over it what the request sent. Its credential is
+/// the request's when the request sends any secret, and the one the
+/// datasource was deployed with otherwise. The deployed entry is read as
 /// `datasources.yml` is, past whatever is not a connection setting; the
 /// request is checked key by key, so a misspelled setting is named and
 /// not read past into a confusing refusal from the warehouse.
-fn connection_of(
+///
+/// `(org, uid, branch)` is the branch the datasource is one of.
+pub(crate) fn connection_of(
     app: &Shared,
-    uid: &str,
-    branch: &str,
+    (org, uid, branch): (&str, &str, &str),
     datasource: &str,
     catalog: Option<&str>,
-    req: ProbeRequest,
+    sent: &Map<String, Value>,
+    longest: Option<i64>,
 ) -> Result<(Connection, Secrets), ApiError> {
-    let d = app.model(uid, branch)?;
+    let d = app.model(org, uid, branch)?;
     check_term(datasource)?;
     let Some(deployed) = d.datasource(datasource) else {
         let known: Vec<String> = d.datasources("")["datasources"]
@@ -200,7 +205,7 @@ fn connection_of(
     if let Some(seconds) = deployed.query_timeout {
         settings.insert("query_timeout".into(), Value::from(seconds));
     }
-    for (key, value) in &req.connection {
+    for (key, value) in sent {
         if !CONNECTION_KEYS.contains(&key.as_str()) && !SECRET_FIELDS.contains(&key.as_str()) {
             return Err(invalid(format!("connection.{key} is not a connection setting")));
         }
@@ -221,23 +226,46 @@ fn connection_of(
         }
         settings.insert(key.clone(), value);
     }
+    // The credential is one or the other, never a blend: what the
+    // request sent, when it sent any secret at all, and otherwise what
+    // the datasource was deployed with. And the deployed one goes only
+    // where it was deployed for: a request that names another host,
+    // user, file or way of securing the connection connects with what
+    // it sent, so nobody who reaches the port can have the deployed
+    // secret presented to a server of their choosing.
+    let sent_one = sent.keys().any(|key| SECRET_FIELDS.contains(&key.as_str()));
+    let elsewhere = sent.keys().any(|key| {
+        key != "adapter" && !SECRET_FIELDS.contains(&key.as_str()) && !crate::credentials::HOW_IT_IS_USED.contains(&key.as_str())
+    });
+    if !sent_one && !elsewhere {
+        for (key, value) in d.secrets_of(datasource).into_iter().flatten() {
+            if let Some(value) = scalar(key, value) {
+                settings.insert(key.clone(), value);
+            }
+        }
+    }
     let settings = serde_yaml::to_value(&settings).map_err(|e| invalid(format!("connection: {e}")))?;
     let mut conn = Connection::from_value(datasource, &settings).map_err(refused)?;
     conn.adapter = adapter;
     if let Some(catalog) = catalog {
         conn.in_catalog(catalog).map_err(refused)?;
     }
-    conn.query_timeout = Some(conn.query_timeout.filter(|s| *s > 0).unwrap_or(60).min(STATEMENT_SECS));
+    // A probe's statement is kept short of its request's deadline; a
+    // run's is the datasource's own.
+    if let Some(longest) = longest {
+        conn.query_timeout = Some(conn.query_timeout.filter(|s| *s > 0).unwrap_or(60).min(longest));
+    }
     Ok((conn, Secrets::from_value(&settings)))
 }
 
 /// The model's datasources: what there is to probe.
 pub(crate) async fn datasources(
     State(app): State<Shared>,
+    Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let d = app.model(&uid, &branch)?;
+    let d = app.model(&org, &uid, &branch)?;
     check_term(&q.q)?;
     Ok(Json(d.datasources(&q.q)))
 }
@@ -250,6 +278,7 @@ pub(crate) async fn datasources(
 pub(crate) async fn tables(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch, datasource)): Params<(String, String, String)>,
     Search(p): Search<TablesQuery>,
     Sent(req): Sent,
@@ -266,10 +295,11 @@ pub(crate) async fn tables(
         return Err(too_big("tables in one page", limit, PAGE));
     }
     let offset = p.offset.unwrap_or(0);
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
+    let (conn, secrets) =
+        connection_of(&app, (&org, &uid, &branch), &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
-        let mut src = zsql_source::open(&conn, secrets).map_err(refused)?;
+        let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
         let filter = if q.is_empty() { Filter::schema(schema.as_deref()) } else { Filter::like(schema.as_deref(), &q) };
         let page = Catalog::list(&mut *src, &filter, limit, offset).map_err(refused)?;
         let tables: Vec<Value> = page
@@ -328,16 +358,18 @@ fn split(path: &str, schema: Option<String>, catalog: Option<String>) -> Result<
 pub(crate) async fn table(
     State(app): State<Shared>,
     held: Option<Extension<Held>>,
+    Org(org): Org,
     Params((uid, branch, datasource, table)): Params<(String, String, String, String)>,
     Search(p): Search<TableQuery>,
     Sent(req): Sent,
 ) -> Result<Json<Value>, ApiError> {
     check_term(&table)?;
     let (catalog, schema, name) = split(&table, named(p.schema)?, named(p.catalog)?)?;
-    let (conn, secrets) = connection_of(&app, &uid, &branch, &datasource, catalog.as_deref(), req)?;
+    let (conn, secrets) =
+        connection_of(&app, (&org, &uid, &branch), &datasource, catalog.as_deref(), &req.connection, Some(STATEMENT_SECS))?;
     blocking(move || {
         let _held = held;
-        let mut src = zsql_source::open(&conn, secrets).map_err(refused)?;
+        let mut src = zsql_datasource::open(&conn, secrets).map_err(refused)?;
         let mut cat = Catalog::read_filtered(&mut *src, &conn.uid, &Filter::table(schema.as_deref(), &name)).map_err(refused)?;
         let within = schema.as_deref().map(|s| format!(" in schema {s}")).unwrap_or_default();
         if cat.tables.len() > 1 {

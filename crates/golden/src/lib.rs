@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 use zsql_dialect::Dialects;
 use zsql_planner::Planner;
 use zsql_semantic::Path as JoinPath;
-use zsql_semantic::{Snapshot, Universe};
+use zsql_semantic::{SemanticModel, Snapshot};
 use zsql_spec::SecurityContext;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -56,7 +56,7 @@ pub struct ExpectedError {
 pub struct Fixtures {
     root: PathBuf,
     dialects: Dialects,
-    universes: std::sync::Mutex<HashMap<String, Arc<Universe>>>,
+    universes: std::sync::Mutex<HashMap<String, Arc<SemanticModel>>>,
     formed: std::sync::Mutex<HashMap<String, Arc<Vec<JoinPath>>>>,
 }
 
@@ -148,11 +148,11 @@ impl Fixtures {
     }
 
     /// The built universe for a snapshot hash, shared across cases.
-    pub fn universe(&self, hash: &str) -> Result<Arc<Universe>> {
+    pub fn semantic(&self, hash: &str) -> Result<Arc<SemanticModel>> {
         if let Some(u) = self.universes.lock().unwrap().get(hash) {
             return Ok(u.clone());
         }
-        let u = Arc::new(Universe::build(self.snapshot(hash)?).with_context(|| format!("building universe {hash}"))?);
+        let u = Arc::new(SemanticModel::build(self.snapshot(hash)?).with_context(|| format!("building universe {hash}"))?);
         self.universes.lock().unwrap().insert(hash.to_string(), u.clone());
         Ok(u)
     }
@@ -162,15 +162,15 @@ impl Fixtures {
         if let Some(p) = self.formed.lock().unwrap().get(hash) {
             return Ok(p.clone());
         }
-        let u = self.universe(hash)?;
+        let u = self.semantic(hash)?;
         let p = Arc::new(zsql_formation::form(&u).paths);
         self.formed.lock().unwrap().insert(hash.to_string(), p.clone());
         Ok(p)
     }
 
     /// The universe and, for `Formed`, the paths a planner needs.
-    pub fn planner_for(&self, hash: &str, source: PathSource) -> Result<(Arc<Universe>, Option<Arc<Vec<JoinPath>>>)> {
-        let u = self.universe(hash)?;
+    pub fn planner_for(&self, hash: &str, source: PathSource) -> Result<(Arc<SemanticModel>, Option<Arc<Vec<JoinPath>>>)> {
+        let u = self.semantic(hash)?;
         let p = match source {
             PathSource::Formed => Some(self.formed_paths(hash)?),
             PathSource::Snapshot => None,
@@ -403,17 +403,17 @@ impl Outcome {
 /// with its security context. An error comes back with the class name a
 /// golden expects.
 pub fn plan_case(planner: &Planner<'_>, dialects: &Dialects, case: &Case) -> std::result::Result<zsql_planner::Plan, (String, String)> {
-    let universe = planner.universe();
+    let semantic = planner.semantic();
     let base = dialects.base().map_err(|e| ("Unimplemented".to_string(), e.to_string()))?;
     zsql_spec::Spec::from_value(case.spec.clone())
-        .and_then(|spec| zsql_spec::lower(&spec, universe, &base))
+        .and_then(|spec| zsql_spec::lower(&spec, semantic, &base))
         .map_err(|e| (e.error_class().to_string(), e.to_string()))
         .and_then(|query| planner.plan_query(query, case.context.as_ref()).map_err(|e| (e.error_class().to_string(), e.to_string())))
 }
 
 pub fn run_case(fixtures: &Fixtures, case: &Case, source: PathSource) -> Result<Outcome> {
-    let (universe, paths) = fixtures.planner_for(&case.universe, source)?;
-    let planner = Planner::new(&universe, fixtures.dialects(), paths.as_deref().map(Vec::as_slice));
+    let (semantic, paths) = fixtures.planner_for(&case.universe, source)?;
+    let planner = Planner::new(&semantic, fixtures.dialects(), paths.as_deref().map(Vec::as_slice));
     run_case_on(&planner, fixtures.dialects(), case)
 }
 
@@ -489,7 +489,7 @@ pub fn score(fixtures: &Fixtures, filter: &str, source: PathSource) -> Result<BT
         let mut hashes: Vec<&str> = cases.iter().map(|c| c.universe.as_str()).collect();
         hashes.sort();
         hashes.dedup();
-        let universes: Vec<(Arc<Universe>, Option<Arc<Vec<JoinPath>>>)> =
+        let universes: Vec<(Arc<SemanticModel>, Option<Arc<Vec<JoinPath>>>)> =
             hashes.iter().map(|h| fixtures.planner_for(h, source)).collect::<Result<_>>()?;
         let planners: HashMap<&str, Planner<'_>> = hashes
             .iter()
@@ -566,13 +566,13 @@ impl PathReport {
     }
 }
 
-pub fn compare_paths(universe: &Universe, stored: &[JoinPath], formed: &[JoinPath]) -> PathReport {
+pub fn compare_paths(semantic: &SemanticModel, stored: &[JoinPath], formed: &[JoinPath]) -> PathReport {
     let cheapest = |paths: &'_ [JoinPath]| -> BTreeMap<(i64, i64), JoinPath> {
         let mut m: BTreeMap<(i64, i64), JoinPath> = BTreeMap::new();
         for p in paths {
             let key = (p.root_table_id, p.field_id);
             let better = match m.get(&key) {
-                Some(e) => (p.cost, universe.path_signature(p)) < (e.cost, universe.path_signature(e)),
+                Some(e) => (p.cost, semantic.path_signature(p)) < (e.cost, semantic.path_signature(e)),
                 None => true,
             };
             if better {
@@ -583,8 +583,8 @@ pub fn compare_paths(universe: &Universe, stored: &[JoinPath], formed: &[JoinPat
     };
     let s = cheapest(stored);
     let f = cheapest(formed);
-    let name = |id: i64| universe.table(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
-    let fname = |id: i64| universe.field(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
+    let name = |id: i64| semantic.table(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
+    let fname = |id: i64| semantic.field(id).map(|t| t.uid.clone()).unwrap_or_else(|| id.to_string());
     let mut report = PathReport::default();
     for (key, sp) in &s {
         report.pairs += 1;

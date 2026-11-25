@@ -17,12 +17,25 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # A hosted runner has about fourteen gigabytes free, and a debug
+  # build of every test binary, each with DuckDB and Arrow linked in
+  # and full debug information, is more than that: the archive step
+  # ends on "No space left on device". Without the debug information
+  # the same build is a fraction of the size. A failing test still says
+  # its file and line; only a backtrace loses its line numbers.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The same reason: what the runner image carries and this build
+      # never uses is most of its disk.
+      - name: Room on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
       - name: Toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -33,7 +46,7 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
       - name: Goldens
-        run: cargo run --release --locked -p zsql-devtool -- golden --strict
+        run: cargo run --release --locked -p xtask -- golden --strict
       - name: CLI without defaults
         run: cargo check --locked -p zsql-cli --no-default-features
       # The same list bin/ci runs; this is the step it had and CI did not,
@@ -43,7 +56,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The transports in zsql-source against real servers, one container per
+  # The transports in zsql-datasource against real servers, one container per
   # warehouse that can run without a cloud account. Its own job so a slow
   # image never holds up the planner's tests; the ignored tests are the
   # ones that need a server, and here they get one.
@@ -51,6 +64,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The same reason: what the runner image carries and this build
+      # never uses is most of its disk.
+      - name: Room on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
       - name: Toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -80,7 +99,12 @@ jobs:
           ZSQL_TEST_TRINO_URL: http://localhost:8080
           ZSQL_TEST_TRINO_DB: tpch
         run: |
-          cargo test --locked -p zsql-source -- --ignored
+          # adbc::tests load ADBC drivers this job does not install; they
+          # are run by hand, see docs/exec-layer.md.
+          cargo test --locked -p zsql-datasource -- --ignored --skip adbc::tests
+          # The records of runs, in the same Postgres.
+          cargo test --locked -p zsql-exec --test postgres -- --ignored
+          cargo test --locked -p zsql-cli --test serve -- --ignored
           cargo test --locked -p zsql-cli --test generate -- --ignored
           cargo test --locked -p zsql-cli --test sample -- --ignored
       # When a container never comes up, say which and why before it is

@@ -7,6 +7,8 @@
     "values": "The sampled values of one dimension, when the project deployed samples (zsql sample writes them). A branch whose summary in list_projects shows values 0 has none, and the call answers NotFound; filter values then come from the question or the field's description.",
     "explore": "Given a query spec, the dimensions and measures that can still be added to it, narrowed by q.",
     "sql": "The SQL for a query spec, and the datasource and adapter it is for. Run it yourself; this server does not.",
-    "explain": "The SQL for a query spec with how it was planned: timings, phases and the node graph."
+    "explain": "The SQL for a query spec with how it was planned: timings, phases and the node graph.",
+    "run": "Runs a query spec on its datasource and returns the rows: columns with their types, then rows as arrays in column order, with row_count and complete. A stored result answers when one is fresh; fresh: true runs anyway. status running or queued means it is not done: ask result with the id. A limit in the spec bounds the query; limit here is only how many rows this answer carries.",
+    "result": "A run by its id: its status and, once it has succeeded, its rows from offset. Use it to wait for a run that was still running, or to read the next rows of one whose complete was false."
   }
 }

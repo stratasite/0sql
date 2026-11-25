@@ -9,8 +9,9 @@ publish = false
 description = "Running a planned query and keeping its rows: the result store and the cache over it"
 
 [dependencies]
-zsql-service.workspace = true
-zsql-source.workspace = true
+tracing.workspace = true
+zsql-core.workspace = true
+zsql-datasource.workspace = true
 zsql-semantic.workspace = true
 zsql-spec.workspace = true
 serde.workspace = true
@@ -18,6 +19,28 @@ serde_json.workspace = true
 flate2.workspace = true
 thiserror.workspace = true
 sha2 = "0.10"
+# A stored result is an Arrow IPC file. LZ4 because its implementation
+# here is Rust, where zstd's would bring a C library into the build.
+arrow-ipc = { version = "60", features = ["lz4"] }
+arrow-array = "60"
+arrow-schema = "60"
+arrow-cast = "60"
+# The records of runs in Postgres: the client the datasource crate
+# already has, a pool for it, and a runtime thread to drive them.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+# Where a result is kept for every node to read: S3, GCS, Azure, or a
+# directory, behind one interface.
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+url = "2"
+futures-util = { version = "0.3", default-features = false }
+# The size of the disk results are kept on.
+libc = "0.2"
+
+[dev-dependencies]
+# A warehouse in a file, for a read that really arrives a batch at a time.
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]
 workspace = true

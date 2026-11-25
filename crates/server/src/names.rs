@@ -1,6 +1,6 @@
-//! The names that become directories: a project's uid and a branch.
-//! Both arrive in a URL the router has already decoded, so both are
-//! checked before they are used for anything.
+//! The names that become directories: an org, a project's uid and a
+//! branch. Each arrives in a URL the router has already decoded, so
+//! each is checked before it is used for anything.
 
 use crate::error::ApiError;
 use axum::http::StatusCode;
@@ -10,15 +10,47 @@ use axum::http::StatusCode;
 /// filesystem allows.
 const NAME_LIMIT: usize = 100;
 
+/// The org a request with no org in its path is for, and the directory
+/// its projects are under.
+pub(crate) const DEFAULT_ORG: &str = zsql_exec::DEFAULT_ORG;
+
+/// The file in the data directory a running server holds.
+pub(crate) const LOCK_FILE: &str = "lock";
+
+/// Whether a name is a slug: lower-case letters, digits, `-` and `_`.
+pub(crate) fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= NAME_LIMIT
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// An org names a directory under the data directory and the first
+/// part of a key in the models map, so it is a slug as a project's uid
+/// is. It never starts with a dot, which keeps the server's own
+/// directories there apart from an org's.
+pub(crate) fn check_org(org: &str) -> Result<(), ApiError> {
+    // The server's lock is a file of this name where an org's directory
+    // would be, so no org can have it.
+    if org == LOCK_FILE {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{org}' is not an org: the server keeps a file of that name")));
+    }
+    if is_slug(org) {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            format!("'{org}' is not an org (lower-case letters, digits, - and _, at most {NAME_LIMIT} characters)"),
+        ))
+    }
+}
+
 /// A project uid as the URL carries it must be a slug (lower-case
-/// letters, digits, `-`, `_`), because it names a directory under the
-/// data directory and half of a key in the models map. One spelling per
+/// letters, digits, `-`, `_`), because it names a directory under its
+/// org's and part of a key in the models map. One spelling per
 /// project, so there is one directory and one key per project.
 pub(crate) fn check_uid(uid: &str) -> Result<(), ApiError> {
-    let ok = !uid.is_empty()
-        && uid.len() <= NAME_LIMIT
-        && uid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if ok {
+    if is_slug(uid) {
         Ok(())
     } else {
         Err(ApiError(
@@ -77,6 +109,12 @@ mod tests {
             &"x".repeat(NAME_LIMIT + 1),
         ] {
             assert!(check_uid(uid).is_err(), "{uid:?}");
+        }
+        for org in ["default", "acme", "acme_eu-1"] {
+            assert!(check_org(org).is_ok(), "{org}");
+        }
+        for org in ["", "Acme", "lock", ".cache", "..", "a/b", "a.b", "a b", &"x".repeat(NAME_LIMIT + 1)] {
+            assert!(check_org(org).is_err(), "{org:?}");
         }
         for branch in ["main", "master", "probe-holder-loan", "release_1.2", "v1.2.3", "RC1"] {
             assert!(check_branch(branch).is_ok(), "{branch}");

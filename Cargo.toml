@@ -8,13 +8,14 @@ members = [
   "crates/planner",
   "crates/project",
   "crates/shorthand",
-  "crates/source",
+  "crates/log",
+  "crates/datasource",
   "crates/exec",
-  "crates/service",
+  "crates/core",
   "crates/server",
   "crates/golden",
-  "crates/devtool",
   "crates/cli",
+  "xtask",
 ]
 
 [workspace.package]
@@ -40,6 +41,10 @@ flate2 = "1"
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
+# Every crate reports through this and none of them prints: crates/log
+# is what a binary installs to decide where a report goes. Without the
+# attribute macros, which nothing here uses.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 zsql-semantic = { path = "crates/semantic" }
 zsql-formation = { path = "crates/formation" }
 zsql-dialect = { path = "crates/dialect" }
@@ -47,9 +52,10 @@ zsql-spec = { path = "crates/spec" }
 zsql-planner = { path = "crates/planner" }
 zsql-project = { path = "crates/project" }
 zsql-shorthand = { path = "crates/shorthand" }
-zsql-source = { path = "crates/source" }
+zsql-log = { path = "crates/log" }
+zsql-datasource = { path = "crates/datasource" }
 zsql-exec = { path = "crates/exec" }
-zsql-service = { path = "crates/service" }
+zsql-core = { path = "crates/core" }
 zsql-server = { path = "crates/server" }
 zsql-golden = { path = "crates/golden" }
 

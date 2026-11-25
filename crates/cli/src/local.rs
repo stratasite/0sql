@@ -11,8 +11,8 @@ use crate::side::Query;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
+use zsql_core::{unlimited, ExploreRequest, Model, SqlRequest, Trust};
 use zsql_dialect::Dialects;
-use zsql_service::{unlimited, ExploreRequest, Model, SqlRequest, Trust};
 use zsql_spec::SecurityContext;
 
 /// What a local model is called where a server would say the branch:
@@ -79,6 +79,6 @@ pub fn check(m: &Model) -> Result<Value> {
     out["test_results"] = m.run_tests().map_err(Refusal::from)?;
     out["validated_only"] = json!(true);
     // Against the warehouse's catalog too, for every datasource that has one.
-    out["catalog"] = crate::catalog_check::findings(m);
+    out["catalog"] = crate::commands::catalog_check::findings(m);
     Ok(out)
 }

@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 
 pub struct Client {
     pub server: String,
-    pub api_key: Option<String>,
     /// For every call but a deploy: a server that accepts and never
     /// answers must not hang the command.
     agent: ureq::Agent,
@@ -17,7 +16,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(server: &str, api_key: Option<String>) -> Self {
+    pub fn new(server: &str) -> Self {
         let agent = |whole: u64| {
             ureq::Agent::new_with_config(
                 ureq::config::Config::builder()
@@ -27,18 +26,11 @@ impl Client {
                     .build(),
             )
         };
-        Client { server: server.trim_end_matches('/').to_string(), api_key, agent: agent(60), slow: agent(600) }
+        Client { server: server.trim_end_matches('/').to_string(), agent: agent(60), slow: agent(600) }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.server, path)
-    }
-
-    fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
-        match &self.api_key {
-            Some(k) => req.header("authorization", &format!("Bearer {k}")),
-            None => req,
-        }
     }
 
     /// Sends, and waits the server out if it says it has not started
@@ -61,22 +53,22 @@ impl Client {
 
     pub fn get(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("GET {url}"), || self.auth(self.agent.get(&url)).call())
+        self.send(&format!("GET {url}"), || self.agent.get(&url).call())
     }
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.agent.post(&url)).send_json(body))
+        self.send(&format!("POST {url}"), || self.agent.post(&url).send_json(body))
     }
 
     pub fn post_bytes(&self, path: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("POST {url}"), || self.auth(self.slow.post(&url)).header("content-type", content_type).send(bytes))
+        self.send(&format!("POST {url}"), || self.slow.post(&url).header("content-type", content_type).send(bytes))
     }
 
     pub fn delete(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
-        self.send(&format!("DELETE {url}"), || self.auth(self.agent.delete(&url)).call())
+        self.send(&format!("DELETE {url}"), || self.agent.delete(&url).call())
     }
 }
 
@@ -121,8 +113,21 @@ fn read(mut r: ureq::http::Response<ureq::Body>) -> Result<Value> {
     Ok(value)
 }
 
-pub fn branch_path(uid: &str, branch: &str) -> String {
-    format!("/projects/{}/branches/{}", urlencode(uid), urlencode(branch))
+/// What every path of an org starts with: `/orgs/{org}`, and nothing
+/// for the default org, whose paths are the ones a server had before
+/// it kept orgs.
+pub fn org_path(org: Option<&str>) -> String {
+    match org.map(str::trim).filter(|o| !o.is_empty() && *o != DEFAULT_ORG) {
+        Some(org) => format!("/orgs/{}", urlencode(org)),
+        None => String::new(),
+    }
+}
+
+/// The org a project with no `org:` is deployed under.
+pub const DEFAULT_ORG: &str = "default";
+
+pub fn branch_path(org: Option<&str>, uid: &str, branch: &str) -> String {
+    format!("{}/projects/{}/branches/{}", org_path(org), urlencode(uid), urlencode(branch))
 }
 
 pub fn urlencode(s: &str) -> String {
@@ -150,22 +155,38 @@ fn query_body(query: &Query, context: Option<&Value>) -> Value {
 }
 
 /// `/sql`: `{sql, adapter}`; `/explain`: that plus timings, phases and the node graph.
-pub fn sql(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
-    client.post(&format!("{}/{}", branch_path(uid, branch), if explain { "explain" } else { "sql" }), &query_body(query, context))
+pub fn sql(
+    client: &Client,
+    org: Option<&str>,
+    uid: &str,
+    branch: &str,
+    query: &Query,
+    context: Option<&Value>,
+    explain: bool,
+) -> Result<Value> {
+    client.post(&format!("{}/{}", branch_path(org, uid, branch), if explain { "explain" } else { "sql" }), &query_body(query, context))
 }
 
 /// `/explore`: the dimensions and measures the query can take on, narrowed
 /// by a search term.
-pub fn explore(client: &Client, uid: &str, branch: &str, query: &Query, context: Option<&Value>, q: Option<&str>) -> Result<Value> {
+pub fn explore(
+    client: &Client,
+    org: Option<&str>,
+    uid: &str,
+    branch: &str,
+    query: &Query,
+    context: Option<&Value>,
+    q: Option<&str>,
+) -> Result<Value> {
     let mut body = query_body(query, context);
     if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
         body["q"] = json!(q);
     }
-    client.post(&format!("{}/explore", branch_path(uid, branch)), &body)
+    client.post(&format!("{}/explore", branch_path(org, uid, branch)), &body)
 }
 
 /// A dimension's sampled values by uid, name or unique substring; the
 /// server resolves the name.
-pub fn values_for(client: &Client, uid: &str, branch: &str, dim: &str) -> Result<Value> {
-    client.get(&format!("{}/values/{}", branch_path(uid, branch), urlencode(dim)))
+pub fn values_for(client: &Client, org: Option<&str>, uid: &str, branch: &str, dim: &str) -> Result<Value> {
+    client.get(&format!("{}/values/{}", branch_path(org, uid, branch), urlencode(dim)))
 }

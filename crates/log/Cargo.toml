@@ -1,0 +1,18 @@
+[package]
+name = "zsql-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Where 0sql's log goes: the one place that knows the level, the format and the destination of what every crate reports through tracing"
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

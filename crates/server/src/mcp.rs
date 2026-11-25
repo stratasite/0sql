@@ -23,6 +23,12 @@
 //! the header a plan runs with no context, which a branch with policies
 //! refuses exactly as it does over REST. See `docs/mcp.md`.
 //!
+//! The org is the connection's too, and for the same reason: it is in
+//! the endpoint's path, `/orgs/{org}/mcp`, or it is the default org at
+//! `/mcp`, and no tool takes one. The catalog an agent is given, the
+//! projects it can list and the results it can ask after are that
+//! org's and no other's.
+//!
 //! No authentication and no Origin check: like the rest of the server
 //! this endpoint answers whoever can reach it, and belongs behind the
 //! developer's own service or on a loopback.
@@ -34,11 +40,11 @@
 //! `application/json`, a notification with 202.
 
 use crate::admission::Class;
-use crate::error::ApiError;
+use crate::error::{ApiError, Org};
 use crate::guard::{busy, Held};
 use crate::names::check_uid;
 use crate::reads::{explain_of, explore_of, fields_of, projects_of, sql_of, tables_of, values_of, FieldsQuery};
-use crate::{read, App, Shared};
+use crate::{App, Shared};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -47,8 +53,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use zsql_core::{ExploreRequest, Model, SqlRequest};
 use zsql_semantic::FieldKind;
-use zsql_service::{ExploreRequest, Model, SqlRequest};
 use zsql_spec::SecurityContext;
 
 pub const PATH: &str = "/mcp";
@@ -90,10 +96,15 @@ impl Settings {
 
     /// Whether a tool is exposed. A call to one that is not is refused
     /// like an unknown tool.
+    ///
+    /// Named, a tool is exposed. With no list, every tool is but the two
+    /// that run a statement: a model that can run what it plans reads
+    /// rows with the credential a datasource was deployed with, which is for whoever
+    /// sets the server up to turn on.
     fn exposed(&self, name: &str) -> bool {
         match &self.tools {
             Some(list) => list.iter().any(|t| t == name),
-            None => true,
+            None => !RUNS.contains(&name),
         }
     }
 }
@@ -143,7 +154,7 @@ fn bad_request(code: i64, message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": code, "message": message } }))).into_response()
 }
 
-pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn endpoint(State(app): State<Shared>, Org(org): Org, headers: HeaderMap, body: Bytes) -> Response {
     let context = match context_of(&headers) {
         Ok(c) => c,
         Err(m) => return bad_request(-32600, &m),
@@ -171,7 +182,7 @@ pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes
         return StatusCode::ACCEPTED.into_response();
     };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(&app, context, &method, params).await {
+    match dispatch(&app, &org, context, &method, params).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err(Fail::Rpc(code, message)) => {
             Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })).into_response()
@@ -180,7 +191,7 @@ pub async fn endpoint(State(app): State<Shared>, headers: HeaderMap, body: Bytes
     }
 }
 
-async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, params: Value) -> Result<Value, Fail> {
+async fn dispatch(app: &Shared, org: &str, context: Option<SecurityContext>, method: &str, params: Value) -> Result<Value, Fail> {
     match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
@@ -192,12 +203,12 @@ async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, 
             )
             .trim()
             .to_string();
-            say!("zsqld: mcp: connected: {client}");
+            tracing::info!("mcp: connected: {client}");
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "0sql", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, catalog(app)),
+                "instructions": format!("{}\n\n{}", app.mcp.prompts.instructions, catalog(app, org)),
             }))
         }
         "ping" => Ok(json!({})),
@@ -205,7 +216,7 @@ async fn dispatch(app: &Shared, context: Option<SecurityContext>, method: &str, 
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            call(app, context, name, args).await
+            call(app, org, context, name, args).await
         }
         _ => Err(Fail::Rpc(METHOD_NOT_FOUND, format!("no method {method}"))),
     }
@@ -227,9 +238,10 @@ const CATALOG_BYTES: usize = 48 * 1024;
 /// where the table says which thing they describe. Deterministic, so the
 /// text is byte-identical from one connection to the next and a client's
 /// prompt cache can hold it.
-fn catalog(app: &App) -> String {
-    let mut deployed: Vec<Arc<Model>> = read(&app.models).values().cloned().collect();
-    deployed.sort_by(|a, b| (&a.uid, &a.branch).cmp(&(&b.uid, &b.branch)));
+fn catalog(app: &App, org: &str) -> String {
+    // One org's, by project and branch: an agent connected for one org
+    // is told nothing of another's.
+    let deployed = app.of_org(org);
     if deployed.is_empty() {
         return "No branch is deployed yet.".into();
     }
@@ -243,14 +255,14 @@ fn catalog(app: &App) -> String {
     }
     let mut short = String::from("# Deployed branches\nToo many fields to list here; call fields with q to find them.\n");
     for d in &deployed {
-        let s = d.universe().snapshot();
+        let s = d.semantic().snapshot();
         short.push_str(&format!("- {}/{}: {} tables, {} fields\n", d.uid, d.branch, s.tables.len(), s.fields.len()));
     }
     short
 }
 
 fn branch_catalog(d: &Model) -> String {
-    let u = d.universe();
+    let u = d.semantic();
     let s = u.snapshot();
     // Field id to the uids of the tables carrying it, sorted.
     let mut tables_of: HashMap<i64, Vec<String>> = HashMap::new();
@@ -322,6 +334,18 @@ fn branch_catalog(d: &Model) -> String {
 
 // ------------------------------------------------------------------ tools
 
+/// The tools that run a statement, exposed only when named.
+const RUNS: [&str; 2] = ["run", "result"];
+
+/// Rows in a tool's answer when it does not say, and the most it may
+/// ask for: a model reads every one of them.
+const TOOL_PAGE: u64 = 200;
+const TOOL_PAGE_MAX: u64 = 1_000;
+
+/// How long a tool waits for rows: short of the deadline a request to
+/// this endpoint has.
+const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The tools, as the client lists them. Every schema refuses unknown
 /// properties, so a `context` can be reported for what it is rather
 /// than silently dropped.
@@ -359,6 +383,18 @@ fn tools(settings: &Settings) -> Vec<Value> {
                 "inputSchema": schema(&[&target, &spec_arg, &json!({ "q": { "type": "string", "description": "keep fields whose name, uid or synonyms contain or come near this" } })], &["project", "spec"], "a query to extend", true) }),
         json!({ "name": "sql", "description": describe("sql"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
         json!({ "name": "explain", "description": describe("explain"), "inputSchema": schema(&[&target, &spec_arg], &["project", "spec"], "a query spec", true) }),
+        json!({ "name": "run", "description": describe("run"),
+                "inputSchema": schema(&[&target, &spec_arg, &json!({
+                    "fresh": { "type": "boolean", "description": "run even though a stored result would answer" },
+                    "offset": { "type": "integer", "description": "rows to skip" },
+                    "limit": { "type": "integer", "description": "rows to return, 200 when omitted and 1000 at most" } })],
+                    &["project", "spec"], "a query spec to run", true) }),
+        json!({ "name": "result", "description": describe("result"),
+                "inputSchema": schema(&[&json!({
+                    "id": { "type": "string", "description": "the id a run answered with" },
+                    "offset": { "type": "integer", "description": "rows to skip" },
+                    "limit": { "type": "integer", "description": "rows to return, 200 when omitted and 1000 at most" } })],
+                    &["id"], "which result, and which of its rows", false) }),
     ];
     all.into_iter().filter(|t| settings.exposed(t["name"].as_str().unwrap_or(""))).collect()
 }
@@ -405,6 +441,45 @@ struct ValuesArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RunArgs {
+    project: String,
+    #[serde(default)]
+    branch: Option<String>,
+    spec: Value,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultArgs {
+    id: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// The rows a tool asked for: fewer than a request may, by default and
+/// at most.
+fn tool_page(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u64), ApiError> {
+    let limit = limit.unwrap_or(TOOL_PAGE);
+    if limit > TOOL_PAGE_MAX {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid",
+            format!("limit is at most {TOOL_PAGE_MAX} rows for a tool; ask for the next page with offset"),
+        ));
+    }
+    crate::exec::page_of(offset, Some(limit))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryArgs {
     project: String,
     #[serde(default)]
@@ -430,17 +505,17 @@ fn args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, Fail> {
 /// The branch a tool works on: the one named, else the one branch of
 /// the project that is deployed, else, among several, the project's
 /// production branch as its own project.yml names it.
-fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
+fn branch_for(app: &App, org: &str, uid: &str, branch: Option<String>) -> Result<String, ApiError> {
     if let Some(b) = branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()) {
         return Ok(b);
     }
     check_uid(uid)?;
-    let models = read(&app.models);
-    let of_project: Vec<&Arc<Model>> = models.values().filter(|d| d.uid == uid).collect();
+    let models = app.of_org(org);
+    let of_project: Vec<&Arc<Model>> = models.iter().filter(|d| d.uid == uid).collect();
     match of_project.as_slice() {
         [] => Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no project {uid}"))),
         [one] => Ok(one.branch.clone()),
-        several => several.iter().find(|d| d.universe().snapshot().branch.uid == d.branch).map(|d| d.branch.clone()).ok_or_else(|| {
+        several => several.iter().find(|d| d.semantic().snapshot().branch.uid == d.branch).map(|d| d.branch.clone()).ok_or_else(|| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 "Invalid",
@@ -454,8 +529,22 @@ fn branch_for(app: &App, uid: &str, branch: Option<String>) -> Result<String, Ap
 /// admitted this request as a plan: take an explore seat too.
 async fn admit_explore(app: &App) -> Result<Held, Fail> {
     match app.admission.admit(Class::Explore).await {
-        Ok(p) => Ok(Held(Arc::new(p))),
+        Ok(p) => Ok(Held::new(p)),
         Err(secs) => Err(Fail::Http(busy(secs, Class::Explore))),
+    }
+}
+
+/// The tools that run a statement mostly wait on a warehouse, and the
+/// guard admitted this request as a plan: take a seat among the runs,
+/// and give the plan's back, so twenty seconds of waiting does not hold
+/// a seat meant for a plan that takes microseconds.
+async fn admit_run(app: &App) -> Result<Held, Fail> {
+    match app.admission.admit(Class::Run).await {
+        Ok(p) => {
+            crate::guard::release_seat();
+            Ok(Held::new(p))
+        }
+        Err(secs) => Err(Fail::Http(busy(secs, Class::Run))),
     }
 }
 
@@ -464,7 +553,7 @@ async fn admit_explore(app: &App) -> Result<Held, Fail> {
 /// refusal then carries the search the client would otherwise make
 /// next, so a spec written from the request's own words costs one
 /// round trip when it is right and still only two when it is not.
-fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiError {
+fn with_candidates(app: &Shared, org: &str, uid: &str, branch: &str, e: ApiError) -> ApiError {
     let ApiError(status, class, message) = e;
     if class != "FieldNotFound" && class != "FieldAmbiguous" {
         return ApiError(status, class, message);
@@ -474,7 +563,7 @@ fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiErr
     if term.is_empty() || term.len() > 200 {
         return ApiError(status, class, message);
     }
-    let found = fields_of(app, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
+    let found = fields_of(app, org, uid, branch, FieldsQuery { q: term.clone(), hidden: false });
     let Ok(found) = found else { return ApiError(status, class, message) };
     let mut lines = Vec::new();
     for f in found["fields"].as_array().into_iter().flatten().take(8) {
@@ -496,14 +585,14 @@ fn with_candidates(app: &Shared, uid: &str, branch: &str, e: ApiError) -> ApiErr
     ApiError(status, class, format!("{message}\nFields near '{term}', by uid:\n{}", lines.join("\n")))
 }
 
-async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, arguments: Value) -> Result<Value, Fail> {
+async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &str, arguments: Value) -> Result<Value, Fail> {
     if !app.mcp.exposed(name) {
         return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}")));
     }
     let answer: Result<Value, ApiError> = match name {
         "list_projects" => {
             let a: ListArgs = args(arguments)?;
-            projects_of(app, a.q.as_deref().unwrap_or(""))
+            projects_of(app, org, a.q.as_deref().unwrap_or(""))
         }
         "fields" => {
             let a: FieldsArgs = args(arguments)?;
@@ -514,7 +603,7 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                 // one initialize carries. One call is all the discovery a
                 // question needs, and a client that cut the instructions
                 // short gets it here in full.
-                let text = branch_for(app, &a.project, a.branch).and_then(|b| Ok(branch_catalog(&*app.model(&a.project, &b)?)));
+                let text = branch_for(app, org, &a.project, a.branch).and_then(|b| Ok(branch_catalog(&*app.model(org, &a.project, &b)?)));
                 return Ok(match text {
                     Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "catalog": text } }),
                     Err(ApiError(status, class, message)) => {
@@ -522,21 +611,23 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                     }
                 });
             }
-            branch_for(app, &a.project, a.branch).and_then(|b| fields_of(app, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| fields_of(app, org, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| tables_of(app, &a.project, &b, a.q.as_deref().unwrap_or("")))
+            branch_for(app, org, &a.project, a.branch).and_then(|b| tables_of(app, org, &a.project, &b, a.q.as_deref().unwrap_or("")))
         }
         "values" => {
             let a: ValuesArgs = args(arguments)?;
-            branch_for(app, &a.project, a.branch).and_then(|b| values_of(app, &a.project, &b, &a.dimension, a.q.as_deref().unwrap_or("")))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| values_of(app, org, &a.project, &b, &a.dimension, a.q.as_deref().unwrap_or("")))
         }
         "explore" => {
             let a: QueryArgs = args(arguments)?;
             let _seat = admit_explore(app).await?;
-            branch_for(app, &a.project, a.branch)
-                .and_then(|b| explore_of(app, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context, q: a.q }))
+            branch_for(app, org, &a.project, a.branch)
+                .and_then(|b| explore_of(app, org, &a.project, &b, ExploreRequest { spec: Some(a.spec), expr: None, context, q: a.q }))
                 .map(|r| serde_json::to_value(r).expect("an explore answer serializes"))
         }
         "sql" | "explain" => {
@@ -545,14 +636,34 @@ async fn call(app: &Shared, context: Option<SecurityContext>, name: &str, argume
                 return Err(Fail::Rpc(INVALID_PARAMS, "arguments: q is for explore".into()));
             }
             let req = SqlRequest { spec: Some(a.spec), expr: None, context };
-            branch_for(app, &a.project, a.branch).and_then(|b| {
+            branch_for(app, org, &a.project, a.branch).and_then(|b| {
                 let planned = if name == "sql" {
-                    sql_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    sql_of(app, org, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 } else {
-                    explain_of(app, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
+                    explain_of(app, org, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 };
-                planned.map_err(|e| with_candidates(app, &a.project, &b, e))
+                planned.map_err(|e| with_candidates(app, org, &a.project, &b, e))
             })
+        }
+        "run" => {
+            let a: RunArgs = args(arguments)?;
+            let _seat = admit_run(app).await?;
+            match (branch_for(app, org, &a.project, a.branch), tool_page(a.offset, a.limit)) {
+                (Ok(branch), Ok(page)) => {
+                    let asked =
+                        crate::exec::ToolRun { org: org.to_string(), uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
+                    crate::exec::run_for_tool(app, asked, TOOL_WAIT, page).await
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        "result" => {
+            let a: ResultArgs = args(arguments)?;
+            let _seat = admit_run(app).await?;
+            match tool_page(a.offset, a.limit) {
+                Ok(page) => crate::exec::result_for_tool(app, org, a.id, TOOL_WAIT, page).await,
+                Err(e) => Err(e),
+            }
         }
         _ => return Err(Fail::Rpc(INVALID_PARAMS, format!("no tool {name}"))),
     };

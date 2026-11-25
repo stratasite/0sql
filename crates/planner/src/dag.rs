@@ -2,7 +2,7 @@
 //! or a Merge over other nodes), edges are inputs. Component wrappers
 //! (`Projected`, `Filtered`) carry node-local state over shared records.
 
-use crate::model::{field_to_s, RFilter, RProjection};
+use crate::resolved::{field_identity, ResolvedFilter, ResolvedProjection};
 use crate::universe::{Base, Model, Subtree};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -56,13 +56,13 @@ impl NodeKind {
 /// A projection as one node renders it.
 #[derive(Debug, Clone)]
 pub struct Projected<'a> {
-    pub proj: Rc<RProjection<'a>>,
+    pub proj: Rc<ResolvedProjection<'a>>,
     pub alias: String,
     pub local_decorators: Vec<Decorator>,
 }
 
 impl<'a> Projected<'a> {
-    pub fn new(proj: Rc<RProjection<'a>>) -> Self {
+    pub fn new(proj: Rc<ResolvedProjection<'a>>) -> Self {
         let alias = proj.alias();
         Projected { proj, alias, local_decorators: vec![] }
     }
@@ -81,22 +81,22 @@ impl<'a> Projected<'a> {
     pub fn decorators(&self) -> Vec<&Decorator> {
         self.proj.def.decorators.iter().chain(self.local_decorators.iter()).collect()
     }
-    pub fn to_s(&self) -> String {
-        self.proj.to_s()
+    pub fn identity(&self) -> String {
+        self.proj.identity()
     }
 }
 
 /// A filter as one node applies it; values may be overridden node-locally.
 #[derive(Debug, Clone)]
 pub struct Filtered<'a> {
-    pub filter: Rc<RFilter<'a>>,
+    pub filter: Rc<ResolvedFilter<'a>>,
     pub filter_value: Option<String>,
     pub filter_value_end: Option<String>,
     pub predicate: Predicate,
 }
 
 impl<'a> Filtered<'a> {
-    pub fn new(filter: Rc<RFilter<'a>>) -> Self {
+    pub fn new(filter: Rc<ResolvedFilter<'a>>) -> Self {
         let filter_value = filter.def.filter_value.clone();
         let filter_value_end = filter.def.filter_value_end.clone();
         let predicate = filter.def.predicate;
@@ -118,15 +118,15 @@ impl<'a> Filtered<'a> {
         self.filter.is_date()
     }
     /// Rails `Filtered#to_s`; part of node identity.
-    pub fn to_s(&self) -> String {
-        format!("<f:{}:{}:{}>", field_to_s(self.field()), self.predicate.name(), self.filter_value.clone().unwrap_or_default())
+    pub fn identity(&self) -> String {
+        format!("<f:{}:{}:{}>", field_identity(self.field()), self.predicate.name(), self.filter_value.clone().unwrap_or_default())
     }
 }
 
 /// What a reference stands for.
 #[derive(Debug, Clone)]
 pub enum Entity<'a> {
-    Proj(Rc<RProjection<'a>>),
+    Proj(Rc<ResolvedProjection<'a>>),
     Field(&'a Field),
 }
 
@@ -144,7 +144,7 @@ impl<'a> Entity<'a> {
 #[derive(Debug, Clone)]
 pub enum MultiExpr<'a> {
     Semantic(&'a Expression),
-    Calc(Rc<RProjection<'a>>),
+    Calc(Rc<ResolvedProjection<'a>>),
 }
 
 impl<'a> MultiExpr<'a> {
@@ -171,7 +171,7 @@ impl<'a> MultiExpr<'a> {
 pub enum Reference<'a> {
     Table { entity: Entity<'a>, expression: &'a Expression, table: &'a Table, greedy: Vec<&'a Expression> },
     Node { entity: Entity<'a>, node: NodeId },
-    Proj { proj: Rc<RProjection<'a>> },
+    Proj { proj: Rc<ResolvedProjection<'a>> },
     Multi { entity: Entity<'a>, expression: Option<MultiExpr<'a>>, sources: Vec<Reference<'a>> },
 }
 
@@ -230,7 +230,7 @@ pub enum StrategyKind<'a> {
 #[derive(Debug)]
 pub struct Owner {
     pub sid: usize,
-    pub tree: crate::model::FilledTree,
+    pub tree: crate::resolved::FilledTree,
     pub identity: String,
 }
 
@@ -292,8 +292,8 @@ impl<'a> Node<'a> {
     pub fn with_universe(
         kind: NodeKind,
         universe: Arc<Base<'a>>,
-        projections: Vec<Rc<RProjection<'a>>>,
-        filters: Vec<Rc<RFilter<'a>>>,
+        projections: Vec<Rc<ResolvedProjection<'a>>>,
+        filters: Vec<Rc<ResolvedFilter<'a>>>,
     ) -> Self {
         let mut n = Node::bare(kind, projections, filters);
         n.universe = Some(universe);
@@ -301,14 +301,14 @@ impl<'a> Node<'a> {
         n
     }
 
-    pub fn merge(projections: Vec<Rc<RProjection<'a>>>, filters: Vec<Rc<RFilter<'a>>>, join_type: String) -> Self {
+    pub fn merge(projections: Vec<Rc<ResolvedProjection<'a>>>, filters: Vec<Rc<ResolvedFilter<'a>>>, join_type: String) -> Self {
         let mut n = Node::bare(NodeKind::Merge, projections, filters);
         n.join_type = join_type;
         n.should_group_by = Some(false);
         n
     }
 
-    fn bare(kind: NodeKind, projections: Vec<Rc<RProjection<'a>>>, filters: Vec<Rc<RFilter<'a>>>) -> Self {
+    fn bare(kind: NodeKind, projections: Vec<Rc<ResolvedProjection<'a>>>, filters: Vec<Rc<ResolvedFilter<'a>>>) -> Self {
         Node {
             id: 0,
             kind,
@@ -337,7 +337,7 @@ impl<'a> Node<'a> {
 
     /// The node's statement with any strategy-imposed limit, rendered the
     /// way this dialect takes one.
-    pub fn final_sql(&self, dialect: &zsql_dialect::Dialect) -> Result<String, zsql_dialect::DialectError> {
+    pub fn final_sql(&self, dialect: &zsql_dialect::Dialect) -> Result<String, zsql_dialect::Error> {
         let s = self.sql.borrow().clone().unwrap_or_default();
         match self.limit.borrow().as_ref() {
             Some(n) => dialect.apply_limit(&s, 0, n),
@@ -378,13 +378,13 @@ impl<'a> Node<'a> {
     }
 
     /// Rails `Node#replace`: a new wrapper in the old one's seat.
-    pub fn replace_projection(&mut self, pid: usize, with: Rc<RProjection<'a>>) {
+    pub fn replace_projection(&mut self, pid: usize, with: Rc<ResolvedProjection<'a>>) {
         if let Some(i) = self.projections.iter().position(|p| p.proj.pid == pid) {
             self.projections[i] = Projected::new(with);
         }
     }
 
-    pub fn add_projection(&mut self, proj: Rc<RProjection<'a>>) {
+    pub fn add_projection(&mut self, proj: Rc<ResolvedProjection<'a>>) {
         if !self.has_proj(proj.pid) {
             self.projections.push(Projected::new(proj));
         }
@@ -392,13 +392,13 @@ impl<'a> Node<'a> {
 
     /// Rails `Dag::Query#expression`: the field's expression on the cheapest
     /// path of the subtree holding it, adding the path when none does.
-    pub fn expression(&mut self, universe: &'a zsql_semantic::Universe, field: &'a Field) -> crate::Result<&'a Expression> {
-        let base = self.universe.clone().ok_or_else(|| crate::PlanError::Resolution("node has no universe".into()))?;
+    pub fn expression(&mut self, universe: &'a zsql_semantic::SemanticModel, field: &'a Field) -> crate::Result<&'a Expression> {
+        let base = self.universe.clone().ok_or_else(|| crate::Error::Resolution("node has no universe".into()))?;
         let path = match self.subtrees.iter().find(|t| t.paths.iter().any(|p| p.field_id == field.id)) {
             Some(t) => t.path_for(field.id).expect("subtree holds field"),
             None => {
                 let path = base.path_for(field.id).ok_or_else(|| {
-                    crate::PlanError::Resolution(format!("Could not find table or path for {} with id: {}.", field_to_s(field), field.id))
+                    crate::Error::Resolution(format!("Could not find table or path for {} with id: {}.", field_identity(field), field.id))
                 })?;
                 match self.subtrees.iter_mut().find(|t| t.join_path == path.joins) {
                     Some(t) => t.push(path),
@@ -408,9 +408,9 @@ impl<'a> Node<'a> {
             }
         };
         universe.expression_for(path.target_table_id, field.id).ok_or_else(|| {
-            crate::PlanError::Resolution(format!(
+            crate::Error::Resolution(format!(
                 "Could not find expression for {} in the the target table {}.",
-                field_to_s(field),
+                field_identity(field),
                 path.target_table_id
             ))
         })
@@ -514,9 +514,9 @@ impl<'a> Node<'a> {
     }
 
     /// Rails `Node#to_s`, the string every alias hashes from.
-    pub fn to_s(&self, graph: &Graph<'a>) -> String {
-        let projections: Vec<String> = self.projections.iter().map(|p| format!("{} -> {}", p.to_s(), p.alias)).collect();
-        let mut filters: Vec<String> = self.filters.iter().map(|f| f.to_s()).collect();
+    pub fn identity(&self, graph: &Graph<'a>) -> String {
+        let projections: Vec<String> = self.projections.iter().map(|p| format!("{} -> {}", p.identity(), p.alias)).collect();
+        let mut filters: Vec<String> = self.filters.iter().map(|f| f.identity()).collect();
         filters.sort();
         let mut s =
             format!("{} \nprojections: \n\t{} \nfilters: \n\t{}", self.kind.class_name(), projections.join("\n\t"), filters.join("\n\t"));
@@ -525,7 +525,7 @@ impl<'a> Node<'a> {
         }
         match self.kind {
             NodeKind::Query | NodeKind::Aggregation => {
-                let mut subs: Vec<String> = self.subtrees.iter().map(|t| t.to_s()).collect();
+                let mut subs: Vec<String> = self.subtrees.iter().map(|t| t.identity()).collect();
                 subs.sort();
                 s.push_str("\nsubtrees:  \n\t");
                 s.push_str(&subs.join(" \n\t"));
@@ -540,10 +540,10 @@ impl<'a> Node<'a> {
         s
     }
 
-    /// Rails `Node#alias`: temp table prefix, node prefix, md5 of `to_s`.
+    /// Rails `Node#alias`: temp table prefix, node prefix, md5 of `identity`.
     /// A node imported from a segment is prefixed `seg` whatever its kind.
     pub fn alias(&self, graph: &Graph<'a>) -> String {
-        let digest = md5::compute(self.to_s(graph).as_bytes());
+        let digest = md5::compute(self.identity(graph).as_bytes());
         let prefix = if self.owner.is_some() { "seg" } else { self.kind.prefix() };
         format!("{}{}{:x}", graph.dialect.temp_table_prefix(), prefix, digest)
     }
@@ -566,7 +566,7 @@ impl<'a> Node<'a> {
                 -(n.projections.len() as i64),
                 cost,
                 first_measure,
-                n.to_s(graph),
+                n.identity(graph),
             )
         });
         ins
@@ -574,7 +574,7 @@ impl<'a> Node<'a> {
 
     /// Rails `Node#from_clause_join_defs`: the joins the FROM walks, most
     /// expensive first, unique.
-    pub fn from_clause_join_defs(&self, universe: &'a zsql_semantic::Universe) -> Vec<&'a zsql_semantic::JoinDef> {
+    pub fn from_clause_join_defs(&self, universe: &'a zsql_semantic::SemanticModel) -> Vec<&'a zsql_semantic::JoinDef> {
         let mut jds: Vec<&zsql_semantic::JoinDef> =
             self.subtrees.iter().flat_map(|s| s.join_path.iter()).filter_map(|j| universe.join(*j)).collect();
         jds.sort_by_cached_key(|j| {

@@ -9,11 +9,7 @@ use std::process::Command;
 
 fn zsql(home: &Path, project: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zsql"));
-    cmd.env("ZSQL_HOME", home)
-        .env_remove("ZSQL_SERVER")
-        .env_remove("ZSQL_API_KEY")
-        .env_remove("ZSQL_RESULTS")
-        .env_remove("ZSQL_RESULTS_DIR");
+    cmd.env("ZSQL_HOME", home).env_remove("ZSQL_SERVER").env_remove("ZSQL_RESULTS").env_remove("ZSQL_RESULTS_DIR");
     cmd.current_dir(project);
     cmd
 }
@@ -58,6 +54,32 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     assert!(out.contains("paid") && out.contains("21.75"), "rows: {out}");
     assert!(out.contains('∅'), "a null status is shown as such: {out}");
     assert!(err.contains("3 rows (complete)") && err.contains("local (sqlite)"), "the footer: {err}");
+
+    // The log is not the output. Unasked, a command logs nothing; asked,
+    // it says what happened on stderr and prints exactly what it printed.
+    assert!(!err.contains("zsql: "), "nothing was logged: {err}");
+    let (ok, loud, log) = run(zsql(&home, &project).args(["-vv", "run", "--expr", "status, total"]));
+    assert!(ok, "{loud}{log}");
+    assert_eq!(loud, out, "the rows are the rows, logged or not");
+    assert!(log.contains("zsql: debug: zsql_exec") && log.contains("answered from a stored result"), "{log}");
+    assert!(log.contains("datasource=local"), "an event carries its fields: {log}");
+    let (ok, _, log) = run(zsql(&home, &project).env("ZSQL_LOG", "zsql=debug").args(["run", "--expr", "status, total", "--fresh"]));
+    assert!(ok, "{log}");
+    assert!(log.contains("a datasource was opened") && log.contains("adapter=sqlite"), "{log}");
+    assert!(log.contains("a statement ran") && log.contains("transport=native") && log.contains("rows=3"), "{log}");
+    let (ok, _, log) =
+        run(zsql(&home, &project).env("ZSQL_LOG", "zsql=debug").env("ZSQL_LOG_FORMAT", "json").args(["run", "--expr", "status, total"]));
+    assert!(ok, "{log}");
+    let event: serde_json::Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &serde_json::Value| v["target"].as_str().is_some_and(|t| t.starts_with("zsql_exec")))
+        .expect("a JSON line from zsql_exec");
+    assert_eq!((event["level"].as_str(), event["datasource"].as_str()), (Some("debug"), Some("local")), "{event}");
+    // A level nobody could mean is refused, not read as silence.
+    let refused = zsql(&home, &project).args(["--log", "inf", "check"]).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("is not a log filter"), "{}", String::from_utf8_lossy(&refused.stderr));
     assert!(!err.contains("cached"), "{err}");
     let id = err.split(" · ").find(|p| p.trim().starts_with("r-")).map(|p| p.trim().to_string()).expect("an id in the footer");
     let results = home.join("results").join("shop");

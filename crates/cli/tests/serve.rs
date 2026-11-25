@@ -251,15 +251,70 @@ fn inside_a_project_it_serves_that_project_and_minus_r_reaches_it() {
 
     let (status, _) = s.stop();
     assert!(status.success());
-    let branch = data.join("grocery-store/main");
+    let branch = data.join("default/grocery-store/main");
     assert!(branch.join("snapshot.json.gz").exists() && branch.join("tests.json").exists());
-    let names: Vec<String> =
-        std::fs::read_dir(data.join("grocery-store")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    let names: Vec<String> = std::fs::read_dir(data.join("default/grocery-store"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
     assert_eq!(names, vec!["main"]);
 }
 
+/// A project that names an org in project.yml is deployed under it and
+/// asked for under it, with no flag; `--org` asks another org, which
+/// has nothing of this one's.
+#[cfg(unix)]
 #[test]
-fn a_bind_beyond_the_loopback_needs_a_deploy_token_or_to_be_meant() {
+fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
+    let root = Scratch::new("org");
+    let project = root.path("grocery-store");
+    copy_dir(&fixture(), &project);
+    let yml = project.join("project.yml");
+    std::fs::write(&yml, format!("{}\norg: acme\n", std::fs::read_to_string(&yml).unwrap().trim_end())).unwrap();
+    let data = root.path("data");
+    let s = Server::start(&project, &root.path("home"), &["--data-dir", data.to_str().unwrap()]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !get(&s.addr, "/orgs/acme/projects").1.contains("\"grocery-store\"") {
+        assert!(std::time::Instant::now() < deadline, "the project was not deployed under its org");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!get(&s.addr, "/projects").1.contains("grocery-store"), "the default org has none of it");
+
+    let run = |args: &[&str]| {
+        zsql()
+            .args(args)
+            .current_dir(&project)
+            .env("ZSQL_HOME", root.path("home"))
+            .env("ZSQL_SERVER", format!("http://{}", s.addr))
+            .output()
+            .unwrap()
+    };
+    let said = |o: &std::process::Output| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let local = run(&["sql", "--json", "--expr", "department, sales value"]);
+    let remote = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"]);
+    assert!(local.status.success() && remote.status.success(), "{}\n{}", said(&local), said(&remote));
+    assert_eq!(String::from_utf8_lossy(&local.stdout), String::from_utf8_lossy(&remote.stdout));
+    assert!(said(&run(&["list"])).contains("grocery-store"));
+    let none = run(&["list", "--org", "default"]);
+    assert!(none.status.success() && !said(&none).contains("grocery-store"), "{}", said(&none));
+    let elsewhere = run(&["status", "-r", "--branch", "main", "--org", "globex"]);
+    assert!(!elsewhere.status.success() && said(&elsewhere).contains("in org globex"), "{}", said(&elsewhere));
+
+    let (status, _) = s.stop();
+    assert!(status.success());
+    assert!(data.join("acme/grocery-store/main/snapshot.json.gz").exists());
+    assert!(data.join("default").is_dir(), "the default org's directory is made at startup");
+    assert_eq!(std::fs::read_dir(data.join("default")).unwrap().count(), 0);
+}
+
+/// The server asks nobody who they are, so a bind beyond this machine
+/// has to be meant. Meant, it deploys its own project and takes a
+/// deploy and a removal from whoever reaches it, with nothing sent to
+/// say who they are: that is for the service in front to decide.
+#[cfg(unix)]
+#[test]
+fn a_bind_beyond_the_loopback_has_to_be_meant_and_then_anyone_who_reaches_it_deploys() {
     let root = Scratch::new("open");
     let out = zsql()
         .args(["serve", "--bind", "0.0.0.0:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
@@ -268,85 +323,53 @@ fn a_bind_beyond_the_loopback_needs_a_deploy_token_or_to_be_meant() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--open") && err.contains("ZSQL_DEPLOY_TOKEN"), "{err}");
-}
-
-/// A server told to keep accounts does not come up as one with none.
-#[test]
-fn a_server_asked_for_accounts_refuses_to_start_without_them() {
-    let root = Scratch::new("retired");
+    assert!(err.contains("--open") && err.contains("ZSQL_OPEN") && err.contains("anyone who reaches it"), "{err}");
+    // The variable says the same as the flag, and a no is a no.
     let out = zsql()
-        .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+        .args(["serve", "--bind", "0.0.0.0:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
         .env("ZSQL_HOME", root.path("home"))
-        .env("ZSQL_ACCOUNTS", "on")
+        .env("ZSQL_OPEN", "0")
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("ZSQL_ACCOUNTS") && err.contains("ZSQL_DEPLOY_TOKEN"), "{err}");
-    assert!(!root.path("data/lock").exists(), "it stopped before it took the data directory");
-}
+    assert_eq!(out.status.code(), Some(1), "ZSQL_OPEN=0 does not open it");
 
-/// With a deploy token the server may listen beyond the loopback, it
-/// deploys its own project with its own token, reads stay open, and
-/// `zsql deploy` and `zsql remove` work for whoever holds the token
-/// and for nobody else.
-#[cfg(unix)]
-#[test]
-fn the_deploy_token_keeps_deploys_to_whoever_holds_it() {
-    const TOKEN: &str = "zdt_the-token-of-this-test";
-    let root = Scratch::new("token");
     let project = root.path("grocery-store");
     copy_dir(&fixture(), &project);
     let data = root.path("data");
+    // A token in the environment, left from a server that took one, changes nothing.
     let s = Server::start_with(
         &project,
         &root.path("home"),
         &["--bind", "0.0.0.0:0", "--data-dir", data.to_str().unwrap()],
-        &[("ZSQL_DEPLOY_TOKEN", TOKEN)],
+        &[("ZSQL_OPEN", "1"), ("ZSQL_DEPLOY_TOKEN", "zdt_left-over")],
     );
     let addr = format!("127.0.0.1:{}", s.addr.rsplit(':').next().unwrap());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !get(&addr, "/projects").1.contains("\"grocery-store\"") {
-        assert!(std::time::Instant::now() < deadline, "the server did not deploy its own project with its own token");
+        assert!(std::time::Instant::now() < deadline, "the server did not deploy its own project");
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    let run = |args: &[&str], key: Option<&str>| {
-        let mut cmd = zsql();
-        cmd.args(args).current_dir(&project).env("ZSQL_HOME", root.path("home")).env("ZSQL_SERVER", format!("http://{addr}"));
-        if let Some(k) = key {
-            cmd.env("ZSQL_API_KEY", k);
-        }
-        cmd.output().unwrap()
+    let run = |args: &[&str]| {
+        zsql()
+            .args(args)
+            .current_dir(&project)
+            .env("ZSQL_HOME", root.path("home"))
+            .env("ZSQL_SERVER", format!("http://{addr}"))
+            .output()
+            .unwrap()
     };
-    // Reads need nothing.
-    let read = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"], None);
+    let read = run(&["sql", "--json", "--branch", "main", "-r", "--expr", "department, sales value"]);
     assert!(read.status.success(), "{}", String::from_utf8_lossy(&read.stderr));
-
-    // A deploy without the token, and with a wrong one, is refused and says what is wanted.
-    for key in [None, Some("zdt_not-it")] {
-        let out = run(&["deploy", "--branch", "staging"], key);
-        assert!(!out.status.success(), "a deploy with {key:?} went through");
-        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(said.contains("deploy token"), "{said}");
-    }
-    assert!(!get(&addr, "/projects").1.contains("\"staging\""));
-
-    // With it, the deploy lands and the removal takes it away again.
-    let out = run(&["deploy", "--branch", "staging"], Some(TOKEN));
+    let out = run(&["deploy", "--branch", "staging"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(get(&addr, "/projects").1.contains("\"staging\""));
-    let out = run(&["remove", "--branch", "staging", "--yes"], None);
-    assert!(!out.status.success(), "a removal without the token went through");
-    let out = run(&["remove", "--branch", "staging", "--yes"], Some(TOKEN));
+    let out = run(&["remove", "--branch", "staging", "--yes"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!get(&addr, "/projects").1.contains("\"staging\""));
 
     let (status, said) = s.stop();
     assert!(status.success());
-    assert!(said.contains("deploys need the deploy token"), "{said}");
-    assert!(!said.contains(TOKEN), "the token is never logged:\n{said}");
+    assert!(!said.contains("token") && !said.contains("zdt_left-over"), "nothing about a token is said or kept:\n{said}");
 }
 
 /// The background form: start records where it listens (a bind of
@@ -447,6 +470,119 @@ fn the_background_server_starts_reports_and_stops() {
 /// variable is honored when no flag names the setting, and a flag
 /// wins over its variable.
 #[cfg(unix)]
+/// The background server is found where it listens whatever its log was
+/// told: the address is read from the line it logs, or, when the log is
+/// quieter than that line or is JSON, from the lock it writes.
+#[test]
+fn a_background_server_is_found_whatever_its_log_says() {
+    for (name, variable, value) in [("quiet", "ZSQL_LOG", "warn"), ("json", "ZSQL_LOG_FORMAT", "json")] {
+        let root = Scratch::new(&format!("log-{name}"));
+        let home = root.path("home");
+        let run = |args: &[&str]| zsql().args(args).current_dir(&root.0).env("ZSQL_HOME", &home).env(variable, value).output().unwrap();
+        let started = std::time::Instant::now();
+        let out = run(&["server", "start", "--bind", "127.0.0.1:0", "--no-project"]);
+        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let addr = said.split(" on ").nth(1).and_then(|rest| rest.split(';').next()).unwrap_or_default().to_string();
+        assert!(addr.starts_with("127.0.0.1:") && !addr.ends_with(":0"), "{name}: the port it was given, not the one asked for: {said}");
+        assert!(started.elapsed() < Duration::from_secs(8), "{name}: found, not waited out: {:?}", started.elapsed());
+        assert!(get(&addr, "/healthz").0 == 200, "{name}: and it answers there");
+
+        let log = std::fs::read_to_string(home.join("server.log")).unwrap_or_default();
+        match name {
+            "quiet" => assert!(!log.contains("listening on"), "the line was not logged, so the lock answered: {log}"),
+            _ => {
+                let lines: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).expect("every line is JSON")).collect();
+                assert!(
+                    lines
+                        .iter()
+                        .any(|v| v["level"] == "info" && v["message"].as_str().is_some_and(|m| m.starts_with("listening on http://"))),
+                    "{log}"
+                );
+            }
+        }
+        let out = run(&["server", "stop"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("stopped process"), "{name}: {}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
+/// A server told to keep its records in a database says what it still
+/// needs, or why it could not reach it, and does not come up keeping
+/// them somewhere else.
+#[test]
+fn a_database_for_the_records_is_all_there_or_the_server_does_not_start() {
+    let root = Scratch::new("db");
+    let serve = |env: &[(&str, &str)]| {
+        let mut cmd = zsql();
+        cmd.args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+            .env("ZSQL_HOME", root.path("home"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, err) = serve(&[("ZSQL_DB", "db.internal/zsql")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB_USER"), "{err}");
+    let (code, err) = serve(&[("ZSQL_DB", "db.internal/zsql"), ("ZSQL_DB_USER", "zsql")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB_PASSWORD"), "{err}");
+    let (code, err) = serve(&[("ZSQL_DB", "ada:pw@db.internal/zsql"), ("ZSQL_DB_USER", "zsql"), ("ZSQL_DB_PASSWORD", "s3cret")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB carries no user or password") && !err.contains("s3cret"), "{err}");
+    // Nothing listens there: the server says so and stops.
+    let (code, err) = serve(&[("ZSQL_DB", "127.0.0.1:1/zsql?sslmode=disable"), ("ZSQL_DB_USER", "zsql"), ("ZSQL_DB_PASSWORD", "s3cret")]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ZSQL_DB") && !err.contains("listening on") && !err.contains("s3cret"), "{err}");
+}
+
+/// With the table there, the server comes up keeping its records in
+/// it, says so, and stops cleanly.
+#[test]
+#[ignore = "needs the Postgres the Sources step brings up"]
+fn a_server_keeps_its_records_in_postgres() {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+    let url = format!("{}:{}/{}?sslmode=disable", var("ZSQL_TEST_PG_HOST"), var("ZSQL_TEST_PG_PORT"), var("ZSQL_TEST_PG_DB"));
+    let settings = zsql_exec::PostgresSettings {
+        url: url.clone(),
+        user: var("ZSQL_TEST_PG_USER"),
+        password: zsql_datasource::Secret::new(var("ZSQL_TEST_PG_PASSWORD")),
+    };
+    zsql_exec::Postgres::connect(&settings).unwrap().batch_execute(include_str!("../../../ops/zsql_results.sql")).unwrap();
+
+    let root = Scratch::new("db-up");
+    let mut child = zsql()
+        .args(["serve", "--bind", "127.0.0.1:0", "--no-project", "--data-dir", root.path("data").to_str().unwrap()])
+        .env("ZSQL_HOME", root.path("home"))
+        .env("ZSQL_DB", &url)
+        .env("ZSQL_DB_USER", var("ZSQL_TEST_PG_USER"))
+        .env("ZSQL_DB_PASSWORD", var("ZSQL_TEST_PG_PASSWORD"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut said = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "ended early:\n{said}");
+        said.push_str(&line);
+        if line.contains("listening on") {
+            break;
+        }
+    }
+    assert!(said.contains("the records of runs are kept in the zsql_results table of ZSQL_DB"), "{said}");
+    assert!(!root.path("data/.cache/records").exists(), "and so not on this node's disk");
+    terminate(&child);
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    let _ = stderr.read_to_string(&mut rest);
+    assert!(status.success(), "{status}; it said:\n{said}{rest}");
+    assert!(!rest.contains("panicked"), "{rest}");
+}
+
 #[test]
 fn the_environment_is_the_base_and_flags_win() {
     let root = Scratch::new("env");
@@ -485,7 +621,7 @@ fn the_environment_is_the_base_and_flags_win() {
     };
     let (child, stderr, banner) = listen(&[]);
     assert!(root.path("elsewhere/lock").exists(), "ZSQL_DATA_DIR was not the data directory");
-    assert!(banner.contains("deploys are open"), "{banner}");
+    assert!(banner.contains("0 deployment(s) loaded from") && !banner.contains("token"), "{banner}");
     finish(child, stderr, banner);
 
     let (child, stderr, banner) = listen(&["--data-dir", root.path("here").to_str().unwrap()]);

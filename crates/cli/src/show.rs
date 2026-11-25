@@ -224,7 +224,19 @@ pub fn print_deploy(v: &Value) -> bool {
     for w in v["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or(""));
     }
-    let catalog_ok = if v["catalog"].is_object() { crate::catalog_check::print(&v["catalog"]) } else { true };
+    // What became of each datasource's credential on the server.
+    for (datasource, became) in v["credentials"].as_object().into_iter().flatten() {
+        let said = match became.as_str().unwrap_or("") {
+            "set" => "its credential is the one this deploy carried",
+            "kept" => "the credential the server had is kept",
+            "dropped" => {
+                "the credential the server had is gone: this deploy carried none, and it was cleared or the datasource points elsewhere"
+            }
+            _ => "no credential: a run needs one in its request",
+        };
+        println!("{datasource}: {said}");
+    }
+    let catalog_ok = if v["catalog"].is_object() { crate::commands::catalog_check::print(&v["catalog"]) } else { true };
     print_tests(&v["test_results"]) && catalog_ok
 }
 

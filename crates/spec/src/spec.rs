@@ -15,17 +15,17 @@
 //! fields resolve freely: hiding is a discovery concern, not a planning one.
 
 use crate::expr::ParsedExpression;
-use crate::model::*;
+use crate::query::*;
 use crate::Attrs;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use zsql_dialect::Dialect;
-use zsql_semantic::{DataType, Field, FieldKind, Predicate, Universe};
+use zsql_semantic::{DataType, Field, FieldKind, Predicate, SemanticModel};
 
 #[derive(Debug, thiserror::Error)]
-pub enum SpecError {
+pub enum Error {
     /// No field answers to a reference.
     #[error("{0}")]
     NotFound(String),
@@ -42,7 +42,7 @@ pub enum SpecError {
     RecordInvalid(String),
 }
 
-impl SpecError {
+impl Error {
     /// The `class` an API error carries. Flat and 0sql's own, like the
     /// envelope classes beside it (`Unauthorized`, `ContextRequired`): what
     /// a caller switches on should not name the framework that happened to
@@ -50,18 +50,18 @@ impl SpecError {
     /// `NotFound`, which is a different failure entirely.
     pub fn error_class(&self) -> &'static str {
         match self {
-            SpecError::NotFound(_) => "FieldNotFound",
-            SpecError::Ambiguous(_) => "FieldAmbiguous",
-            SpecError::Invalid(_) => "InvalidSpec",
-            SpecError::RecordInvalid(_) => "InvalidValue",
+            Error::NotFound(_) => "FieldNotFound",
+            Error::Ambiguous(_) => "FieldAmbiguous",
+            Error::Invalid(_) => "InvalidSpec",
+            Error::RecordInvalid(_) => "InvalidValue",
         }
     }
 }
 
-type Result<T> = std::result::Result<T, SpecError>;
+type Result<T> = std::result::Result<T, Error>;
 
-fn invalid(msg: impl Into<String>) -> SpecError {
-    SpecError::Invalid(msg.into())
+fn invalid(msg: impl Into<String>) -> Error {
+    Error::Invalid(msg.into())
 }
 
 /// The dialect settings a query may change: how it is planned, not how
@@ -97,8 +97,8 @@ fn checked_db_settings(given: Option<&Attrs>) -> Result<Attrs> {
     Ok(given.clone())
 }
 
-fn record_invalid(msg: impl Into<String>) -> SpecError {
-    SpecError::RecordInvalid(msg.into())
+fn record_invalid(msg: impl Into<String>) -> Error {
+    Error::RecordInvalid(msg.into())
 }
 
 // ---------------------------------------------------------------- spec types
@@ -317,7 +317,7 @@ fn parse_filter_node(v: &Value) -> Result<FilterNodeSpec> {
 /// regard to case; an `@d`/`@m` suffix (or the longer `@dim`, `@measure`)
 /// or an explicit `kind` picks between a dimension and a measure that
 /// share the spelling. Hidden fields resolve like any other.
-pub fn resolve_field<'u>(universe: &'u Universe, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
+pub fn resolve_field<'u>(semantic: &'u SemanticModel, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
     let reference = reference.trim();
     let (base, suffix) = match reference.split_once('@') {
         Some((b, s)) => (b, Some(s)),
@@ -328,24 +328,24 @@ pub fn resolve_field<'u>(universe: &'u Universe, reference: &str, kind: Option<&
         Some(k) => vec![k],
         None => vec![FieldKind::Dimension, FieldKind::Measure],
     };
-    let mut matches: Vec<&Field> = kinds.iter().filter_map(|k| universe.field_by_uid(base, Some(*k))).collect();
+    let mut matches: Vec<&Field> = kinds.iter().filter_map(|k| semantic.field_by_uid(base, Some(*k))).collect();
     if matches.is_empty() {
         let wanted = base.trim().to_lowercase();
-        matches = universe.fields().iter().filter(|f| kinds.contains(&f.kind) && f.name.trim().to_lowercase() == wanted).collect();
+        matches = semantic.fields().iter().filter(|f| kinds.contains(&f.kind) && f.name.trim().to_lowercase() == wanted).collect();
     }
     // A synonym the modeler wrote resolves like the name itself.
     if matches.is_empty() {
         let wanted = base.trim().to_lowercase();
-        matches = universe
+        matches = semantic
             .fields()
             .iter()
             .filter(|f| kinds.contains(&f.kind) && f.synonyms.iter().any(|s| s.trim().to_lowercase() == wanted))
             .collect();
     }
     match matches.len() {
-        0 => Err(SpecError::NotFound(format!("No field named '{base}' in this model."))),
+        0 => Err(Error::NotFound(format!("No field named '{base}' in this model."))),
         1 => Ok(matches[0]),
-        _ => Err(SpecError::Ambiguous(format!(
+        _ => Err(Error::Ambiguous(format!(
             "Field '{base}' is ambiguous — more than one field answers to it. Use {base}@d or {base}@m to pick the dimension or the measure."
         ))),
     }
@@ -386,7 +386,7 @@ fn ref_text(v: &Value) -> Result<String> {
 // ------------------------------------------------------------------ lowering
 
 struct Cx<'u> {
-    universe: &'u Universe,
+    semantic: &'u SemanticModel,
     reserved: Vec<String>,
     aggregates: Vec<String>,
     corrections: std::cell::RefCell<Vec<crate::fuzzy::Correction>>,
@@ -397,14 +397,14 @@ impl<'u> Cx<'u> {
     /// nothing answers exactly. A near match is recorded as a correction;
     /// an unclear one fails naming the closest fields.
     fn resolve(&self, reference: &str, kind: Option<&str>) -> Result<&'u Field> {
-        match resolve_field(self.universe, reference, kind) {
-            Err(SpecError::NotFound(msg)) => {
+        match resolve_field(self.semantic, reference, kind) {
+            Err(Error::NotFound(msg)) => {
                 let (base, suffix) = reference.trim().split_once('@').map(|(b, s)| (b, Some(s))).unwrap_or((reference.trim(), None));
                 let kinds: Vec<FieldKind> = match kind_hint(kind).or_else(|| kind_hint(suffix)) {
                     Some(k) => vec![k],
                     None => vec![FieldKind::Dimension, FieldKind::Measure],
                 };
-                let ranked = crate::fuzzy::suggest(self.universe, base, &kinds);
+                let ranked = crate::fuzzy::suggest(self.semantic, base, &kinds);
                 match crate::fuzzy::pick(&ranked) {
                     Some(best) => {
                         self.corrections.borrow_mut().push(crate::fuzzy::Correction {
@@ -415,7 +415,7 @@ impl<'u> Cx<'u> {
                         });
                         Ok(best.field)
                     }
-                    None => Err(SpecError::NotFound(format!("{msg}{}", crate::fuzzy::did_you_mean(&ranked)))),
+                    None => Err(Error::NotFound(format!("{msg}{}", crate::fuzzy::did_you_mean(&ranked)))),
                 }
             }
             other => other,
@@ -426,9 +426,9 @@ impl<'u> Cx<'u> {
 /// Lowers a spec into the typed query the planner consumes. `dialect` is
 /// the base dialect (`Dialects::base`): its reserved keywords and aggregate
 /// functions parse each calculation's formula, as Rails' defaults do.
-pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Query> {
+pub fn lower(spec: &Spec, semantic: &SemanticModel, dialect: &Dialect) -> Result<Query> {
     let cx =
-        Cx { universe, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions(), corrections: Default::default() };
+        Cx { semantic, reserved: dialect.reserved_keywords(), aggregates: dialect.aggregate_functions(), corrections: Default::default() };
 
     // Projections in listed order, calculations in place, then the
     // separate calculations list; formulas resolve against every field
@@ -461,7 +461,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
         .filter(|p| p.field_kind == Some(FieldKind::Dimension) && !p.is_calculation())
         .filter_map(|p| {
             let uid = p.field_uid.clone()?;
-            let name = cx.universe.field_by_uid(&uid, Some(FieldKind::Dimension)).map(|f| f.name.to_lowercase()).unwrap_or_default();
+            let name = cx.semantic.field_by_uid(&uid, Some(FieldKind::Dimension)).map(|f| f.name.to_lowercase()).unwrap_or_default();
             Some((uid, name, display_alias(&cx, p).trim().to_lowercase()))
         })
         .collect();
@@ -473,7 +473,7 @@ pub fn lower(spec: &Spec, universe: &Universe, dialect: &Dialect) -> Result<Quer
             let name = p
                 .field_uid
                 .as_deref()
-                .and_then(|u| cx.universe.field_by_uid(u, Some(FieldKind::Measure)))
+                .and_then(|u| cx.semantic.field_by_uid(u, Some(FieldKind::Measure)))
                 .map(|f| f.name.to_lowercase())
                 .unwrap_or_default();
             (uid, name, display_alias(&cx, p).trim().to_lowercase())
@@ -639,7 +639,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     let mut sql = sql;
     let mut measure_refs = Vec::new();
     for name in &parsed.measure_refs {
-        let f = match cx.universe.field_by_name(name, FieldKind::Measure) {
+        let f = match cx.semantic.field_by_name(name, FieldKind::Measure) {
             Some(f) => f,
             None => {
                 let f = cx.resolve(name, Some("measure")).map_err(|e| {
@@ -653,7 +653,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     }
     let mut dimension_refs = Vec::new();
     for name in &parsed.dimension_refs {
-        let f = match cx.universe.field_by_name(name, FieldKind::Dimension) {
+        let f = match cx.semantic.field_by_name(name, FieldKind::Dimension) {
             Some(f) => f,
             None => {
                 let f = cx.resolve(name, Some("dimension")).map_err(|e| {
@@ -676,8 +676,8 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
             projection_refs.push(name.clone());
             continue;
         }
-        let dim = cx.universe.field_by_name(name, FieldKind::Dimension);
-        let msr = cx.universe.field_by_name(name, FieldKind::Measure);
+        let dim = cx.semantic.field_by_name(name, FieldKind::Dimension);
+        let msr = cx.semantic.field_by_name(name, FieldKind::Measure);
         // A name belongs to at most one dimension and at most one
         // measure, so the only ambiguity is a name that is both.
         match (dim, msr) {
@@ -965,7 +965,7 @@ fn humanize(s: &str) -> String {
 }
 
 fn display_alias(cx: &Cx, p: &Projection) -> String {
-    let name = p.field_uid.as_deref().and_then(|u| cx.universe.field_by_uid(u, p.field_kind)).map(|f| f.name.as_str());
+    let name = p.field_uid.as_deref().and_then(|u| cx.semantic.field_by_uid(u, p.field_kind)).map(|f| f.name.as_str());
     derived_alias(p, name)
 }
 
@@ -1128,7 +1128,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     for k in &s.keys {
         let text = ref_text(k)?;
         let f = cx.resolve(&text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
+            Error::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Dimension {
@@ -1140,7 +1140,7 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
     for m in &s.measures {
         let text = ref_text(m)?;
         let f = cx.resolve(&text, None).or_else(|e| match e {
-            SpecError::Ambiguous(_) => cx.resolve(&text, Some("measure")),
+            Error::Ambiguous(_) => cx.resolve(&text, Some("measure")),
             e => Err(e),
         })?;
         if f.kind != FieldKind::Measure {
@@ -1176,14 +1176,14 @@ fn lower_segment(cx: &Cx, s: &SegmentSpec, index: usize, query_projections: &mut
         };
         let first_key = projections[0].source_ref.clone().unwrap_or_default();
         let key_name = cx
-            .universe
+            .semantic
             .field_by_uid(projections[0].field_uid.as_deref().unwrap_or(""), Some(FieldKind::Dimension))
             .map(|f| f.name.clone())
             .unwrap_or(first_key);
         for e in &s.expanding {
             let text = ref_text(&e.field)?;
             let f = cx.resolve(&text, None).or_else(|err| match err {
-                SpecError::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
+                Error::Ambiguous(_) => cx.resolve(&text, Some("dimension")),
                 err => Err(err),
             })?;
             if f.kind != FieldKind::Dimension {
@@ -1274,9 +1274,9 @@ fn rename_ref(sql: &str, old: &str, new: &str) -> String {
 }
 
 /// The "Did you mean" tail of a not-found error, or empty.
-fn did_you_mean_suffix(e: &SpecError) -> String {
+fn did_you_mean_suffix(e: &Error) -> String {
     match e {
-        SpecError::NotFound(m) | SpecError::Ambiguous(m) => m.find(" Did you mean").map(|i| m[i..].to_string()).unwrap_or_default(),
+        Error::NotFound(m) | Error::Ambiguous(m) => m.find(" Did you mean").map(|i| m[i..].to_string()).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -1292,7 +1292,7 @@ fn measure_projection_for<'p>(cx: &Cx, projections: &'p [Projection], reference:
     if matches.is_empty() {
         // Rails `resolve_target_ref`: a measure's name or uid becomes its uid
         // before matching; a ref that is no field is tried as written.
-        let uid = match resolve_field(cx.universe, reference, Some("measure")) {
+        let uid = match resolve_field(cx.semantic, reference, Some("measure")) {
             Ok(f) => f.uid.to_lowercase(),
             Err(_) => reference.split('@').next().unwrap_or("").trim().to_lowercase(),
         };
@@ -1560,10 +1560,10 @@ mod tests {
     /// is a deliberate act with a failing test, not a silent break.
     #[test]
     fn error_classes_are_0sqls_own() {
-        assert_eq!(SpecError::NotFound(String::new()).error_class(), "FieldNotFound");
-        assert_eq!(SpecError::Ambiguous(String::new()).error_class(), "FieldAmbiguous");
-        assert_eq!(SpecError::Invalid(String::new()).error_class(), "InvalidSpec");
-        assert_eq!(SpecError::RecordInvalid(String::new()).error_class(), "InvalidValue");
+        assert_eq!(Error::NotFound(String::new()).error_class(), "FieldNotFound");
+        assert_eq!(Error::Ambiguous(String::new()).error_class(), "FieldAmbiguous");
+        assert_eq!(Error::Invalid(String::new()).error_class(), "InvalidSpec");
+        assert_eq!(Error::RecordInvalid(String::new()).error_class(), "InvalidValue");
         // Nothing here may name a framework we are not.
         for class in ["FieldNotFound", "FieldAmbiguous", "InvalidSpec", "InvalidValue"] {
             assert!(!class.contains("ActiveRecord") && !class.contains("::"), "{class}");

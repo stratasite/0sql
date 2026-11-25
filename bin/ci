@@ -61,6 +61,9 @@ sources() {
   # while CI, which checks out fresh, never sees it. They protect
   # nothing: see harness/sources/tls/README.md.
   chmod a+r harness/sources/tls/*.key 2>/dev/null || true
+  # Not covered here: adbc::tests, which load ADBC drivers that nothing
+  # in this step installs. Run them by hand with ADBC_DRIVER_PATH set;
+  # see docs/exec-layer.md.
   local rc=0
   $compose up -d --wait --wait-timeout 300 || rc=$?
   if [ $rc -eq 0 ]; then
@@ -70,7 +73,7 @@ sources() {
     ZSQL_TEST_MYSQL_HOST=localhost ZSQL_TEST_MYSQL_USER=root ZSQL_TEST_MYSQL_PASSWORD=zsql ZSQL_TEST_MYSQL_DB=zsql \
     ZSQL_TEST_MSSQL_HOST=localhost ZSQL_TEST_MSSQL_USER=sa ZSQL_TEST_MSSQL_PASSWORD=Zsql-test-1 ZSQL_TEST_MSSQL_DB=master \
     ZSQL_TEST_TRINO_URL=http://localhost:8080 ZSQL_TEST_TRINO_DB=tpch \
-      sh -c 'cargo test --locked -p zsql-source -- --ignored && cargo test --locked -p zsql-cli --test generate -- --ignored && cargo test --locked -p zsql-cli --test sample -- --ignored' || rc=$?
+      sh -c 'cargo test --locked -p zsql-datasource -- --ignored --skip adbc::tests && cargo test --locked -p zsql-exec --test postgres -- --ignored && cargo test --locked -p zsql-cli --test serve -- --ignored && cargo test --locked -p zsql-cli --test generate -- --ignored && cargo test --locked -p zsql-cli --test sample -- --ignored' || rc=$?
   else
     $compose ps -a
   fi
@@ -81,7 +84,7 @@ sources() {
 step "Format"                 cargo fmt --all --check
 step "Clippy"                 cargo clippy --workspace --all-targets --locked -- -D warnings
 step "Tests"                  cargo test --workspace --locked
-step "Goldens"                cargo run --release --locked -p zsql-devtool -- golden --strict
+step "Goldens"                cargo run --release --locked -p xtask -- golden --strict
 step "CLI without defaults"   cargo check --locked -p zsql-cli --no-default-features
 step "Docs without warnings"  env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 step "Deny"                   cargo deny check

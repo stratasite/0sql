@@ -3,14 +3,15 @@
 //! model. Every read a command or the repl makes goes through here, so
 //! the two cannot drift apart.
 
+use crate::cli::Target;
 use crate::failure::Refusal;
 use crate::local::{self, Local};
 use crate::project::{stamps, stamps_under, Stamp};
-use crate::{remote, Target};
+use crate::remote;
 use anyhow::Result;
 use serde_json::Value;
 use std::time::Instant;
-use zsql_service::Model;
+use zsql_core::Model;
 
 /// A query as it travels: a spec, or the expression line for whoever
 /// plans it to read, so the item descriptions come from one place.
@@ -62,9 +63,7 @@ pub trait Side {
     /// `.run`: the query run on its datasource and its rows kept, which
     /// only this machine can do, holding the credentials.
     fn run(&mut self, _query: &Query, _context: Option<&Value>, _fresh: bool) -> Result<()> {
-        anyhow::bail!(
-            "runs here only: the credentials are on this machine, and the server holds none. Open the repl without -r to run queries."
-        )
+        anyhow::bail!("runs here only: `zsql` does not yet ask a server to run. Open the repl without -r to run queries.")
     }
     /// `.results`: what `.run` kept.
     fn results(&mut self) -> Result<()> {
@@ -80,7 +79,7 @@ impl Side for Target {
     }
 
     fn announce(&mut self) -> Result<Vec<String>> {
-        let summary = self.client.get(&remote::branch_path(&self.uid, &self.branch))?;
+        let summary = self.client.get(&remote::branch_path(self.org.as_deref(), &self.uid, &self.branch))?;
         println!(
             "{}",
             dim(&format!(
@@ -114,33 +113,41 @@ impl Side for Target {
     }
 
     fn tables(&mut self) -> Result<Value> {
-        self.client.get(&format!("{}/tables", remote::branch_path(&self.uid, &self.branch)))
+        self.client.get(&format!("{}/tables", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)))
     }
 
     fn fields(&mut self, q: &str, hidden: bool) -> Result<Value> {
-        self.client.get(&format!("{}/fields?q={}&hidden={hidden}", remote::branch_path(&self.uid, &self.branch), remote::urlencode(q)))
+        self.client.get(&format!(
+            "{}/fields?q={}&hidden={hidden}",
+            remote::branch_path(self.org.as_deref(), &self.uid, &self.branch),
+            remote::urlencode(q)
+        ))
     }
 
     fn values(&mut self, dim: &str) -> Result<Value> {
-        remote::values_for(&self.client, &self.uid, &self.branch, dim)
+        remote::values_for(&self.client, self.org.as_deref(), &self.uid, &self.branch, dim)
     }
 
     fn explore(&mut self, query: &Query, context: Option<&Value>, term: Option<&str>) -> Result<Value> {
-        remote::explore(&self.client, &self.uid, &self.branch, query, context, term)
+        remote::explore(&self.client, self.org.as_deref(), &self.uid, &self.branch, query, context, term)
     }
 
     fn sql(&mut self, query: &Query, context: Option<&Value>, explain: bool) -> Result<Value> {
-        remote::sql(&self.client, &self.uid, &self.branch, query, context, explain)
+        remote::sql(&self.client, self.org.as_deref(), &self.uid, &self.branch, query, context, explain)
     }
 
     fn check(&mut self) -> Result<Value> {
         let Some(p) = &self.project else { anyhow::bail!("validating on the server needs a project directory") };
-        let archive = crate::project::archive(&p.dir)?;
-        self.client.post_bytes(&format!("{}/validate", remote::branch_path(&self.uid, &self.branch)), "application/gzip", &archive)
+        let archive = crate::project::archive(&p.dir, crate::project::For::Validate)?;
+        self.client.post_bytes(
+            &format!("{}/validate", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)),
+            "application/gzip",
+            &archive,
+        )
     }
 
     fn test(&mut self) -> Result<Value> {
-        self.client.post(&format!("{}/test", remote::branch_path(&self.uid, &self.branch)), &serde_json::json!({}))
+        self.client.post(&format!("{}/test", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)), &serde_json::json!({}))
     }
 }
 
@@ -272,11 +279,17 @@ impl Side for Session {
     }
 
     fn run(&mut self, query: &Query, context: Option<&Value>, fresh: bool) -> Result<()> {
-        crate::run::run(&self.local.project, &self.model, query, context, crate::run::Options { fresh, ..Default::default() })
+        crate::commands::run::run(
+            &self.local.project,
+            &self.model,
+            query,
+            context,
+            crate::commands::run::Options { fresh, ..Default::default() },
+        )
     }
 
     fn results(&mut self) -> Result<()> {
-        crate::run::results(&self.local.project, crate::run::ResultsCommand::List { json: false })
+        crate::commands::run::results(&self.local.project, crate::commands::run::ResultsCommand::List { json: false })
     }
 
     fn check(&mut self) -> Result<Value> {

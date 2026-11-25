@@ -1,12 +1,13 @@
-//! Where the CLI finds the project, the server and its deploy token.
+//! Where the CLI finds the project and the server.
 //!
 //! - `project.yml` in the project directory: `uid`, `name`, `production_branch`,
-//!   and optionally `server` (a self-hosted server).
+//!   and optionally `org` (the org it is deployed under; the server's
+//!   default org without it) and `server` (a self-hosted server).
 //! - `.zsql` in the project directory (or `.strata`, the strata CLI's file,
-//!   when `.zsql` is absent): `api_key` (the server's deploy token, under the
-//!   name it has always had in this file), `server`, and per-datasource secrets.
+//!   when `.zsql` is absent): `server`, and per-datasource secrets. An
+//!   `api_key` left there from when a server took a deploy token is not read.
 //! - `~/.zsql/config`: the same keys, for every project of this user.
-//! - `ZSQL_SERVER` and `ZSQL_API_KEY` in the environment, which win.
+//! - `ZSQL_SERVER` in the environment, which wins.
 //!
 //! `~/.zsql` is also where the repl history lives. `ZSQL_HOME` moves
 //! the whole directory, which is how tests keep out of the real one.
@@ -24,6 +25,9 @@ pub struct Project {
     pub uid: String,
     pub name: String,
     pub production_branch: String,
+    /// `org:` from project.yml: the org the project is deployed under
+    /// and asked for in. Without it, the server's default org.
+    pub org: Option<String>,
     /// `server:` from project.yml, when set.
     pub server: Option<String>,
 }
@@ -61,6 +65,7 @@ pub fn read_project(dir: &Path) -> Result<Project> {
         uid,
         name,
         production_branch: v.get("production_branch").and_then(|b| b.as_str()).unwrap_or("main").trim().to_string(),
+        org: v.get("org").and_then(|o| o.as_str()).map(|o| o.trim().to_lowercase()).filter(|o| !o.is_empty()),
         server: v.get("server").and_then(|s| s.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     })
 }
@@ -105,17 +110,13 @@ pub fn server(flag: Option<&str>, project: Option<&Project>) -> String {
         .to_string()
 }
 
-pub fn api_key(project: Option<&Project>) -> Option<String> {
-    std::env::var("ZSQL_API_KEY").ok().filter(|s| !s.is_empty()).or_else(|| secret(project.map(|p| p.dir.as_path()), "api_key"))
-}
-
 /// Writes `key: value` into the local secrets file, replacing an existing line.
 pub fn write_secret(project_dir: &Path, key: &str, value: &str) -> Result<()> {
     let path = project_dir.join(LOCAL_FILE);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().filter(|l| !l.trim_start().starts_with(&format!("{key}:"))).map(str::to_string).collect();
     if lines.is_empty() {
-        lines.push("# zsql local configuration: deploy token (api_key), server, datasource secrets. Do not commit.".into());
+        lines.push("# zsql local configuration: server, datasource secrets. Do not commit.".into());
     }
     lines.push(format!("{key}: {value}"));
     std::fs::write(&path, lines.join("\n") + "\n").with_context(|| path.display().to_string())?;

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
-pub enum DialectError {
+pub enum Error {
     #[error("io {0}: {1}")]
     Io(String, std::io::Error),
     #[error("yaml {0}: {1}")]
@@ -38,18 +38,18 @@ pub struct Dialect {
 
 impl Dialect {
     /// `base.yml` overlaid with `<name>.yml` from `dir`.
-    pub fn load(dir: &Path, name: &str) -> Result<Self, DialectError> {
+    pub fn load(dir: &Path, name: &str) -> Result<Self, Error> {
         let mut settings = read_yaml(&dir.join("base.yml"))?;
         let own = dir.join(format!("{name}.yml"));
         if !own.exists() {
-            return Err(DialectError::Unknown(name.to_string()));
+            return Err(Error::Unknown(name.to_string()));
         }
         settings.extend(read_yaml(&own)?);
         Ok(Self { name: name.to_string(), settings })
     }
 
     /// The same overlay from YAML text, for settings compiled into a binary.
-    pub fn from_texts(name: &str, base: &str, own: &str) -> Result<Self, DialectError> {
+    pub fn from_texts(name: &str, base: &str, own: &str) -> Result<Self, Error> {
         let mut settings = parse_yaml(base, "base.yml")?;
         settings.extend(parse_yaml(own, &format!("{name}.yml"))?);
         Ok(Self { name: name.to_string(), settings })
@@ -82,45 +82,45 @@ impl Dialect {
         self.settings.get(key)
     }
 
-    pub fn str(&self, key: &str) -> Result<&str, DialectError> {
+    pub fn str(&self, key: &str) -> Result<&str, Error> {
         match self.settings.get(key) {
             Some(Value::String(s)) => Ok(s),
-            Some(_) => Err(DialectError::Type(key.into(), "string")),
-            None => Err(DialectError::Missing(self.name.clone(), key.into())),
+            Some(_) => Err(Error::Type(key.into(), "string")),
+            None => Err(Error::Missing(self.name.clone(), key.into())),
         }
     }
 
-    pub fn bool(&self, key: &str) -> Result<bool, DialectError> {
+    pub fn bool(&self, key: &str) -> Result<bool, Error> {
         match self.settings.get(key) {
             Some(Value::Bool(b)) => Ok(*b),
-            Some(_) => Err(DialectError::Type(key.into(), "bool")),
-            None => Err(DialectError::Missing(self.name.clone(), key.into())),
+            Some(_) => Err(Error::Type(key.into(), "bool")),
+            None => Err(Error::Missing(self.name.clone(), key.into())),
         }
     }
 
     /// Renders the template stored under `key`, substituting `@name` placeholders.
-    pub fn render(&self, key: &str, vars: &[(&str, &str)]) -> Result<String, DialectError> {
+    pub fn render(&self, key: &str, vars: &[(&str, &str)]) -> Result<String, Error> {
         let template = self.str(key)?;
-        render_template(template, vars).map_err(|p| DialectError::Placeholder(key.into(), p))
+        render_template(template, vars).map_err(|p| Error::Placeholder(key.into(), p))
     }
 
-    pub fn quote(&self, ident: &str) -> Result<String, DialectError> {
+    pub fn quote(&self, ident: &str) -> Result<String, Error> {
         self.render("quote", &[("exp", ident)])
     }
 
     /// A string literal with the value's quotes doubled.
-    pub fn string_lit(&self, value: &str) -> Result<String, DialectError> {
+    pub fn string_lit(&self, value: &str) -> Result<String, Error> {
         let escaped = value.replace('\'', "''");
         self.render("string_literal", &[("exp", &escaped)])
     }
 
     // ---- the functions the planner emits, mirroring the dwh gem ----
 
-    pub fn lower_case(&self, exp: &str) -> Result<String, DialectError> {
+    pub fn lower_case(&self, exp: &str) -> Result<String, Error> {
         self.render("lower_case", &[("exp", exp)])
     }
 
-    pub fn cast(&self, exp: &str, ty: &str) -> Result<String, DialectError> {
+    pub fn cast(&self, exp: &str, ty: &str) -> Result<String, Error> {
         self.render("cast", &[("exp", exp), ("type", ty)])
     }
 
@@ -128,7 +128,7 @@ impl Dialect {
     /// Anything before `at` is left alone, so the common table expressions
     /// a plan is wrapped in keep their own shape and only the statement
     /// they feed takes the limit. `n` is interpolated as given.
-    pub fn apply_limit(&self, sql: &str, at: usize, n: &str) -> Result<String, DialectError> {
+    pub fn apply_limit(&self, sql: &str, at: usize, n: &str) -> Result<String, Error> {
         let clause = self.render("limit_clause", &[("n", n)])?;
         match self.str("limit_style")? {
             // Its own clause at the end, which is every dialect but one.
@@ -137,19 +137,19 @@ impl Dialect {
             // DISTINCT, so the keyword is the whole prefix to step over.
             "top" => match sql.get(at..).and_then(|s| s.strip_prefix("SELECT")) {
                 Some(rest) => Ok(format!("{}SELECT {clause}{rest}", &sql[..at])),
-                None => Err(DialectError::NotASelect(self.name.clone())),
+                None => Err(Error::NotASelect(self.name.clone())),
             },
-            other => Err(DialectError::LimitStyle(self.name.clone(), other.to_string())),
+            other => Err(Error::LimitStyle(self.name.clone(), other.to_string())),
         }
     }
 
-    pub fn cross_join(&self, relation: &str) -> Result<String, DialectError> {
+    pub fn cross_join(&self, relation: &str) -> Result<String, Error> {
         self.render("cross_join", &[("relation", relation)])
     }
 
     /// `DATE_TRUNC('month', x)` cast to DATE above the hour grain; the week
     /// start day template when the warehouse's default week differs.
-    pub fn truncate_date(&self, unit: &str, exp: &str) -> Result<String, DialectError> {
+    pub fn truncate_date(&self, unit: &str, exp: &str) -> Result<String, Error> {
         let unit = unit.trim().to_lowercase();
         let res = if unit == "week" && self.adjust_week_start_day() {
             let key = format!("{}_week_start_day", self.str("week_start_day")?.to_lowercase());
@@ -171,11 +171,11 @@ impl Dialect {
         }
     }
 
-    pub fn date_literal(&self, val: &str) -> Result<String, DialectError> {
+    pub fn date_literal(&self, val: &str) -> Result<String, Error> {
         self.render("date_literal", &[("val", val)])
     }
 
-    pub fn timestamp_literal(&self, val: &str) -> Result<String, DialectError> {
+    pub fn timestamp_literal(&self, val: &str) -> Result<String, Error> {
         self.render("date_time_literal", &[("val", val)])
     }
 
@@ -188,24 +188,24 @@ impl Dialect {
         self.str("date_time_format").unwrap_or("%Y-%m-%d %H:%M:%S")
     }
 
-    pub fn array_in_list(&self, exp: &str, list: &str) -> Result<String, DialectError> {
+    pub fn array_in_list(&self, exp: &str, list: &str) -> Result<String, Error> {
         self.render("array_in_list", &[("exp", exp), ("list", list)])
     }
 
-    pub fn array_exclude_list(&self, exp: &str, list: &str) -> Result<String, DialectError> {
+    pub fn array_exclude_list(&self, exp: &str, list: &str) -> Result<String, Error> {
         self.render("array_exclude_list", &[("exp", exp), ("list", list)])
     }
 
-    pub fn array_unnest_join(&self, exp: &str, alias: &str) -> Result<String, DialectError> {
+    pub fn array_unnest_join(&self, exp: &str, alias: &str) -> Result<String, Error> {
         self.render("array_unnest_join", &[("exp", exp), ("alias", alias)])
     }
 
-    pub fn null_if_zero(&self, exp: &str) -> Result<String, DialectError> {
+    pub fn null_if_zero(&self, exp: &str) -> Result<String, Error> {
         self.render("null_if_zero", &[("exp", exp)])
     }
 
     /// Rails `date_add`; Postgres spells a quarter as three months.
-    pub fn date_add(&self, unit: &str, val: i64, exp: &str) -> Result<String, DialectError> {
+    pub fn date_add(&self, unit: &str, val: i64, exp: &str) -> Result<String, Error> {
         let (unit, val) = if self.name == "postgres" && unit.trim().to_lowercase() == "quarter" {
             ("months".to_string(), val * 3)
         } else {
@@ -215,7 +215,7 @@ impl Dialect {
     }
 
     /// Rails `extract_*`: a date part, or an upper-cased day or month name.
-    pub fn extract(&self, part: &str, exp: &str, abbreviate: bool) -> Result<String, DialectError> {
+    pub fn extract(&self, part: &str, exp: &str, abbreviate: bool) -> Result<String, Error> {
         match part {
             "day_name" | "month_name" => {
                 let key = match (part, abbreviate) {
@@ -365,11 +365,11 @@ impl Dialects {
 
     /// `base.yml` alone: the reserved keywords and aggregate functions every
     /// warehouse shares, which classify calculations before a datasource is known.
-    pub fn base(&self) -> Result<std::sync::Arc<Dialect>, DialectError> {
+    pub fn base(&self) -> Result<std::sync::Arc<Dialect>, Error> {
         self.get("base")
     }
 
-    pub fn get(&self, adapter: &str) -> Result<std::sync::Arc<Dialect>, DialectError> {
+    pub fn get(&self, adapter: &str) -> Result<std::sync::Arc<Dialect>, Error> {
         if let Some(d) = self.loaded.lock().unwrap().get(adapter) {
             return Ok(d.clone());
         }
@@ -385,11 +385,8 @@ impl Dialects {
         let d = match &self.source {
             Source::Dir(dir) => Dialect::load(dir, adapter)?,
             Source::Builtin => {
-                let own = BUILTIN
-                    .iter()
-                    .find(|(n, _)| *n == adapter)
-                    .map(|(_, t)| *t)
-                    .ok_or_else(|| DialectError::Unknown(adapter.to_string()))?;
+                let own =
+                    BUILTIN.iter().find(|(n, _)| *n == adapter).map(|(_, t)| *t).ok_or_else(|| Error::Unknown(adapter.to_string()))?;
                 Dialect::from_texts(adapter, BUILTIN_BASE, own)?
             }
         };
@@ -398,14 +395,14 @@ impl Dialects {
         Ok(d)
     }
 
-    pub fn names(&self) -> Result<Vec<String>, DialectError> {
+    pub fn names(&self) -> Result<Vec<String>, Error> {
         let Source::Dir(dir) = &self.source else {
             return Ok(BUILTIN.iter().map(|(n, _)| n.to_string()).collect());
         };
         let mut names = Vec::new();
-        let entries = std::fs::read_dir(dir).map_err(|e| DialectError::Io(dir.display().to_string(), e))?;
+        let entries = std::fs::read_dir(dir).map_err(|e| Error::Io(dir.display().to_string(), e))?;
         for entry in entries {
-            let entry = entry.map_err(|e| DialectError::Io(dir.display().to_string(), e))?;
+            let entry = entry.map_err(|e| Error::Io(dir.display().to_string(), e))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("yml") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -420,16 +417,16 @@ impl Dialects {
     }
 }
 
-fn read_yaml(path: &Path) -> Result<BTreeMap<String, Value>, DialectError> {
-    let text = std::fs::read_to_string(path).map_err(|e| DialectError::Io(path.display().to_string(), e))?;
+fn read_yaml(path: &Path) -> Result<BTreeMap<String, Value>, Error> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.display().to_string(), e))?;
     parse_yaml(&text, &path.display().to_string())
 }
 
-fn parse_yaml(text: &str, label: &str) -> Result<BTreeMap<String, Value>, DialectError> {
+fn parse_yaml(text: &str, label: &str) -> Result<BTreeMap<String, Value>, Error> {
     if text.trim().is_empty() {
         return Ok(BTreeMap::new());
     }
-    let value: Value = serde_yaml::from_str(text).map_err(|e| DialectError::Yaml(label.to_string(), e))?;
+    let value: Value = serde_yaml::from_str(text).map_err(|e| Error::Yaml(label.to_string(), e))?;
     let mut map = BTreeMap::new();
     if let Value::Mapping(m) = value {
         for (k, v) in m {
@@ -583,6 +580,6 @@ mod tests {
     fn a_top_dialect_refuses_what_is_not_a_select() {
         let d = Dialects::builtin().get("sqlserver").unwrap();
         let e = d.apply_limit("INSERT INTO t VALUES (1)", 0, "25").unwrap_err();
-        assert!(matches!(e, DialectError::NotASelect(_)), "{e}");
+        assert!(matches!(e, Error::NotASelect(_)), "{e}");
     }
 }

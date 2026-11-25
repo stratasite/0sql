@@ -21,8 +21,8 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-impl From<zsql_service::ServiceError> for Refusal {
-    fn from(e: zsql_service::ServiceError) -> Self {
+impl From<zsql_core::Error> for Refusal {
+    fn from(e: zsql_core::Error) -> Self {
         Refusal { class: e.class.to_string(), message: e.message }
     }
 }

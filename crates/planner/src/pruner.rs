@@ -1,13 +1,13 @@
 //! Rails `Planner::Universe::Pruner`: ranking candidate universes or
 //! subtrees for a field set, and cutting the set to the minimum that covers it.
 
-use crate::model::RFilter;
+use crate::resolved::ResolvedFilter;
 use crate::universe::{Base, Model, Subtree};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use zsql_semantic::{Field, Id, Predicate, Table, Universe};
+use zsql_semantic::{Field, Id, Predicate, SemanticModel, Table};
 
 /// Sort ascending on: hints hit, dimensions covered, partition score, tier,
 /// measures covered, cost, local fields, then the model's string for stability.
@@ -16,8 +16,8 @@ pub fn sort_for_max_hints_and_dims<M: Model>(
     measures: &[&Field],
     dimensions: &[&Field],
     hints: &[&Table],
-    filters: &[Rc<RFilter>],
-    universe: &Universe,
+    filters: &[Rc<ResolvedFilter>],
+    semantic: &SemanticModel,
 ) -> Vec<M> {
     let measure_ids: HashSet<Id> = measures.iter().map(|f| f.id).collect();
     let dimension_ids: HashSet<Id> = dimensions.iter().map(|f| f.id).collect();
@@ -29,7 +29,7 @@ pub fn sort_for_max_hints_and_dims<M: Model>(
         let dim_count = m.dimension_count(&dimension_ids) as i64;
         let measure_count = m.measure_count(&measure_ids) as i64;
         let local = all_field_ids.intersection(m.local_field_ids()).count() as i64;
-        (-hint_count, -dim_count, -partition_score(m.root(), filters, universe), m.tier(), -measure_count, m.cost(), -local, m.to_s())
+        (-hint_count, -dim_count, -partition_score(m.root(), filters, semantic), m.tier(), -measure_count, m.cost(), -local, m.identity())
     };
     models.sort_by_cached_key(key);
     models
@@ -43,7 +43,7 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
     if measures.is_empty() {
         let first = models.first().cloned().ok_or_else(|| {
             let names: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
-            PlanError::Resolution(format!("no table reaches every dimension of the query together: {}", names.join(", ")))
+            Error::Resolution(format!("no table reaches every dimension of the query together: {}", names.join(", ")))
         })?;
         pruned.push(first);
     } else {
@@ -54,7 +54,7 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
                 .cloned()
                 .ok_or_else(|| {
                     let dims: Vec<&str> = dimensions.iter().map(|d| d.name.as_str()).collect();
-                    PlanError::Resolution(format!(
+                    Error::Resolution(format!(
                         "no table holding the measure {} reaches every dimension of the query ({}); it may need a join path, or the dimensions may belong to different tables",
                         m.name,
                         dims.join(", ")
@@ -67,20 +67,20 @@ pub fn prune_to_minimum<M: Model + Clone>(models: Vec<M>, measures: &[&Field], d
                 .iter()
                 .find(|u| u.has_field(d.id))
                 .cloned()
-                .ok_or_else(|| PlanError::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id)))?;
+                .ok_or_else(|| Error::Resolution(format!("Could not find Universe for dimension: {}, id: {}", d.name, d.id)))?;
             pruned.push(u);
         }
     }
     let mut seen = HashSet::new();
-    pruned.retain(|m| seen.insert(m.to_s()));
-    pruned.sort_by_cached_key(|m| (m.cost(), m.to_s()));
+    pruned.retain(|m| seen.insert(m.identity()));
+    pruned.sort_by_cached_key(|m| (m.cost(), m.identity()));
     Ok(pruned)
 }
 
 /// Rails `sort_paths_for_max_hints_and_dims`: the universe's paths grouped
 /// by join path, each subtree keeping only the requested fields' paths.
 pub fn sort_paths_for_max_hints_and_dims<'a>(
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     base: Arc<Base<'a>>,
     measures: &[&Field],
     dimensions: &[&Field],
@@ -95,15 +95,15 @@ pub fn sort_paths_for_max_hints_and_dims<'a>(
             Subtree::from_group(base.clone(), g, kept)
         })
         .collect();
-    sort_for_max_hints_and_dims(subtrees, measures, dimensions, hints, &[], universe)
+    sort_for_max_hints_and_dims(subtrees, measures, dimensions, hints, &[], semantic)
 }
 
 /// +1 per dimension filter inside a root-table partition, -1 outside, 0 when unrelated.
-pub fn partition_score(root: &Table, filters: &[Rc<RFilter>], universe: &Universe) -> i64 {
+pub fn partition_score(root: &Table, filters: &[Rc<ResolvedFilter>], semantic: &SemanticModel) -> i64 {
     if filters.is_empty() {
         return 0;
     }
-    let parts: Vec<_> = universe.snapshot().partitions.iter().filter(|p| p.table_id == root.id).collect();
+    let parts: Vec<_> = semantic.snapshot().partitions.iter().filter(|p| p.table_id == root.id).collect();
     if parts.is_empty() {
         return 0;
     }
@@ -121,7 +121,7 @@ pub fn partition_score(root: &Table, filters: &[Rc<RFilter>], universe: &Univers
 /// Rails `Partition#within_partition_range?`, for numeric and date range
 /// partitions; a list partition holds the filter when every value the
 /// filter wants is listed.
-fn within_partition(part: &zsql_semantic::Partition, f: &RFilter) -> bool {
+fn within_partition(part: &zsql_semantic::Partition, f: &ResolvedFilter) -> bool {
     use crate::sql::dates::parse_value;
     if part.predicate == Predicate::InList {
         let listed: HashSet<String> = part.filter_value.as_deref().map(split_list).unwrap_or_default().into_iter().collect();
@@ -190,8 +190,8 @@ mod tests {
         .unwrap()
     }
 
-    fn filter<'a>(field: &'a Field, predicate: Predicate, value: &str, end: Option<&str>) -> RFilter<'a> {
-        RFilter {
+    fn filter<'a>(field: &'a Field, predicate: Predicate, value: &str, end: Option<&str>) -> ResolvedFilter<'a> {
+        ResolvedFilter {
             fid: 0,
             field,
             def: zsql_spec::Filter {

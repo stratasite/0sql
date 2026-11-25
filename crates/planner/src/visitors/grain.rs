@@ -3,14 +3,14 @@
 //! names a measure rule lists into dimension ids.
 
 use crate::dag::{Filtered, Graph, Node, NodeId, NodeKind, Projected};
-use crate::model::{RFilter, RProjection, RQuery};
+use crate::resolved::{ResolvedFilter, ResolvedProjection, ResolvedQuery};
 use crate::resolver::set_subtrees;
 use crate::universe::Base;
 use crate::Result;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use zsql_semantic::{Exclusion, ExclusionScope, Field, FieldKind, Id, Inclusion, Universe};
+use zsql_semantic::{Exclusion, ExclusionScope, Field, FieldKind, Id, Inclusion, SemanticModel};
 
 /// Rails `Aggregation#grain_component`: a field, or a calculation's formula.
 pub fn grain_key(p: &Projected) -> String {
@@ -61,20 +61,20 @@ pub fn measure_signature(node: &Node, measure: &Field) -> crate::visitors::segme
 /// Rails `Dag.create_agg_node`: wrappers are re-made around the shared records.
 pub fn create_agg_node<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
     base: Arc<Base<'a>>,
-    projections: Vec<Rc<RProjection<'a>>>,
-    filters: Vec<Rc<RFilter<'a>>>,
+    projections: Vec<Rc<ResolvedProjection<'a>>>,
+    filters: Vec<Rc<ResolvedFilter<'a>>>,
 ) -> Result<NodeId> {
     let node = Node::with_universe(NodeKind::Aggregation, base, projections, filters);
     let id = graph.add_node(node);
-    set_subtrees(graph, id, universe, q)?;
+    set_subtrees(graph, id, semantic, q)?;
     Ok(id)
 }
 
 /// Rails `Dag.create_merge_node`.
-pub fn create_merge_node<'a>(graph: &mut Graph<'a>, q: &RQuery<'a>) -> NodeId {
+pub fn create_merge_node<'a>(graph: &mut Graph<'a>, q: &ResolvedQuery<'a>) -> NodeId {
     let filters = q.filters.iter().filter(|f| f.is_measure() && graph.dialect.final_measure_filter()).cloned().collect();
     let merge = Node::merge(q.all_projections(), filters, graph.dialect.final_pass_measure_join_type().to_string());
     graph.add_node(merge)
@@ -109,12 +109,12 @@ pub fn move_measure_components<'a>(
 /// Rails `Rules::Exclusion#dimension_ids`, resolved from entity names when
 /// the rule carries no cached ids: named dimensions, the dimensions mapped
 /// on named tables, or every dimension reachable from named root tables.
-pub fn exclusion_dimension_ids(universe: &Universe, rule: &Exclusion) -> Vec<Id> {
+pub fn exclusion_dimension_ids(semantic: &SemanticModel, rule: &Exclusion) -> Vec<Id> {
     if let Some(ids) = &rule.dimension_ids {
         return ids.clone();
     }
     let names: Vec<String> = rule.entities.iter().map(|e| e.trim().to_lowercase()).collect();
-    let snap = universe.snapshot();
+    let snap = semantic.snapshot();
     match rule.scope {
         ExclusionScope::Dimension => {
             snap.fields.iter().filter(|f| f.kind == FieldKind::Dimension && names.contains(&f.name.to_lowercase())).map(|f| f.id).collect()
@@ -124,7 +124,7 @@ pub fn exclusion_dimension_ids(universe: &Universe, rule: &Exclusion) -> Vec<Id>
             let mut out = Vec::new();
             for e in &snap.expressions {
                 if tables.contains(&e.table_id) {
-                    if let Some(f) = universe.field(e.field_id) {
+                    if let Some(f) = semantic.field(e.field_id) {
                         if f.kind == FieldKind::Dimension && !out.contains(&f.id) {
                             out.push(f.id);
                         }
@@ -147,12 +147,12 @@ pub fn exclusion_dimension_ids(universe: &Universe, rule: &Exclusion) -> Vec<Id>
 }
 
 /// Rails `Inclusion#dimension_ids`, resolved from names when not cached.
-pub fn inclusion_dimension_ids(universe: &Universe, rule: &Inclusion) -> Vec<Id> {
+pub fn inclusion_dimension_ids(semantic: &SemanticModel, rule: &Inclusion) -> Vec<Id> {
     if let Some(ids) = &rule.dimension_ids {
         return ids.clone();
     }
     let names: Vec<String> = rule.dimensions.iter().map(|e| e.trim().to_lowercase()).collect();
-    universe
+    semantic
         .snapshot()
         .fields
         .iter()
@@ -168,7 +168,7 @@ pub fn covered_elsewhere(graph: &Graph, id: NodeId) -> bool {
 }
 
 /// Dimension ids a calculation stands on, directly or through aliases.
-pub fn calc_dimension_ids(calc: &RProjection, q: &RQuery) -> Vec<Id> {
+pub fn calc_dimension_ids(calc: &ResolvedProjection, q: &ResolvedQuery) -> Vec<Id> {
     let mut ids: Vec<Id> = calc.field_refs.iter().filter(|f| f.is_dimension()).map(|f| f.id).collect();
     for a in &calc.def.projection_refs {
         if let Some(p) = q.projections.iter().find(|p| p.match_alias(a)) {

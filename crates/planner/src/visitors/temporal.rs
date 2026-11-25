@@ -4,19 +4,19 @@
 //! two periods join on the same date column.
 
 use crate::dag::{Filtered, Graph, MultiExpr, NodeId, NodeKind, Projected, Reference};
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use crate::sql::dates::parse_value;
 use crate::sql::expr::entity_gsub;
 use crate::visitors::alias::SKIP_ALIAS_PREFIX;
 use crate::visitors::grain::{create_agg_node, create_merge_node, grain_key};
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use std::collections::HashSet;
 use std::rc::Rc;
-use zsql_semantic::{Field, Predicate, Universe};
+use zsql_semantic::{Field, Predicate, SemanticModel};
 use zsql_spec::{Decorator, DecoratorKind};
 
-pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) -> Result<()> {
+pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = graph.root();
     let measures: Vec<Projected<'a>> = graph.nodes[node]
         .projections
@@ -38,11 +38,11 @@ pub fn run<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>) ->
     for mp in measures {
         let r = graph.nodes[node].get_ref(mp.proj.pid, mp.proj.field_id()).cloned();
         if mp.is_calculation() {
-            process_calculation(graph, universe, q, &mp, node)?;
+            process_calculation(graph, semantic, q, &mp, node)?;
         } else if let Some(Reference::Multi { expression: Some(MultiExpr::Semantic(exp)), .. }) = r {
-            process_compound(graph, universe, q, &mp, node, exp)?;
+            process_compound(graph, semantic, q, &mp, node, exp)?;
         } else {
-            process_table(graph, universe, q, &mp)?;
+            process_table(graph, semantic, q, &mp)?;
         }
     }
     Ok(())
@@ -56,7 +56,7 @@ fn unit(t: &Decorator) -> String {
     t.str("transform").unwrap_or("ERROR").split('_').next().unwrap_or("ERROR").to_string()
 }
 
-fn projected_grain(q: &RQuery) -> Option<String> {
+fn projected_grain(q: &ResolvedQuery) -> Option<String> {
     let date = q.projections.iter().find(|p| p.field.map(|f| f.is_date()).unwrap_or(false))?;
     date.def.decorators.iter().find(|d| d.kind == DecoratorKind::Truncate).and_then(|d| d.grain().map(str::to_string))
 }
@@ -72,7 +72,7 @@ fn unit_rank(u: &str) -> Option<i32> {
     })
 }
 
-fn unit_is_higher(t: &Decorator, q: &RQuery) -> bool {
+fn unit_is_higher(t: &Decorator, q: &ResolvedQuery) -> bool {
     match (unit_rank(&unit(t)), projected_grain(q).and_then(|g| unit_rank(&g))) {
         (Some(u), Some(g)) => u >= g,
         _ => false,
@@ -84,12 +84,12 @@ fn digest(name: &str, t: &Decorator) -> String {
     format!("{}{}_{}", SKIP_ALIAS_PREFIX, prefix, &format!("{:x}", md5::compute(name.as_bytes()))[..9])
 }
 
-fn process_table<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, mp: &Projected<'a>) -> Result<()> {
+fn process_table<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQuery<'a>, mp: &Projected<'a>) -> Result<()> {
     let t = temporalizer(mp);
     let field = mp.field().expect("measure field");
     let agg = graph.live().find(|n| n.purpose.is_none() && n.kind == NodeKind::Aggregation && n.has_proj(mp.proj.pid)).map(|n| n.id);
-    let agg = agg.ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", mp.to_s())))?;
-    let calc = transformed_calculation(graph, universe, q, field, &t, Some(agg), Some(mp))?;
+    let agg = agg.ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", mp.identity())))?;
+    let calc = transformed_calculation(graph, semantic, q, field, &t, Some(agg), Some(mp))?;
     let sql = if t.bool("percent_change", false) {
         format!(
             "( ([{}]@m) - ([{}]) ) /\n\t\t({})",
@@ -100,7 +100,7 @@ fn process_table<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'
     } else {
         format!("[{}]", calc.alias())
     };
-    let mut final_calc = (*q.static_calc(universe, &mp.alias, &sql)).clone_shallow();
+    let mut final_calc = (*q.static_calc(semantic, &mp.alias, &sql)).clone_shallow();
     final_calc.set_source(Some(mp.proj.clone()));
     final_calc.def.decorators = mp.decorators().into_iter().filter(|d| d.kind != DecoratorKind::Temporalize).cloned().collect();
     let root = graph.root();
@@ -111,17 +111,23 @@ fn process_table<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'
 /// Rails `process_calculation`: every measure the formula reads, directly or
 /// through a projected measure's alias, is swapped for its comparison-period
 /// static; the result replaces the calculation at the root.
-fn process_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQuery<'a>, mp: &Projected<'a>, merge: NodeId) -> Result<()> {
+fn process_calculation<'a>(
+    graph: &mut Graph<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    mp: &Projected<'a>,
+    merge: NodeId,
+) -> Result<()> {
     let t = temporalizer(mp);
     let original = mp.proj.def.sql.clone().unwrap_or_default();
-    let mut transformed = update_transformed_fields(graph, universe, q, &mp.proj, &original, &t)?;
+    let mut transformed = update_transformed_fields(graph, semantic, q, &mp.proj, &original, &t)?;
     for r in mp.proj.def.projection_refs.clone() {
-        transformed = update_transformed_projection_refs(graph, universe, q, &transformed, &r, merge, &t, &mp.proj)?;
+        transformed = update_transformed_projection_refs(graph, semantic, q, &transformed, &r, merge, &t, &mp.proj)?;
     }
     if t.bool("percent_change", false) {
         transformed = format!("(({}) - ({})) / \n\t\t({})", original, transformed, graph.dialect.null_if_zero(&transformed)?);
     }
-    let mut final_calc = (*q.static_calc(universe, &mp.alias, &transformed)).clone_shallow();
+    let mut final_calc = (*q.static_calc(semantic, &mp.alias, &transformed)).clone_shallow();
     final_calc.set_source(Some(mp.proj.clone()));
     final_calc.def.decorators = mp.decorators().into_iter().filter(|d| d.kind != DecoratorKind::Temporalize).cloned().collect();
     let root = graph.root();
@@ -131,15 +137,15 @@ fn process_calculation<'a>(graph: &mut Graph<'a>, universe: &'a Universe, q: &RQ
 
 fn update_transformed_fields<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
-    calc: &Rc<RProjection<'a>>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    calc: &Rc<ResolvedProjection<'a>>,
     sql: &str,
     t: &Decorator,
 ) -> Result<String> {
     let mut out = sql.to_string();
     for m in calc.field_refs.iter().filter(|f| f.is_measure()) {
-        let tf = transformed_calculation(graph, universe, q, m, t, None, None)?;
+        let tf = transformed_calculation(graph, semantic, q, m, t, None, None)?;
         out = entity_gsub(&out, &m.name, &format!("[{}]", tf.alias()));
     }
     Ok(out)
@@ -148,24 +154,24 @@ fn update_transformed_fields<'a>(
 #[allow(clippy::too_many_arguments)]
 fn update_transformed_projection_refs<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
     sql: &str,
     alias: &str,
     merge: NodeId,
     t: &Decorator,
-    parent: &Rc<RProjection<'a>>,
+    parent: &Rc<ResolvedProjection<'a>>,
 ) -> Result<String> {
     let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(alias)).cloned() else { return Ok(sql.to_string()) };
     let mut out = sql.to_string();
     if !pj.is_calculation() && pj.is_measure() && pj.proj.pid != parent.pid {
-        let tf = transformed_calculation(graph, universe, q, pj.field().expect("field"), t, None, None)?;
+        let tf = transformed_calculation(graph, semantic, q, pj.field().expect("field"), t, None, None)?;
         out = entity_gsub(&out, &pj.proj.alias(), &format!("[{}]", tf.alias()));
     } else if pj.is_calculation() && pj.proj.pid != parent.pid {
         // A referenced calculation is inlined with its own measures moved to
         // the comparison period, recursively, so the whole formula shifts as
         // one. (Rails stops here with an undefined method.)
-        let inner = transformed_formula(graph, universe, q, &pj.proj, merge, t, &mut vec![parent.pid, pj.proj.pid])?;
+        let inner = transformed_formula(graph, semantic, q, &pj.proj, merge, t, &mut vec![parent.pid, pj.proj.pid])?;
         out = entity_gsub(&out, &pj.proj.alias(), &format!("({inner})"));
     }
     Ok(out)
@@ -176,26 +182,26 @@ fn update_transformed_projection_refs<'a>(
 /// alias cycles.
 fn transformed_formula<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
-    calc: &Rc<RProjection<'a>>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    calc: &Rc<ResolvedProjection<'a>>,
     merge: NodeId,
     t: &Decorator,
     seen: &mut Vec<usize>,
 ) -> Result<String> {
     let original = calc.def.sql.clone().unwrap_or_default();
-    let mut out = update_transformed_fields(graph, universe, q, calc, &original, t)?;
+    let mut out = update_transformed_fields(graph, semantic, q, calc, &original, t)?;
     for r in calc.def.projection_refs.clone() {
         let Some(pj) = graph.nodes[merge].projections.iter().find(|p| p.proj.match_alias(&r)).cloned() else { continue };
         if !pj.is_calculation() && pj.is_measure() {
-            let tf = transformed_calculation(graph, universe, q, pj.field().expect("field"), t, None, None)?;
+            let tf = transformed_calculation(graph, semantic, q, pj.field().expect("field"), t, None, None)?;
             out = entity_gsub(&out, &pj.proj.alias(), &format!("[{}]", tf.alias()));
         } else if pj.is_calculation() {
             if seen.contains(&pj.proj.pid) {
-                return Err(PlanError::Resolution(format!("Calculation {} references itself through {}", calc.alias(), pj.proj.alias())));
+                return Err(Error::Resolution(format!("Calculation {} references itself through {}", calc.alias(), pj.proj.alias())));
             }
             seen.push(pj.proj.pid);
-            let inner = transformed_formula(graph, universe, q, &pj.proj, merge, t, seen)?;
+            let inner = transformed_formula(graph, semantic, q, &pj.proj, merge, t, seen)?;
             out = entity_gsub(&out, &pj.proj.alias(), &format!("({inner})"));
         }
     }
@@ -204,28 +210,28 @@ fn transformed_formula<'a>(
 
 fn process_compound<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
     mp: &Projected<'a>,
     merge: NodeId,
     exp: &'a zsql_semantic::Expression,
 ) -> Result<()> {
     let t = temporalizer(mp);
     let mut original = exp.sql.clone().unwrap_or_default();
-    let refs: Vec<&Field> = exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()).filter_map(|i| universe.field(*i)).collect();
+    let refs: Vec<&Field> = exp.dimension_ref_ids.iter().chain(exp.measure_ref_ids.iter()).filter_map(|i| semantic.field(*i)).collect();
     for f in &refs {
         let ty = if f.is_dimension() { "@D" } else { "@M" };
         original = entity_gsub(&original, &f.name, &format!("[{}]{}", f.name, ty));
     }
     let mut transformed = original.clone();
     for m in refs.iter().filter(|f| f.is_measure()) {
-        let calc = transformed_calculation(graph, universe, q, m, &t, None, None)?;
+        let calc = transformed_calculation(graph, semantic, q, m, &t, None, None)?;
         transformed = entity_gsub(&transformed, &m.name, &format!("[{}]", calc.alias()));
     }
     if t.bool("percent_change", false) {
         transformed = format!("(({}) - ({})) / \n\t\t({})", original, transformed, graph.dialect.null_if_zero(&transformed)?);
     }
-    let calc = q.static_calc(universe, &mp.alias, &transformed);
+    let calc = q.static_calc(semantic, &mp.alias, &transformed);
     let key = mp.proj.field_id().map(crate::dag::RefKey::Field).unwrap_or(crate::dag::RefKey::Proj(mp.proj.pid));
     if let Some(Reference::Multi { expression, .. }) = graph.nodes[merge].field_refs.get_mut(&key) {
         *expression = Some(MultiExpr::Calc(calc));
@@ -236,27 +242,27 @@ fn process_compound<'a>(
 /// The comparison-period static for the measure, on the transformed node.
 fn transformed_calculation<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     t: &Decorator,
     agg: Option<NodeId>,
     mp: Option<&Projected<'a>>,
-) -> Result<Rc<RProjection<'a>>> {
+) -> Result<Rc<ResolvedProjection<'a>>> {
     let agg = match agg {
         Some(a) => a,
         None => graph
             .live()
             .find(|n| n.purpose.is_none() && n.kind == NodeKind::Aggregation && n.has_field(measure.id))
             .map(|n| n.id)
-            .ok_or_else(|| PlanError::Resolution(format!("No aggregation node holds {}", measure.name)))?,
+            .ok_or_else(|| Error::Resolution(format!("No aggregation node holds {}", measure.name)))?,
     };
-    let transformed = find_or_create_transformed_node(graph, universe, q, measure, t, agg)?;
+    let transformed = find_or_create_transformed_node(graph, semantic, q, measure, t, agg)?;
     let alias = digest(&measure.name, t);
     let calc = match graph.nodes[transformed].projections.iter().find(|p| p.is_calculation() && p.proj.match_alias(&alias)) {
         Some(p) => p.proj.clone(),
         None => {
-            let c = (*q.static_calc(universe, &alias, &format!("[{}]@m", measure.name))).clone_shallow();
+            let c = (*q.static_calc(semantic, &alias, &format!("[{}]@m", measure.name))).clone_shallow();
             c.set_source(
                 graph.nodes[agg]
                     .projections
@@ -300,8 +306,8 @@ fn transformed_calculation<'a>(
 
 fn find_or_create_transformed_node<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
-    q: &RQuery<'a>,
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
     measure: &'a Field,
     t: &Decorator,
     agg: NodeId,
@@ -324,17 +330,17 @@ fn find_or_create_transformed_node<'a>(
     if let Some(n) = found {
         return Ok(n);
     }
-    let projections: Vec<Rc<RProjection<'a>>> =
+    let projections: Vec<Rc<ResolvedProjection<'a>>> =
         graph.nodes[agg].projections.iter().filter(|p| p.is_dimension()).map(|p| p.proj.clone()).collect();
     let mut filters: Vec<Filtered<'a>> = graph.nodes[agg].filters.iter().filter(|f| !f.is_date()).cloned().collect();
     // Date filters will be shifted, so they get uncoupled copies.
     filters.extend(graph.nodes[agg].filters.iter().filter(|f| f.is_date()).map(|f| Filtered::new(f.filter.clone())));
     let base = graph.nodes[agg].universe.clone().expect("agg universe");
     let root = graph.root();
-    let id = create_agg_node(graph, universe, q, base, projections, vec![])?;
+    let id = create_agg_node(graph, semantic, q, base, projections, vec![])?;
     graph.nodes[id].filters = filters;
     // Subtrees were set without the filters; rebuild with them.
-    crate::resolver::set_subtrees(graph, id, universe, q)?;
+    crate::resolver::set_subtrees(graph, id, semantic, q)?;
     graph.add_edge(id, root);
     for input in graph.nodes[agg].inputs.clone() {
         match graph.nodes[agg].strategies.iter().find(|s| s.node == input).cloned() {
@@ -350,7 +356,7 @@ fn find_or_create_transformed_node<'a>(
 }
 
 /// Push projected dates forward one period so the comparison rows join.
-fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &RQuery<'a>) -> Result<()> {
+fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &ResolvedQuery<'a>) -> Result<()> {
     let u = unit(t);
     let base_sql = graph.dialect.date_add(&u, 1, "@expression")?;
     let grain = projected_grain(q);
@@ -375,18 +381,18 @@ fn transform_date_projections<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorat
 }
 
 /// Shift the date filters back one period.
-fn transform_date_filters<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &RQuery<'a>) -> Result<()> {
+fn transform_date_filters<'a>(graph: &mut Graph<'a>, id: NodeId, t: &Decorator, q: &ResolvedQuery<'a>) -> Result<()> {
     let u = unit(t);
     let grain = projected_grain(q);
     let higher = unit_is_higher(t, q);
     let format = graph.dialect.date_format().to_string();
     for f in graph.nodes[id].filters.iter_mut().filter(|f| f.is_date()) {
         let value = f.filter_value.clone().unwrap_or_default();
-        let start = parse_value(&value, false).ok_or_else(|| PlanError::Resolution(format!("cannot parse date {value}")))?;
+        let start = parse_value(&value, false).ok_or_else(|| Error::Resolution(format!("cannot parse date {value}")))?;
         let mut fv = shift_back(start, &u);
         let mut fve = if f.predicate == Predicate::Between {
             let end = f.filter_value_end.clone().unwrap_or_default();
-            shift_back(parse_value(&end, true).ok_or_else(|| PlanError::Resolution(format!("cannot parse date {end}")))?, &u)
+            shift_back(parse_value(&end, true).ok_or_else(|| Error::Resolution(format!("cannot parse date {end}")))?, &u)
         } else {
             f.predicate = Predicate::Between;
             start - Duration::days(1)

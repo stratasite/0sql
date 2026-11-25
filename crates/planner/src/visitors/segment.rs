@@ -3,23 +3,23 @@
 //! final SQL carries exactly one CTE per segment.
 
 use crate::dag::{Entity, Graph, NodeId, NodeKind, Owner, RefKey, Reference, Strategy, StrategyKind};
-use crate::model::{FilledTree, RQuery, RSegment};
+use crate::resolved::{FilledTree, ResolvedQuery, ResolvedSegment};
 use crate::resolver::{self, Options};
 use crate::universe::Universes;
 use crate::visitors::segmentation::component_links;
-use crate::{PlanError, Result};
+use crate::{Error, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 use zsql_dialect::Dialects;
-use zsql_semantic::Universe;
+use zsql_semantic::SemanticModel;
 use zsql_spec::LinkMode;
 
 pub fn run<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    q: &RQuery<'a>,
+    q: &ResolvedQuery<'a>,
 ) -> Result<()> {
     if q.is_segment() {
         return Ok(());
@@ -38,7 +38,7 @@ pub fn run<'a>(
             let seg_node = match segment_nodes.get(&sid) {
                 Some(n) => *n,
                 None => {
-                    let n = build_segment_node(graph, universe, universes, dialects, &segment)?;
+                    let n = build_segment_node(graph, semantic, universes, dialects, &segment)?;
                     segment_nodes.insert(sid, n);
                     n
                 }
@@ -68,7 +68,7 @@ fn consumer(n: &crate::dag::Node) -> bool {
 
 /// Measure-level links, then query-level ones not overridden per segment;
 /// unique by (segment, mode), sorted the way Rails sorts them.
-fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, LinkMode)> {
+fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &ResolvedQuery<'a>) -> Vec<(usize, LinkMode)> {
     let node = &graph.nodes[id];
     let mut links: Vec<(usize, LinkMode)> =
         node.projections.iter().filter(|p| p.is_measure()).flat_map(|p| component_links(&p.proj)).collect();
@@ -88,24 +88,24 @@ fn links_for<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Vec<(usize, L
 /// fact-shaping visitors, with the datasource pinned to the consumer's.
 fn build_segment_node<'a>(
     graph: &mut Graph<'a>,
-    universe: &'a Universe,
+    semantic: &'a SemanticModel,
     universes: &Universes<'a>,
     dialects: &Dialects,
-    segment: &Rc<RSegment<'a>>,
+    segment: &Rc<ResolvedSegment<'a>>,
 ) -> Result<NodeId> {
     let sq = segment.as_query();
     let opts = Options { datasource: Some(graph.datasource), ..Default::default() };
-    let mut sub = match resolver::resolve_with(universe, universes, dialects, &sq, &opts) {
+    let mut sub = match resolver::resolve_with(semantic, universes, dialects, &sq, &opts) {
         Ok(g) => g,
-        Err(PlanError::Resolution(m)) => return Err(PlanError::Resolution(format!("Could not resolve segment {}: {}", segment.name(), m))),
+        Err(Error::Resolution(m)) => return Err(Error::Resolution(format!("Could not resolve segment {}: {}", segment.name(), m))),
         Err(e) => return Err(e),
     };
     sub.dialect = graph.dialect.clone();
-    crate::visitors::complex_measure::run(&mut sub, universe, universes, dialects, &sq)?;
-    crate::visitors::exclusion::run(&mut sub, universe, &sq)?;
-    crate::visitors::inclusion::run(&mut sub, universe, &sq)?;
-    crate::visitors::snapshot::run(&mut sub, universe, &sq)?;
-    crate::visitors::top_n::run(&mut sub, universe, universes, dialects, &sq)?;
+    crate::visitors::complex_measure::run(&mut sub, semantic, universes, dialects, &sq)?;
+    crate::visitors::exclusion::run(&mut sub, semantic, &sq)?;
+    crate::visitors::inclusion::run(&mut sub, semantic, &sq)?;
+    crate::visitors::snapshot::run(&mut sub, semantic, &sq)?;
+    crate::visitors::top_n::run(&mut sub, semantic, universes, dialects, &sq)?;
 
     let owner = Rc::new(Owner { sid: segment.sid, tree: sq.tree.clone(), identity: tree_identity(segment) });
     let first_new = graph.nodes.len();
@@ -124,11 +124,11 @@ fn build_segment_node<'a>(
 
 /// Rails `Node#owner_tree_identity`: a custom tree shape, leaves rendered as
 /// the filter's text, in Ruby's `inspect` form.
-fn tree_identity(segment: &RSegment) -> String {
+fn tree_identity(segment: &ResolvedSegment) -> String {
     if segment.def.filter_tree.is_none() || !segment.custom_tree {
         return String::new();
     }
-    fn render(t: &FilledTree, segment: &RSegment) -> String {
+    fn render(t: &FilledTree, segment: &ResolvedSegment) -> String {
         match t {
             FilledTree::Group(op, kids) => {
                 let mut parts = vec![ruby_str(op)];
@@ -139,7 +139,7 @@ fn tree_identity(segment: &RSegment) -> String {
                 let f = segment.filters.iter().find(|f| f.fid == *fid).expect("segment filter");
                 ruby_str(&format!(
                     "<f:{}:{}:{}>",
-                    crate::model::field_to_s(f.field),
+                    crate::resolved::field_identity(f.field),
                     f.def.predicate.name(),
                     f.def.filter_value.clone().unwrap_or_default()
                 ))
@@ -154,7 +154,7 @@ fn ruby_str(s: &str) -> String {
 }
 
 /// Pre-binds each carried column to the segment node's definition projection.
-fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId, segment: &Rc<RSegment<'a>>) -> Result<()> {
+fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId, segment: &Rc<ResolvedSegment<'a>>) -> Result<()> {
     let carried: Vec<_> = graph.nodes[id]
         .projections
         .iter()
@@ -164,7 +164,7 @@ fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId
     for proj in carried {
         let (parent_pid, _) = proj.carried_from.expect("carried");
         let Some(seg_proj) = graph.nodes[seg_node].projected(parent_pid).map(|p| p.proj.clone()) else {
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "Segment {} does not expand {} — remove the carried column or add the dimension to the segment's expanding zone.",
                 segment.name(),
                 proj.field.map(|f| f.name.clone()).unwrap_or_default()
@@ -175,7 +175,7 @@ fn bind_expanded_columns<'a>(graph: &mut Graph<'a>, id: NodeId, seg_node: NodeId
     Ok(())
 }
 
-fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -> Result<()> {
+fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = &graph.nodes[id];
     if node.kind == NodeKind::Merge {
         return Ok(());
@@ -183,7 +183,7 @@ fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -
     for p in node.projections.iter().filter(|p| p.proj.is_carried()) {
         if !node.field_refs.contains_key(&RefKey::Proj(p.proj.pid)) {
             let kind = if q.def.population { "segment" } else { "query" };
-            return Err(PlanError::Resolution(format!(
+            return Err(Error::Resolution(format!(
                 "{} reads from an expanding segment that does not apply here — expanding segments cannot combine with top-n rankings or snapshot resolution, and the segment must be linked to this {}.",
                 p.alias, kind
             )));
@@ -192,7 +192,7 @@ fn verify_expanded_bindings<'a>(graph: &Graph<'a>, id: NodeId, q: &RQuery<'a>) -
     Ok(())
 }
 
-fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<RSegment<'a>>, q: &RQuery<'a>) -> Result<()> {
+fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<ResolvedSegment<'a>>, q: &ResolvedQuery<'a>) -> Result<()> {
     let node = &graph.nodes[id];
     let base = node.universe.as_ref().expect("consumer universe");
     let missing: Vec<String> = segment.key_dimensions().iter().filter(|k| !base.has_dimension(k.id)).map(|k| k.name.clone()).collect();
@@ -201,7 +201,7 @@ fn verify_reachable<'a>(graph: &Graph<'a>, id: NodeId, segment: &Rc<RSegment<'a>
     }
     let measures: Vec<String> = node.projections.iter().filter(|p| p.is_measure()).map(|p| p.alias.clone()).collect();
     let desc = if measures.is_empty() { q.def.name.clone().unwrap_or_default() } else { format!("measure {}", measures.join(", ")) };
-    Err(PlanError::Resolution(format!(
+    Err(Error::Resolution(format!(
         "Segment {} cannot be applied to {}: key dimension {} is not reachable from {}.",
         segment.name(),
         desc,

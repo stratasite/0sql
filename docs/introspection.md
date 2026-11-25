@@ -20,6 +20,9 @@ connects with that and whatever the request sends over it. `zsql
 deploy` still strips secrets, so the server holds one only when a
 deployer's own archive carried it; otherwise the service in front sends
 it with each request and the server drops it with the answer.
+2026-11-24: no longer so. `zsql deploy` carries a datasource's secrets
+and the server keeps them as its credential; `docs/operating.md` says
+how.
 `docs/operating.md`, "Probing a datasource".)
 
 ## What this is not

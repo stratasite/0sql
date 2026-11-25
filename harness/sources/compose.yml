@@ -1,4 +1,4 @@
-# The warehouses zsql-source can be proven against without a cloud
+# The warehouses zsql-datasource can be proven against without a cloud
 # account, one per transport and then some: Postgres, MySQL and SQL Server
 # on the wire, ClickHouse and Trino over HTTP. SQLite needs no server.
 #
@@ -6,7 +6,7 @@
 #   ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PORT=5466 \
 #   ZSQL_TEST_PG_PASSWORD=zsql \
 #   ZSQL_TEST_CLICKHOUSE_URL=http://localhost:8123 \
-#     cargo test -p zsql-source -- --ignored
+#     cargo test -p zsql-datasource -- --ignored
 #
 # Every password here is for a throwaway container on loopback, and is
 # the same word so the test variables are easy to type.

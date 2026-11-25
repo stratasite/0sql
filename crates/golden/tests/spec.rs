@@ -3,7 +3,7 @@
 //! references are refused by name.
 
 use zsql_golden::{run_case_on, Fixtures, PathSource};
-use zsql_spec::{lower, resolve_field, Spec, SpecError};
+use zsql_spec::{lower, resolve_field, Spec};
 
 #[test]
 fn specs_serialize_back_and_lower_to_the_same_plan() {
@@ -13,15 +13,15 @@ fn specs_serialize_back_and_lower_to_the_same_plan() {
     let (mut checked, mut skipped) = (0, 0);
     for (_, cases) in fx.cases().unwrap() {
         for case in &cases {
-            let (universe, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
-            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            let (semantic, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+            let planner = zsql_planner::Planner::new(&semantic, dialects, paths.as_deref().map(Vec::as_slice));
             if !run_case_on(&planner, dialects, case).unwrap().passed() {
                 skipped += 1;
                 continue;
             }
             let spec = Spec::from_value(case.spec.clone()).unwrap();
-            let first = lower(&spec, &universe, &base).unwrap();
-            let again = lower(&first.to_spec(), &universe, &base).unwrap_or_else(|e| panic!("{}: re-lowering its own spec: {e}", case.id));
+            let first = lower(&spec, &semantic, &base).unwrap();
+            let again = lower(&first.to_spec(), &semantic, &base).unwrap_or_else(|e| panic!("{}: re-lowering its own spec: {e}", case.id));
             let a = planner.plan_query(first, case.context.as_ref());
             let b = planner.plan_query(again, case.context.as_ref());
             match (a, b) {
@@ -44,8 +44,8 @@ fn fields_resolve_by_name_as_well_as_uid() {
     let mut checked = 0;
     for (_, cases) in fx.cases().unwrap() {
         for case in cases.iter().filter(|c| matches!(c.expected, zsql_golden::Expected::Sql { .. })) {
-            let (universe, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
-            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            let (semantic, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+            let planner = zsql_planner::Planner::new(&semantic, dialects, paths.as_deref().map(Vec::as_slice));
             if !run_case_on(&planner, dialects, case).unwrap().passed() {
                 continue;
             }
@@ -55,7 +55,7 @@ fn fields_resolve_by_name_as_well_as_uid() {
             let mut by_name = spec.clone();
             for p in by_name.projections.iter_mut() {
                 if let Some(serde_json::Value::String(uid)) = &p.field {
-                    let f = resolve_field(&universe, uid, p.field_type.as_deref()).unwrap();
+                    let f = resolve_field(&semantic, uid, p.field_type.as_deref()).unwrap();
                     let suffix = match f.kind {
                         zsql_semantic::FieldKind::Dimension => "@d",
                         zsql_semantic::FieldKind::Measure => "@m",
@@ -64,8 +64,8 @@ fn fields_resolve_by_name_as_well_as_uid() {
                     p.field_type = None;
                 }
             }
-            let a = planner.plan_query(lower(&spec, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
-            let b = planner.plan_query(lower(&by_name, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
+            let a = planner.plan_query(lower(&spec, &semantic, &base).unwrap(), case.context.as_ref()).unwrap();
+            let b = planner.plan_query(lower(&by_name, &semantic, &base).unwrap(), case.context.as_ref()).unwrap();
             assert_eq!(a.sql, b.sql, "{}: naming the fields changes the plan", case.id);
             checked += 1;
         }
@@ -77,19 +77,19 @@ fn fields_resolve_by_name_as_well_as_uid() {
 fn unresolvable_references_are_named_in_the_error() {
     let fx = Fixtures::open(Fixtures::default_root());
     let hash = fx.snapshot_hashes().unwrap().into_iter().next().unwrap();
-    let universe = fx.universe(&hash).unwrap();
-    match resolve_field(&universe, "no_such_field_anywhere", None) {
-        Err(SpecError::NotFound(msg)) => assert!(msg.contains("no_such_field_anywhere"), "{msg}"),
+    let semantic = fx.semantic(&hash).unwrap();
+    match resolve_field(&semantic, "no_such_field_anywhere", None) {
+        Err(zsql_spec::Error::NotFound(msg)) => assert!(msg.contains("no_such_field_anywhere"), "{msg}"),
         other => panic!("expected NotFound, got {other:?}"),
     }
-    let f = universe.fields().first().unwrap();
+    let f = semantic.fields().first().unwrap();
     let spelled = format!("  {}  ", f.uid.to_uppercase());
-    assert_eq!(resolve_field(&universe, &spelled, None).unwrap().uid, f.uid);
-    if let Some(h) = universe.fields().iter().find(|f| f.hidden) {
-        assert_eq!(resolve_field(&universe, &h.uid, None).unwrap().uid, h.uid);
+    assert_eq!(resolve_field(&semantic, &spelled, None).unwrap().uid, f.uid);
+    if let Some(h) = semantic.fields().iter().find(|f| f.hidden) {
+        assert_eq!(resolve_field(&semantic, &h.uid, None).unwrap().uid, h.uid);
     }
     let bad = Spec::from_value(serde_json::json!({ "projections": [], "filtres": [] }));
-    assert!(matches!(bad, Err(SpecError::Invalid(ref m)) if m.contains("filtres")), "{bad:?}");
+    assert!(matches!(bad, Err(zsql_spec::Error::Invalid(ref m)) if m.contains("filtres")), "{bad:?}");
 }
 
 /// A window's or contribution's partition and order refs resolve by name
@@ -103,8 +103,8 @@ fn partition_and_order_refs_resolve_by_name_and_refuse_a_miss() {
     let (mut checked, mut refused) = (0, 0);
     for (_, cases) in fx.cases().unwrap() {
         for case in cases.iter().filter(|c| matches!(c.expected, zsql_golden::Expected::Sql { .. })) {
-            let (universe, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
-            let planner = zsql_planner::Planner::new(&universe, dialects, paths.as_deref().map(Vec::as_slice));
+            let (semantic, paths) = fx.planner_for(&case.universe, PathSource::Formed).unwrap();
+            let planner = zsql_planner::Planner::new(&semantic, dialects, paths.as_deref().map(Vec::as_slice));
             if !run_case_on(&planner, dialects, case).unwrap().passed() {
                 continue;
             }
@@ -123,7 +123,7 @@ fn partition_and_order_refs_resolve_by_name_and_refuse_a_miss() {
             }
             // Every uid in a partition or order ref becomes the field's name.
             let name_of = |uid: &str| {
-                universe
+                semantic
                     .field_by_uid(uid, Some(zsql_semantic::FieldKind::Dimension))
                     .map(|f| f.name.clone())
                     .unwrap_or_else(|| uid.to_string())
@@ -152,13 +152,13 @@ fn partition_and_order_refs_resolve_by_name_and_refuse_a_miss() {
                     }
                 }
             }
-            let a = planner.plan_query(lower(&spec, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
-            let b = planner.plan_query(lower(&by_name, &universe, &base).unwrap(), case.context.as_ref()).unwrap();
+            let a = planner.plan_query(lower(&spec, &semantic, &base).unwrap(), case.context.as_ref()).unwrap();
+            let b = planner.plan_query(lower(&by_name, &semantic, &base).unwrap(), case.context.as_ref()).unwrap();
             assert_eq!(a.sql, b.sql, "{}: naming the partition changes the plan", case.id);
             checked += 1;
             if miss.to_value() != spec.to_value() {
-                match lower(&miss, &universe, &base) {
-                    Err(SpecError::RecordInvalid(msg)) => assert!(msg.contains("not a projected dimension"), "{}: {msg}", case.id),
+                match lower(&miss, &semantic, &base) {
+                    Err(zsql_spec::Error::RecordInvalid(msg)) => assert!(msg.contains("not a projected dimension"), "{}: {msg}", case.id),
                     other => panic!("{}: a partition naming nothing was accepted: {other:?}", case.id),
                 }
                 refused += 1;

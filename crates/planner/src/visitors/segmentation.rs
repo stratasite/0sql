@@ -3,7 +3,7 @@
 //! measures may share an aggregation.
 
 use crate::dag::Node;
-use crate::model::{RProjection, RQuery};
+use crate::resolved::{ResolvedProjection, ResolvedQuery};
 use std::rc::Rc;
 use zsql_semantic::Field;
 use zsql_spec::LinkMode;
@@ -11,7 +11,7 @@ use zsql_spec::LinkMode;
 pub type Signature = Vec<(usize, LinkMode)>;
 
 /// The links on the first persisted, linked projection up the source chain.
-pub fn component_links<'a>(p: &Rc<RProjection<'a>>) -> Vec<(usize, LinkMode)> {
+pub fn component_links<'a>(p: &Rc<ResolvedProjection<'a>>) -> Vec<(usize, LinkMode)> {
     let mut current = Some(p.clone());
     let mut seen: Vec<usize> = Vec::new();
     while let Some(c) = current {
@@ -34,7 +34,7 @@ pub fn signature_for(links: &[(usize, LinkMode)]) -> Signature {
     v
 }
 
-pub fn signature<'a>(p: &Rc<RProjection<'a>>) -> Signature {
+pub fn signature<'a>(p: &Rc<ResolvedProjection<'a>>) -> Signature {
     signature_for(&component_links(p))
 }
 
@@ -45,7 +45,7 @@ pub fn node_signature(node: &Node) -> Signature {
 }
 
 /// Every key dimension any of the query's segments demands, measure-level included.
-pub fn all_key_dimensions<'a>(q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn all_key_dimensions<'a>(q: &ResolvedQuery<'a>) -> Vec<&'a Field> {
     let mut out: Vec<&Field> = q.query_level_key_dimensions();
     for p in q.projections.iter().filter(|p| p.is_measure() || p.is_calculation()) {
         for (sid, _) in component_links(p) {
@@ -62,7 +62,7 @@ pub fn all_key_dimensions<'a>(q: &RQuery<'a>) -> Vec<&'a Field> {
 }
 
 /// Key dimensions demanded by a projection's own links and the query-level ones.
-pub fn keys_for<'a>(p: &Rc<RProjection<'a>>, q: &RQuery<'a>) -> Vec<&'a Field> {
+pub fn keys_for<'a>(p: &Rc<ResolvedProjection<'a>>, q: &ResolvedQuery<'a>) -> Vec<&'a Field> {
     let mut out: Vec<&Field> = Vec::new();
     let mut sids: Vec<usize> = component_links(p).iter().map(|(s, _)| *s).collect();
     sids.dedup();

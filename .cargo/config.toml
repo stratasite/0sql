@@ -1,0 +1,4 @@
+# `cargo xtask <command>`: the engine on the command line, for its
+# developers. See xtask/src/main.rs.
+[alias]
+xtask = "run --release --package xtask --"

@@ -763,7 +763,7 @@ which `crates/golden/tests/spec.rs` pins. The lowering is
 model-free: it emits names as written, lowers `@d`/`@m` to
 `field_type`, turns a moving frame's row count into `size`, and flattens
 a tree with no `or` into the array form. Resolution of partition and
-order references moves into the spec lowering, which has the universe
+order references moves into the spec lowering, which has the semantic model
 and the projections, and fails on a miss instead of pruning. `HELP`
 becomes a generated summary of the grammar. Goldens: a text file of
 lines beside their expected specs, in the pattern of the existing
