@@ -44,6 +44,10 @@ fn server() -> Server {
 }
 
 fn app_over(data_dir: &std::path::Path) -> Shared {
+    app_with(data_dir, &crate::RunLimits::default())
+}
+
+fn app_with(data_dir: &std::path::Path, limits: &crate::RunLimits) -> Shared {
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
     Arc::new(App {
         dialects,
@@ -52,10 +56,12 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         admission: Admission::new(&AdmissionCounts::default()),
         mcp: mcp::Settings::builtin(),
         deploying: std::sync::Mutex::new(()),
-        runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
+        runs: crate::open_runs(data_dir, limits).unwrap(),
         default_sql_limit: None,
     })
 }
+
+mod archive;
 
 /// A status and a JSON body (null when the body is not JSON).
 #[derive(Debug)]

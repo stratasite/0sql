@@ -161,6 +161,11 @@ const STALE_WITHIN: Duration = Duration::from_secs(2);
 const IDLE: Duration = Duration::from_secs(30);
 
 impl Runs {
+    /// The object store results are kept in, when there is one.
+    pub fn objects(&self) -> Option<&Arc<Objects>> {
+        self.inner.objects.as_ref()
+    }
+
     /// Opens the runs whose results live under `dir`. Whatever this node
     /// had in progress when it last stopped is ended as failed: nothing
     /// of it survived.

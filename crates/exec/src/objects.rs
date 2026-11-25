@@ -23,6 +23,9 @@ pub const PREFIX: &str = "cache";
 /// A part of a large upload; a result smaller than one goes whole.
 const PART: usize = 8 * 1024 * 1024;
 
+/// How long one put of [`Objects::put_new`] may take.
+pub const PUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The store results are kept in.
 pub struct Objects {
     // A thread that is always there to drive the store's requests.
@@ -125,6 +128,44 @@ impl Objects {
             Ok(())
         })?;
         Ok(key)
+    }
+
+    /// Puts `bytes` at `path` beneath the store's own prefix, whole,
+    /// where nothing is yet, and says where they went: the key
+    /// [`Objects::delete`] takes, or `None` when something is there
+    /// already, which is left as it was. A store that cannot be asked
+    /// for that is simply put to. A put that has not ended in
+    /// `PUT_WITHIN` is given up: its caller is holding something. A put
+    /// that failed or was given up is cleared away as well as it can
+    /// be, since it may have landed all the same.
+    /// For what is kept beside the results and is not one: nothing here
+    /// ever clears it away.
+    pub fn put_new(&self, path: &[&str], bytes: Vec<u8>) -> Result<Option<String>> {
+        let key = path.iter().fold(self.base.clone(), |at, part| at.join(*part)).to_string();
+        let at = Key::parse(&key).map_err(|e| failed(&key, e))?;
+        let payload = PutPayload::from(bytes);
+        self.on(async {
+            let putting = async {
+                match self.store.put_opts(&at, payload.clone(), object_store::PutMode::Create.into()).await {
+                    Ok(_) => Ok(true),
+                    Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+                    Err(object_store::Error::NotImplemented { .. }) => self.store.put(&at, payload).await.map(|_| true),
+                    Err(e) => Err(e),
+                }
+            };
+            let put = match tokio::time::timeout(PUT_WITHIN, putting).await {
+                Ok(done) => done.map_err(|e| failed(&key, e)),
+                Err(_) => Err(failed(&key, format!("not put within {} seconds", PUT_WITHIN.as_secs()))),
+            };
+            if put.is_err() {
+                // The store may have taken the bytes and the answer been
+                // lost, or the put been given up as it landed: the caller
+                // is told nothing was put, so nothing is left there.
+                let _ = tokio::time::timeout(PUT_WITHIN, self.store.delete(&at)).await;
+            }
+            put
+        })
+        .map(|put| put.then_some(key))
     }
 
     /// Fetches a result's rows to `to`, written beside it and renamed,

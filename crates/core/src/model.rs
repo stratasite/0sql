@@ -136,6 +136,23 @@ fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut V
     }
     Value::Object(out)
 }
+
+/// Takes every secret out of a datasource's settings for a copy that
+/// leaves the server, at any depth: a key that [`is_secret`] goes with
+/// its value, in a mapping inside a list as much as one at the top.
+/// The test is the one that decides what is served, so a copy holds
+/// what a caller could have read and no more.
+pub fn strip_secrets(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, _| !is_secret(key));
+            map.values_mut().for_each(strip_secrets);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_secrets),
+        _ => {}
+    }
+}
+
 pub const TESTS_FILE: &str = "tests.json";
 
 impl Model {
@@ -237,8 +254,31 @@ impl Model {
     /// are any (and not a stale file when there are none), and the
     /// tests.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
+        self.write_with(dir, self.semantic().snapshot())?;
+        self.write_secrets(dir)
+    }
+
+    /// What [`Model::write`] keeps, for a place other than the server's
+    /// own disk: the same files but [`SECRETS_FILE`], which is never
+    /// written, and a snapshot gone over once more for anything that
+    /// [`is_secret`]. [`Model::from_stored`] reads it back as a model
+    /// that plans the same and connects with nothing.
+    pub fn write_without_secrets(&self, dir: &Path) -> std::io::Result<()> {
+        let mut snapshot = self.semantic().snapshot().clone();
+        for datasource in &mut snapshot.datasources {
+            let mut settings = Value::Object(std::mem::take(&mut datasource.connection));
+            strip_secrets(&mut settings);
+            if let Value::Object(settings) = settings {
+                datasource.connection = settings;
+            }
+            strip_secrets(&mut datasource.extra_query_params);
+        }
+        self.write_with(dir, &snapshot)
+    }
+
+    fn write_with(&self, dir: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(self.semantic().snapshot())?)?;
+        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(snapshot)?)?;
         let values_path = dir.join(zsql_project::values::FILE_NAME);
         match &self.values {
             Some(v) => v.write(&values_path)?,
@@ -248,8 +288,7 @@ impl Model {
         }
         // ProjectTest serializes its file as a file name, so nothing of
         // the directory it was loaded from is kept.
-        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)?;
-        self.write_secrets(dir)
+        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)
     }
 
     /// The secrets, in a file of their own that only its owner reads;

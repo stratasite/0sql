@@ -27,6 +27,8 @@ zsql-exec.workspace = true
 # A response body fed by a reader on its own thread.
 futures-core = "0.3"
 serde_yaml.workspace = true
+# A deploy kept in the object store is a zip, for whoever opens it by hand.
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 zsql-shorthand.workspace = true

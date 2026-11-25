@@ -119,6 +119,30 @@ What to keep in mind whichever path is used:
   the data directory. They are not in `snapshot.json.gz`. No read
   serves one, and anyone who reaches the port can then run and probe
   that warehouse with it. See "The credential of a datasource".
+- **A deploy is kept in the object store, without its secrets.** With
+  `ZSQL_OBJECT_STORE` set, every deploy is also put there as
+  `deploys/<org>/<project>/<branch>/<org>-<project>-<branch>-<time>.zip`,
+  the time in UTC to the millisecond (`20261124T153012.123Z`). The zip
+  holds `deploy.json` (what the deploy answered), `project/` (the files
+  the model was loaded from, and nothing else the archive carried) and
+  `compiled/` (the snapshot, the sampled values and the tests, as the
+  data directory has them). Every setting of a datasource whose name
+  says secret (`password`, `token`, `private_key`, `api_key` and
+  their like) is left out of both `project/datasources.yml` and the
+  snapshot, at any depth. The test is the one that decides what is
+  served, and it is a test of names: a credential written under a key
+  nobody would take for one, or into a `url`, is kept as written, so
+  the bucket is still worth guarding. `datasources.yml` is written
+  again, and so without its comments. The deploy's answer names the
+  zip under `archive`. A deploy that cannot be kept is refused with
+  `502 ArchiveError` and replaces nothing; a put is given a minute,
+  and one that failed or was given up is cleared away. A zip is only
+  ever put where nothing is, so no deploy's zip replaces another's.
+  The zip is put while the deploy
+  lock is held, so the zips of a branch are in the order its deploys
+  went live, and a slow store slows every deploy behind it. Nothing
+  clears these away: how long they are kept is the bucket's lifecycle
+  rule to say.
 
 ## Probing a datasource
 
@@ -363,7 +387,7 @@ same thing. The ones an operator sets:
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE` | how much of each kind of work runs at once; `docs/admission.md` |
 | `ZSQL_DB`, `ZSQL_DB_USER`, `ZSQL_DB_PASSWORD` | a Postgres to keep the records of runs in, as `host:port/database` with `?sslmode=` when it says; unset, they are kept on this node's disk. The table is `zsql_results`, made from `ops/zsql_results.sql` by whoever runs the database: the server checks for it at startup and never creates it |
-| `ZSQL_OBJECT_STORE` | where results are kept for every node to read: `s3://bucket/prefix`, `gs://`, `az://`, or `file:///dir`. A result goes under `cache/` there. Unset, a result is only on the disk of the node that made it |
+| `ZSQL_OBJECT_STORE` | where results are kept for every node to read: `s3://bucket/prefix`, `gs://`, `az://`, or `file:///dir`. A result goes under `cache/` there, and each deploy, without its secrets, under `deploys/`. Unset, a result is only on the disk of the node that made it |
 | `ZSQL_OBJECT_STORE_<OPTION>` | the store's options, by the store's own names: `ZSQL_OBJECT_STORE_AWS_ACCESS_KEY_ID`, `ZSQL_OBJECT_STORE_AWS_SECRET_ACCESS_KEY`, `ZSQL_OBJECT_STORE_AWS_REGION`, `ZSQL_OBJECT_STORE_AWS_ENDPOINT` and so on. An option the store does not have stops the server at startup. `AWS_*` and `GOOGLE_APPLICATION_CREDENTIALS` are never read for the store: the Athena and BigQuery adapters fall back to them, and a storage credential there would become a warehouse login |
 | `ZSQL_LOCAL_CACHE_MAX_PERCENT` | the share of the disk this node's results may take; 60. Past it, with an object store, the least recently read local copies are removed; without one, a run fails saying the disk is full |
 | `ZSQL_CACHE_SWEEP_SECS` | how often results that no longer answer, expired or invalidated, are deleted from the store and the disk; 300 |
