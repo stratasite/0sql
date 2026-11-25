@@ -18,7 +18,7 @@ release, and does not wait for CI.
 
 ## Why glibc, and not static
 
-Until 0.7 the Linux builds were statically linked against musl, so one
+Through 0.7.0 the Linux builds were statically linked against musl, so one
 binary ran on any distribution. A static binary cannot load a shared
 library, and an ADBC driver is one: those builds had the driver code
 compiled out and read Snowflake and BigQuery over REST, as text. The

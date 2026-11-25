@@ -60,7 +60,7 @@ driver manager looks (`ADBC_DRIVER_PATH`, `~/.config/adbc/drivers`,
 takes a relative path, so a project directory cannot supply the library
 that is handed the credentials.
 
-A static musl binary cannot load a library, and until 0.7 the Linux
+A static musl binary cannot load a library, and through 0.7.0 the Linux
 releases were static musl, so a released Linux `zsql` always used REST
 for these two. Since 2026-11-25 the Linux releases are dynamic glibc
 builds (`docs/releasing.md`, `docs/linux-build.md`) and load a driver

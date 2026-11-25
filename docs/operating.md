@@ -11,8 +11,8 @@ leaves to the operator.
 Linux with glibc 2.34 or newer, on x86_64 or arm64: Ubuntu 22.04,
 Debian 12, RHEL 9, Amazon Linux 2023, or a container based on one.
 `ldd --version` says which a machine has. The binary asks for nothing
-else. It does not run on Alpine or in a `scratch` container; until 0.7
-it was a static build that did.
+else. It does not run on Alpine or in a `scratch` container; through
+0.7.0 it was a static build that did.
 
 **The ADBC drivers are optional and worth having** where a datasource
 is Snowflake or BigQuery. With a driver a result arrives typed and in
@@ -524,7 +524,7 @@ sign-up, a web app, rate limits, all in the server. That is gone.
 
 ## What changes shape between releases
 
-**The binary.** Through 0.7 the Linux release was a static build that
+**The binary.** Through 0.7.0 the Linux release was a static build that
 ran on any distribution. After it, the release needs glibc 2.34
 ("What the machine needs", above). On Alpine or an older glibc the new
 binary does not start; the installer tries a download before it

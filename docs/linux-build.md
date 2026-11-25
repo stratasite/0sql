@@ -101,7 +101,8 @@ cross's glibc container with its floor measured.
 
 - **The server that runs `app.0sql.io`.** It installs the released
   Linux binary and needs glibc 2.34. `ldd --version` there has not
-  been run; it gates phase 6.
+  been run. It does not gate the release: that server is upgraded
+  later, and must be checked before it is.
 - **A query through a driver under the service unit.** Loading works.
 
 ## Phases
@@ -179,7 +180,7 @@ cross's glibc container with its floor measured.
     are static, and it is safe to publish before the release.
   - After installing it asks the new `zsql` for its drivers. Where
     one is missing it recommends them and says how to get `dbc`. A
-    `zsql` without that command, 0.7 and older, is asked nothing.
+    `zsql` without that command, 0.7.0 and older, is asked nothing.
   - Its header states the requirement.
 
   Anything that fetches `releases/latest/download/zsql-x86_64-linux`
@@ -218,10 +219,11 @@ cross's glibc container with its floor measured.
     `exec.md`, `execution.md`, `local-sql.md`) are history and stay
     as written.
 
-- [ ] **Phase 6 — the release.** A minor version, since where it runs
-  changes. In order: the server of `app.0sql.io` is known to be at or
-  above the floor; the workflow publishes the glibc builds; the new
-  installer goes live; the release notes name the requirement and what
+- [ ] **Phase 6 — the release.** As 0.7.2, decided 2026-11-25: the
+  0.7 line is still being iterated on, and the server of `app.0sql.io`
+  is dealt with later and does not gate it. In order: the new
+  installer goes live, which is safe ahead of the release; the
+  workflow publishes the glibc builds; the release notes name the requirement and what
   no longer works.
 
 ## Not in this plan
