@@ -142,14 +142,8 @@ fn bucket_measures<'a>(
     universes: &Universes<'a>,
     q: &ResolvedQuery<'a>,
 ) -> Result<Option<Vec<Bucket<'a>>>> {
-    // A dimension measure is a member like any measure: it forks with its
-    // own signature, and stays behind when a sibling's segment is not its own.
-    let members: Vec<Rc<ResolvedProjection<'a>>> = graph.nodes[id]
-        .projections
-        .iter()
-        .filter(|p| p.is_measure() && (!p.is_calculation() || p.proj.is_dimension_measure(&q.projections)))
-        .map(|p| p.proj.clone())
-        .collect();
+    let members: Vec<Rc<ResolvedProjection<'a>>> =
+        graph.nodes[id].projections.iter().filter(|p| p.is_measure() && !p.is_calculation()).map(|p| p.proj.clone()).collect();
     if members.iter().all(|p| signature(p).is_empty()) {
         return Ok(None);
     }
@@ -256,10 +250,10 @@ fn fork_measures<'a>(
                 && c.kind == NodeKind::Aggregation
                 && dimensionally_equivalent(c, &dims, &filters)
                 && node_signature(c) == *sig
-                && moved.iter().chain(built.iter()).all(|p| {
-                    let fields = aggregated_fields(p);
-                    !fields.is_empty() && fields.iter().all(|f| c.universe.as_ref().map(|u| u.has_field(f.id)).unwrap_or(false))
-                })
+                && moved
+                    .iter()
+                    .chain(built.iter())
+                    .all(|p| p.field.map(|f| c.universe.as_ref().map(|u| u.has_field(f.id)).unwrap_or(false)).unwrap_or(false))
         })
         .map(|c| c.id);
 
@@ -314,10 +308,10 @@ fn universe_for<'a>(
 ) -> Result<Arc<Base<'a>>> {
     let node = &graph.nodes[id];
     let keys = keys_for(p, q);
-    let fields = aggregated_fields(p);
+    let field = p.field.expect("measure projection field");
     let mut required: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
     required.extend(node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.field()));
-    required.extend(fields.iter().copied());
+    required.push(field);
     let mut seen = std::collections::HashSet::new();
     required.retain(|f| seen.insert(f.id));
     let covers = |u: &Base<'a>| required.iter().all(|f| u.has_field(f.id)) && keys.iter().all(|k| u.has_dimension(k.id));
@@ -332,7 +326,7 @@ fn universe_for<'a>(
         let message = format!(
             "Segment {} cannot be applied to {}: no universe reaches key dimension {} together with the measure.",
             segments.join(", "),
-            p.alias(),
+            field.name,
             keys.iter().map(|k| k.name.clone()).collect::<Vec<_>>().join(", ")
         );
         if universes.bases.iter().any(|u| covers(u)) {
@@ -342,16 +336,6 @@ fn universe_for<'a>(
     }
     let dims: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
     let dim_filters: Vec<Rc<ResolvedFilter<'a>>> = node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.filter.clone()).collect();
-    let measures: Vec<&Field> = fields.iter().copied().filter(|f| f.is_measure()).collect();
-    let sorted = sort_for_max_hints_and_dims(candidates, &measures, &dims, &q.hints, &dim_filters, semantic);
+    let sorted = sort_for_max_hints_and_dims(candidates, &[field], &dims, &q.hints, &dim_filters, semantic);
     Ok(sorted[0].clone())
-}
-
-/// What a member aggregates: a measure's field, or the dimensions a
-/// dimension measure reads.
-fn aggregated_fields<'a>(p: &Rc<ResolvedProjection<'a>>) -> Vec<&'a Field> {
-    match p.field {
-        Some(f) => vec![f],
-        None => p.field_refs.clone(),
-    }
 }

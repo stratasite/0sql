@@ -7,6 +7,7 @@
 //! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
+pub mod lift;
 pub mod profile;
 pub mod pruner;
 pub mod resolved;
@@ -168,6 +169,7 @@ pub fn plan_query_with<'a>(
 pub struct Planner<'a> {
     semantic: &'a SemanticModel,
     dialects: &'a Dialects,
+    paths: &'a [zsql_semantic::Path],
     universes: universe::Universes<'a>,
 }
 
@@ -178,7 +180,7 @@ impl<'a> Planner<'a> {
             Some(p) => universe::Universes::build_from(semantic, p),
             None => universe::Universes::build(semantic),
         };
-        Planner { semantic, dialects, universes }
+        Planner { semantic, dialects, paths: paths.unwrap_or(&semantic.snapshot().paths), universes }
     }
 
     pub fn semantic(&self) -> &'a SemanticModel {
@@ -254,6 +256,18 @@ impl<'a> Planner<'a> {
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
+        // A calculation that is a measure on dimensions is planned as one,
+        // over a copy of the model that holds it as a field.
+        let aggregates = self.dialects.base().map_err(|e| Error::Resolution(e.to_string()))?.aggregate_functions();
+        if let Some(lifted) = lift::lift(self.semantic, self.paths, &aggregates, &query)? {
+            let semantic = SemanticModel::build(lifted.snapshot).map_err(|e| Error::Resolution(e.to_string()))?;
+            let planner = Planner::new(&semantic, self.dialects, Some(&lifted.paths));
+            return planner.plan_resolved(lifted.query, principal, explain);
+        }
+        self.plan_resolved(query, principal, explain)
+    }
+
+    fn plan_resolved(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
         let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
         resolved::check_supported(&rquery, self.semantic, principal)?;
         match run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, vec![], explain) {

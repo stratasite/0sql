@@ -523,10 +523,6 @@ fn reaggregable_measure(cx: &Ctx, p: &Projected, node: &Node) -> bool {
         return false;
     }
     if p.is_calculation() {
-        // One an input already aggregated arrives as a column, like a measure.
-        if matches!(node.get_ref(p.proj.pid, None), Some(Reference::Multi { expression: None, .. })) {
-            return true;
-        }
         let Some(source) = p.proj.source() else { return false };
         if !source.is_measure() || source.is_calculation() {
             return false;

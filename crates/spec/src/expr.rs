@@ -52,6 +52,49 @@ pub fn aggregates_every_reference(sql: &str, aggregates: &[&str]) -> bool {
     aggregated
 }
 
+/// What one outermost aggregate call reads: the `@m` names, the `@d`
+/// names and the untyped references inside its parentheses, lower-cased.
+#[derive(Debug, Default, PartialEq)]
+pub struct AggregateCall {
+    pub measures: Vec<String>,
+    pub dimensions: Vec<String>,
+    pub aliases: Vec<String>,
+}
+
+/// The outermost aggregate calls of a formula, in order, with what each
+/// reads. `sum([A]@m) / count(distinct [B]@d)` is two calls;
+/// `count(distinct case when [A]@m > 0 then [B]@d end)` is one that reads both.
+pub fn aggregate_calls(sql: &str, aggregates: &[&str]) -> Vec<AggregateCall> {
+    static TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\](@[md])?|([a-z_][a-z0-9_]*)?\(|\)").unwrap());
+    let scrubbed = scrub(&sql.to_lowercase(), "\"", "\"", &mut |_| {});
+    let mut calls: Vec<AggregateCall> = Vec::new();
+    let mut stack: Vec<bool> = Vec::new();
+    for c in TOKEN.captures_iter(&scrubbed) {
+        let token = &c[0];
+        if let Some(name) = c.get(1) {
+            if stack.iter().any(|a| *a) {
+                let call = calls.last_mut().expect("an open aggregate call");
+                let name = name.as_str().trim().to_string();
+                let list = match c.get(2).map(|t| t.as_str()) {
+                    Some("@m") => &mut call.measures,
+                    Some(_) => &mut call.dimensions,
+                    None => &mut call.aliases,
+                };
+                push_unique(list, name);
+            }
+        } else if token == ")" {
+            stack.pop();
+        } else {
+            let is_agg = aggregates.contains(&c.get(3).map(|m| m.as_str()).unwrap_or(""));
+            if is_agg && !stack.iter().any(|a| *a) {
+                calls.push(AggregateCall::default());
+            }
+            stack.push(is_agg);
+        }
+    }
+    calls
+}
+
 /// Bracket references in a formula: (`@m` names, `@d` names, untyped aliases).
 pub fn parse_refs(sql: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let stripped = scrub(sql, "\"", "\"", &mut |_| {});
@@ -297,6 +340,22 @@ mod parser_tests {
         assert!(!aggregates_every_reference("lower([Region]@d)", &aggs));
         assert!(!aggregates_every_reference("sum([Units]@d) over (order by [Date]@d)", &aggs));
         assert!(!aggregates_every_reference("upper('count(') || [Region]@d", &aggs));
+    }
+
+    #[test]
+    fn aggregate_calls_list_what_each_outermost_call_reads() {
+        let aggs = ["sum", "count", "avg", "min", "max"];
+        let calls = aggregate_calls("sum([Net Paid]@m) / count(distinct [Customer ID]@d)", &aggs);
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].measures.clone(), calls[0].dimensions.clone()), (vec!["net paid".to_string()], vec![]));
+        assert_eq!((calls[1].measures.clone(), calls[1].dimensions.clone()), (vec![], vec!["customer id".to_string()]));
+
+        let calls =
+            aggregate_calls("count(distinct case when sum([Net Paid]@m) > 1 or [Paid] > 2 then [Customer ID]@d end) + [Region]@d", &aggs);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].measures, vec!["net paid"]);
+        assert_eq!(calls[0].dimensions, vec!["customer id"]);
+        assert_eq!(calls[0].aliases, vec!["paid"]);
     }
 
     #[test]

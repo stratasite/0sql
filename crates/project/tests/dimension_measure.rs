@@ -137,12 +137,67 @@ fn a_query_of_one_universe_still_plans_as_one_select() {
 }
 
 #[test]
-fn a_dimension_measure_no_measure_table_reaches_is_refused() {
-    let err = plan(serde_json::json!({
+fn a_dimension_measure_alone_aggregates_on_the_table_that_holds_the_dimension() {
+    let sql = plan(serde_json::json!({ "projections": [customers()] })).unwrap();
+    assert!(sql.contains("count(distinct T0.\"c_customer_id\") AS \"Customers\"\nFROM\n\tcustomer T0"), "{sql}");
+}
+
+#[test]
+fn a_dimension_measure_no_measure_table_reaches_aggregates_on_a_table_of_its_own() {
+    // Inventory cannot reach the customer, so the count comes from the
+    // table that can; the two sit side by side.
+    let sql = plan(serde_json::json!({
         "projections": [{"field": "inventory quantity on hand"}, customers()]
     }))
-    .unwrap_err();
-    assert!(err.contains("Customers") && err.contains("Customer ID"), "{err}");
+    .unwrap();
+    assert!(sql.contains("count(distinct T0.\"c_customer_id\")") && sql.contains("FROM\n\tcustomer T0"), "{sql}");
+    assert!(sql.contains("sum(T0.\"inv_quantity_on_hand\")"), "{sql}");
+}
+
+#[test]
+fn a_prior_period_of_a_dimension_measure_aggregates_base_rows_in_a_shifted_node() {
+    let mut c = customers();
+    c["alias"] = "Customers LY".into();
+    c["decorators"] = serde_json::json!([{"type": "temporalize", "transform": "year_over_year"}]);
+    let sql = plan(serde_json::json!({
+        "projections": [
+            {"field": "date", "decorators": [{"type": "truncate", "grain": "year"}]},
+            {"field": "store net paid"},
+            c
+        ]
+    }))
+    .unwrap();
+    assert!(!sql.contains("[Customer ID]"), "the formula is never left unresolved:\n{sql}");
+    let shifted = parts(&sql).into_iter().find(|p| p.contains("date_add(") && p.contains("FROM\n\tstore_sales")).expect("a shifted node");
+    assert!(shifted.contains("count(distinct T1.\"c_customer_id\") AS \"__msrly_"), "{sql}");
+}
+
+#[test]
+fn a_share_of_a_dimension_measure_divides_by_a_total_aggregated_on_its_own() {
+    let mut c = customers();
+    c["alias"] = "Customer share".into();
+    c["decorators"] = serde_json::json!([{"type": "contribute"}]);
+    let sql = plan(serde_json::json!({
+        "projections": [{"field": "item category"}, {"field": "store net paid"}, c]
+    }))
+    .unwrap();
+    assert!(!sql.contains("[Customer ID]"), "{sql}");
+    assert!(sql.contains("count(distinct T1.\"c_customer_id\") AS \"__msrtotal_"), "{sql}");
+    assert!(sql.lines().any(|l| l.contains("__msrtotal_") && l.contains("AS \"Customer share\"")), "{sql}");
+}
+
+#[test]
+fn a_window_over_a_dimension_measure_runs_over_its_column_at_the_merge() {
+    let mut c = customers();
+    c["alias"] = "Running customers".into();
+    c["decorators"] = serde_json::json!([{"type": "window", "function": "sum", "mode": "running", "order_by": {"item-category": "asc"}}]);
+    let sql = plan(serde_json::json!({
+        "projections": [{"field": "item category"}, {"field": "store net paid"}, {"field": "catalog net paid"}, c]
+    }))
+    .unwrap();
+    assert!(!sql.contains("c_customer_id\" AS"), "the customer is never a column:\n{sql}");
+    assert_eq!(sql.matches("count(distinct").count(), 1, "{sql}");
+    assert!(sql.lines().any(|l| l.contains(" OVER (") && l.contains("AS \"Running customers\"")), "{sql}");
 }
 
 #[test]
@@ -161,4 +216,80 @@ fn a_dimension_used_beside_a_measure_stays_a_final_pass_calculation() {
     .unwrap();
     let merge = sql.rsplit("\n)\nSELECT").next().unwrap();
     assert!(merge.contains("count(distinct case when"), "{sql}");
+}
+
+#[test]
+fn a_measure_inside_an_aggregate_over_an_unprojected_dimension_is_refused() {
+    // The measure would have to be totalled per customer before the count,
+    // and nothing plans that; the old plan folded the customer into every
+    // node and took a max of the measures beside it.
+    let err = plan(serde_json::json!({
+        "projections": [
+            {"field": "store net paid"},
+            {"calculation": true, "alias": "Big spenders", "data_type": "integer",
+             "sql": "count(distinct case when [Store Net Paid]@m > 100 then [Customer ID]@d end)"}
+        ]
+    }))
+    .unwrap_err();
+    assert!(
+        err.contains("\"Big spenders\"") && err.contains("Store Net Paid") && err.contains("inside an aggregate over Customer ID"),
+        "{err}"
+    );
+    assert!(err.contains("segment keyed on Customer ID"), "{err}");
+}
+
+#[test]
+fn the_same_refusal_reaches_a_measure_read_by_its_alias() {
+    let err = plan(serde_json::json!({
+        "projections": [
+            {"field": "store net paid", "alias": "Paid"},
+            {"calculation": true, "alias": "Big spenders", "data_type": "integer",
+             "sql": "count(distinct case when [Paid] > 100 then [Customer ID]@d end)"}
+        ]
+    }))
+    .unwrap_err();
+    assert!(err.contains("inside an aggregate over Customer ID"), "{err}");
+}
+
+#[test]
+fn a_measure_beside_an_aggregate_over_an_unprojected_dimension_is_refused_with_the_way_to_write_it() {
+    let err = plan(serde_json::json!({
+        "projections": [
+            {"field": "store net paid"},
+            {"calculation": true, "alias": "Per customer", "sql": "sum([Store Net Paid]@m) / count(distinct [Customer ID]@d)"}
+        ]
+    }))
+    .unwrap_err();
+    assert!(err.contains("\"Per customer\"") && err.contains("a calculation of its own") && err.contains("by its alias"), "{err}");
+
+    // What the message says to write plans, and keeps the measure a sum.
+    let sql = plan(serde_json::json!({
+        "projections": [
+            {"field": "item category"},
+            {"field": "store net paid"},
+            customers(),
+            {"calculation": true, "alias": "Per customer", "sql": "sum([Store Net Paid]@m) / sum([Customers])"}
+        ]
+    }))
+    .unwrap();
+    assert!(!sql.contains("c_customer_id\" AS"), "the customer is never a column:\n{sql}");
+    assert!(sql.lines().any(|l| l.contains(" / ") && l.contains("AS \"Per customer\"")), "{sql}");
+}
+
+#[test]
+fn a_segment_on_the_dimension_measure_is_the_way_to_count_members_by_a_measure() {
+    // Customers whose store total is over 100: the segment totals the
+    // measure per customer, the dimension measure counts who is left.
+    let sql = plan(serde_json::json!({
+        "projections": [{"field": "store net paid"}, customers()],
+        "segments": [{
+            "keys": ["customer id"],
+            "filters": [{"field": "store net paid", "predicate": "greater_than", "value": 100}],
+            "apply_to": ["Customers"]
+        }]
+    }))
+    .unwrap();
+    assert!(sql.contains("HAVING\n\tsum(T0.\"ss_net_paid\") > 100"), "{sql}");
+    assert!(part_with(&sql, "count(distinct").contains("JOIN seg"), "{sql}");
+    assert!(!part_with(&sql, "sum(T0.\"ss_net_paid\") AS").contains("JOIN seg"), "{sql}");
 }
