@@ -9,11 +9,12 @@ pub fn utc_minute(t: std::time::SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
 }
 
-/// UTC, to the second, as a name can hold it and a listing sorts it:
-/// `20261001T150405Z`.
+/// UTC, to the millisecond, as a name can hold it and a listing sorts
+/// it: `20261001T150405.123Z`.
 pub fn utc_stamp(t: std::time::SystemTime) -> String {
     let (y, m, d, hour, minute, second) = civil(t);
-    format!("{y:04}{m:02}{d:02}T{hour:02}{minute:02}{second:02}Z")
+    let millis = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis()).unwrap_or(0);
+    format!("{y:04}{m:02}{d:02}T{hour:02}{minute:02}{second:02}.{millis:03}Z")
 }
 
 /// The year, month, day, hour, minute and second of a time, in UTC.

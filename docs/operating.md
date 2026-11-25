@@ -121,19 +121,25 @@ What to keep in mind whichever path is used:
   who reaches the port can then probe that warehouse with it.
 - **A deploy is kept in the object store, without its secrets.** With
   `ZSQL_OBJECT_STORE` set, every deploy is also put there as
-  `deploys/<org>-<project>-<branch>-<time>.zip`, the time in UTC to the
-  second (`20261124T153012Z`). The zip holds `deploy.json` (what the
-  deploy answered), `project/` (the files the model was loaded from,
-  and nothing else the archive carried) and `compiled/` (the snapshot,
-  the sampled values and the tests, as the data directory has them).
-  Every secret-shaped key of a datasource is left out of both
-  `project/datasources.yml` and the snapshot, at any depth, so the
-  store never holds a warehouse credential; `datasources.yml` is
-  written again without them, and so without its comments. The
-  deploy's answer names the zip under `archive`. A deploy that cannot
-  be kept is refused with `502 ArchiveError` before it replaces
-  anything. Nothing clears these away: how long they are kept is the
-  bucket's lifecycle rule to say.
+  `deploys/<org>/<project>/<branch>/<org>-<project>-<branch>-<time>.zip`,
+  the time in UTC to the millisecond (`20261124T153012.123Z`). The zip
+  holds `deploy.json` (what the deploy answered), `project/` (the files
+  the model was loaded from, and nothing else the archive carried) and
+  `compiled/` (the snapshot, the sampled values and the tests, as the
+  data directory has them). Every setting of a datasource whose name
+  says secret (`password`, `token`, `private_key`, `passphrase`,
+  `dsn`, `keyfile_json` and their like) is left out of both
+  `project/datasources.yml` and the snapshot, at any depth, and a URL
+  loses its password. It is a test of names: a credential written
+  under a key nobody would take for one is kept as written, so the
+  bucket is still worth guarding. `datasources.yml` is written again,
+  and so without its comments. The deploy's answer names the zip under
+  `archive`. A deploy that cannot be kept is refused with `502
+  ArchiveError` and replaces nothing. The zip is put while the deploy
+  lock is held, so the zips of a branch are in the order its deploys
+  went live, and a slow store slows every deploy behind it. Nothing
+  clears these away: how long they are kept is the bucket's lifecycle
+  rule to say.
 
 ## Probing a datasource
 

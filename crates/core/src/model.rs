@@ -94,16 +94,45 @@ fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut V
     }
     Value::Object(out)
 }
-/// Takes every secret out of a value, at any depth: a key that
-/// [`is_secret`] goes with its value, in a mapping inside a list as
-/// much as one at the top.
+/// Whether a datasource setting is left out of a copy that leaves the
+/// server: every [`is_secret`], and the names a credential goes by
+/// that the served catalog has no reason to know. Wider than what is
+/// served on purpose: a copy in a bucket outlives the server's say over
+/// who reads it.
+fn leaves_with_the_server(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    is_secret(key)
+        || ["pwd", "passphrase", "dsn", "connection_string", "connection_uri", "keyfile_json", "account_key"]
+            .iter()
+            .any(|word| lower.contains(word) && !lower.ends_with("_file") && !lower.ends_with("_path"))
+}
+
+/// A URL without the password in it: `scheme://user:secret@host` is
+/// `scheme://user@host`. Anything else is as it was.
+fn without_url_password(text: &str) -> Option<String> {
+    let start = text.find("://")? + 3;
+    let authority = text[start..].find(['/', '?', '#']).map_or(text.len(), |i| start + i);
+    let at = start + text[start..authority].rfind('@')?;
+    let colon = start + text[start..at].find(':')?;
+    Some(format!("{}{}", &text[..colon], &text[at..]))
+}
+
+/// Takes every secret out of a datasource's settings for a copy that
+/// leaves the server, at any depth: a key that names one goes with its
+/// value, in a mapping inside a list as much as one at the top, and a
+/// URL loses its password.
 pub fn strip_secrets(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.retain(|key, _| !is_secret(key));
+            map.retain(|key, _| !leaves_with_the_server(key));
             map.values_mut().for_each(strip_secrets);
         }
         Value::Array(items) => items.iter_mut().for_each(strip_secrets),
+        Value::String(text) => {
+            if let Some(clean) = without_url_password(text) {
+                *text = clean;
+            }
+        }
         _ => {}
     }
 }
@@ -200,8 +229,11 @@ impl Model {
     pub fn write_without_secrets(&self, dir: &Path) -> std::io::Result<()> {
         let mut snapshot = self.semantic().snapshot().clone();
         for datasource in &mut snapshot.datasources {
-            datasource.connection.retain(|key, _| !is_secret(key));
-            datasource.connection.values_mut().for_each(strip_secrets);
+            let mut settings = Value::Object(std::mem::take(&mut datasource.connection));
+            strip_secrets(&mut settings);
+            if let Value::Object(settings) = settings {
+                datasource.connection = settings;
+            }
             strip_secrets(&mut datasource.extra_query_params);
         }
         self.write_with(dir, &snapshot)

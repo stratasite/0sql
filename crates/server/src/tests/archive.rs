@@ -55,6 +55,12 @@ fn archive_with_secrets(uid: &str) -> Vec<u8> {
         "    - host: other.internal",
         "      api_key: hunter2-listed",
         "  private_key_file: /keys/dw.p8",
+        "  url: https://reader:hunter2-url@db.internal/path",
+        "  passphrase: hunter2-phrase",
+        "token_store:",
+        "  name: Tokens",
+        "  adapter: duckdb",
+        "  host: tokens.internal",
         "",
     ]
     .join("\n");
@@ -68,17 +74,17 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
     let a = s.deploy_to("acme", "shop", "main", archive_with_secrets("shop")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
 
-    // Named for the org, the project, the branch and the second.
+    // Named for the org, the project, the branch and the moment, in a
+    // directory of the branch's own; the answer says where, from the
+    // store's own prefix down and no further up.
     let key = a.body["archive"].as_str().expect("the answer says where the deploy was kept").to_string();
-    // The key is whole, the store's own prefix first: here, its directory.
-    let name = key.rsplit('/').next().unwrap().to_string();
-    assert_eq!(key, format!("{}/deploys/{name}", store.display().to_string().trim_start_matches('/')));
+    let name = key.strip_prefix("deploys/acme/shop/main/").unwrap_or_else(|| panic!("{key}")).to_string();
     let stamp = name.strip_prefix("acme-shop-main-").and_then(|rest| rest.strip_suffix(".zip")).unwrap_or_else(|| panic!("{key}"));
-    assert!(stamp.len() == 16 && stamp.ends_with('Z') && stamp.as_bytes()[8] == b'T', "{key}");
+    assert!(stamp.len() == 20 && stamp.ends_with('Z') && stamp.as_bytes()[8] == b'T' && stamp.as_bytes()[15] == b'.', "{key}");
+    let zip_file = store.join(&key);
     let kept: Vec<String> =
-        std::fs::read_dir(store.join("deploys")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        std::fs::read_dir(zip_file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
     assert_eq!(kept, vec![name.clone()]);
-    let zip_file = store.join("deploys").join(&name);
 
     let files = unzipped(std::fs::read(&zip_file).unwrap());
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
@@ -102,10 +108,12 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
     let of = |name: &str| files.iter().find(|(n, _)| n == name).map(|(_, text)| text.clone()).unwrap();
     for name in ["project/datasources.yml", "compiled/snapshot.json.gz"] {
         let text = of(name);
-        for kept in ["db.internal", "reader", "other.internal", "scope", "/keys/dw.p8"] {
+        for kept in
+            ["db.internal", "reader", "other.internal", "scope", "/keys/dw.p8", "https://reader@db.internal/path", "tokens.internal"]
+        {
             assert!(text.contains(kept), "{name} lost {kept}:\n{text}");
         }
-        for gone in ["password", "client_secret", "api_key"] {
+        for gone in ["password", "client_secret", "api_key", "passphrase"] {
             assert!(!text.contains(gone), "{name} still names {gone}:\n{text}");
         }
     }
@@ -138,7 +146,13 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
     let a = s.send(Method::POST, "/orgs/acme/projects/shop/branches/other/validate", &[], body).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert!(a.body.get("archive").is_none());
-    assert_eq!(std::fs::read_dir(store.join("deploys")).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(store.join("deploys/acme/shop")).unwrap().count(), 1);
+
+    // A second deploy is a second zip: the first is still there.
+    let b = s.deploy_to("acme", "shop", "main", archive("shop", "again")).await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.body);
+    assert_ne!(b.body["archive"], json!(key));
+    assert_eq!(std::fs::read_dir(zip_file.parent().unwrap()).unwrap().count(), 2);
 }
 
 #[tokio::test]
@@ -151,6 +165,14 @@ async fn a_deploy_that_cannot_be_kept_is_not_made() {
     assert!(a.error().contains("was not made"), "{}", a.error());
     assert!(s.fields("shop", "main").await.is_err(), "nothing answers for the branch");
     assert!(!s.data_dir.join("default/shop/main").exists());
+    let left: Vec<String> = std::fs::read_dir(s.data_dir.join("default/shop"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(left.is_empty(), "nothing staged is left behind: {left:?}");
+    assert!(!a.error().contains(&store.display().to_string()), "the answer does not say where the store is: {}", a.error());
 }
 
 #[tokio::test]

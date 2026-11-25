@@ -73,29 +73,55 @@ fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, bod
         out["test_results"] = deployed.run_tests()?;
         out["validated_only"] = Value::Bool(!keep);
         if keep {
-            // Kept in the object store first, and outside the lock: a
-            // deploy that cannot be kept is refused before it replaces
-            // anything, and a slow store holds up no other deploy.
-            if let Some(objects) = app.runs.objects() {
-                let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
-                let kept = crate::archive::keep(objects, (&org, &uid, &branch), &root, &scratch, &deployed, &out);
-                let _ = std::fs::remove_dir_all(&scratch);
-                let key = kept.map_err(|m| {
-                    let said = format!("the deploy could not be kept in the object store, and was not made: {m}");
-                    ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said.replace(&work_prefix, ""))
-                })?;
-                tracing::info!("kept {org}/{uid}/{branch} in the object store at {key}");
-                out["archive"] = Value::String(key);
-            }
+            // What is kept in the object store is made ready outside
+            // the lock, since zipping a project is the slow half and
+            // holds up no other deploy there.
+            let unkept = |m: String| {
+                let said = format!("the deploy could not be kept in the object store, and was not made: {m}");
+                ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said.replace(&work_prefix, ""))
+            };
+            let zip = match app.runs.objects() {
+                Some(_) => Some(crate::archive::zipped(&org, &root, &work.join(".kept"), &deployed, &out).map_err(unkept)?),
+                None => None,
+            };
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
             let _writing = lock(&app.deploying);
             let live = app.dir(&org, &uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
-            deployed.write(&staged).and_then(|()| swap_in(&staged, &live)).map_err(|e| {
+            let unstaged = |e: std::io::Error| {
                 let _ = std::fs::remove_dir_all(&staged);
                 bad(e.to_string())
-            })?;
+            };
+            deployed.write(&staged).map_err(unstaged)?;
+            // Put under the lock, between the write and the swap, and
+            // named for this moment: the zips of a branch are in the
+            // order its deploys went live, a deploy the disk refused
+            // leaves none, and one the store refuses replaces nothing.
+            let mut kept = None;
+            if let (Some(objects), Some(zip)) = (app.runs.objects(), zip) {
+                let path = crate::archive::path_of(&org, &uid, &branch, std::time::SystemTime::now());
+                let parts: Vec<&str> = path.iter().map(String::as_str).collect();
+                let key = objects.put(&parts, zip).map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&staged);
+                    // The store's own words name where it is; the log
+                    // has them, and the answer what was being put.
+                    tracing::warn!("{org}/{uid}/{branch} could not be kept in the object store: {e}");
+                    unkept(format!("{} could not be put there", path.join("/")))
+                })?;
+                out["archive"] = Value::String(path.join("/"));
+                kept = Some((objects, key));
+            }
+            if let Err(e) = swap_in(&staged, &live) {
+                // What was put is of a deploy that was not made.
+                if let Some((objects, key)) = &kept {
+                    let _ = objects.delete(key);
+                }
+                return Err(unstaged(e));
+            }
+            if let Some((_, key)) = &kept {
+                tracing::info!("kept {org}/{uid}/{branch} in the object store at {key}");
+            }
             write(&app.models).insert(crate::key(&org, &uid, &branch), deployed);
             tracing::info!("deployed {org}/{uid}/{branch}");
         }

@@ -127,11 +127,12 @@ impl Objects {
         Ok(key)
     }
 
-    /// Puts `bytes` at `<under>/<name>` beneath the store's own prefix,
-    /// whole, and says where they went. For what is kept beside the
-    /// results and is not one: nothing here ever clears it away.
-    pub fn put(&self, under: &str, name: &str, bytes: Vec<u8>) -> Result<String> {
-        let key = self.base.clone().join(under).join(name).to_string();
+    /// Puts `bytes` at `path` beneath the store's own prefix, whole,
+    /// and says where they went: the key [`Objects::delete`] takes. For
+    /// what is kept beside the results and is not one: nothing here
+    /// ever clears it away.
+    pub fn put(&self, path: &[&str], bytes: Vec<u8>) -> Result<String> {
+        let key = path.iter().fold(self.base.clone(), |at, part| at.join(*part)).to_string();
         let at = Key::parse(&key).map_err(|e| failed(&key, e))?;
         self.on(async { self.store.put(&at, PutPayload::from(bytes)).await.map(|_| ()).map_err(|e| failed(&key, e)) })?;
         Ok(key)
