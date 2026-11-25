@@ -50,17 +50,19 @@ all, with the rest of the command line's work.
 
 ## Credentials
 
-To be revisited once execution exists. Until then:
+Settled on 2026-11-24 and built: a datasource's credential is the one
+it was deployed with. "The credential of a datasource" in
+`docs/operating.md` is the whole of it.
 
-| the request sends | the server's environment has | what happens |
+| the request sends | the datasource was deployed with | what happens |
 |---|---|---|
-| a secret or an OAuth token | anything | the request's is used for this run and dropped after it |
-| nothing | a secret for that datasource | the server's is used |
+| a secret or an OAuth token | anything | the request's is used for this run, whole, and dropped after it |
+| nothing | a secret | the deployed one is used |
 | nothing | nothing | refused before connecting, naming the datasource and the fields it takes |
-| an expired or wrong one | anything | the warehouse's refusal, as it gave it; never a fall back to the server's |
+| an expired or wrong one | anything | the warehouse's refusal, as it gave it; never a fall back to the deployed one |
 
-The server's variables are the ones the command line reads,
-`ZSQL_DS_<UID>_<FIELD>`. The rules are the same for both kinds of run.
+The server reads no credential from its environment. The rules are the
+same for both kinds of run.
 
 ## Connections
 
@@ -240,14 +242,13 @@ most. Arrow is the whole result as a stream.
 | `query_wait_time` | datasource | 10 |
 | `cache_ttl` | datasource | as today; 0 is no cache |
 
-None of these names is taken, and none can be produced by
-`ZSQL_DS_<UID>_<FIELD>`.
+None of these names is taken.
 
 ## What reach means now
 
 `docs/operating.md` tells an operator that whoever reaches the port
 gets SQL text and the shape of the warehouse, not rows. With runs that
-is rows, and with `sql-exec` and a credential held by the server it is
+is rows, and with `sql-exec` and a deployed credential it is
 writes. That section is rewritten with this work; the port must not be
 exposed on the old understanding.
 
@@ -303,7 +304,8 @@ exposed on the old understanding.
 
 ## Not yet decided
 
-- Credentials, after execution exists.
+- An OAuth token for each end user: who obtains it, and how it is
+  kept fresh.
 
 ## Order of work
 

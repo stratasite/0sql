@@ -120,12 +120,11 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
         (&json!("acme"), &json!("shop"), &json!("main"), &json!(1))
     );
 
-    // The server's own copy is as it was deployed: the secret is what a
-    // run connects with, and only the copy that leaves is without it.
-    let live = std::fs::read(s.data_dir.join("acme/shop/main").join(zsql_core::SNAPSHOT_FILE)).unwrap();
-    let mut snapshot = String::new();
-    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&live[..]), &mut snapshot).unwrap();
-    assert!(snapshot.contains("hunter2-top"));
+    // The server's own copy has the credential, in the file of secrets
+    // beside the snapshot: it is what a run connects with, and that
+    // file is the one the copy that leaves is without.
+    let held = std::fs::read_to_string(s.data_dir.join("acme/shop/main").join(zsql_core::SECRETS_FILE)).unwrap();
+    assert!(held.contains("hunter2-top"), "{held}");
 
     // The compiled half reads back as a model.
     let back = s.data_dir.join(".back");

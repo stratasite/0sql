@@ -192,9 +192,6 @@ pub struct Config {
     /// How many statements run at once, how many may wait, and the row
     /// limit a run is given when its request has none.
     pub runs: RunLimits,
-    /// The credential this server holds for a datasource, by its uid:
-    /// used when a request for a run sends none.
-    pub secrets: crate::SecretsOf,
 }
 
 /// What bounds the statements a server runs.
@@ -248,7 +245,6 @@ impl Config {
             admission: AdmissionCounts::default(),
             mcp: mcp::Settings::builtin(),
             runs: RunLimits::default(),
-            secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
         }
     }
 }
@@ -286,7 +282,6 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         deploying: std::sync::Mutex::new(()),
         runs,
         default_sql_limit: config.runs.default_sql_limit,
-        secrets: config.secrets,
     });
     let (n, skipped) = reload(&app)?;
     tracing::info!("{n} deployment(s) loaded from {}", app.data_dir.display());

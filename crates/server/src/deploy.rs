@@ -2,7 +2,7 @@
 //! tested, written beside the branch and swapped in whole. And the
 //! removal of a branch, which takes the same lock.
 
-use crate::error::{not_found, ApiError, Org, Params};
+use crate::error::{not_found, ApiError, Org, Params, Search};
 use crate::guard::Held;
 use crate::names::{check_branch, check_uid};
 use crate::{blocking, lock, write, Shared};
@@ -20,11 +20,12 @@ pub(crate) async fn deploy(
     held: Option<Extension<Held>>,
     Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
+    Search(q): Search<DeployQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, org, uid, branch, body, true)
+        deploy_or_validate(app, org, uid, branch, body, Some(q))
     })
     .await
 }
@@ -38,12 +39,32 @@ pub(crate) async fn validate(
 ) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let _held = held;
-        deploy_or_validate(app, org, uid, branch, body, false)
+        deploy_or_validate(app, org, uid, branch, body, None)
     })
     .await
 }
 
-fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, body: Bytes, keep: bool) -> Result<Json<Value>, ApiError> {
+/// How a deploy is to treat what the branch already has.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeployQuery {
+    /// This deploy is the whole truth about the branch's credentials: a
+    /// datasource that arrives with no secret is left with none, where
+    /// it would otherwise keep the one it had.
+    #[serde(default)]
+    clear_secrets: bool,
+}
+
+/// `keep` is how a deploy is kept; without it this is a validation,
+/// which keeps nothing.
+fn deploy_or_validate(
+    app: Shared,
+    org: String,
+    uid: String,
+    branch: String,
+    body: Bytes,
+    keep: Option<DeployQuery>,
+) -> Result<Json<Value>, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
     if body.is_empty() {
         return Err(bad("the body must be a tar.gz of the project directory".into()));
@@ -67,34 +88,39 @@ fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, bod
         unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_core::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
-        let deployed =
-            Arc::new(Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?);
+        let mut deployed =
+            Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let mut out = deployed.summary();
         out["test_results"] = deployed.run_tests()?;
-        out["validated_only"] = Value::Bool(!keep);
-        if keep {
-            // What is kept in the object store is made ready outside
-            // the lock, since zipping a project is the slow half and
-            // holds up no other deploy there. In a directory beside
-            // the unpacked archive and never inside it: nothing the
-            // deployer sent is in there to be taken for the model.
-            let zip = match app.runs.objects() {
-                Some(_) => {
-                    let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
-                    let _ = std::fs::remove_dir_all(&scratch);
-                    let zipped = crate::archive::zipped(&org, &root, &scratch, &deployed, &out);
-                    let _ = std::fs::remove_dir_all(&scratch);
-                    Some(zipped.map_err(|m| {
-                        let said = format!("the deploy could not be made ready to keep, and was not made: {m}");
-                        let said = said.replace(&work_prefix, "").replace(&format!("{}/", scratch.display()), "");
-                        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "ArchiveError", said)
-                    })?)
-                }
-                None => None,
-            };
+        out["validated_only"] = Value::Bool(keep.is_none());
+        // What is kept in the object store is made ready outside
+        // the lock, since zipping a project is the slow half and
+        // holds up no other deploy there. In a directory beside
+        // the unpacked archive and never inside it: nothing the
+        // deployer sent is in there to be taken for the model.
+        let zip = match app.runs.objects().filter(|_| keep.is_some()) {
+            Some(_) => {
+                let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
+                let _ = std::fs::remove_dir_all(&scratch);
+                let zipped = crate::archive::zipped(&org, &root, &scratch, &deployed, &out);
+                let _ = std::fs::remove_dir_all(&scratch);
+                Some(zipped.map_err(|m| {
+                    let said = format!("the deploy could not be made ready to keep, and was not made: {m}");
+                    let said = said.replace(&work_prefix, "").replace(&format!("{}/", scratch.display()), "");
+                    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "ArchiveError", said)
+                })?)
+            }
+            None => None,
+        };
+        if let Some(how) = keep {
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
             let _writing = lock(&app.deploying);
+            // Under the lock, so the model whose credentials are kept
+            // is the one this deploy replaces.
+            let previous = crate::read(&app.models).get(&crate::key(&org, &uid, &branch)).cloned();
+            out["credentials"] = crate::credentials::settle(&mut deployed, previous.as_deref(), how.clear_secrets);
+            let deployed = Arc::new(deployed);
             let live = app.dir(&org, &uid, &branch);
             let staged = live.with_file_name(format!(".{branch}.staging-{}", nanos()));
             let unstaged = |e: std::io::Error| {

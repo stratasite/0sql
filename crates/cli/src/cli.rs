@@ -473,6 +473,9 @@ pub(crate) enum Command {
         /// Send without loading and testing the model here first.
         #[arg(long)]
         skip_check: bool,
+        /// Leave a datasource this deploy carries no secret for with none, where it would keep the one the server has.
+        #[arg(long)]
+        clear_secrets: bool,
         #[command(flatten)]
         remote: Remote,
     },

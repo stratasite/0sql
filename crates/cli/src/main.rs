@@ -3,8 +3,8 @@
 //! a server. `-r` says the server, `--server` and `--uid` imply it, and
 //! `--branch` alone is a mistake, not a hint. Commands that connect to a
 //! warehouse (`catalog`, `generate --live`, `sample`, `run`, `datasource
-//! test`) never take those flags: the credentials are on this machine
-//! and the server holds none.
+//! test`) never take those flags: they connect from this machine, with
+//! the credentials it holds. A deploy carries those to the server.
 
 mod assist;
 mod cli;

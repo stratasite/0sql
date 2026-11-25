@@ -125,10 +125,6 @@ impl ServeArgs {
         if let Some(v) = var("ZSQL_CACHE_SWEEP_SECS") {
             cfg.runs.cache_sweep = Duration::from_secs(number(&v, "ZSQL_CACHE_SWEEP_SECS")?.max(1) as u64);
         }
-        // The credential the server holds for a datasource, for a run
-        // whose request sends none: ZSQL_DS_<UID>_<FIELD>, read when it
-        // is asked for, from the environment and nowhere else.
-        cfg.secrets = std::sync::Arc::new(|uid| zsql_datasource::secrets(None, uid));
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
             .map_err(|e| anyhow::anyhow!(e))?;

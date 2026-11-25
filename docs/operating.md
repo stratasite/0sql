@@ -112,13 +112,13 @@ What to keep in mind whichever path is used:
   who may send them and with what: forward them only for a caller it
   would trust with that reach, and build the connection itself rather
   than pass a client's through.
-- **A deployed secret is on disk.** A deploy keeps every key of a
-  datasource's entry. `zsql deploy` strips the secret-shaped ones
-  before it sends, so the CLI never puts one on the server; an archive
-  built another way that carries a `password` has it kept in
-  `snapshot.json.gz`, in the clear, readable by the server's user and
-  in every backup of the data directory. No read serves it, and anyone
-  who reaches the port can then probe that warehouse with it.
+- **A deployed secret is on disk.** A deploy carries the secrets of
+  each datasource, and the server keeps them as that datasource's
+  credential: in `secrets.json` beside the compiled model, in the
+  clear, readable by the server's user alone and in every backup of
+  the data directory. They are not in `snapshot.json.gz`. No read
+  serves one, and anyone who reaches the port can then run and probe
+  that warehouse with it. See "The credential of a datasource".
 - **A deploy is kept in the object store, without its secrets.** With
   `ZSQL_OBJECT_STORE` set, every deploy is also put there as
   `deploys/<org>/<project>/<branch>/<org>-<project>-<branch>-<time>.zip`,
@@ -209,10 +209,9 @@ and `DELETE /results/{id}` cancels a run. `docs/execution.md` is the
 design.
 
 **Whose credential.** The one the request sends, in `connection`, and
-otherwise the one the server holds for that datasource in
-`ZSQL_DS_<UID>_<FIELD>`. The service in front decides which: it can
-send each user's own, or send none and let every user run as the
-server's account.
+otherwise the one the datasource was deployed with. The service in
+front decides which: it can send each user's own, or send none and let
+every user run as the deployed account.
 
 - **A credential the server holds is worth whatever the database
   grants it, to everyone who reaches the port.** With one set, a
@@ -254,6 +253,47 @@ memory.
 `ZSQL_OBJECT_STORE` for the rows. Without the store a result is only
 on the node that ran it, and another node runs the statement again.
 
+## The credential of a datasource
+
+A datasource's credential arrives with a deploy. There is no setting
+for one on the server: `ZSQL_DS_<UID>_<FIELD>` in the server's
+environment is not read.
+
+- **A deploy carries it.** `zsql deploy` sends, in each datasource's
+  entry, the secrets written there and the ones the deploying machine
+  holds for it in `.zsql`, its environment or the home config: what a
+  query run on that machine connects with. `.zsql` itself is not sent.
+  So whoever deploys sets who the server runs as. A developer's own
+  account deployed from a laptop is that, for every caller, until a
+  deploy carries another or the service in front sends one with each
+  request.
+- **It is one branch's.** The credential belongs to that datasource on
+  that branch of that project in that org.
+- **A request's own replaces it whole.** A request that sends any
+  secret in `connection` connects with exactly the secrets it sent;
+  nothing deployed is blended in. Settings that are not secrets, such
+  as `role`, are still laid over the deployed entry one by one.
+- **A deploy that carries none keeps it,** so a pipeline can deploy a
+  model without holding the secret. It is kept only while the
+  datasource points where it did: a changed adapter, host, database,
+  account, username or any other setting but `schema`, `dataset`,
+  `warehouse`, `role`, `workgroup`, `output_location`, `sslmode`,
+  `ca_file`, `cache_ttl` and `query_wait_time` drops it, so a credential never follows a
+  datasource somewhere new.
+- **A branch deployed for the first time has none.** It borrows from
+  no other branch, the production branch included.
+- **To take one away,** deploy with `zsql deploy --clear-secrets`
+  (`?clear_secrets=true`), which leaves a datasource the deploy carries
+  no secret for with none; or remove the branch. To rotate one, deploy
+  again with the new secret.
+- **The answer to a deploy says what became of each:** `credentials`
+  maps every datasource to `set`, `kept`, `dropped` or `none`. `GET
+  .../datasources` names the secrets held and shows none.
+- **Send it over TLS.** A deploy now carries a secret through whatever
+  is in front of the server.
+- **It is on one node.** A deploy reaches the node it was sent to; see
+  `docs/clustering.md`.
+
 ## Orgs
 
 A project belongs to an org, and a server may keep the projects of
@@ -279,11 +319,8 @@ it. Two orgs may each have a project of the same uid.
   in the words an unknown id gets. A stored result answers the same
   question in its own org only, an invalidation reaches one org's
   results, and no warehouse connection is reused between two.
-- **The server's own credentials are the default org's.**
-  `ZSQL_DS_<UID>_<FIELD>` is kept by a datasource's uid alone, and any
-  org can deploy a datasource of any uid, pointing anywhere. So a run
-  in a named org connects with what its request sends and is never
-  handed one of the server's.
+- **A credential is one org's.** It is deployed with a datasource, to
+  one branch of one project of one org, and is that branch's alone.
 - **Who may ask for which org is decided in front**, like everything
   else. A proxy that keeps orgs apart allows each caller the one prefix
   `/orgs/<theirs>/` and nothing outside it; the unprefixed routes are
@@ -303,6 +340,7 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 | | |
 |---|---|
 | `<org>/<project>/<branch>/` | a deployed branch: the compiled model (`snapshot.json.gz`), its tests and sampled values. `default/` is the org of a deploy that names none, and is made at startup |
+| `<org>/<project>/<branch>/secrets.json` | the secrets the branch's datasources were deployed with, in the clear, readable by the server's user alone; absent when there are none |
 | `lock` | held by the running server; its pid, address and public URL, which `zsql server status` reads |
 | `.cache/results/` | the rows of each run the server made, an Arrow file each |
 | `.cache/records/` | the record of each run, when the records are not in a database |
@@ -336,7 +374,6 @@ same thing. The ones an operator sets:
 | `ZSQL_CONCURRENT_RUNS` | how many statements run at once; 100 |
 | `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
 | `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |
-| `ZSQL_DS_<UID>_<FIELD>` | the credential the server holds for a datasource, used by a run in the default org whose request sends none |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 
 `ops/zsqld.service` is a systemd unit to start from: a dedicated user, a
@@ -431,6 +468,14 @@ such a directory where it is, does not serve it, and names it at
 startup. Stop the server and move each `<project>` directory into
 `default/`, or deploy each branch again. The paths with no org in them
 answer as they did, for the default org.
+
+**A datasource's credential.** A server before this one read it from
+`ZSQL_DS_<UID>_<FIELD>` in its own environment. Those are not read now,
+and nothing says so: a run that relied on one is refused for want of a
+password until the branch is deployed again from a machine that holds
+the secret. A secret that an older deploy left inside
+`snapshot.json.gz` is still used, and moves to `secrets.json` the next
+time that branch is deployed.
 
 **The compiled model.** `snapshot.json.gz` carries a `version`, and
 `zsql_semantic::snapshot::FORMAT` is the newest a build writes and

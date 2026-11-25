@@ -129,7 +129,7 @@ fn refused(e: zsql_datasource::Error) -> ApiError {
         }
         zsql_datasource::Error::NoSecret { uid, .. } => (
             StatusCode::BAD_REQUEST,
-            format!("datasource {uid} needs a password; deploy it in datasources.yml or send it in the connection"),
+            format!("datasource {uid} needs a password; deploy the datasource with its secret or send one in the connection"),
         ),
         zsql_datasource::Error::NoSchemas(engine) => (StatusCode::BAD_REQUEST, format!("{engine} has no schemas; ask without one")),
         _ => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -167,8 +167,10 @@ fn scalar(key: &str, value: &Value) -> Option<Value> {
     }
 }
 
-/// The connection for one probe: what the datasource was deployed with,
-/// and over it what the request sent. The deployed entry is read as
+/// The connection for one probe or run: what the datasource was
+/// deployed with, and over it what the request sent. Its credential is
+/// the request's when the request sends any secret, and the one the
+/// datasource was deployed with otherwise. The deployed entry is read as
 /// `datasources.yml` is, past whatever is not a connection setting; the
 /// request is checked key by key, so a misspelled setting is named and
 /// not read past into a confusing refusal from the warehouse.
@@ -223,6 +225,17 @@ pub(crate) fn connection_of(
             }
         }
         settings.insert(key.clone(), value);
+    }
+    // The credential is one or the other, never a blend: what the
+    // request sent, when it sent any secret at all, and otherwise what
+    // the datasource was deployed with.
+    let sent_one = sent.keys().any(|key| SECRET_FIELDS.contains(&key.as_str()));
+    if !sent_one {
+        for (key, value) in d.secrets_of(datasource).into_iter().flatten() {
+            if let Some(value) = scalar(key, value) {
+                settings.insert(key.clone(), value);
+            }
+        }
     }
     let settings = serde_yaml::to_value(&settings).map_err(|e| invalid(format!("connection: {e}")))?;
     let mut conn = Connection::from_value(datasource, &settings).map_err(refused)?;

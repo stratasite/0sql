@@ -7,10 +7,12 @@
 //! service, which decides who may ask, sends the security context each
 //! plan runs under, and paces its callers. It keeps of a
 //! datasource what its entry was deployed with, every key, and a probe
-//! connects with that and whatever the request sends over it; what a
-//! request sends is dropped with the answer. `zsql deploy` strips
-//! secrets from the entry, so a secret is kept only when a deployer
-//! put one there on purpose, and it is never served. The server has no
+//! or a run connects with that and whatever the request sends over it;
+//! what a request sends is dropped with the answer. A deploy carries a
+//! datasource's secrets, and they are its credential on that branch:
+//! kept apart from the compiled model, never served, and set aside
+//! whole by a request that sends a secret of its own (see
+//! `credentials`). The server has no
 //! credential of its own to check: a deploy, a validate, a test run
 //! and a removal are as open as a read, and whoever may do any of them
 //! is decided by the service in front.
@@ -56,6 +58,8 @@
 //! - `names`: the org, project and branch names that become directories
 //! - `deploy`: an archive in, a model out
 //! - `archive`: a deploy kept in the object store, without its secrets
+//! - `credentials`: the secrets a datasource is deployed with, and what
+//!   a later deploy keeps of them
 //! - `reads`: sql, explain, explore and the catalog
 //! - `probe`: a datasource's own tables, read from the warehouse with
 //!   the connection the request sends
@@ -65,6 +69,7 @@
 
 pub mod admission;
 mod archive;
+mod credentials;
 mod deploy;
 mod error;
 mod exec;
@@ -123,13 +128,7 @@ pub(crate) struct App {
     /// The row limit a run is given when its request has none. `None`
     /// leaves it without one: a bound is the caller's to set.
     default_sql_limit: Option<u64>,
-    /// The credential this server holds for a datasource, used when a
-    /// request sends none.
-    secrets: SecretsOf,
 }
-
-/// What this server was given to connect to a datasource with, by its uid.
-pub type SecretsOf = Arc<dyn Fn(&str) -> zsql_datasource::Secrets + Send + Sync>;
 
 /// A deployment's key in the models map. None of the three names can
 /// hold a `/`, so the keys of one org are the ones that start with it
