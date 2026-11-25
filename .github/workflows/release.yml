@@ -197,6 +197,8 @@ jobs:
 
       - name: It loads the drivers
         run: |
+          # dbc's installer unpacks an archive, and this image has no tar.
+          dnf install -y -q tar gzip
           curl -LsSf https://dbc.columnar.tech/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
           dbc install snowflake

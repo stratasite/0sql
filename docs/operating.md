@@ -6,6 +6,39 @@ shape between releases. [Running the server](https://0sql.io/docs/getting-starte
 on the site is the guide to setting one up; this is what the guide
 leaves to the operator.
 
+## What the machine needs
+
+Linux with glibc 2.34 or newer, on x86_64 or arm64: Ubuntu 22.04,
+Debian 12, RHEL 9, Amazon Linux 2023, or a container based on one.
+`ldd --version` says which a machine has. The binary asks for nothing
+else. It does not run on Alpine or in a `scratch` container; until 0.7
+it was a static build that did.
+
+**The ADBC drivers are optional and worth having** where a datasource
+is Snowflake or BigQuery. With a driver a result arrives typed and in
+parallel streams; without one the warehouse's REST API answers, a page
+at a time, every column as text. They are installed with `dbc`,
+Columnar's installer (https://docs.columnar.tech/dbc/):
+
+```
+curl -LsSf https://dbc.columnar.tech/install.sh | sh
+dbc install --level system snowflake
+dbc install --level system bigquery
+zsql datasource drivers
+```
+
+A server looks for them in `ADBC_DRIVER_PATH`, the `~/.config/adbc/drivers`
+of the user it runs as, and `/etc/adbc/drivers`, which is where
+`--level system` puts them. Under `ops/zsqld.service` use the last: the
+unit hides home directories. The drivers load under that unit's
+restrictions; a query through one under them has not been run.
+`ZSQL_ADBC=off` keeps every read on REST. Nothing is chosen per
+datasource: a driver that is found is used, and one that is installed
+and will not load is an error, not a fallback.
+
+Install the same drivers on every node, or the same datasource answers
+typed from one and as text from the next.
+
 ## Where it belongs
 
 The server has no accounts, no users, no keys and no token. It answers whoever
@@ -487,6 +520,13 @@ sign-up, a web app, rate limits, all in the server. That is gone.
   `/projects/{uid}/access` answer 404.
 
 ## What changes shape between releases
+
+**The binary.** Through 0.7 the Linux release was a static build that
+ran on any distribution. After it, the release needs glibc 2.34
+("What the machine needs", above). On Alpine or an older glibc the new
+binary does not start; the installer tries a download before it
+replaces what is installed, and anything that copies the release asset
+into place itself does not.
 
 **The data directory.** A deployed branch is kept at
 `<org>/<project>/<branch>/`. A server from before orgs kept it at

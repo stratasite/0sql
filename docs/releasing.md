@@ -2,7 +2,7 @@
 
 One tag, one workflow (`.github/workflows/release.yml`), one binary per
 platform: `zsql`, which is the CLI and the server. Four builds go on the
-release: Linux x86_64 and arm64, statically linked against musl, and
+release: Linux x86_64 and arm64, dynamically linked against glibc, and
 macOS on Apple silicon and Intel, with one `SHA256SUMS` beside them.
 `https://0sql.io/install.sh` reads the release through GitHub's
 permanent `releases/latest/download/` redirect and checks the download
@@ -16,16 +16,36 @@ compiles the CLI on macOS, because the release builds there and a
 Linux-only name once reached a tag. A tag builds nothing but the
 release, and does not wait for CI.
 
-## Why musl, and static
+## Why glibc, and not static
 
-A statically linked glibc cannot resolve names: it loads its name
-service modules at runtime and dumps core without them, and the CLI
-resolves a server's hostname while the server may be given one to bind.
-That was observed, not assumed. musl resolves names and still links
-statically, so one binary runs on any distribution. SQLite, behind the
-SQLite datasource, is C, so the x86_64 build installs `musl-gcc` and the arm64
-build goes through `cross`. `rust-toolchain.toml` pins the toolchain a
-release is built with; rustup reads it on its own.
+Until 0.7 the Linux builds were statically linked against musl, so one
+binary ran on any distribution. A static binary cannot load a shared
+library, and an ADBC driver is one: those builds had the driver code
+compiled out and read Snowflake and BigQuery over REST, as text. The
+builds are now dynamic, so they load a driver where one is installed,
+and they answered the same requests several times faster in the trial
+(`docs/linux-build.md` has the numbers). A statically linked glibc was
+never a choice: it cannot resolve names, which was observed.
+
+What a build asks of the machine it runs on is the glibc it was built
+against, or newer. So the Linux builds are made in an `ubuntu:22.04`
+container, on whatever runner GitHub currently offers, and not on the
+runner itself: a runner's Ubuntu moves, and the `ubuntu-22.04` runners
+are retired on 2027-04-17. The C++ runtime DuckDB needs is linked in,
+so glibc is the only thing asked for. Built there, the binary needs
+**glibc 2.34**: Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023 and
+anything newer. It does not run on Alpine, in a `scratch` container, or
+on Debian 11 and Ubuntu 20.04.
+
+The workflow holds the release to that. It fails when the binary links
+to anything but glibc's own libraries and `libgcc_s`, or needs a symbol
+newer than 2.34, and it runs both Linux builds in an Amazon Linux 2023
+container, where it installs the Snowflake and BigQuery drivers with
+`dbc` and has the binary load them. Raising the floor is editing that
+check, on purpose.
+
+The macOS builds need macOS 11 on Apple silicon. `rust-toolchain.toml`
+pins the toolchain a release is built with; rustup reads it on its own.
 
 ## In order
 
@@ -49,15 +69,19 @@ release is built with; rustup reads it on its own.
    refuses a tag that disagrees with the manifest, so a forgotten step 1
    costs a tag rather than a bad release.
 
-5. **Let the workflow prove the binaries.** It asserts the Linux build
-   is really static, runs `--version` and `--help` where it can, starts
-   `zsql serve` from the binary and waits for `/healthz`, and asks a
-   public server how it is from the static Linux binary, which exercises
-   the resolver, TLS and HTTP in one go. If any of that fails there is
-   no release, by design. It then publishes the four builds and one
+5. **Let the workflow prove the binaries.** It checks what the Linux
+   builds link to and the glibc they need, runs `--version` and
+   `--help` where it can, starts `zsql serve` from the binary and waits
+   for `/healthz`, asks a public server how it is from the Linux
+   binaries, which exercises the resolver, TLS and HTTP in one go, and
+   loads the ADBC drivers from them on glibc 2.34. If any of that fails
+   there is no release, by design. It needs `app.0sql.io` and
+   Columnar's driver registry to be up. It then publishes the four builds and one
    `SHA256SUMS`.
 
-6. **Install it where it runs**, keeping the binary it replaces:
+6. **Install it where it runs**, keeping the binary it replaces. The
+   machine needs glibc 2.34 (`ldd --version`); on an older one the
+   service will not start, and `zsql.prev` is the way back.
 
    ```
    gh release download v0.6.0 -p 'zsql-x86_64-linux' -p SHA256SUMS

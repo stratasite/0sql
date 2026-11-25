@@ -40,6 +40,7 @@ arrow-cast = "60"
 
 # ADBC drivers are shared libraries loaded at run time, which a static
 # musl binary cannot do; there the REST transports are the only path.
+# The releases are glibc and macOS builds, which have it.
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 adbc_core = "0.25"
 adbc_driver_manager = "0.25"

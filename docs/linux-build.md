@@ -1,7 +1,9 @@
 # The Linux build: from static musl to glibc
 
 A plan, started 2026-11-25 and reviewed the same day. Phases are the
-checklist; tick them off here.
+checklist; tick them off here. "What the trial found" is phase 0's
+answer, and where it differs from what the plan first assumed, it is
+the trial that stands.
 
 ## What changes, and why
 
@@ -21,6 +23,7 @@ Decided on 2026-11-25:
 
 - **One Linux build, glibc.** No musl build beside it and no fallback.
 - **Built on Ubuntu 22.04**, so it needs glibc 2.35 or newer at most.
+  (Measured: 2.34.)
   No image with an older glibc: a server runs in a container whose
   base we choose, and the requirement is stated.
 - **The installer refuses** a machine without glibc, or with one too
@@ -38,17 +41,45 @@ line hands a query to, not a dynamic `zsql`". It is a dynamic `zsql`.
 |---|---|
 | Ubuntu 22.04 and newer | Ubuntu 20.04 |
 | Debian 12 and newer | Debian 11 |
-| Fedora, Arch, RHEL 10 | Alpine, `scratch` |
+| RHEL 9 and its clones, Amazon Linux 2023 | Alpine, `scratch` |
+| Fedora, Arch, RHEL 10 | |
 | a container based on any of those | |
 
-RHEL 9 and Amazon Linux 2023 carry glibc 2.34, one short of what
-Ubuntu 22.04 has. Whether they work depends on the newest symbol the
-binary actually asks for, which is often older than the build
-machine's glibc. Phase 0 measures it, and the table, the installer and
-the release check all follow the measured number.
+The binary is built against glibc 2.35 and asks for nothing newer than
+2.34, so RHEL 9 and Amazon Linux 2023 are in.
 
 macOS does not change: its builds are dynamic already and have the
-ADBC code in them.
+ADBC code in them. They need macOS 11.
+
+## What the trial found
+
+Run on 2026-11-25, x86_64, built in `ubuntu:22.04` on a laptop.
+
+| | |
+|---|---|
+| compiler | GCC 11.4, Ubuntu 22.04's own. DuckDB builds; 6 m 43 s on 12 cores |
+| links to | `libc`, `libm`, `libgcc_s`. `libstdc++` is linked in |
+| newest glibc symbol | 2.34 (`dlopen`, `pthread_create` and their kin) |
+| runs and serves in | `ubuntu:22.04`, `debian:12`, `amazonlinux:2023`, `rockylinux:9` |
+| refuses to start in | `debian:11` (glibc 2.31), `alpine:3` |
+| size | 91.6 MB, against the musl build's 89.8 MB |
+| drivers | Snowflake 1.16.0 and BigQuery 1.15.0 load from the release binary, in Ubuntu 22.04 and Amazon Linux 2023. They are Go, link to glibc alone and need nothing newer than 2.3.2. The SQLite driver, used only by tests, needs the host's `libstdc++` |
+| under the service unit | both drivers load with `MemoryDenyWriteExecute`, the system call filter and the rest of `ops/zsqld.service`'s restrictions. Loading only: no query was run through one |
+
+`libgcc_s` stays dynamic: Rust's own runtime asks for it by name. It is
+part of the base system of every glibc distribution tried.
+
+**The two builds under load**, one server each, same machine, three
+runs each, 0.7.0 musl against this build:
+
+| | musl | glibc |
+|---|---|---|
+| a DuckDB aggregate over 20 million rows, three times in a row | 5.0 to 5.5 s | 3.4 s |
+| 96 SQLite reads of 300,000 rows, 32 at a time, each kept as a result | 31 s | 5.0 to 5.5 s |
+| peak memory | 2.0 GB | 2.1 GB |
+
+That is musl's allocator under threads. It was not a reason for the
+change and it is the largest effect of it.
 
 ## Where it is built
 
@@ -66,27 +97,17 @@ none predates that; phase 1 finds out by running one. If it is
 refused, arm64 is built in the same container under emulation, or in
 cross's glibc container with its floor measured.
 
-## Open, to settle in phase 0
+## Still open
 
-- **The measured floor**, as above.
-- **The C++ runtime.** A plain glibc build needs the host's
-  `libstdc++.so.6` and `libgcc_s.so.1`. `CXXSTDLIB=static:-bundle=stdc++`
-  is what the `cc` crate reads to link the first statically;
-  `-static-libgcc` may do the second. Recommended: both linked in, if
-  it links and runs, so that glibc is the only requirement.
-- **The compiler.** Ubuntu 22.04's default is GCC 11. Use it unless
-  DuckDB will not build; a newer one's static runtime can raise the
-  floor.
-- **The drivers' own needs.** The Snowflake and BigQuery drivers are
-  shared libraries with a glibc floor of their own, which Columnar
-  does not state. Read it off them.
-
-No other system library is expected: TLS is rustls, SQLite and DuckDB
-are bundled, compression is Rust, and nothing sets an allocator.
+- **The server that runs `app.0sql.io`.** It installs the released
+  Linux binary and needs glibc 2.34. `ldd --version` there has not
+  been run; it gates phase 6.
+- **A query through a driver under the service unit.** Loading works.
 
 ## Phases
 
-- [ ] **Phase 0 — a trial build, publishing nothing.** On a branch,
+- [x] **Phase 0 — a trial build, publishing nothing.** Done but for
+  the server's glibc; see "What the trial found". On a branch,
   first on a laptop in the container, then through the release
   workflow's manual trigger (its release job runs only on a tag):
   - x86_64 built in `ubuntu:22.04` for `x86_64-unknown-linux-gnu`;
@@ -114,14 +135,16 @@ are bundled, compression is Rust, and nothing sets an allocator.
   If the build does not compile or link in the container, the plan
   stops here and is revisited.
 
-- [ ] **Phase 1 — arm64.** On `ubuntu-24.04-arm` in the same
+- [x] **Phase 1 — arm64.** Built and run on GitHub on 2026-11-25:
+  the runner is available to this repository, the build needs glibc
+  2.34 as x86_64 does, and DuckDB links. On `ubuntu-24.04-arm` in the same
   container. The arm64 binary is run before a release carries it:
   today nothing runs the cross-built one. arm64 links with GNU ld
   where x86_64 does not (the note in
   `crates/datasource/src/adapters/duckdb.rs`); confirm DuckDB's
   extensions link.
 
-- [ ] **Phase 2 — the release workflow.**
+- [x] **Phase 2 — the release workflow.**
   - The Linux rows become the glibc targets, built in the container.
     The asset names stay `zsql-x86_64-linux` and `zsql-aarch64-linux`,
     so every download URL keeps working.
@@ -132,53 +155,49 @@ are bundled, compression is Rust, and nothing sets an allocator.
     server" keep running, now on both Linux builds. The last still
     asks `app.0sql.io`; it wants another host before that one is taken
     down.
-  - A step proves a driver loads from the released binary. The binary
-    only loads a driver for a Snowflake or BigQuery connection, so
-    this needs either a command that lists the drivers it can find
-    (which the installer could use too) or a Snowflake run against an
-    account that does not exist, failing after the load. Decide in
-    phase 0.
+  - A step proves a driver loads from the released binary: `zsql
+    datasource drivers`, added for this, says which drivers a build
+    finds and loads. The workflow installs both with `dbc` in an
+    Amazon Linux 2023 container and reads its answer.
   - `Cross.toml` and the `cross` step go. `rust-toolchain.toml` names
     the glibc target.
 
-- [ ] **Phase 3 — CI covers the driver path.** `bin/ci` and
-  `.github/workflows/ci.yml` install `dbc` and the SQLite driver and
-  run the two tests named in phase 0, in place of `--skip
-  adbc::tests`. Until then a green run says nothing about the drivers.
+- [x] **Phase 3 — CI covers the driver path.** `bin/adbc-drivers`
+  fetches `dbc` and three drivers into `target/adbc`, and `bin/ci` and
+  `.github/workflows/ci.yml` run the three driver tests that need no
+  account, in place of `--skip adbc::tests`. Until then a green run says nothing about the drivers.
 
-- [ ] **Phase 4 — the installer.** `public/install.sh`, in the
-  `0sql-marketing` repository. Two changes, shipped apart.
-
-  **Now, ahead of everything:** it moves the download over the
-  installed binary and only then tries to run it. On a machine the new
-  build cannot run on, that replaces a working `zsql` with a dead one.
-  Run the download from the temporary directory first and leave the
-  installed one alone when it fails. Safe with today's builds.
-
-  **With the release in phase 6, and not before:**
-  - On Linux: find the C library and its version. musl, or glibc older
-    than the floor, stops with what was found, what is needed, and the
-    container bases that work. A pinned `ZSQL_VERSION` of 0.7 or older
-    is a musl build and is not refused.
-  - On Linux and macOS: look for `dbc`. Without it, say what the
-    drivers give (typed columns and faster reads from Snowflake and
-    BigQuery), how to install `dbc` and the two drivers, and that it
-    is recommended. With it, say which of the two are installed.
-  - Its header no longer says the binary is static and has no
-    dependencies.
+- [x] **Phase 4 — the installer.** `public/install.sh`, in the
+  `0sql-marketing` repository. Written and tried in containers; not
+  committed or published there.
+  - It tries a download from beside where it will live before it
+    replaces anything, and leaves the installed `zsql` alone when the
+    new one will not run. Before, it replaced first.
+  - When a download will not run on Linux it says why: musl, or the
+    glibc version found, what is needed, and what works. This is asked
+    only after a failure, so it needs no knowledge of which versions
+    are static, and it is safe to publish before the release.
+  - After installing it asks the new `zsql` for its drivers. Where
+    one is missing it recommends them and says how to get `dbc`. A
+    `zsql` without that command, 0.7 and older, is asked nothing.
+  - Its header states the requirement.
 
   Anything that fetches `releases/latest/download/zsql-x86_64-linux`
   without the installer, a Dockerfile on Alpine for one, gets the new
   build with no check. The release notes are the only warning it has.
 
-- [ ] **Phase 5 — the docs and what the code says of itself.**
+- [x] **Phase 5 — the docs and what the code says of itself.** Done
+  here; the site and issue #41 wait for the release.
   - `docs/releasing.md`: "Why musl, and static" becomes why glibc, the
     floor, and what moves it; its other mentions of static with it.
   - `docs/operating.md`: what a server's machine or container needs,
     how to install the drivers, and where a server finds them.
-  - `README.md` and, in `0sql-marketing`,
-    `src/components/OpenSource.astro`: "One static binary" goes; the
-    requirement is stated under installing.
+  - `README.md`: "One static binary" goes; the requirement is stated
+    under installing. Done.
+  - In `0sql-marketing`, the site says "one static binary" in
+    `src/components/OpenSource.astro` and in the docs under
+    `src/content/docs/` (installation, quickstart, cli). **Not done:**
+    true of 0.7.0, so they change with the release.
   - `docs/exec-layer.md`: the notes that the Linux release cannot load
     a driver, and the reversed decision.
   - `ops/zsqld.service`: the comment that the binary is static, and

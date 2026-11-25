@@ -10,7 +10,8 @@
 //! Nothing is chosen in `datasources.yml`. When the driver is there it
 //! is used; when it is not, the REST transport answers, as text. A
 //! static musl build cannot load a library at all, so this module is
-//! not compiled into one.
+//! not compiled into one. No release is such a build any more; one
+//! made by hand still works, over REST.
 //!
 //! Text reads, the catalog and sampled values, stay on REST whether or
 //! not a driver is installed. A sampled value is a string a consumer
