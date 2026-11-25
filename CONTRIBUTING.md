@@ -38,7 +38,7 @@ one was not; adding a case is the way to pin new behavior.
 - Formatted with `rustfmt` (the width is in `rustfmt.toml`), clean under
   clippy with warnings denied.
 - No new dependency without a sentence on why an existing one would not
-  do; the CLI is a single static binary and every crate ships in it.
+  do; the CLI is a single binary and every crate ships in it.
 - Docs in `docs/` are design notes: update the one that describes what
   you changed. User-facing documentation lives at
   [0sql.io/docs](https://0sql.io/docs/) and is maintained separately.

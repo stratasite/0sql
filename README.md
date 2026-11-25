@@ -7,7 +7,7 @@ refusal that says why. It hands the statement back for you to run, or
 runs it on your warehouse itself and returns the rows, keeping the
 result to answer the same question again.
 
-One static binary, `zsql`, is the command line, the planner and the
+One binary, `zsql`, is the command line, the planner and the
 server. Open source under MIT. Docs at [0sql.io/docs](https://0sql.io/docs/),
 a live playground at [0sql.io/try](https://0sql.io/try/).
 
@@ -18,6 +18,10 @@ Install it:
 ```sh
 curl -fsSL https://0sql.io/install.sh | sh
 ```
+
+It runs on macOS 11 or newer and on Linux with glibc 2.34 or newer
+(Ubuntu 22.04, Debian 12, RHEL 9, Amazon Linux 2023). Not on Alpine:
+base a container on one of those.
 
 Start a project and describe one table:
 
@@ -238,7 +242,8 @@ on each node. Without them a server keeps both on its own disk.
 over their wire protocols; Snowflake, BigQuery, Databricks, Trino,
 ClickHouse and Athena over HTTP; DuckDB and SQLite in the process.
 Snowflake and BigQuery go through their ADBC drivers when one is
-installed. DuckDB and the drivers return each column as its type; the
+installed (`dbc install snowflake`; `zsql datasource drivers` says what
+is found). DuckDB and the drivers return each column as its type; the
 others return text today.
 
 Since the server returns rows, reaching its port is reaching your

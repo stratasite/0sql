@@ -60,12 +60,12 @@ driver manager looks (`ADBC_DRIVER_PATH`, `~/.config/adbc/drivers`,
 takes a relative path, so a project directory cannot supply the library
 that is handed the credentials.
 
-A static musl binary cannot load a library, and the Linux releases are
-static musl (`docs/releasing.md`). So the released Linux `zsql` always
-uses REST for these two, and ADBC is reached from a glibc or macOS
-build. That is acceptable for the command line and is the first hard
-fact about the execution service: the process that runs queries at
-volume cannot be the static binary.
+A static musl binary cannot load a library, and through 0.7.0 the Linux
+releases were static musl, so a released Linux `zsql` always used REST
+for these two. Since 2026-11-25 the Linux releases are dynamic glibc
+builds (`docs/releasing.md`, `docs/linux-build.md`) and load a driver
+as the macOS ones do. A build for a musl target still compiles, without
+this module.
 
 ### Text reads stay on REST
 
@@ -157,10 +157,11 @@ The command line's side of this is deferred as a whole; the server
 side comes first. All of it is logged as stratasite/0sql#41, with what
 was decided on 2026-11-24. What is owed to it:
 
-- **ADBC on the Linux release.** The static musl binary cannot load a
-  driver, so `zsql run` there is always REST for Snowflake and
-  BigQuery. The intended route is a separate, dynamically linked
-  executor the command line hands a query to, not a dynamic `zsql`.
+- **ADBC on the Linux release. Done, 2026-11-25, the other way.** The
+  intended route was a separate, dynamically linked executor the
+  command line hands a query to, not a dynamic `zsql`. That was
+  reversed: the Linux release is a dynamic glibc `zsql`
+  (`docs/linux-build.md`).
 - **Installing a driver without a second tool.** Today a driver arrives
   by `dbc install`, Columnar's tool, which the user has to install
   first. `zsql` should fetch the package itself, check its signature

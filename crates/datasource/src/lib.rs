@@ -43,6 +43,44 @@ pub use secret::{local_entry, secret, secret_env_var, secrets, Secret, Secrets, 
 pub(crate) use source::Deadline;
 pub use source::{read_only, single_statement, Access, Sink, Source};
 
+/// Why a driver is not in use here, when it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Driver {
+    /// Found and loaded: reads that are kept come through it, typed.
+    Loaded,
+    /// Not installed where a driver is looked for; REST answers.
+    Missing,
+    /// Installed and will not load, with what the loader said.
+    Broken(String),
+}
+
+/// The warehouses a driver is looked for, and what was found for each.
+/// `None` in a build that cannot load a shared library at all, and
+/// when `ZSQL_ADBC` switches drivers off.
+pub fn drivers() -> Option<Vec<(&'static str, Driver)>> {
+    #[cfg(not(target_env = "musl"))]
+    {
+        if !adbc::enabled() {
+            return None;
+        }
+        Some(
+            ["snowflake", "bigquery"]
+                .into_iter()
+                .map(|name| {
+                    let found = match adbc::load(name) {
+                        Ok(Some(_)) => Driver::Loaded,
+                        Ok(None) => Driver::Missing,
+                        Err(e) => Driver::Broken(e.to_string()),
+                    };
+                    (name, found)
+                })
+                .collect(),
+        )
+    }
+    #[cfg(target_env = "musl")]
+    None
+}
+
 /// Whether this adapter can be opened with [`Secrets::oauth_token`]: an
 /// access token obtained elsewhere and sent as the credential. The ones
 /// that cannot have no bearer login on the protocol spoken here.

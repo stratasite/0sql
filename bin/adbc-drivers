@@ -1,0 +1,25 @@
+#!/bin/sh
+# The ADBC drivers the driver tests load, in a directory of this
+# checkout's own: target/adbc/drivers. Prints that directory, which is
+# what ADBC_DRIVER_PATH is set to. Nothing is installed for the user,
+# and a second run finds what the first left and fetches nothing.
+#
+#   ADBC_DRIVER_PATH=$(bin/adbc-drivers) cargo test -p zsql-datasource -- --ignored adbc::tests --skip live_bigquery
+#
+# `dbc` is Columnar's driver installer (https://docs.columnar.tech/dbc/).
+# SQLite is the driver the tests read through; Snowflake and BigQuery
+# are loaded to check every option zsql sends them is one they know.
+set -eu
+cd "$(dirname "$0")/.."
+root=$PWD/target/adbc
+drivers=$root/drivers
+mkdir -p "$root/bin" "$drivers"
+
+if [ ! -x "$root/bin/dbc" ]; then
+  curl -LsSf https://dbc.columnar.tech/install.sh \
+    | DBC_UNMANAGED_INSTALL="$root/bin" DBC_NO_MODIFY_PATH=1 sh >&2
+fi
+for driver in sqlite snowflake bigquery; do
+  [ -f "$drivers/$driver.toml" ] || ADBC_DRIVER_PATH="$drivers" "$root/bin/dbc" install "$driver" >&2
+done
+echo "$drivers"

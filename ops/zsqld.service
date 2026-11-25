@@ -25,8 +25,11 @@ StateDirectoryMode=0750
 Restart=on-failure
 RestartSec=2
 
-# The binary is static and the service wants nothing from the system
-# but its own state directory and a loopback socket: no capabilities,
+# The binary needs glibc 2.34 and nothing else, and the service wants
+# nothing from the system but its own state directory and a loopback
+# socket. An ADBC driver, when one is wanted, is read from
+# /etc/adbc/drivers (`dbc install --level system snowflake`): a home
+# directory is hidden from this service. So: no capabilities,
 # a read-only filesystem apart from the state directory, a private
 # temp directory (a deploy unpacks an archive there), a system call
 # filter, and network limited to IPv4, IPv6 and Unix sockets.

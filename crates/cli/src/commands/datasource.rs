@@ -88,6 +88,12 @@ pub enum DatasourceWhat {
         #[arg(short = 'd', long)]
         datasource: Option<String>,
     },
+    /// The ADBC drivers this zsql can load for Snowflake and BigQuery. With one, a kept result is typed and read faster; without, REST answers as text. Needs no project.
+    Drivers {
+        /// Print them as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Which keys each adapter wants, in the order to ask for them, and
@@ -147,10 +153,14 @@ const ADAPTERS: [&str; 12] = [
 ];
 
 pub fn run(project_dir: Option<&Path>, what: DatasourceWhat) -> Result<()> {
+    if let DatasourceWhat::Drivers { json } = what {
+        return drivers(json || crate::tty::agent());
+    }
     let project = config::find_project(project_dir.unwrap_or(Path::new(".")))?;
     match what {
         DatasourceWhat::List { json } => list(&project.dir, json || crate::tty::agent()),
         DatasourceWhat::Test { datasource } => test(&project.dir, datasource.as_deref()),
+        DatasourceWhat::Drivers { .. } => unreachable!("answered above, without a project"),
         DatasourceWhat::Auth { datasource, field, secret_stdin } => {
             auth(&project.dir, datasource.as_deref(), field.as_deref(), secret_stdin)
         }
@@ -328,6 +338,49 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
     match next {
         Some(field) => eprintln!("next: zsql datasource auth -d {} --field {field}", after.uid),
         None => eprintln!("next: zsql datasource test -d {}", after.uid),
+    }
+    Ok(())
+}
+
+/// What `dbc install` has put where this build can load it. A driver
+/// that is installed and will not load fails the command: that is a
+/// broken install, and `zsql run` would refuse on it too.
+fn drivers(json: bool) -> Result<()> {
+    use zsql_datasource::Driver;
+    let found = zsql_datasource::drivers();
+    if json {
+        let list: Vec<serde_json::Value> = found
+            .iter()
+            .flatten()
+            .map(|(name, d)| {
+                let (state, error) = match d {
+                    Driver::Loaded => ("loaded", None),
+                    Driver::Missing => ("missing", None),
+                    Driver::Broken(e) => ("broken", Some(e.as_str())),
+                };
+                serde_json::json!({ "driver": name, "state": state, "error": error })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "can_load": found.is_some(), "drivers": list }))?);
+    } else {
+        match &found {
+            None => println!("no drivers: this build cannot load one, or ZSQL_ADBC switches them off. REST answers, as text."),
+            Some(list) => {
+                for (name, d) in list {
+                    match d {
+                        Driver::Loaded => println!("{name}: loaded"),
+                        Driver::Missing => println!("{name}: not installed (dbc install {name})"),
+                        Driver::Broken(e) => println!("{name}: installed and will not load: {e}"),
+                    }
+                }
+                if list.iter().any(|(_, d)| *d == Driver::Missing) {
+                    eprintln!("dbc is Columnar's driver installer: https://docs.columnar.tech/dbc/");
+                }
+            }
+        }
+    }
+    if found.iter().flatten().any(|(_, d)| matches!(d, Driver::Broken(_))) {
+        bail!("a driver is installed and will not load");
     }
     Ok(())
 }
