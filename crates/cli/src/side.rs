@@ -63,9 +63,7 @@ pub trait Side {
     /// `.run`: the query run on its datasource and its rows kept, which
     /// only this machine can do, holding the credentials.
     fn run(&mut self, _query: &Query, _context: Option<&Value>, _fresh: bool) -> Result<()> {
-        anyhow::bail!(
-            "runs here only: the credentials are on this machine, and the server holds none. Open the repl without -r to run queries."
-        )
+        anyhow::bail!("runs here only: `zsql` does not yet ask a server to run. Open the repl without -r to run queries.")
     }
     /// `.results`: what `.run` kept.
     fn results(&mut self) -> Result<()> {

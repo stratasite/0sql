@@ -97,11 +97,15 @@ curl -s http://127.0.0.1:3699/projects/shop/branches/main/sql \
 ```
 
 Run that statement against your own warehouse, with your own
-credentials, in your own code. Or have the server run it: give it a
-credential for the datasource and ask for rows instead.
+credentials, in your own code. Or have the server run it: put the
+datasource's password in `.zsql`, which stays out of git, and ask for
+rows instead. A deploy carries it, and `zsql serve` deploys the
+project it is started in.
 
-```sh
-ZSQL_DS_WAREHOUSE_PASSWORD=... zsql serve
+```yaml
+# .zsql
+warehouse:
+  password: ...
 ```
 
 ```sh
@@ -183,8 +187,8 @@ still take on, and `fields`, `tables` and `values` read the catalog.
 3. Otherwise it takes one of `ZSQL_CONCURRENT_RUNS` seats, or waits in
    a queue with an end.
 4. The statement runs on the datasource, under its `query_timeout`,
-   with the credential the request sent or the one the server holds
-   (`ZSQL_DS_<UID>_<FIELD>`). Rows go to disk a batch at a time, so a
+   with the credential the request sent or the one the datasource was
+   deployed with. Rows go to disk a batch at a time, so a
    large result costs disk and time, not memory.
 5. The request waits `query_wait_time` (ten seconds unless the
    datasource says). Ready in time, the rows are in the answer.
@@ -208,8 +212,14 @@ projects of several. Every route above is also served under
 crosses: a listing, a stored result, an invalidation and a warehouse
 connection are one org's. An org is a directory of the data directory
 and nothing more, and `zsql` reads it from `org:` in `project.yml` or
-`--org`. The credentials the server holds are the default org's; a run
-in a named org connects with what its request sends.
+`--org`.
+
+**Credentials.** `zsql deploy` carries each datasource's secrets from
+`.zsql`, and on the server they are that datasource's credential for
+the branch: kept apart from the compiled model, never served. A
+request that sends a secret of its own connects with that and nothing
+else. A later deploy that carries none keeps what the branch had, so a
+pipeline can deploy without holding the secret.
 
 **More than one node.** With `ZSQL_DB` the records of runs live in a
 Postgres table every node shares, and with `ZSQL_OBJECT_STORE` the

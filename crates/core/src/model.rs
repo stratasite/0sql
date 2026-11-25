@@ -62,6 +62,48 @@ pub struct Model {
     /// Each field's tables, by field id, in model order: built once,
     /// since the catalog asks for it once per field.
     tables_by_field: HashMap<zsql_semantic::Id, Vec<String>>,
+    /// The secrets each datasource's entry carried, by the datasource's
+    /// uid in lower case: every secret key, at the depth it was written,
+    /// and nothing else. They are taken out of the snapshot when the
+    /// model is built, so the snapshot holds none and can be kept,
+    /// compared and passed on as what it is, the compiled model. Kept
+    /// apart on disk too, in [`SECRETS_FILE`]. Never served.
+    pub secrets: std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+}
+
+/// Where a model's secrets are kept under its directory, readable by
+/// its owner alone.
+pub const SECRETS_FILE: &str = "secrets.json";
+
+/// Takes every secret out of a datasource's settings, at any depth, and
+/// returns them in the shape they were in.
+fn take_secrets(settings: &mut serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut taken = serde_json::Map::new();
+    let keys: Vec<String> = settings.keys().cloned().collect();
+    for key in keys {
+        if is_secret(&key) {
+            if let Some(value) = settings.remove(&key) {
+                taken.insert(key, value);
+            }
+        } else if let Some(Value::Object(inner)) = settings.get_mut(&key) {
+            let within = take_secrets(inner);
+            if !within.is_empty() {
+                taken.insert(key, Value::Object(within));
+            }
+        }
+    }
+    taken
+}
+
+/// The secrets held, by path: `password`, `oauth.client_secret`.
+fn secret_paths(held: &serde_json::Map<String, Value>, under: &str, out: &mut Vec<String>) {
+    for (key, value) in held {
+        let path = if under.is_empty() { key.clone() } else { format!("{under}.{key}") };
+        match value {
+            Value::Object(inner) if !is_secret(key) => secret_paths(inner, &path, out),
+            _ => out.push(path),
+        }
+    }
 }
 
 /// What the files on disk are called under a model's directory.
@@ -102,9 +144,17 @@ impl Model {
     pub fn build(
         uid: &str,
         branch: &str,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         dialects: &'static Dialects,
     ) -> std::result::Result<Model, zsql_semantic::BuildError> {
+        // The secrets leave the snapshot before anything is built on it.
+        let mut secrets = std::collections::BTreeMap::new();
+        for d in &mut snapshot.datasources {
+            let taken = take_secrets(&mut d.connection);
+            if !taken.is_empty() {
+                secrets.insert(d.uid.to_lowercase(), taken);
+            }
+        }
         let semantic = SemanticModel::build(snapshot)?;
         let warnings = semantic.warnings().to_vec();
         let mut tables_by_field: HashMap<zsql_semantic::Id, Vec<String>> = HashMap::new();
@@ -125,6 +175,7 @@ impl Model {
             loaded_at: now(),
             sources: vec![],
             tables_by_field,
+            secrets,
         })
     }
 
@@ -166,6 +217,17 @@ impl Model {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
             Err(e) => return Err(e.into()),
         };
+        // What was kept apart, over anything a snapshot written before
+        // secrets were kept apart still had in it.
+        match std::fs::read_to_string(dir.join(SECRETS_FILE)) {
+            Ok(text) => {
+                let kept: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
+                    serde_json::from_str(&text).map_err(|e| StoredError::Secrets(e.to_string()))?;
+                m.secrets.extend(kept);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         m.loaded_at = std::fs::metadata(&snap_path).and_then(|m| m.modified()).map(utc_minute).unwrap_or_default();
         Ok(m)
     }
@@ -186,7 +248,33 @@ impl Model {
         }
         // ProjectTest serializes its file as a file name, so nothing of
         // the directory it was loaded from is kept.
-        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)
+        std::fs::write(dir.join(TESTS_FILE), serde_json::to_vec(&self.tests)?)?;
+        self.write_secrets(dir)
+    }
+
+    /// The secrets, in a file of their own that only its owner reads;
+    /// no file when there are none.
+    fn write_secrets(&self, dir: &Path) -> std::io::Result<()> {
+        let path = dir.join(SECRETS_FILE);
+        let _ = std::fs::remove_file(&path);
+        if self.secrets.is_empty() {
+            return Ok(());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        options.open(&path)?.write_all(&serde_json::to_vec(&self.secrets)?)
+    }
+
+    /// The secrets a datasource was deployed with, by its uid in any
+    /// case: for a reader that connects. Not for serving.
+    pub fn secrets_of(&self, datasource: &str) -> Option<&serde_json::Map<String, Value>> {
+        self.secrets.get(&datasource.trim().to_lowercase())
     }
 
     pub fn semantic(&self) -> &SemanticModel {
@@ -475,8 +563,14 @@ impl Model {
             .iter()
             .filter(|d| wanted(&d.uid) || wanted(&d.name) || wanted(&d.adapter))
             .map(|d| {
+                // The secrets are held apart; `shown` is the second guard
+                // on what is left.
                 let mut secrets = Vec::new();
                 let connection = shown(&d.connection, "", &mut secrets);
+                if let Some(held) = self.secrets_of(&d.uid) {
+                    secret_paths(held, "", &mut secrets);
+                }
+                secrets.sort();
                 json!({
                     "uid": d.uid, "name": d.name, "adapter": d.adapter, "tier": d.tier, "description": d.description,
                     "query_timeout": d.query_timeout, "extra_query_params": d.extra_query_params,
@@ -488,7 +582,7 @@ impl Model {
     }
 
     /// One datasource as it was deployed, by its uid in any case: for a
-    /// reader that connects, so its secrets are in it. Not for serving.
+    /// reader that connects. Its secrets are [`Model::secrets_of`]'s.
     pub fn datasource(&self, datasource: &str) -> Option<&zsql_semantic::Datasource> {
         let want = datasource.trim().to_lowercase();
         self.semantic().snapshot().datasources.iter().find(|d| d.uid.to_lowercase() == want)

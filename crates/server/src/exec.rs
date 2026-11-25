@@ -13,7 +13,7 @@
 //! same from `run` as from `results`, so a caller reads one shape.
 //!
 //! The credential a run connects with is the request's when it sends
-//! one, and otherwise the one this server was given for the datasource.
+//! one, and otherwise the one the datasource was deployed with.
 //! Nothing here decides who may ask: the service in front does.
 
 use crate::error::{ApiError, Input, Org, Params, Search};
@@ -133,12 +133,10 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
     let sql = planned.plan.sql_with_limit(row_limit, &dialect).map_err(zsql_core::Error::from)?;
     let datasource = planned.plan.datasource_uid.clone();
 
-    let (mut conn, sent) = connection_of(app, (org, uid, branch), &datasource, None, &req.connection, None)?;
+    let (mut conn, secrets) = connection_of(app, (org, uid, branch), &datasource, None, &req.connection, None)?;
     // What a statement may do is the database's to say, through the
     // credential it is run with: nothing here checks it.
     conn.access = zsql_datasource::Access::Unchecked;
-    // The request's credential when it sent one; this server's otherwise.
-    let secrets = secrets_for(app, org, &datasource, sent);
     let wait = wait_of(req.wait, conn.wait())?;
     // A datasource that keeps nothing is neither looked up nor found.
     let ttl = conn.cache_ttl.map(|s| Duration::from_secs(s.max(0) as u64)).unwrap_or(zsql_exec::DEFAULT_TTL);
@@ -166,22 +164,6 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
         })
         .map_err(internal)?;
     Ok((record, how, wait))
-}
-
-/// The credential a run connects with: the request's when it sent one,
-/// and otherwise the one this server was given for the datasource.
-///
-/// The server's are kept by a datasource's uid alone, so they are the
-/// default org's and no other's. Any org may deploy a datasource of
-/// any uid, pointing anywhere, and one that named another's would
-/// otherwise be opened with a credential that was never meant for it.
-/// A run in a named org connects with what its request sends.
-fn secrets_for(app: &Shared, org: &str, datasource: &str, sent: zsql_datasource::Secrets) -> zsql_datasource::Secrets {
-    if sent.is_empty() && org == crate::names::DEFAULT_ORG {
-        (app.secrets)(datasource)
-    } else {
-        sent
-    }
 }
 
 /// What a connection may be reused under: everything about where it
@@ -231,9 +213,8 @@ fn submit_sql(app: &Shared, org: &str, uid: &str, branch: &str, req: SqlExecRequ
     if !zsql_datasource::single_statement(&req.sql) {
         return Err(invalid("sql is one statement: send each of several in a request of its own"));
     }
-    let (mut conn, sent) = connection_of(app, (org, uid, branch), req.datasource.trim(), None, &req.connection, None)?;
+    let (mut conn, secrets) = connection_of(app, (org, uid, branch), req.datasource.trim(), None, &req.connection, None)?;
     conn.access = zsql_datasource::Access::Writable;
-    let secrets = secrets_for(app, org, &conn.uid, sent);
     let wait = wait_of(req.wait, conn.wait())?;
     // DuckDB cannot be open for reading and for writing at once in one
     // process, and a writable connection has its file to itself. So the
@@ -359,8 +340,8 @@ pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, pa
 }
 
 /// A run asked for by a tool: a spec under the context the connection
-/// carries, with this server's own credential, since a model has none
-/// to send. What comes back is the record and a page, as `described`
+/// carries, with the credential the datasource was deployed with, since
+/// a model has none to send. What comes back is the record and a page, as `described`
 /// gives them.
 pub(crate) async fn run_for_tool(app: &Shared, asked: ToolRun, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
     let ToolRun { org, uid, branch, spec, context, fresh } = asked;

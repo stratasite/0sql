@@ -151,6 +151,24 @@ impl Secrets {
         hash.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Each secret held, under its name in [`SECRET_FIELDS`]: for
+    /// whoever sends a credential on, as a deploy does. Not for
+    /// printing.
+    pub fn fields(&self) -> Vec<(&'static str, &str)> {
+        let all = [
+            ("password", &self.password),
+            ("personal_access_token", &self.personal_access_token),
+            ("private_key", &self.private_key),
+            ("oauth_client_id", &self.oauth_client_id),
+            ("oauth_client_secret", &self.oauth_client_secret),
+            ("access_key_id", &self.access_key_id),
+            ("secret_access_key", &self.secret_access_key),
+            ("session_token", &self.session_token),
+            ("oauth_token", &self.oauth_token),
+        ];
+        all.into_iter().filter_map(|(name, held)| Some((name, held.as_ref()?.expose()))).collect()
+    }
+
     /// Whether nothing was given: no field of it holds a secret.
     pub fn is_empty(&self) -> bool {
         self.password.is_none()

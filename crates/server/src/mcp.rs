@@ -99,7 +99,7 @@ impl Settings {
     ///
     /// Named, a tool is exposed. With no list, every tool is but the two
     /// that run a statement: a model that can run what it plans reads
-    /// rows with this server's own credential, which is for whoever
+    /// rows with the credential a datasource was deployed with, which is for whoever
     /// sets the server up to turn on.
     fn exposed(&self, name: &str) -> bool {
         match &self.tools {

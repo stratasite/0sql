@@ -81,4 +81,6 @@ pub enum StoredError {
     Io(#[from] std::io::Error),
     #[error("tests.json does not parse: {0}")]
     Tests(String),
+    #[error("secrets.json does not parse: {0}")]
+    Secrets(String),
 }

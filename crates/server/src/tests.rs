@@ -54,7 +54,6 @@ fn app_over(data_dir: &std::path::Path) -> Shared {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,
-        secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
     })
 }
 
@@ -1294,13 +1293,10 @@ async fn a_run_is_answered_by_its_id_and_a_failure_is_recorded() {
     );
 }
 
-/// What the server was told about limits and credentials: a row limit
-/// for a request with none, a datasource that keeps nothing, and the
-/// credential it holds when the request sends none.
+/// What the server was told about limits: a row limit for a request
+/// with none, and a datasource that keeps nothing.
 #[tokio::test]
-async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_credential() {
-    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let seen = asked.clone();
+async fn a_default_limit_and_a_datasource_that_keeps_nothing() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
     std::fs::create_dir_all(&data_dir).unwrap();
     let dialects: &'static Dialects = Box::leak(Box::new(Dialects::builtin()));
@@ -1313,10 +1309,6 @@ async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_cre
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: Some(2),
-        secrets: Arc::new(move |uid| {
-            seen.lock().unwrap().push(uid.to_string());
-            zsql_datasource::Secrets::default()
-        }),
     });
     let s = Server { router: router(app.clone()), app, data_dir };
     let file = sales("limits");
@@ -1334,26 +1326,13 @@ async fn a_default_limit_a_datasource_that_keeps_nothing_and_the_servers_own_cre
     assert_eq!((&a.body["row_limit"], &a.body["row_count"]), (&json!(2), &json!(2)), "the server's limit, for a request with none");
     assert!(a.body["sql"].as_str().unwrap().to_uppercase().contains("LIMIT 2"), "{}", a.body["sql"]);
     assert!(a.body["cache_key"].is_null(), "cache_ttl: 0 keeps nothing");
-    assert_eq!(*asked.lock().unwrap(), ["dw"], "nothing was sent, so the server's credential for dw was asked for");
     let b = s.post(&run, json!({ "expr": "category asc, revenue" })).await;
     assert_eq!(b.body["cache"], "miss", "and so nothing is found again");
     assert_ne!(a.body["id"], b.body["id"]);
 
-    // The request's own limit wins, and its own credential is the one used.
-    let own = s.post(&run, json!({ "expr": "category asc, revenue, limit 1", "connection": { "password": "theirs" } })).await;
+    // The request's own limit wins.
+    let own = s.post(&run, json!({ "expr": "category asc, revenue, limit 1" })).await;
     assert_eq!((&own.body["row_limit"], &own.body["row_count"]), (&json!(1), &json!(1)), "{}", own.body);
-    assert_eq!(asked.lock().unwrap().len(), 2, "a credential was sent, so the server's was not asked for");
-
-    // The server's credentials are kept by a datasource's uid, and any
-    // org can deploy a datasource of that uid: they are the default
-    // org's, and a run in another org is never handed one.
-    assert_eq!(s.deploy_to("acme", CS, "main", archive_of(&files)).await.status, StatusCode::OK);
-    let theirs = s.post(&format!("/orgs/acme/projects/{CS}/branches/main/run"), json!({ "expr": "category asc, revenue" })).await;
-    assert_eq!((&theirs.body["status"], &theirs.body["org_uid"]), (&json!("succeeded"), &json!("acme")), "{}", theirs.body);
-    let exec = json!({ "datasource": "dw", "sql": "SELECT 1" });
-    let theirs = s.post(&format!("/orgs/acme/projects/{CS}/branches/main/sql-exec"), exec).await;
-    assert_eq!(theirs.body["status"], "succeeded", "{}", theirs.body);
-    assert_eq!(asked.lock().unwrap().len(), 2, "neither asked for the server's credential");
 }
 
 /// The caller's own statement, run as it was written: it may write, it
@@ -1421,7 +1400,7 @@ async fn sql_exec_runs_one_statement_of_the_callers_and_keeps_nothing_of_it_for_
 
 /// The two tools that run a statement are not offered unless they are
 /// named: a model that can run what it plans reads rows with the
-/// server's own credential. Named, they run a spec and read a result.
+/// credential the datasource was deployed with. Named, they run a spec and read a result.
 #[tokio::test]
 async fn the_tools_that_run_are_offered_only_when_named() {
     let listed = |a: &Answer| -> Vec<String> {
@@ -1452,7 +1431,6 @@ async fn the_tools_that_run_are_offered_only_when_named() {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,
-        secrets: Arc::new(|_| zsql_datasource::Secrets::default()),
     });
     let s = Server { router: router(app.clone()), app, data_dir };
     let file = sales("tools");
@@ -1682,4 +1660,122 @@ async fn a_result_is_its_orgs_alone() {
     assert_eq!(s.post(&format!("/{run}"), ask()).await.body["cache"], "miss");
     let a = s.post("/orgs/acme/cache/invalidate", json!({ "datasource": "dw", "tables": ["sales"] })).await;
     assert_eq!(a.body["invalidated"], 1, "{}", a.body);
+}
+
+/// A deploy carries a datasource's secrets, and they are its credential
+/// on that branch: kept apart from the compiled model, never served,
+/// used by a run whose request sends none and set aside whole by one
+/// that does. A later deploy that carries none keeps them while the
+/// datasource points where it did, a new branch starts with none, and
+/// a deploy asked to clear, or a removal, takes them away.
+#[tokio::test]
+async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
+    let s = server();
+    let file = sales("credentials");
+    let entry = |extra: &str| {
+        let mut files = fixture_files(CS, "one");
+        files.iter_mut().find(|(p, _)| p == "datasources.yml").unwrap().1 =
+            format!("dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n  file: {}\n{extra}", file.display());
+        archive_of(&files)
+    };
+    let with = entry("  username: svc\n  password: deployed-pw\n  oauth_client_secret: deployed-cs\n");
+    let without = entry("  username: svc\n");
+    // What a run on the branch would connect with: the password and the client secret.
+    let connects = |s: &Server, org: &str, branch: &str, sent: Value| {
+        let sent = sent.as_object().cloned().unwrap_or_default();
+        let (_, secrets) =
+            crate::probe::connection_of(&s.app, (org, CS, branch), "dw", None, &sent, None).map_err(|e| e.2).expect("a connection");
+        (secrets.password.map(|p| p.expose().to_string()), secrets.oauth_client_secret.map(|p| p.expose().to_string()))
+    };
+    let both = || (Some("deployed-pw".to_string()), Some("deployed-cs".to_string()));
+
+    let a = s.deploy(CS, "main", with.clone()).await;
+    assert_eq!((a.status, &a.body["credentials"]), (StatusCode::OK, &json!({ "dw": "set" })), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), both());
+
+    // On disk: in a file of their own that only its owner reads, and
+    // nowhere in the compiled model.
+    let dir = s.data_dir.join("default").join(CS).join("main");
+    let kept = std::fs::read_to_string(dir.join("secrets.json")).unwrap();
+    assert!(kept.contains("deployed-pw") && kept.contains("deployed-cs"), "{kept}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("secrets.json")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let mut snapshot = String::new();
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(std::fs::File::open(dir.join("snapshot.json.gz")).unwrap()),
+        &mut snapshot,
+    )
+    .unwrap();
+    assert!(snapshot.contains("\"svc\"") && !snapshot.contains("deployed-"), "the snapshot holds the settings and no secret");
+
+    // Named, never shown; and no answer of a deploy or a run carries one.
+    let listed = s.get(&format!("/projects/{CS}/branches/main/datasources")).await;
+    assert_eq!(listed.body["datasources"][0]["secrets"], json!(["oauth_client_secret", "password"]));
+    assert_eq!(listed.body["datasources"][0]["connection"]["username"], "svc");
+    let ran = s.post(&format!("/projects/{CS}/branches/main/run"), json!({ "expr": "category asc, revenue" })).await;
+    assert_eq!(ran.body["status"], "succeeded", "{}", ran.body);
+    for answer in [&a, &listed, &ran] {
+        assert!(!answer.body.to_string().contains("deployed-"), "{}", answer.body);
+    }
+
+    // A request that sends any secret is the whole credential: nothing
+    // deployed is blended into it. A setting that is no secret is not one.
+    assert_eq!(connects(&s, "default", "main", json!({ "password": "theirs" })), (Some("theirs".to_string()), None));
+    assert_eq!(connects(&s, "default", "main", json!({ "oauth_token": "t" })), (None, None));
+    assert_eq!(connects(&s, "default", "main", json!({ "role": "analyst" })), both());
+
+    // A deploy that carries none keeps it, and a restart finds it.
+    let a = s.deploy(CS, "main", without.clone()).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), both());
+    let again = app_over(&s.data_dir);
+    reload(&again).unwrap();
+    let restarted = Server { router: router(again.clone()), app: again, data_dir: s.data_dir.clone() };
+    assert_eq!(connects(&restarted, "default", "main", json!({})), both());
+
+    // How it is used may change; where it points may not.
+    let a =
+        s.deploy(CS, "main", entry("  username: svc\n  schema: marts\n  cache_ttl: 60\n  query_timeout: 45\n  sslmode: require\n")).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
+    let a = s.deploy(CS, "main", entry("  username: someone_else\n")).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "dropped" }), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), (None, None));
+    assert!(!dir.join("secrets.json").exists(), "and no file is left for none");
+    let a = s.deploy(CS, "main", without.clone()).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "none" }), "once gone it does not come back: {}", a.body);
+
+    // A branch deployed for the first time has none, whatever another
+    // branch holds; nor has the same project in another org.
+    assert_eq!(s.deploy(CS, "main", with.clone()).await.body["credentials"], json!({ "dw": "set" }));
+    let a = s.deploy(CS, "dev", without.clone()).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "none" }), "{}", a.body);
+    assert_eq!(connects(&s, "default", "dev", json!({})), (None, None));
+    let a = s.deploy_to("acme", CS, "main", without.clone()).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "none" }), "{}", a.body);
+    // And an org's own is its own: a named org is served by what it deployed.
+    assert_eq!(s.deploy_to("acme", CS, "main", entry("  username: svc\n  password: acme-pw\n")).await.status, StatusCode::OK);
+    assert_eq!(connects(&s, "acme", "main", json!({})), (Some("acme-pw".to_string()), None));
+    assert_eq!(connects(&s, "default", "main", json!({})), both());
+
+    // A validation keeps nothing and changes nothing.
+    let a = s.validate(CS, "main", entry("  username: svc\n  password: validated\n")).await;
+    assert!(a.status == StatusCode::OK && a.body["credentials"].is_null(), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), both());
+
+    // Asked to clear, a deploy is the whole truth.
+    let clear = format!("/projects/{CS}/branches/main/deploy?clear_secrets=true");
+    let a = s.send(Method::POST, &clear, &[], Some(("application/gzip", without.clone()))).await;
+    assert_eq!((a.status, &a.body["credentials"]), (StatusCode::OK, &json!({ "dw": "dropped" })), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), (None, None));
+    let typo = format!("/projects/{CS}/branches/main/deploy?clear_secret=true");
+    assert_eq!(s.send(Method::POST, &typo, &[], Some(("application/gzip", without))).await.status, StatusCode::BAD_REQUEST);
+
+    // A removal takes the credential with the branch.
+    let acme = s.data_dir.join("acme").join(CS).join("main");
+    assert!(acme.join("secrets.json").exists());
+    assert_eq!(s.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}/branches/main"), &[], None).await.status, StatusCode::OK);
+    assert!(!acme.exists());
 }

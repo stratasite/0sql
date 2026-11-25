@@ -239,7 +239,8 @@ pub struct Datasource {
     /// `database`, `account`, ...) and anything else the entry said. The
     /// planner reads none of it; it is kept because whoever deployed it
     /// put it there, for a reader that connects. A secret deployed in
-    /// the entry is here too, so this is never served as it stands.
+    /// the entry is here as the loader read it and gone once a model
+    /// is built on the snapshot, which keeps its secrets apart.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub connection: serde_json::Map<String, Value>,
 }

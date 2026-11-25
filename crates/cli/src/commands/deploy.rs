@@ -6,7 +6,16 @@ use crate::side::Side;
 use crate::{project, remote, show};
 use anyhow::{bail, Result};
 
-pub fn deploy(at: Where, dry_run: bool, watch: bool, skip_check: bool) -> Result<()> {
+/// How a deploy is asked for.
+pub struct How {
+    pub dry_run: bool,
+    pub watch: bool,
+    pub skip_check: bool,
+    pub clear_secrets: bool,
+}
+
+pub fn deploy(at: Where, how: How) -> Result<()> {
+    let How { dry_run, watch, skip_check, clear_secrets } = how;
     let t = at.target(true)?;
     let Some(p) = &t.project else { bail!("deploy needs a project directory") };
     // The model loaded and tested here first: a round trip to the server
@@ -24,8 +33,15 @@ pub fn deploy(at: Where, dry_run: bool, watch: bool, skip_check: bool) -> Result
         let archive = project::archive(&p.dir)?;
         let note = if t.branch == p.production_branch { " (the production branch)" } else { "" };
         println!("{action} {} ({} bytes) as {}{note} to {}", p.name, archive.len(), t.name(), t.client.server);
+        // Said before it goes: a deploy carries the secrets this machine
+        // holds, and they become the datasource's credential there.
+        let carried = project::carries_secrets_for(&p.dir);
+        if !carried.is_empty() && !dry_run {
+            println!("with the secrets held here for: {}", carried.join(", "));
+        }
+        let clear = if clear_secrets && !dry_run { "?clear_secrets=true" } else { "" };
         let v = t.client.post_bytes(
-            &format!("{}/{action}", remote::branch_path(t.org.as_deref(), &t.uid, &t.branch)),
+            &format!("{}/{action}{clear}", remote::branch_path(t.org.as_deref(), &t.uid, &t.branch)),
             "application/gzip",
             &archive,
         )?;

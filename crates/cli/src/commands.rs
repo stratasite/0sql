@@ -35,7 +35,9 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         }
         Command::Init { dir, name, uid, no_git } => scaffold::init(dir, name, uid, no_git),
         Command::Datasource { what } => datasource::run(dir, what),
-        Command::Deploy { dry_run, watch, skip_check, remote } => deploy::deploy(Where::with(project, remote), dry_run, watch, skip_check),
+        Command::Deploy { dry_run, watch, skip_check, clear_secrets, remote } => {
+            deploy::deploy(Where::with(project, remote), deploy::How { dry_run, watch, skip_check, clear_secrets })
+        }
         Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
             let format = format.or_else(|| tty::agent().then(|| "json".to_string()));
             let (mode, q, context) = query.resolve(here)?;
