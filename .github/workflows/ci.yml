@@ -99,9 +99,11 @@ jobs:
           ZSQL_TEST_TRINO_URL: http://localhost:8080
           ZSQL_TEST_TRINO_DB: tpch
         run: |
-          # adbc::tests load ADBC drivers this job does not install; they
-          # are run by hand, see docs/exec-layer.md.
-          cargo test --locked -p zsql-datasource -- --ignored --skip adbc::tests
+          # adbc::tests load ADBC drivers, fetched into target/. The
+          # ones that need a BigQuery project are run by hand; see
+          # docs/exec-layer.md.
+          export ADBC_DRIVER_PATH=$(bin/adbc-drivers)
+          cargo test --locked -p zsql-datasource -- --ignored --skip live_bigquery
           # The records of runs, in the same Postgres.
           cargo test --locked -p zsql-exec --test postgres -- --ignored
           cargo test --locked -p zsql-cli --test serve -- --ignored

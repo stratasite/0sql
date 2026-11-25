@@ -40,32 +40,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Built in cross's container like the arm64 one: DuckDB is C++,
-          # and musl-tools on the runner has a C compiler but no C++. The
-          # container is pinned in Cross.toml, because cross's own is too
-          # old to compile DuckDB.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+          # The Linux builds are dynamically linked against glibc, and
+          # the glibc they are built against is the oldest they will
+          # run on. So they are built in an Ubuntu 22.04 container and
+          # not on the runner: the runner's Ubuntu moves, and 22.04
+          # runners are retired on 2027-04-17. See docs/linux-build.md.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            container: ubuntu:22.04
             asset: zsql-x86_64-linux
-            cross: true
-          # No arm64 Linux runner on this plan, so this one is built in
-          # a container for the target rather than on it.
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            container: ubuntu:22.04
             asset: zsql-aarch64-linux
-            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             asset: zsql-aarch64-macos
-            cross: false
           # The runner is Apple silicon; Xcode carries both SDKs, so the
           # Intel build is a cross-compile on the same machine.
           - target: x86_64-apple-darwin
             os: macos-latest
             asset: zsql-x86_64-macos
-            cross: false
     runs-on: ${{ matrix.os }}
+    # Empty for macOS, which builds on the runner itself.
+    container: ${{ matrix.container }}
     steps:
+      # A bare Ubuntu has no compiler and no rustup. GCC 11 is what
+      # 22.04 carries, and it compiles DuckDB.
+      - name: What the container lacks
+        if: matrix.container
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git file binutils
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: actions/checkout@v4
 
       - name: Toolchain
@@ -74,32 +84,20 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustc --version
 
-      # The images are pinned by digest in Cross.toml: cross's own carry
-      # a 2019 compiler that DuckDB's C++ does not build with.
-      #
-      # musl, not glibc, on Linux. A static glibc binary cannot resolve
-      # names: it loads its name service modules at runtime and dumps
-      # core without them. musl resolves names and still links
-      # statically, so the binary runs on any distribution and can be
-      # given a hostname to bind or to reach. SQLite is C and DuckDB is
-      # C++, so both Linux targets build in cross's container, which
-      # carries a musl toolchain with both compilers.
-
-      - name: cross
-        if: matrix.cross
-        run: |
-          curl -fsSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
-            | sudo tar -xz -C /usr/local/bin cross
-          cross --version
-
       # The default build: the CLI with the server.
+      #
+      # On Linux the C++ runtime DuckDB needs is linked in, so that the
+      # machine it runs on has to supply glibc and nothing else: `cc`
+      # reads CXXSTDLIB, and rustc is told where GCC keeps the archive.
+      # Not statically linked as a whole: a static binary cannot load an
+      # ADBC driver, which is why this is not the musl build it was.
       - name: Build
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }} -p zsql-cli
-          else
-            cargo build --release --locked --target ${{ matrix.target }} -p zsql-cli
+          if [ "${{ runner.os }}" = Linux ]; then
+            export CXXSTDLIB=static:-bundle=stdc++
+            export RUSTFLAGS="-L native=$(dirname "$(gcc -print-file-name=libstdc++.a)")"
           fi
+          cargo build --release --locked --target ${{ matrix.target }} -p zsql-cli
 
       - name: Package
         run: |
@@ -116,18 +114,30 @@ jobs:
       - name: It is what it claims to be
         run: file dist/${{ matrix.asset }}
 
-      # The Linux build must be static: that is what lets it run on any
-      # distribution.
-      - name: It is really static
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      # What the Linux build asks of the machine it runs on: glibc's own
+      # libraries and libgcc_s, which every glibc system has, and no
+      # symbol newer than glibc 2.34. A new library here, or a newer
+      # symbol, is a machine it stops running on, so it fails the
+      # release and is decided, not discovered.
+      - name: It needs glibc 2.34 and nothing else
+        if: runner.os == 'Linux'
         run: |
-          file dist/${{ matrix.asset }} | grep -qE 'static(ally linked|-pie linked)'
-          ! ldd dist/${{ matrix.asset }} 2>/dev/null | grep -q '=>'
+          needed=$(objdump -p dist/${{ matrix.asset }} | awk '$1 == "NEEDED" { print $2 }' | sort)
+          echo "$needed"
+          extra=$(echo "$needed" | grep -vxE 'libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-[a-z0-9-]+\.so\.[0-9]' || true)
+          test -z "$extra" || { echo "needs more than glibc: $extra"; exit 1; }
+          newest=$(objdump -T dist/${{ matrix.asset }} | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "newest symbol: $newest"
+          test "$(printf '%s\n' GLIBC_2.34 "$newest" | sort -V | tail -1)" = GLIBC_2.34 || {
+            echo "needs $newest, newer than glibc 2.34"
+            exit 1
+          }
 
-      # Only the two that can run here. The cross-built ones are checked
-      # by whoever installs them, and by the installer's checksum.
+      # Each of these runs on the machine that built it, so the arm64
+      # Linux build and the Apple silicon one are run; the Intel macOS
+      # build is a cross-compile and is not.
       - name: It really runs
-        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        if: runner.os == 'Linux' || matrix.target == 'aarch64-apple-darwin'
         run: |
           ./dist/${{ matrix.asset }} --version
           ./dist/${{ matrix.asset }} --help > /dev/null
@@ -135,7 +145,7 @@ jobs:
       # The server inside it comes up and answers. Job control is off in
       # this shell, so the pid is kept by hand.
       - name: The server really starts
-        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        if: runner.os == 'Linux' || matrix.target == 'aarch64-apple-darwin'
         run: |
           ZSQL_HOME=$(mktemp -d) ./dist/${{ matrix.asset }} serve --bind 127.0.0.1:3699 &
           pid=$!
@@ -143,14 +153,11 @@ jobs:
           curl -fsS http://127.0.0.1:3699/healthz
           kill "$pid"
 
-      # The one thing a static Linux binary can plausibly get wrong is
-      # reaching a server at all: a name to resolve and a certificate to
-      # check, both of which a statically linked glibc would fail. This
-      # asks the public server how it is, which exercises the resolver,
-      # TLS and HTTP in one go. It does mean a release needs that host
-      # to be up.
+      # A name to resolve and a certificate to check, in one go: this
+      # asks the public server how it is. It does mean a release needs
+      # that host to be up.
       - name: It can reach a server
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: runner.os == 'Linux'
         run: ./dist/${{ matrix.asset }} health --server https://app.0sql.io
 
       - uses: actions/upload-artifact@v4
@@ -158,8 +165,48 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/*
 
-  release:
+  # The Linux builds on the oldest glibc they claim, 2.34, which is
+  # what Amazon Linux 2023 and RHEL 9 carry, and with the ADBC drivers
+  # installed the way a user installs them. Loading a driver is what
+  # these builds are dynamic for. It does mean a release needs
+  # Columnar's driver registry to be up.
+  floor:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset: zsql-x86_64-linux
+          - os: ubuntu-24.04-arm
+            asset: zsql-aarch64-linux
+    runs-on: ${{ matrix.os }}
+    container: amazonlinux:2023
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+
+      - name: It runs on glibc 2.34
+        run: |
+          ldd --version | head -1
+          chmod +x dist/${{ matrix.asset }}
+          ./dist/${{ matrix.asset }} --version
+          ./dist/${{ matrix.asset }} datasource drivers
+
+      - name: It loads the drivers
+        run: |
+          curl -LsSf https://dbc.columnar.tech/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          dbc install snowflake
+          dbc install bigquery
+          ./dist/${{ matrix.asset }} datasource drivers | tee drivers.txt
+          grep -qx 'snowflake: loaded' drivers.txt
+          grep -qx 'bigquery: loaded' drivers.txt
+
+  release:
+    needs: [build, floor]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:

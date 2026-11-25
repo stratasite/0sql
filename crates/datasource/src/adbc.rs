@@ -46,7 +46,7 @@ pub struct Plan {
 }
 
 /// Whether drivers are looked for at all.
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     !matches!(std::env::var("ZSQL_ADBC").ok().as_deref().map(str::trim), Some("off" | "0" | "false" | "no"))
 }
 
