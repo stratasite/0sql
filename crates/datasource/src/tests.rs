@@ -163,6 +163,37 @@ fn a_secret_comes_from_the_environment_first_and_the_gitignored_files_after() {
     std::fs::remove_file(dir.join(".zsql")).unwrap();
     assert_eq!(secret(Some(&dir), "wh", "password").unwrap().expose(), "from-strata");
 
+    // A secret written in datasources.yml itself is read, last of all.
+    std::fs::remove_file(dir.join(".strata")).unwrap();
+    std::fs::remove_file(home.join("config")).unwrap();
+    std::fs::write(
+        dir.join("datasources.yml"),
+        "Wh:\n  adapter: bigquery\n  project_id: written\n  username: written\n  password: 123456\n  key_file: ./sa.json\n",
+    )
+    .unwrap();
+    assert_eq!(secret(Some(&dir), "wh", "password").unwrap().expose(), "123456", "digits are still a password");
+    let written = Connection::read(&dir, "wh").unwrap();
+    assert_eq!(
+        (written.project.as_deref(), written.username.as_deref(), written.client_email.as_deref()),
+        (Some("written"), Some("written"), None)
+    );
+
+    // And .zsql goes over that file, setting by setting: a secret, a
+    // setting that is no secret, and one spelled another way. What it
+    // does not say stays as written; the adapter is never its to say.
+    std::fs::write(
+        dir.join(".zsql"),
+        "wh:\n  password: hidden\n  project: hidden\n  client_email: sa@p.iam.gserviceaccount.com\n  adapter: duckdb\n  auth_mode: kp\nwh_username: flat\nwh_east_username: another-datasource\n",
+    )
+    .unwrap();
+    let c = Connection::read(&dir, "wh").unwrap();
+    assert_eq!((c.project.as_deref(), c.username.as_deref()), (Some("hidden"), Some("flat")));
+    assert_eq!((c.client_email.as_deref(), c.adapter.as_str()), (Some("sa@p.iam.gserviceaccount.com"), "bigquery"));
+    assert_eq!(c.key_file.as_deref(), Some(Path::new("./sa.json")));
+    assert_eq!(secrets(Some(&dir), "wh").password.unwrap().expose(), "hidden");
+    let held = local_entry(Some(&dir), "wh");
+    assert!(held.get("auth_mode").is_none() && held.get("adapter").is_none(), "only what a connection reads: {held:?}");
+
     std::env::remove_var("ZSQL_HOME");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1787,6 +1818,29 @@ fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
     assert_eq!(token.3, "grant_type=refresh_token&client_id=cid&client_secret=csec&refresh_token=rt");
     drop(seen);
 
+    // A service account kept in .zsql: its key and the address it signs
+    // for, with no file anywhere. The key is the PEM, as YAML unescaped
+    // it or with the JSON file's own escapes left in, or a path to it.
+    let bare = Connection { key_file: None, client_email: Some("zsql@p.iam.gserviceaccount.com".into()), ..conn.clone() };
+    let nowhere = |_: &str| None;
+    for key in [pem.clone(), pem.replace('\n', "\\n"), sf_key().display().to_string()] {
+        let secrets = Secrets { private_key: Some(Secret(key)), ..Default::default() };
+        assert_eq!(credentials_at_hand(&bare, &secrets), Some(true));
+        bigquery::BigQuery::open_with(&bare, secrets.clone(), &nowhere, None).expect("a key in .zsql opens");
+        assert!(crate::adbc::bigquery(&bare, &secrets, &nowhere).is_none(), "the driver is not handed the key");
+    }
+    // It is used before a file, so a bad one is said and not passed over.
+    let secrets = Secrets { private_key: Some(Secret("-----BEGIN PRIVATE KEY-----\nnot a key".into())), ..Default::default() };
+    let err =
+        bigquery::BigQuery::open_with(&Connection { key_file: Some(key.clone()), ..bare.clone() }, secrets, &nowhere, None).err().unwrap();
+    assert!(matches!(err, Error::NoCredentials(..)), "{err}");
+    // Half of one is named by the half that is missing.
+    let secrets = Secrets { private_key: Some(Secret(pem.clone())), ..Default::default() };
+    let half = Connection { client_email: None, key_file: None, ..conn.clone() };
+    let err = bigquery::BigQuery::open_with(&half, secrets.clone(), &nowhere, None).err().unwrap().to_string();
+    assert!(err.contains("client_email") && err.contains(".zsql under bq"), "{err}");
+    assert!(!crate::adapters::bigquery::has_inline(&half, &secrets));
+
     // Nothing to go on is named; a wrong file is named with its path.
     let err = bigquery::BigQuery::open_with(
         &Connection { key_file: None, ..conn.clone() },
@@ -1798,6 +1852,7 @@ fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
     .unwrap()
     .to_string();
     assert!(err.contains("key_file") && err.contains("GOOGLE_APPLICATION_CREDENTIALS"), "{err}");
+    assert!(err.contains("private_key and client_email in .zsql under bq"), "{err}");
     std::fs::write(dir.join("odd.json"), r#"{"type": "external_account"}"#).unwrap();
     let err = open(&Connection { key_file: Some(dir.join("odd.json")), ..conn.clone() }, Secrets::default()).err().unwrap().to_string();
     assert!(err.contains("odd.json") && err.contains("external_account"), "{err}");
@@ -2610,4 +2665,23 @@ fn one_statement_is_told_from_several() {
     for several in ["SELECT 1; SELECT 2", "SELECT 1;; DROP TABLE t", "", "  ;  ", "-- only a comment"] {
         assert!(!single_statement(several), "{several:?}");
     }
+}
+
+/// A listing says a credential is at hand only where the adapter would
+/// find one: a secret some other adapter takes is not this one's.
+#[test]
+fn a_credential_is_at_hand_only_when_the_adapter_takes_it() {
+    let of = |adapter: &str| Connection { uid: "d".into(), adapter: adapter.into(), ..Default::default() };
+    let secret = |s: &str| Some(Secret(s.into()));
+    let key = Secrets { private_key: secret("-----BEGIN PRIVATE KEY-----"), ..Default::default() };
+    let password = Secrets::password(secret("pw"));
+    assert_eq!(credentials_at_hand(&of("duckdb"), &password), None);
+    assert_eq!(credentials_at_hand(&of("postgres"), &password), Some(true));
+    assert_eq!(credentials_at_hand(&of("postgres"), &key), Some(false));
+    assert_eq!(credentials_at_hand(&of("snowflake"), &key), Some(true));
+    assert_eq!(credentials_at_hand(&of("snowflake"), &password), Some(false));
+    assert_eq!(credentials_at_hand(&of("databricks"), &Secrets { oauth_client_secret: secret("s"), ..Default::default() }), Some(true));
+    let token = Secrets { oauth_token: secret("t"), ..Default::default() };
+    assert_eq!((credentials_at_hand(&of("trino"), &token), credentials_at_hand(&of("mysql"), &token)), (Some(true), Some(false)));
+    assert_eq!(credentials_at_hand(&of("bigquery"), &token), Some(true));
 }

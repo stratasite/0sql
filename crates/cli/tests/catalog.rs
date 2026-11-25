@@ -213,18 +213,9 @@ fn datasources_are_listed_added_and_tested() {
     let (ok, out) = run(zsql(&home, &project).args(["--agent", "run", "total"]));
     assert!(ok && serde_json::from_str::<serde_json::Value>(&out).unwrap()["manifest"]["rows"] == 1, "{out}");
 
-    // A secret set after the fact, from stdin.
-    let mut cmd = zsql(&home, &project);
-    cmd.args(["datasource", "auth", "-d", "local", "--field", "password", "--secret-stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    use std::io::Write as _;
-    child.stdin.take().unwrap().write_all(b"hunter2\n").unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(std::fs::read_to_string(project.join(".zsql")).unwrap().contains("local_password: hunter2"));
+    // A datasource that opens a file is given no secret, whichever is named.
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "local", "--field", "password", "--secret-stdin"]));
+    assert!(!ok && out.contains("takes no secret"), "{out}");
     let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "local"]));
     assert!(!ok && out.contains("takes no secret"), "sqlite opens a file: {out}");
 

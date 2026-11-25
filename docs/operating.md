@@ -268,7 +268,10 @@ the server's own process, below.)
 - **A deploy carries it.** `zsql deploy` sends, in each datasource's
   entry, the secrets written there and the ones the deploying machine
   holds for it in `.zsql`, its environment or the home config: what a
-  query run on that machine connects with. `.zsql` itself is not sent.
+  query run on that machine connects with. A setting that is no secret
+  but is kept in `.zsql` all the same, a username or a service
+  account's `client_email`, goes with them, over the one written in
+  `datasources.yml`. `.zsql` itself is not sent.
   So whoever deploys sets who the server runs as. A developer's own
   account deployed from a laptop is that, for every caller, until a
   deploy carries another or the service in front sends one with each

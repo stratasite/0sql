@@ -509,10 +509,11 @@ fn host_label(url: &str) -> Option<&str> {
 
 /// The options the BigQuery driver is opened with, or `None` when REST
 /// is the only way in: the driver takes a credentials file or a refresh
-/// token and mints its own access tokens, and has no option for a token
-/// somebody else already obtained.
+/// token and mints its own access tokens, and is given neither a token
+/// somebody else already obtained nor a key held in `.zsql`, which the
+/// REST transport signs with itself.
 pub fn bigquery(conn: &Connection, secrets: &Secrets, env: &dyn Fn(&str) -> Option<String>) -> Option<Plan> {
-    if secrets.oauth_token.is_some() {
+    if secrets.oauth_token.is_some() || crate::adapters::bigquery::has_inline(conn, secrets) {
         return None;
     }
     let mut o: Vec<(String, String)> = Vec::new();

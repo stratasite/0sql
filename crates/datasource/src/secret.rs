@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::connection::{overlay, CONNECTION_KEYS};
 #[cfg(doc)]
 use crate::takes_oauth_token;
 
@@ -35,31 +36,13 @@ pub fn secret_env_var(uid: &str, field: &str) -> String {
     format!("ZSQL_DS_{key}_{}", field.to_uppercase())
 }
 
-/// A datasource's secret, from the environment first and then the
-/// gitignored files, so a shell can override a checked-out project
-/// without editing it.
-///
-/// In a file it is either nested under the datasource's own key, as the
-/// template describes, or flat as `<uid>_<field>`:
-///
-/// ```yaml
-/// warehouse:
-///   password: hunter2
-/// # or
-/// warehouse_password: hunter2
-/// ```
-pub fn secret(project_dir: Option<&Path>, uid: &str, field: &str) -> Option<Secret> {
-    let clean = |s: &str| {
-        let s = s.trim();
-        (!s.is_empty()).then(|| Secret(s.to_string()))
-    };
-    if let Some(v) = std::env::var(secret_env_var(uid, field)).ok().as_deref().and_then(clean) {
-        return Some(v);
-    }
+/// The gitignored files a datasource's settings may be in, nearest first:
+/// the project's `.zsql` (or `.strata`, the older CLI's file, read only
+/// when `.zsql` is absent, which is the rule the rest of the CLI
+/// follows), then the account-wide config.
+fn local_files(project_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Some(dir) = project_dir {
-        // `.strata` is the older CLI's file and is read only when `.zsql`
-        // is absent, which is the rule the rest of the CLI follows.
         let local = dir.join(".zsql");
         files.push(if local.exists() { local } else { dir.join(".strata") });
     }
@@ -70,16 +53,85 @@ pub fn secret(project_dir: Option<&Path>, uid: &str, field: &str) -> Option<Secr
     {
         files.push(home.join("config"));
     }
-    for f in files {
-        let Ok(text) = std::fs::read_to_string(&f) else { continue };
-        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else { continue };
-        let nested = doc.get(uid).and_then(|d| d.get(field)).and_then(|v| v.as_str()).and_then(clean);
-        let flat = doc.get(format!("{uid}_{field}")).and_then(|v| v.as_str()).and_then(clean);
-        if let Some(v) = nested.or(flat) {
-            return Some(v);
+    files
+}
+
+/// A setting as text: what was written, trimmed, and a number as its
+/// digits, so a password of `123456` is still a password.
+fn text(v: &serde_yaml::Value) -> Option<String> {
+    let s = match v {
+        serde_yaml::Value::String(s) => s.trim().to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    (!s.is_empty()).then_some(s)
+}
+
+/// What this machine holds for a datasource outside `datasources.yml`:
+/// its entry in `.zsql`, then in the account-wide config. Any key of
+/// [`CONNECTION_KEYS`] or [`SECRET_FIELDS`] may be there, nested under
+/// the datasource's own key, as the template describes and as `.strata`
+/// had them, or flat as `<uid>_<key>`:
+///
+/// ```yaml
+/// warehouse:
+///   username: analyst
+///   password: hunter2
+/// # or
+/// warehouse_password: hunter2
+/// ```
+///
+/// The nearest file that holds a key decides it, and within a file the
+/// nested spelling does. `adapter` is not read from here: which
+/// warehouse a datasource is belongs to the model.
+pub fn local_entry(project_dir: Option<&Path>, uid: &str) -> serde_yaml::Mapping {
+    let known = || CONNECTION_KEYS.iter().chain(SECRET_FIELDS.iter()).copied().filter(|k| *k != "adapter");
+    let mut out = serde_yaml::Mapping::new();
+    for f in local_files(project_dir) {
+        let Ok(text_of) = std::fs::read_to_string(&f) else { continue };
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text_of) else { continue };
+        for key in known() {
+            let nested = doc.get(uid).and_then(|d| d.get(key)).filter(|v| text(v).is_some());
+            let flat = doc.get(format!("{uid}_{key}")).filter(|v| text(v).is_some());
+            if let Some(v) = nested.or(flat) {
+                out.entry(key.into()).or_insert_with(|| v.clone());
+            }
         }
     }
-    None
+    out
+}
+
+/// A datasource's entry as a command run here reads it: what
+/// `datasources.yml` says, and over it what this machine holds for it
+/// in `.zsql`. A key in both is `.zsql`'s, under any of its spellings.
+pub(crate) fn entry(project_dir: Option<&Path>, uid: &str) -> serde_yaml::Mapping {
+    let written = project_dir
+        .and_then(|dir| std::fs::read_to_string(dir.join("datasources.yml")).ok())
+        .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok())
+        .and_then(|doc| {
+            let (_, d) = doc.as_mapping()?.iter().find(|(k, _)| k.as_str().is_some_and(|k| k.trim().to_lowercase() == uid))?;
+            d.as_mapping().cloned()
+        });
+    let mut entry = written.unwrap_or_default();
+    overlay(&mut entry, local_entry(project_dir, uid));
+    entry
+}
+
+/// A datasource's secret: from the environment first, so a shell can
+/// override a checked-out project without editing it; then `.zsql` and
+/// the account-wide config, as [`local_entry`] reads them; then
+/// `datasources.yml` itself, for whoever wrote it there.
+pub fn secret(project_dir: Option<&Path>, uid: &str, field: &str) -> Option<Secret> {
+    held(&entry(project_dir, uid), uid, field)
+}
+
+fn held(entry: &serde_yaml::Mapping, uid: &str, field: &str) -> Option<Secret> {
+    std::env::var(secret_env_var(uid, field))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| entry.get(field).and_then(text))
+        .map(Secret)
 }
 
 /// Every secret a transport might ask for, resolved once. An adapter takes
@@ -211,7 +263,8 @@ impl Secrets {
 /// Every field of [`SECRET_FIELDS`] for one datasource, each resolved as
 /// [`secret`] resolves it.
 pub fn secrets(project_dir: Option<&Path>, uid: &str) -> Secrets {
-    let get = |field: &str| secret(project_dir, uid, field);
+    let entry = entry(project_dir, uid);
+    let get = |field: &str| held(&entry, uid, field);
     Secrets {
         password: get("password"),
         personal_access_token: get("personal_access_token"),

@@ -118,7 +118,7 @@ pub fn write_secret(project_dir: &Path, key: &str, value: &str) -> Result<()> {
     if lines.is_empty() {
         lines.push("# zsql local configuration: server, datasource secrets. Do not commit.".into());
     }
-    lines.push(format!("{key}: {value}"));
+    lines.push(format!("{key}: {}", scalar(value)));
     std::fs::write(&path, lines.join("\n") + "\n").with_context(|| path.display().to_string())?;
     #[cfg(unix)]
     {
@@ -126,6 +126,22 @@ pub fn write_secret(project_dir: &Path, key: &str, value: &str) -> Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// A value as one line of YAML that reads back as exactly that text:
+/// as it is where that is so, and otherwise double-quoted with its
+/// escapes, so a PEM's line breaks, a `#`, a `: ` or a password that is
+/// all digits survive the file.
+fn scalar(value: &str) -> String {
+    let plain = !value.contains(['\n', '\r'])
+        && serde_yaml::from_str::<serde_yaml::Value>(&format!("k: {value}"))
+            .is_ok_and(|v| v.get("k").and_then(|k| k.as_str()) == Some(value) && v.as_mapping().is_some_and(|m| m.len() == 1));
+    if plain {
+        value.to_string()
+    } else {
+        // JSON's string is YAML's double-quoted scalar.
+        serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+    }
 }
 
 /// The checked-out git branch of the project, which is what deploys go to.
@@ -154,6 +170,20 @@ pub fn git_branch(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_is_written_on_one_line_and_reads_back_as_itself() {
+        assert_eq!(scalar("hunter2"), "hunter2");
+        assert_eq!(scalar("zsql@p.iam.gserviceaccount.com"), "zsql@p.iam.gserviceaccount.com");
+        for value in
+            ["-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----", "123456", "a #b", "k: v", "null", "~", " padded", "é\t\\"]
+        {
+            let line = format!("k: {}", scalar(value));
+            assert!(!line.contains('\n'), "{line}");
+            let read: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
+            assert_eq!(read["k"].as_str(), Some(value), "{line}");
+        }
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();

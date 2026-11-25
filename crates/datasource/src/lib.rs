@@ -36,10 +36,10 @@ use adapters::{athena, bigquery, clickhouse, databricks, duckdb, mysql, postgres
 pub use adapters::postgres::settings as postgres_settings;
 pub use batch::Batches;
 pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Listing, Names, Scope, Table};
-pub use connection::{Connection, SslMode, CONNECTION_KEYS};
+pub use connection::{overlay, Connection, SslMode, ALIASES, CONNECTION_KEYS};
 pub use error::{chain, Error, Result};
 pub use rows::Rows;
-pub use secret::{secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};
+pub use secret::{local_entry, secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};
 pub(crate) use source::Deadline;
 pub use source::{read_only, single_statement, Access, Sink, Source};
 
@@ -48,6 +48,21 @@ pub use source::{read_only, single_statement, Access, Sink, Source};
 /// that cannot have no bearer login on the protocol spoken here.
 pub fn takes_oauth_token(adapter: &str) -> bool {
     matches!(adapter, "snowflake" | "bigquery" | "databricks" | "trino" | "sqlserver")
+}
+
+/// Whether what this adapter logs in with is at hand, without
+/// connecting: `None` for one that opens a file and takes nothing.
+/// What [`open`] would look for, so a listing and a connection agree.
+pub fn credentials_at_hand(conn: &Connection, secrets: &Secrets) -> Option<bool> {
+    let token = takes_oauth_token(&conn.adapter) && secrets.oauth_token.is_some();
+    Some(match conn.adapter.as_str() {
+        "sqlite" | "duckdb" => return None,
+        "snowflake" => token || secrets.personal_access_token.is_some() || secrets.private_key.is_some() || conn.private_key_file.is_some(),
+        "databricks" => token || secrets.personal_access_token.is_some() || secrets.oauth_client_secret.is_some(),
+        "bigquery" => bigquery::at_hand(conn, secrets),
+        "athena" => secrets.secret_access_key.is_some(),
+        _ => token || secrets.password.is_some(),
+    })
 }
 
 /// Opens the adapter this connection names, with whichever of the

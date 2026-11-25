@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use zsql_datasource::{Catalog, Connection, Filter, Secrets, CONNECTION_KEYS, SECRET_FIELDS};
+use zsql_datasource::{Catalog, Connection, Filter, Secrets, ALIASES, CONNECTION_KEYS, SECRET_FIELDS};
 
 /// The most tables one page holds, and how many it holds when the
 /// request does not say. A warehouse can have tens of thousands, so a
@@ -139,20 +139,6 @@ fn refused(e: zsql_datasource::Error) -> ApiError {
 
 /// The settings that are numbers; every other one is text.
 const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
-
-/// The settings with more than one spelling. One sent in the request
-/// replaces the deployed one under any of its names.
-const ALIASES: [&[&str]; 9] = [
-    &["schema", "dataset"],
-    &["sslmode", "ssl_mode"],
-    &["ca_file", "sslrootcert", "ssl_ca"],
-    &["account", "account_identifier"],
-    &["private_key_file", "private_key_path"],
-    &["client_id", "oauth_client_id"],
-    &["project", "project_id"],
-    &["key_file", "credentials_file"],
-    &["output_location", "s3_output_location"],
-];
 
 /// A setting as the connection reads it: a number sent as text is still
 /// the number, and a secret or a name sent as a number is still text.
