@@ -73,6 +73,20 @@ fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, bod
         out["test_results"] = deployed.run_tests()?;
         out["validated_only"] = Value::Bool(!keep);
         if keep {
+            // Kept in the object store first, and outside the lock: a
+            // deploy that cannot be kept is refused before it replaces
+            // anything, and a slow store holds up no other deploy.
+            if let Some(objects) = app.runs.objects() {
+                let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
+                let kept = crate::archive::keep(objects, (&org, &uid, &branch), &root, &scratch, &deployed, &out);
+                let _ = std::fs::remove_dir_all(&scratch);
+                let key = kept.map_err(|m| {
+                    let said = format!("the deploy could not be kept in the object store, and was not made: {m}");
+                    ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said.replace(&work_prefix, ""))
+                })?;
+                tracing::info!("kept {org}/{uid}/{branch} in the object store at {key}");
+                out["archive"] = Value::String(key);
+            }
             // Keep the compiled model on disk so a restart reloads it:
             // written beside the branch, then swapped in whole.
             let _writing = lock(&app.deploying);

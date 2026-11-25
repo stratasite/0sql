@@ -21,11 +21,11 @@ mod time;
 mod tests;
 
 pub use error::{Error, Kind, LoadError, Result, StoredError};
-pub use model::{holds, is_secret, load, Model, Trust, SNAPSHOT_FILE, TESTS_FILE};
+pub use model::{holds, is_secret, load, strip_secrets, Model, Trust, SNAPSHOT_FILE, TESTS_FILE};
 pub use request::{
     spec_of, unlimited, ExplainResponse, ExploreRequest, ExploreResponse, Planned, ShapeCheck, SqlRequest, SqlResponse, Timings,
 };
-pub use time::{now, utc_minute};
+pub use time::{now, utc_minute, utc_stamp};
 
 pub use zsql_project::values::ValueCatalog;
 pub use zsql_project::{Loaded, ProjectTest};

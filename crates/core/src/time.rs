@@ -5,6 +5,19 @@ pub fn now() -> String {
 
 /// UTC, to the minute: `2026-10-01 15:04`.
 pub fn utc_minute(t: std::time::SystemTime) -> String {
+    let (y, m, d, hour, minute, _) = civil(t);
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+}
+
+/// UTC, to the second, as a name can hold it and a listing sorts it:
+/// `20261001T150405Z`.
+pub fn utc_stamp(t: std::time::SystemTime) -> String {
+    let (y, m, d, hour, minute, second) = civil(t);
+    format!("{y:04}{m:02}{d:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// The year, month, day, hour, minute and second of a time, in UTC.
+fn civil(t: std::time::SystemTime) -> (i64, i64, i64, i64, i64, i64) {
     let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     // Civil-from-days (Howard Hinnant), so no date crate is needed here.
     let days = secs.div_euclid(86400);
@@ -19,5 +32,5 @@ pub fn utc_minute(t: std::time::SystemTime) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
 }

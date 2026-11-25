@@ -94,6 +94,20 @@ fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut V
     }
     Value::Object(out)
 }
+/// Takes every secret out of a value, at any depth: a key that
+/// [`is_secret`] goes with its value, in a mapping inside a list as
+/// much as one at the top.
+pub fn strip_secrets(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, _| !is_secret(key));
+            map.values_mut().for_each(strip_secrets);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_secrets),
+        _ => {}
+    }
+}
+
 pub const TESTS_FILE: &str = "tests.json";
 
 impl Model {
@@ -175,8 +189,27 @@ impl Model {
     /// are any (and not a stale file when there are none), and the
     /// tests.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
+        self.write_with(dir, self.semantic().snapshot())
+    }
+
+    /// What [`Model::write`] keeps, for a place other than the server's
+    /// own disk: the same files, with every secret a datasource was
+    /// deployed with left out of the snapshot. [`Model::from_stored`]
+    /// reads it back as a model that plans the same and connects with
+    /// nothing.
+    pub fn write_without_secrets(&self, dir: &Path) -> std::io::Result<()> {
+        let mut snapshot = self.semantic().snapshot().clone();
+        for datasource in &mut snapshot.datasources {
+            datasource.connection.retain(|key, _| !is_secret(key));
+            datasource.connection.values_mut().for_each(strip_secrets);
+            strip_secrets(&mut datasource.extra_query_params);
+        }
+        self.write_with(dir, &snapshot)
+    }
+
+    fn write_with(&self, dir: &Path, snapshot: &Snapshot) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(self.semantic().snapshot())?)?;
+        write_gz(&dir.join(SNAPSHOT_FILE), &serde_json::to_vec(snapshot)?)?;
         let values_path = dir.join(zsql_project::values::FILE_NAME);
         match &self.values {
             Some(v) => v.write(&values_path)?,

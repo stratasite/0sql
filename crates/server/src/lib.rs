@@ -55,6 +55,7 @@
 //! - `admission`: how much of each kind of work runs at once
 //! - `names`: the org, project and branch names that become directories
 //! - `deploy`: an archive in, a model out
+//! - `archive`: a deploy kept in the object store, without its secrets
 //! - `reads`: sql, explain, explore and the catalog
 //! - `probe`: a datasource's own tables, read from the warehouse with
 //!   the connection the request sends
@@ -63,6 +64,7 @@
 //! - `run`: configuration, the router and the server's life
 
 pub mod admission;
+mod archive;
 mod deploy;
 mod error;
 mod exec;
