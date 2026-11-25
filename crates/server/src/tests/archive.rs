@@ -108,9 +108,7 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
     let of = |name: &str| files.iter().find(|(n, _)| n == name).map(|(_, text)| text.clone()).unwrap();
     for name in ["project/datasources.yml", "compiled/snapshot.json.gz"] {
         let text = of(name);
-        for kept in
-            ["db.internal", "reader", "other.internal", "scope", "/keys/dw.p8", "https://reader@db.internal/path", "tokens.internal"]
-        {
+        for kept in ["db.internal", "reader", "other.internal", "scope", "/keys/dw.p8", "https://db.internal/path", "tokens.internal"] {
             assert!(text.contains(kept), "{name} lost {kept}:\n{text}");
         }
         for gone in ["password", "client_secret", "api_key", "passphrase"] {

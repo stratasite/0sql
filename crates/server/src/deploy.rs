@@ -75,13 +75,21 @@ fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, bod
         if keep {
             // What is kept in the object store is made ready outside
             // the lock, since zipping a project is the slow half and
-            // holds up no other deploy there.
-            let unkept = |m: String| {
-                let said = format!("the deploy could not be kept in the object store, and was not made: {m}");
-                ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said.replace(&work_prefix, ""))
-            };
+            // holds up no other deploy there. In a directory beside
+            // the unpacked archive and never inside it: nothing the
+            // deployer sent is in there to be taken for the model.
             let zip = match app.runs.objects() {
-                Some(_) => Some(crate::archive::zipped(&org, &root, &work.join(".kept"), &deployed, &out).map_err(unkept)?),
+                Some(_) => {
+                    let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    let zipped = crate::archive::zipped(&org, &root, &scratch, &deployed, &out);
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    Some(zipped.map_err(|m| {
+                        let said = format!("the deploy could not be made ready to keep, and was not made: {m}");
+                        let said = said.replace(&work_prefix, "").replace(&format!("{}/", scratch.display()), "");
+                        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "ArchiveError", said)
+                    })?)
+                }
                 None => None,
             };
             // Keep the compiled model on disk so a restart reloads it:
@@ -98,24 +106,45 @@ fn deploy_or_validate(app: Shared, org: String, uid: String, branch: String, bod
             // named for this moment: the zips of a branch are in the
             // order its deploys went live, a deploy the disk refused
             // leaves none, and one the store refuses replaces nothing.
+            // Put only where nothing is: another node, or a clock set
+            // back, may have this very name, and then the next moment's
+            // is taken.
             let mut kept = None;
             if let (Some(objects), Some(zip)) = (app.runs.objects(), zip) {
-                let path = crate::archive::path_of(&org, &uid, &branch, std::time::SystemTime::now());
-                let parts: Vec<&str> = path.iter().map(String::as_str).collect();
-                let key = objects.put(&parts, zip).map_err(|e| {
-                    let _ = std::fs::remove_dir_all(&staged);
-                    // The store's own words name where it is; the log
-                    // has them, and the answer what was being put.
-                    tracing::warn!("{org}/{uid}/{branch} could not be kept in the object store: {e}");
-                    unkept(format!("{} could not be put there", path.join("/")))
-                })?;
-                out["archive"] = Value::String(path.join("/"));
+                let mut tries = 0;
+                let (path, key) = loop {
+                    let path = crate::archive::path_of(&org, &uid, &branch, std::time::SystemTime::now());
+                    let parts: Vec<&str> = path.iter().map(String::as_str).collect();
+                    let unkept = |why: String| {
+                        let _ = std::fs::remove_dir_all(&staged);
+                        // The store's own words name where it is; the log
+                        // has them, and the answer what was being put.
+                        tracing::warn!("{org}/{uid}/{branch} could not be kept in the object store: {why}");
+                        let said = format!(
+                            "the deploy could not be kept in the object store, and was not made: {} could not be put there",
+                            path.join("/")
+                        );
+                        ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said)
+                    };
+                    match objects.put_new(&parts, zip.clone()) {
+                        Ok(Some(key)) => break (path.join("/"), key),
+                        Ok(None) if tries < 5 => {
+                            tries += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Ok(None) => return Err(unkept("every name tried was taken".into())),
+                        Err(e) => return Err(unkept(e.to_string())),
+                    }
+                };
+                out["archive"] = Value::String(path);
                 kept = Some((objects, key));
             }
             if let Err(e) = swap_in(&staged, &live) {
                 // What was put is of a deploy that was not made.
                 if let Some((objects, key)) = &kept {
-                    let _ = objects.delete(key);
+                    if let Err(left) = objects.delete(key) {
+                        tracing::warn!("{org}/{uid}/{branch} was not deployed, and its zip is still in the object store at {key}: {left}");
+                    }
                 }
                 return Err(unstaged(e));
             }
