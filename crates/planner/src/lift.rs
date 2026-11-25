@@ -2,32 +2,38 @@
 //! `count(distinct [Customer ID]@d)`, is planned as the model measure it
 //! would be had the modeler declared it: a field, an expression on each
 //! table it can be aggregated on, and a path that roots it there. The
-//! records are made for the one query, in a copy of the model, and the
-//! calculation is rewritten into a projection of the field. Everything
-//! after that sees a measure: the resolver hosts it in one universe, and
-//! segments, prior periods, shares, windows and top-n rankings treat it as
-//! they treat any other.
+//! records are made for the one query and laid over the model, which is
+//! neither copied nor changed, and the calculation is rewritten into a
+//! projection of the field. Everything after that sees a measure: the
+//! resolver hosts it in one universe, and segments, prior periods, shares,
+//! windows and top-n rankings treat it as they treat any other.
 //!
 //! A model measure is declared on one table. A calculation has no home, so
 //! it is mapped on every table that reaches all the dimensions it reads,
 //! and the resolver's ranking picks among them: a universe the query
 //! already aggregates in comes first.
 
+use crate::universe::Universes;
 use crate::{Error, Result};
 use serde_json::json;
-use zsql_semantic::{Expression, Field, FieldKind, Id, Path, SemanticModel, Snapshot};
+use zsql_semantic::{Expression, Field, FieldKind, Id, Path, SemanticModel};
 use zsql_spec::{Projection, ProjectionKind, Query};
 
-/// The model with the lifted measures in it, the paths that reach them,
-/// and the query that projects them.
+/// What every synthetic measure's name and uid start with. No spec can
+/// name one: lowering resolves a spec against the model before any exists.
+pub const SYNTHETIC_MEASURE: &str = "synmsr:";
+
+/// The records to lay over the model and its universes, and the query that
+/// projects the synthetic measures in place of the calculations.
 pub struct Lifted {
-    pub snapshot: Snapshot,
+    pub fields: Vec<Field>,
+    pub expressions: Vec<Expression>,
     pub paths: Vec<Path>,
     pub query: Query,
 }
 
 /// `None` when the query has nothing to lift.
-pub fn lift(semantic: &SemanticModel, paths: &[Path], aggregates: &[String], query: &Query) -> Result<Option<Lifted>> {
+pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[String], query: &Query) -> Result<Option<Lifted>> {
     let projected: Vec<&str> = query
         .projections
         .iter()
@@ -42,113 +48,111 @@ pub fn lift(semantic: &SemanticModel, paths: &[Path], aggregates: &[String], que
         return Ok(None);
     }
 
-    let snap = semantic.snapshot();
-    let mut next_id = [
-        snap.datasources.iter().map(|x| x.id).max(),
-        snap.tables.iter().map(|x| x.id).max(),
-        snap.fields.iter().map(|x| x.id).max(),
-        snap.expressions.iter().map(|x| x.id).max(),
-        snap.join_defs.iter().map(|x| x.id).max(),
-        snap.partitions.iter().map(|x| x.id).max(),
-        snap.paths.iter().map(|x| x.id).max(),
-        paths.iter().map(|x| x.id).max(),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(0);
+    // Synthetic records count down from -1: a range no model id is in, so
+    // none can collide and one is plain to see in an explain.
+    let mut next_id: Id = 0;
     let mut fresh = || {
-        next_id += 1;
+        next_id -= 1;
         next_id
     };
+    let invalid =
+        |alias: &str, e: serde_json::Error| Error::Resolution(format!("Calculation \"{alias}\" could not be planned as a measure: {e}"));
 
-    let mut snapshot = snap.clone();
-    let mut all_paths = paths.to_vec();
-    let mut query = query.clone();
-    for (n, i) in wanted.into_iter().enumerate() {
-        let calc = query.projections[i].clone();
+    let mut lifted = Lifted { fields: vec![], expressions: vec![], paths: vec![], query: query.clone() };
+    // (name, formula, data type) of each field made so far.
+    let mut made: Vec<(String, String, String)> = Vec::new();
+    for i in wanted {
+        let calc = lifted.query.projections[i].clone();
         let alias = calc.alias.clone().unwrap_or_default();
         let dims: Vec<&Field> = calc.dimension_refs.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension))).collect();
-        // Every table whose universe reaches all of them.
-        let tables: Vec<Id> = snap
-            .tables
-            .iter()
-            .filter(|t| dims.iter().all(|d| paths.iter().any(|p| p.root_table_id == t.id && p.field_id == d.id)))
-            .map(|t| t.id)
-            .collect();
-        if tables.is_empty() {
-            let names: Vec<&str> = dims.iter().map(|d| d.name.as_str()).collect();
-            return Err(Error::Resolution(format!(
-                "Calculation \"{alias}\" aggregates {}, which no table reaches together, so it cannot be computed.",
-                names.join(", ")
-            )));
-        }
-
-        // The name is what `[Name]@m` and the engine's own columns go by,
-        // so it must not answer to a field the model already has.
-        let taken = |name: &str| {
-            semantic.field_by_name(name, FieldKind::Measure).is_some()
-                || semantic.field_by_name(name, FieldKind::Dimension).is_some()
-                || snapshot.fields.iter().any(|f| f.name.eq_ignore_ascii_case(name))
-        };
-        let name = if taken(&alias) { format!("{alias} (calculation {})", n + 1) } else { alias.clone() };
-        let field_id = fresh();
-        let uid = format!("calculation-{field_id}");
-        let field: Field = serde_json::from_value(json!({
-            "id": field_id,
-            "uid": uid,
-            "name": name,
-            "type": "Semantic::Measure",
-            "data_type": calc.calculation_data_type.clone().unwrap_or_else(|| "decimal".into()),
-        }))
-        .map_err(|e| Error::Resolution(format!("Calculation \"{alias}\" could not be planned as a measure: {e}")))?;
-        snapshot.fields.push(field);
-
         // The formula as a model expression writes it: references by name.
         let sql = calc.sql.clone().unwrap_or_default().replace("]@d", "]").replace("]@D", "]");
-        let dim_ids: Vec<Id> = dims.iter().map(|d| d.id).collect();
-        for table_id in tables {
-            let expression: Expression = serde_json::from_value(json!({
-                "id": fresh(),
-                "table_id": table_id,
-                "field_id": field_id,
-                "sql": sql,
-                "dimension_ref_ids": dim_ids,
+        let data_type = calc.calculation_data_type.clone().unwrap_or_else(|| "decimal".into());
+
+        // Named for the alias, so a message that names the field reads as
+        // the calculation. Two projections of one formula under one alias
+        // share a field; a name already taken gets a number.
+        let mut name = format!("{SYNTHETIC_MEASURE}{alias}");
+        let mut n = 1;
+        let reuse = loop {
+            match made.iter().find(|(made_name, ..)| made_name.eq_ignore_ascii_case(&name)) {
+                Some((_, made_sql, made_type)) if *made_sql == sql && *made_type == data_type => break true,
+                None if semantic.field_by_name(&name, FieldKind::Measure).is_none() => break false,
+                _ => {
+                    n += 1;
+                    name = format!("{SYNTHETIC_MEASURE}{alias}#{n}");
+                }
+            }
+        };
+        let uid = name.to_lowercase();
+
+        if !reuse {
+            // Every table whose universe reaches all the dimensions.
+            let tables: Vec<_> = universes.bases.iter().filter(|b| dims.iter().all(|d| b.has_dimension(d.id))).map(|b| b.root).collect();
+            if tables.is_empty() {
+                let names: Vec<&str> = dims.iter().map(|d| d.name.as_str()).collect();
+                return Err(Error::Resolution(format!(
+                    "Calculation \"{alias}\" aggregates {}, which no table reaches together, so it cannot be computed.",
+                    names.join(", ")
+                )));
+            }
+            let field_id = fresh();
+            let field: Field = serde_json::from_value(json!({
+                "id": field_id,
+                "uid": uid,
+                "name": name,
+                "type": "Semantic::Measure",
+                "data_type": data_type,
             }))
-            .map_err(|e| Error::Resolution(format!("Calculation \"{alias}\" could not be planned as a measure: {e}")))?;
-            snapshot.expressions.push(expression);
-            let table = snap.tables.iter().find(|t| t.id == table_id).expect("table");
-            let path: Path = serde_json::from_value(json!({
-                "id": fresh(),
-                "root_table_id": table_id,
-                "target_table_id": table_id,
-                "from_table_id": null,
-                "field_id": field_id,
-                "field_type": "Semantic::Measure",
-                "step_number": 0,
-                "cost": table.cost,
-                "tier": 0,
-                "joins": [],
-                "table_nodes": [table_id],
-                "datasource_id": table.datasource_id,
-                "blending_field_id": null,
-                "extended_blend_group": null,
-            }))
-            .map_err(|e| Error::Resolution(format!("Calculation \"{alias}\" could not be planned as a measure: {e}")))?;
-            all_paths.push(path);
+            .map_err(|e| invalid(&alias, e))?;
+            lifted.fields.push(field);
+            made.push((name.clone(), sql.clone(), data_type.clone()));
+
+            let dim_ids: Vec<Id> = dims.iter().map(|d| d.id).collect();
+            for table in tables {
+                let expression: Expression = serde_json::from_value(json!({
+                    "id": fresh(),
+                    "table_id": table.id,
+                    "field_id": field_id,
+                    "sql": sql,
+                    "dimension_ref_ids": dim_ids,
+                }))
+                .map_err(|e| invalid(&alias, e))?;
+                lifted.expressions.push(expression);
+                // As a measure declared on the table is reached: at the root.
+                let path: Path = serde_json::from_value(json!({
+                    "id": fresh(),
+                    "root_table_id": table.id,
+                    "target_table_id": table.id,
+                    "from_table_id": null,
+                    "field_id": field_id,
+                    "field_type": "Semantic::Measure",
+                    "step_number": 0,
+                    "cost": table.cost,
+                    "tier": 0,
+                    "joins": [],
+                    "table_nodes": [table.id],
+                    "datasource_id": table.datasource_id,
+                    "blending_field_id": null,
+                    "extended_blend_group": null,
+                }))
+                .map_err(|e| invalid(&alias, e))?;
+                lifted.paths.push(path);
+            }
         }
 
-        let p = &mut query.projections[i];
+        let p = &mut lifted.query.projections[i];
         p.kind = ProjectionKind::Field;
         p.field_uid = Some(uid);
         p.field_kind = Some(FieldKind::Measure);
         p.sql = None;
         p.calculation_field_type = None;
         p.dimension_refs = vec![];
-        // Kept set: the resolver reads it to aggregate the measure in one
-        // universe, since unlike a model measure it is mapped on many.
+        // `aggregates_dimensions` stays set: the resolver reads it to
+        // aggregate the measure in one universe, since unlike a model
+        // measure it is mapped on many.
     }
-    Ok(Some(Lifted { snapshot, paths: all_paths, query }))
+    Ok(Some(lifted))
 }
 
 /// One that reads only projected dimensions is already at the query's

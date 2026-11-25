@@ -169,7 +169,6 @@ pub fn plan_query_with<'a>(
 pub struct Planner<'a> {
     semantic: &'a SemanticModel,
     dialects: &'a Dialects,
-    paths: &'a [zsql_semantic::Path],
     universes: universe::Universes<'a>,
 }
 
@@ -180,7 +179,7 @@ impl<'a> Planner<'a> {
             Some(p) => universe::Universes::build_from(semantic, p),
             None => universe::Universes::build(semantic),
         };
-        Planner { semantic, dialects, paths: paths.unwrap_or(&semantic.snapshot().paths), universes }
+        Planner { semantic, dialects, universes }
     }
 
     pub fn semantic(&self) -> &'a SemanticModel {
@@ -256,12 +255,13 @@ impl<'a> Planner<'a> {
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
-        // A calculation that is a measure on dimensions is planned as one,
-        // over a copy of the model that holds it as a field.
+        // A calculation that is a measure on dimensions is planned as one:
+        // a synthetic field laid over the model for this query alone.
         let aggregates = self.dialects.base().map_err(|e| Error::Resolution(e.to_string()))?.aggregate_functions();
-        if let Some(lifted) = lift::lift(self.semantic, self.paths, &aggregates, &query)? {
-            let semantic = SemanticModel::build(lifted.snapshot).map_err(|e| Error::Resolution(e.to_string()))?;
-            let planner = Planner::new(&semantic, self.dialects, Some(&lifted.paths));
+        if let Some(lifted) = lift::lift(self.semantic, &self.universes, &aggregates, &query)? {
+            let semantic = self.semantic.layered(lifted.fields, lifted.expressions);
+            let universes = self.universes.layered(&semantic, &lifted.paths);
+            let planner = Planner { semantic: &semantic, dialects: self.dialects, universes };
             return planner.plan_resolved(lifted.query, principal, explain);
         }
         self.plan_resolved(query, principal, explain)

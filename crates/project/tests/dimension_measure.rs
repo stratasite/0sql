@@ -293,3 +293,50 @@ fn a_segment_on_the_dimension_measure_is_the_way_to_count_members_by_a_measure()
     assert!(part_with(&sql, "count(distinct").contains("JOIN seg"), "{sql}");
     assert!(!part_with(&sql, "sum(T0.\"ss_net_paid\") AS").contains("JOIN seg"), "{sql}");
 }
+
+#[test]
+fn a_layer_is_seen_only_through_the_model_it_was_laid_over() {
+    let model = semantic();
+    let store_sales = model.table_by_uid("store-sales").unwrap();
+    let customer_id = model.field_by_name("Customer ID", zsql_semantic::FieldKind::Dimension).unwrap();
+    let field: zsql_semantic::Field = serde_json::from_value(
+        serde_json::json!({"id": -1, "uid": "synmsr:probe", "name": "synmsr:Probe", "type": "Semantic::Measure", "data_type": "integer"}),
+    )
+    .unwrap();
+    let expression: zsql_semantic::Expression = serde_json::from_value(serde_json::json!({
+        "id": -2, "table_id": store_sales.id, "field_id": -1, "sql": "count(distinct [Customer ID])", "dimension_ref_ids": [customer_id.id]
+    }))
+    .unwrap();
+    let before = (model.fields().len(), model.expressions_of(store_sales.id).count());
+    let layered = model.layered(vec![field], vec![expression]);
+
+    let measure = zsql_semantic::FieldKind::Measure;
+    assert_eq!(layered.field(-1).map(|f| f.name.as_str()), Some("synmsr:Probe"));
+    assert!(layered.field_by_uid("synmsr:probe", Some(measure)).is_some());
+    assert!(layered.field_by_name("SYNMSR:probe", measure).is_some());
+    assert!(layered.expression_for(store_sales.id, -1).is_some());
+    assert_eq!(layered.expressions_of(store_sales.id).count(), before.1 + 1);
+    // What the model already held is still found through the layer.
+    assert_eq!(layered.field(customer_id.id).map(|f| f.id), Some(customer_id.id));
+    // The layer is never listed, and the model it was laid over never has it.
+    assert_eq!(layered.fields().len(), before.0);
+    assert!(model.field(-1).is_none() && model.field_by_uid("synmsr:probe", Some(measure)).is_none());
+    assert!(model.expression_for(store_sales.id, -1).is_none());
+    assert_eq!((model.fields().len(), model.expressions_of(store_sales.id).count()), before);
+}
+
+#[test]
+fn a_lifted_plan_leaves_the_model_as_it_was_and_plans_the_same_way_twice() {
+    let spec = serde_json::json!({
+        "projections": [{"field": "store net paid"}, customers()],
+        "filters": [{"field": "catalog net paid", "predicate": "greater_than", "value": 0}]
+    });
+    let fields = semantic().fields().len();
+    let first = plan(spec.clone()).unwrap();
+    let second = plan(spec).unwrap();
+    assert_eq!(first, second, "node and column names do not depend on the run");
+    assert_eq!(semantic().fields().len(), fields);
+    assert!(semantic().field_by_name("synmsr:Customers", zsql_semantic::FieldKind::Measure).is_none());
+    // And no spec can name a synthetic measure: lowering sees the model alone.
+    assert!(plan(serde_json::json!({"projections": [{"field": "synmsr:customers"}]})).is_err());
+}
