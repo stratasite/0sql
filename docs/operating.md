@@ -123,7 +123,9 @@ What to keep in mind whichever path is used:
   `ZSQL_OBJECT_STORE` set, every deploy is also put there as
   `deploys/<org>/<project>/<branch>/<org>-<project>-<branch>-<time>.zip`,
   the time in UTC to the millisecond (`20261124T153012.123Z`). The zip
-  holds `deploy.json` (what the deploy answered), `project/` (the files
+  holds `deploy.json` (what the deploy answered, whole: counts,
+  warnings, test results, what became of each datasource's credential
+  and where this zip is), `project/` (the files
   the model was loaded from, and nothing else the archive carried) and
   `compiled/` (the snapshot, the sampled values and the tests, as the
   data directory has them). Every setting of a datasource whose name
@@ -140,7 +142,10 @@ What to keep in mind whichever path is used:
   ever put where nothing is, so no deploy's zip replaces another's.
   The zip is put while the deploy
   lock is held, so the zips of a branch are in the order its deploys
-  went live, and a slow store slows every deploy behind it. Nothing
+  went live, and a slow store slows every deploy behind it. A store
+  slow enough can outlast the request: a deploy is answered within 90
+  seconds or told the deadline passed, and the deploy may still go
+  live after that. `zsql status` says which model the branch has. Nothing
   clears these away: how long they are kept is the bucket's lifecycle
   rule to say.
 

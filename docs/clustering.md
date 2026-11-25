@@ -29,6 +29,14 @@ run on two real machines.
   an org is done with the server stopped; on a cluster that is every
   node stopped, and every node's directory renamed. *Read.*
 
+- **A deploy is in the object store, and no node reads it there.**
+  With `ZSQL_OBJECT_STORE` set every deploy is kept as a zip under
+  `deploys/`, the compiled model in it, with no secret. It is a record
+  and not a source: a node loads from its own data directory only. It
+  is most of what sharing a model would need, and none of what sharing
+  a credential would, since the secrets are left out of it on purpose.
+  The zips of a branch are named by each node's own clock. *Read.*
+
 What an answer has to settle: where a deployed model lives so that
 every node has it, how a node learns of a deploy it did not receive,
 and what a request sees while the nodes disagree.

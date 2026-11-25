@@ -112,10 +112,14 @@ fn deploy_or_validate(
         // deployer sent is in there to be taken for the model.
         let zip = match app.runs.objects().filter(|_| keep.is_some()) {
             Some(_) => {
+                // This user's alone and nobody's before, as the directory
+                // the archive is unpacked into is: what is in it goes
+                // into the zip, so nobody else may put anything there.
                 let scratch = work.with_file_name(format!("zsqld-deploy-{}-{seq}-kept", std::process::id()));
                 let _ = std::fs::remove_dir_all(&scratch);
-                let zipped = crate::archive::zipped(&org, &root, &scratch, &deployed, &out);
-                let _ = std::fs::remove_dir_all(&scratch);
+                made.create(&scratch).map_err(|e| bad(format!("a directory to make the zip in: {e}")))?;
+                let _swept = Swept(scratch.clone());
+                let zipped = crate::archive::zipped(&root, &scratch, &deployed);
                 Some(zipped.map_err(|m| {
                     let said = format!("the deploy could not be made ready to keep, and was not made: {m}");
                     let said = said.replace(&work_prefix, "").replace(&format!("{}/", scratch.display()), "");
@@ -164,7 +168,18 @@ fn deploy_or_validate(
                         );
                         ApiError(StatusCode::BAD_GATEWAY, "ArchiveError", said)
                     };
-                    match objects.put_new(&parts, zip.clone()) {
+                    // The answer is whole now, credentials and all, and
+                    // goes into the zip as it will be given.
+                    out["archive"] = Value::String(path.join("/"));
+                    let whole = crate::archive::with_answer(zip.clone(), &org, &out).map_err(|m| {
+                        let _ = std::fs::remove_dir_all(&staged);
+                        ApiError(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ArchiveError",
+                            format!("the deploy could not be made ready to keep, and was not made: {m}"),
+                        )
+                    })?;
+                    match objects.put_new(&parts, whole) {
                         Ok(Some(key)) => break (path.join("/"), key),
                         Ok(None) if tries < 5 => {
                             tries += 1;
@@ -174,7 +189,7 @@ fn deploy_or_validate(
                         Err(e) => return Err(unkept(e.to_string())),
                     }
                 };
-                out["archive"] = Value::String(path);
+                let _ = path;
                 kept = Some((objects, key));
             }
             if let Err(e) = swap_in(&staged, &live) {

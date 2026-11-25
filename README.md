@@ -221,6 +221,10 @@ request that sends a secret of its own connects with that and nothing
 else. A later deploy that carries none keeps what the branch had, so a
 pipeline can deploy without holding the secret.
 
+**A record of each deploy.** With `ZSQL_OBJECT_STORE` set, every
+deploy is also kept there as a zip: the project files, the compiled
+model and what the deploy answered, with every secret left out.
+
 **More than one node.** With `ZSQL_DB` the records of runs live in a
 Postgres table every node shares, and with `ZSQL_OBJECT_STORE` the
 results live in S3, GCS, Azure or a directory, with a size-limited copy

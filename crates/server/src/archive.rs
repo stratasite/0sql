@@ -7,7 +7,8 @@
 //! never the same path.
 //!
 //! ```text
-//! deploy.json            what the deploy answered: counts, warnings, test results
+//! deploy.json            what the deploy answered: counts, warnings, test results,
+//!                        what became of each credential, and where this zip is
 //! project/...            the files the model was loaded from, as they were sent
 //! compiled/...           what the server keeps of it: the snapshot, the values, the tests
 //! ```
@@ -57,10 +58,11 @@ fn within(rel: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// The zip of a deploy, with no secret in it. `root` is the project as
-/// it was unpacked, `scratch` a directory of this deploy's own to
-/// write in, and `answer` what the deploy is about to say.
-pub(crate) fn zipped(org: &str, root: &Path, scratch: &Path, model: &Model, answer: &Value) -> Result<Vec<u8>, String> {
+/// The zip of a deploy but for its answer, with no secret in it:
+/// the slow half, made before the deploy has the lock. `root` is the
+/// project as it was unpacked and `scratch` a directory of this
+/// deploy's own to write in. [`with_answer`] finishes it.
+pub(crate) fn zipped(root: &Path, scratch: &Path, model: &Model) -> Result<Vec<u8>, String> {
     let failed = |what: &str, e: &dyn std::fmt::Display| format!("{what}: {e}");
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let mut add = |name: &str, bytes: &[u8]| -> Result<(), String> {
@@ -68,10 +70,6 @@ pub(crate) fn zipped(org: &str, root: &Path, scratch: &Path, model: &Model, answ
         zip.start_file(name, options).map_err(|e| failed(name, &e))?;
         zip.write_all(bytes).map_err(|e| failed(name, &e))
     };
-
-    let mut said = answer.clone();
-    said["org"] = Value::String(org.to_string());
-    add("deploy.json", &serde_json::to_vec_pretty(&said).map_err(|e| failed("deploy.json", &e))?)?;
 
     // The loader names what it read, directories and files that might
     // have been there among them; the files that are there are the
@@ -97,6 +95,21 @@ pub(crate) fn zipped(org: &str, root: &Path, scratch: &Path, model: &Model, answ
         add(&format!("compiled/{name}"), &std::fs::read(&path).map_err(|e| failed(&name, &e))?)?;
     }
     Ok(zip.finish().map_err(|e| failed("the zip", &e))?.into_inner())
+}
+
+/// A zip [`zipped`] made, with what the deploy answers added as
+/// `deploy.json`. Added last, under the deploy's lock, because that is
+/// when the answer is whole: what became of each datasource's
+/// credential is settled there, and where the zip is put is known.
+pub(crate) fn with_answer(zip: Vec<u8>, org: &str, answer: &Value) -> Result<Vec<u8>, String> {
+    let failed = |e: &dyn std::fmt::Display| format!("deploy.json: {e}");
+    let mut said = answer.clone();
+    said["org"] = Value::String(org.to_string());
+    let mut zip = zip::ZipWriter::new_append(std::io::Cursor::new(zip)).map_err(|e| failed(&e))?;
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).unix_permissions(0o644);
+    zip.start_file("deploy.json", options).map_err(|e| failed(&e))?;
+    zip.write_all(&serde_json::to_vec_pretty(&said).map_err(|e| failed(&e))?).map_err(|e| failed(&e))?;
+    Ok(zip.finish().map_err(|e| failed(&e))?.into_inner())
 }
 
 /// `datasources.yml` with every secret setting left out of each

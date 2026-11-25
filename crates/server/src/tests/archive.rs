@@ -115,6 +115,10 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
         }
     }
     let said: Value = serde_json::from_str(&of("deploy.json")).unwrap();
+    // The whole answer, as it was given: what became of each
+    // credential, and where this zip is.
+    assert_eq!((&said["archive"], &said["credentials"]), (&json!(key), &a.body["credentials"]), "{said}");
+    assert!(said["credentials"].as_object().is_some_and(|c| !c.is_empty()), "{said}");
     assert_eq!(
         (&said["org"], &said["project"], &said["branch"], &said["test_results"]["passed"]),
         (&json!("acme"), &json!("shop"), &json!("main"), &json!(1))
