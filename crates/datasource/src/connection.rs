@@ -293,7 +293,10 @@ pub const CONNECTION_KEYS: [&str; 37] = [
     "query_wait_time",
 ];
 
-/// The settings with more than one spelling.
+/// The settings that are numbers; every other one is text.
+pub const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
+
+/// The settings with more than one spelling, the one read first first.
 pub const ALIASES: [&[&str]; 9] = [
     &["schema", "dataset"],
     &["sslmode", "ssl_mode"],

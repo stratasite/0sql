@@ -89,6 +89,28 @@ fn a_bigquery_key_is_saved_whole_and_list_agrees_with_the_connection() {
     assert_eq!(dot_zsql(&project)["bigquery_private_key"].as_str(), Some(PEM), "one key written does not disturb another");
     assert_eq!(secret_of(&home, &project, "bigquery"), "yes");
 
+    // A key named by its file is saved as the key, not as the path.
+    std::fs::write(project.join("key.pem"), format!("{PEM}\n")).unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "bigquery", "--secret-stdin"]), Some("key.pem\n"));
+    assert!(ok, "{out}");
+    assert_eq!(dot_zsql(&project)["bigquery_private_key"].as_str(), Some(PEM));
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "bigquery", "--secret-stdin"]), Some("absent.pem\n"));
+    assert!(!ok && out.contains("neither a PEM nor a file"), "{out}");
+    // One written by hand over several lines is replaced whole.
+    std::fs::write(
+        project.join(".zsql"),
+        "bigquery_private_key: |\n  -----BEGIN PRIVATE KEY-----\n  old\nbigquery_client_email: sa@p.iam.gserviceaccount.com\n",
+    )
+    .unwrap();
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "auth", "-d", "bigquery", "--secret-stdin"]), Some(PEM));
+    assert!(ok && !out.contains("warning"), "{out}");
+    assert_eq!(dot_zsql(&project)["bigquery_private_key"].as_str(), Some(PEM));
+    assert_eq!(secret_of(&home, &project, "bigquery"), "yes");
+
+    // A BigQuery datasource is added without a key file, and told where its key goes.
+    let (ok, out) = run(zsql(&home, &project).args(["datasource", "add", "bq2", "--adapter", "bigquery", "--project-id", "p"]), None);
+    assert!(ok && out.contains("no key_file") && out.contains("zsql datasource auth -d bq2"), "{out}");
+
     // Nested, as .strata had them, is the same credential.
     std::fs::write(
         project.join(".zsql"),

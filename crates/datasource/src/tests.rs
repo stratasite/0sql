@@ -194,6 +194,22 @@ fn a_secret_comes_from_the_environment_first_and_the_gitignored_files_after() {
     let held = local_entry(Some(&dir), "wh");
     assert!(held.get("auth_mode").is_none() && held.get("adapter").is_none(), "only what a connection reads: {held:?}");
 
+    // A value is read as the setting it is: a port in quotes is the
+    // port, digits are a username, and what cannot be the setting
+    // leaves the written one alone.
+    std::fs::write(dir.join("datasources.yml"), "wh:\n  adapter: postgres\n  port: 5432\n  username: written\n  query_timeout: 30\n")
+        .unwrap();
+    std::fs::write(dir.join(".zsql"), "wh:\n  port: \"5433\"\n  query_timeout: soon\nwh_username: 12345\n").unwrap();
+    let c = Connection::read(&dir, "wh").unwrap();
+    assert_eq!((c.port, c.username.as_deref(), c.query_timeout), (Some(5433), Some("12345"), Some(30)));
+
+    // The nearer file decides a setting however the farther one spells it.
+    std::fs::write(dir.join("datasources.yml"), "wh:\n  adapter: bigquery\n").unwrap();
+    std::fs::write(dir.join(".zsql"), "wh_project_id: mine\nwh:\n  dataset: d\n  schema: s\n").unwrap();
+    std::fs::write(home.join("config"), "wh:\n  project: shared\n  location: EU\n").unwrap();
+    let c = Connection::read(&dir, "wh").unwrap();
+    assert_eq!((c.project.as_deref(), c.location.as_deref(), c.schema.as_deref()), (Some("mine"), Some("EU"), Some("s")));
+
     std::env::remove_var("ZSQL_HOME");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1840,6 +1856,9 @@ fn bigquery_queries_polls_pages_caps_and_signs_a_service_account_grant() {
     let err = bigquery::BigQuery::open_with(&half, secrets.clone(), &nowhere, None).err().unwrap().to_string();
     assert!(err.contains("client_email") && err.contains(".zsql under bq"), "{err}");
     assert!(!crate::adapters::bigquery::has_inline(&half, &secrets));
+    // And a listing says so, even beside a file that would have done.
+    assert_eq!(credentials_at_hand(&Connection { key_file: Some(key.clone()), ..half.clone() }, &secrets), Some(false));
+    assert_eq!(credentials_at_hand(&Connection { key_file: Some(key.clone()), ..half.clone() }, &Secrets::default()), Some(true));
 
     // Nothing to go on is named; a wrong file is named with its path.
     let err = bigquery::BigQuery::open_with(

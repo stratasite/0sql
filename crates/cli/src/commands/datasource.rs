@@ -284,7 +284,7 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
         tty::ask(&format!("{field} for {}", conn.uid), None, "--secret-stdin reads it from stdin")?.trim().to_string()
     } else {
         let what = if field == "private_key" {
-            "private_key (the path of its PEM file; --secret-stdin takes the PEM itself)"
+            "private_key (the path of its PEM file, which is read now; --secret-stdin takes the PEM itself)"
         } else {
             field.as_str()
         };
@@ -293,6 +293,18 @@ fn auth(dir: &Path, datasource: Option<&str>, field: Option<&str>, secret_stdin:
     if value.is_empty() {
         bail!("nothing entered; nothing saved");
     }
+    // A key named by its file is saved as the key: a path means one
+    // thing from this directory and another from the next, and nothing
+    // at all to a server a deploy carries it to.
+    let value = if field == "private_key" && !value.contains("-----BEGIN") {
+        let pem = std::fs::read_to_string(&value).with_context(|| format!("{value}: neither a PEM nor a file that can be read"))?;
+        if !pem.contains("-----BEGIN") {
+            bail!("{value} is not a PEM; a service account's JSON key file is named by key_file in datasources.yml");
+        }
+        pem.trim().to_string()
+    } else {
+        value
+    };
     config::write_secret(dir, &format!("{}_{field}", conn.uid), &value)?;
     println!("saved   {field} for {} in .zsql", conn.uid);
     // What a connection would now read, which is what was just saved
@@ -403,7 +415,7 @@ fn add(
                         _ => None,
                     },
                     "schema" => Some(""),
-                    "warehouse" | "catalog" => Some(""),
+                    "warehouse" | "catalog" | "key_file" => Some(""),
                     _ => None,
                 };
                 tty::ask(k, default, &format!("--{k} is needed for {adapter}; {flags}"))?

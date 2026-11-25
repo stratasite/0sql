@@ -283,7 +283,13 @@ pub(crate) fn has_inline(conn: &Connection, secrets: &Secrets) -> bool {
 
 /// Whether a credential is at hand, without reading or trading it.
 pub(crate) fn at_hand(conn: &Connection, secrets: &Secrets) -> bool {
-    secrets.oauth_token.is_some() || has_inline(conn, secrets) || file(conn, &|k| std::env::var(k).ok(), gcloud_default()).is_some()
+    // A key held is used before any file, so half a service account is
+    // no credential even beside a file that would have been one.
+    match (&secrets.oauth_token, &secrets.private_key) {
+        (Some(_), _) => true,
+        (None, Some(_)) => conn.client_email.is_some(),
+        (None, None) => file(conn, &|k| std::env::var(k).ok(), gcloud_default()).is_some(),
+    }
 }
 
 /// A service account from `.zsql`: `private_key`, the PEM or a path to

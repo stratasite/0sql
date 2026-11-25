@@ -36,7 +36,7 @@ use adapters::{athena, bigquery, clickhouse, databricks, duckdb, mysql, postgres
 pub use adapters::postgres::settings as postgres_settings;
 pub use batch::Batches;
 pub use catalog::{Added, Catalog, Column, Drift, Filter, ForeignKey, Listing, Names, Scope, Table};
-pub use connection::{overlay, Connection, SslMode, ALIASES, CONNECTION_KEYS};
+pub use connection::{overlay, Connection, SslMode, ALIASES, CONNECTION_KEYS, NUMBERS};
 pub use error::{chain, Error, Result};
 pub use rows::Rows;
 pub use secret::{local_entry, secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};

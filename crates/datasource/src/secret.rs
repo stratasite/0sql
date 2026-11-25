@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::connection::{overlay, CONNECTION_KEYS};
+use crate::connection::{overlay, ALIASES, CONNECTION_KEYS, NUMBERS};
 #[cfg(doc)]
 use crate::takes_oauth_token;
 
@@ -81,24 +81,48 @@ fn text(v: &serde_yaml::Value) -> Option<String> {
 /// warehouse_password: hunter2
 /// ```
 ///
-/// The nearest file that holds a key decides it, and within a file the
-/// nested spelling does. `adapter` is not read from here: which
-/// warehouse a datasource is belongs to the model.
+/// The nearest file that holds a setting decides it, under whichever
+/// of its spellings, and within a file the nested one does. A value is
+/// read as `datasources.yml` would have it: a port written as text is
+/// still the port. `adapter` is not read from here: which warehouse a
+/// datasource is belongs to the model.
+///
+/// A flat key is read by its prefix, so where one datasource's key
+/// begins another's (`wh` and `wh_private`), `wh_private_key_file` is
+/// `wh`'s `private_key_file`: nest the entries of such a pair.
 pub fn local_entry(project_dir: Option<&Path>, uid: &str) -> serde_yaml::Mapping {
     let known = || CONNECTION_KEYS.iter().chain(SECRET_FIELDS.iter()).copied().filter(|k| *k != "adapter");
     let mut out = serde_yaml::Mapping::new();
     for f in local_files(project_dir) {
-        let Ok(text_of) = std::fs::read_to_string(&f) else { continue };
-        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text_of) else { continue };
+        let Ok(written) = std::fs::read_to_string(&f) else { continue };
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&written) else { continue };
+        let mut here = serde_yaml::Mapping::new();
         for key in known() {
-            let nested = doc.get(uid).and_then(|d| d.get(key)).filter(|v| text(v).is_some());
-            let flat = doc.get(format!("{uid}_{key}")).filter(|v| text(v).is_some());
-            if let Some(v) = nested.or(flat) {
-                out.entry(key.into()).or_insert_with(|| v.clone());
+            let read = |v: &serde_yaml::Value| {
+                let text = text(v)?;
+                Some(if NUMBERS.contains(&key) { serde_yaml::Value::Number(text.parse::<i64>().ok()?.into()) } else { text.into() })
+            };
+            let nested = doc.get(uid).and_then(|d| d.get(key)).and_then(read);
+            let flat = doc.get(format!("{uid}_{key}")).and_then(read);
+            // A nearer file already said this one, perhaps spelled another way.
+            let said = spellings(key).iter().any(|name| out.contains_key(*name));
+            if let (Some(v), false) = (nested.or(flat), said) {
+                here.insert(key.into(), v);
+            }
+        }
+        // Two spellings in one file: the one `Connection` reads first.
+        for (key, v) in here {
+            if !key.as_str().is_some_and(|k| spellings(k).iter().any(|name| out.contains_key(*name))) {
+                out.insert(key, v);
             }
         }
     }
     out
+}
+
+/// Every spelling of a setting, itself included.
+fn spellings(key: &str) -> Vec<&str> {
+    ALIASES.iter().find(|names| names.contains(&key)).map(|names| names.to_vec()).unwrap_or_else(|| vec![key])
 }
 
 /// A datasource's entry as a command run here reads it: what

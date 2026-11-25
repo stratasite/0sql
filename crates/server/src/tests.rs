@@ -1762,6 +1762,13 @@ async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
     assert_eq!(connects(&s, "default", "main", json!({})), both());
     let listed = s.get(&format!("/projects/{CS}/branches/main/datasources")).await;
     assert_eq!(listed.body["datasources"][0]["secrets"], json!(["oauth_client_id", "oauth_client_secret", "password"]));
+    // A service account's address is such an identifier too: a deploy
+    // from a machine that holds neither half keeps what one that held
+    // both had set.
+    let a = s.deploy(CS, "main", entry("  username: svc\n  client_email: sa@p.iam.gserviceaccount.com\n")).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
+    let a = s.deploy(CS, "main", entry("  username: svc\n")).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
     for moved in ["  username: svc\n  host: other.internal\n", "  username: someone_else\n"] {
         assert_eq!(s.deploy(CS, "main", with.clone()).await.body["credentials"], json!({ "dw": "set" }));
         let a = s.deploy(CS, "main", entry(moved)).await;

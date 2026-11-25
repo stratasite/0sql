@@ -527,7 +527,11 @@ pub fn bigquery(conn: &Connection, secrets: &Secrets, env: &dyn Fn(&str) -> Opti
     }
     // The file the REST transport would read, in its order; with none
     // named, the driver walks the application-default chain itself.
-    let file = conn.key_file.as_ref().map(|p| p.display().to_string()).or_else(|| env("GOOGLE_APPLICATION_CREDENTIALS"));
+    let file = conn
+        .key_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| env("GOOGLE_APPLICATION_CREDENTIALS").filter(|p| !p.trim().is_empty()));
     match file {
         Some(path) => {
             set("bigquery.auth_type", "json_credential_file");
