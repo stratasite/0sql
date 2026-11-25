@@ -59,6 +59,7 @@ impl<'a> ResolvedProjection<'a> {
             dimension_refs: vec![],
             measure_refs: vec![],
             projection_refs: vec![],
+            aggregates_dimensions: false,
             format: None,
             decorators: vec![],
             parent: None,
@@ -118,6 +119,7 @@ impl<'a> ResolvedProjection<'a> {
             dimension_refs: dimension_refs.iter().map(|f| f.uid.clone()).collect(),
             measure_refs: measure_refs.iter().map(|f| f.uid.clone()).collect(),
             projection_refs: vec![],
+            aggregates_dimensions: false,
             format: None,
             decorators: vec![],
             parent: None,
@@ -169,6 +171,24 @@ impl<'a> ResolvedProjection<'a> {
         let Some(sql) = &self.def.sql else { return false };
         let refs: Vec<&str> = aggregates.iter().map(String::as_str).collect();
         crate::sql::expr::has_aggregates(sql, &refs)
+    }
+
+    /// A measure defined on dimensions: an aggregate calculation that reads
+    /// no measure, by `@m` or through an alias, and keeps every dimension
+    /// it reads inside an aggregate call, as `count(distinct [Customer]@d)`
+    /// does. It aggregates base rows, so it is planned as a measure of one
+    /// aggregation; the dimensions it reads are its inputs, never grain.
+    pub fn is_dimension_measure(&self, projections: &[Rc<ResolvedProjection<'a>>]) -> bool {
+        // Decorated ones (a prior period, a share, a window) keep the
+        // final-pass path for now.
+        self.is_calculation()
+            && self.def.aggregates_dimensions
+            && self.def.decorators.is_empty()
+            && self
+                .def
+                .projection_refs
+                .iter()
+                .all(|r| projections.iter().find(|p| p.match_alias(r)).map(|t| !t.is_calculation() && t.is_dimension()).unwrap_or(false))
     }
 
     pub fn is_calculation(&self) -> bool {

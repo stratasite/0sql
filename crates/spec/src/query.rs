@@ -186,6 +186,11 @@ pub struct Projection {
     pub dimension_refs: Vec<String>,
     pub measure_refs: Vec<String>,
     pub projection_refs: Vec<String>,
+    /// A calculation that is a measure defined on dimensions: it
+    /// aggregates, reads no measure field, and keeps every reference inside
+    /// an aggregate call, as `count(distinct [Customer]@d)` does. The
+    /// dimensions it reads are its inputs, not part of the query's grain.
+    pub aggregates_dimensions: bool,
     pub format: Option<Value>,
     pub decorators: Vec<Decorator>,
     pub parent: Option<String>,

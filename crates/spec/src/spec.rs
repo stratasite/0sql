@@ -593,6 +593,7 @@ fn lower_field_projection(cx: &Cx, p: &ProjectionSpec, reference: String, ordina
         dimension_refs: vec![],
         measure_refs: vec![],
         projection_refs: vec![],
+        aggregates_dimensions: false,
         format: p.format.clone().filter(|v| !v.is_null()),
         decorators,
         parent: None,
@@ -709,6 +710,11 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
     for d in &p.decorators {
         decorators.push(lower_decorator(d, None, alias)?);
     }
+    let aggregate_names: Vec<&str> = cx.aggregates.iter().map(String::as_str).collect();
+    let aggregates_dimensions = field_type == "measure"
+        && measure_refs.is_empty()
+        && !dimension_refs.is_empty()
+        && crate::expr::aggregates_every_reference(&sql, &aggregate_names);
 
     Ok(Projection {
         reference,
@@ -723,6 +729,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
         sql: Some(sql),
         calculation_field_type: Some(field_type.into()),
         calculation_data_type: Some(data_type),
+        aggregates_dimensions,
         dimension_refs,
         measure_refs,
         projection_refs,
@@ -1259,6 +1266,7 @@ fn segment_projection(reference: String, f: &Field, ordinal: i64, kind: Projecti
         dimension_refs: vec![],
         measure_refs: vec![],
         projection_refs: vec![],
+        aggregates_dimensions: false,
         format: None,
         decorators: vec![],
         parent: None,

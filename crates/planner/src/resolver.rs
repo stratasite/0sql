@@ -129,13 +129,38 @@ fn resolve_inner<'a>(
         return Err(Error::Resolution("Query is not valid: a segment needs key dimensions".into()));
     }
     let measures = measures(semantic, q);
+    // One that reads only projected dimensions is already at the query's
+    // grain wherever it is evaluated, so it stays where it always was.
+    let projected_dims: Vec<Id> =
+        q.projections.iter().filter(|p| !p.is_calculation() && !p.is_carried() && p.is_dimension()).filter_map(|p| p.field_id()).collect();
+    let dimension_measures: Vec<Rc<ResolvedProjection<'a>>> = q
+        .projections
+        .iter()
+        .filter(|p| p.is_dimension_measure(&q.projections) && p.field_refs.iter().any(|f| !projected_dims.contains(&f.id)))
+        .cloned()
+        .collect();
+    // Every dimension the query names ranks the universes. What a
+    // universe must reach is narrower when a measure anchors the query:
+    // a dimension measure's inputs are aggregated in the one node that
+    // hosts it, so only that node has to reach them.
     let mut dimensions = dimensions(semantic, q);
     for d in opts.required_dims.iter().chain(segment_keys.iter()) {
         if !dimensions.iter().any(|x| x.id == d.id) {
             dimensions.push(d);
         }
     }
-    let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
+    let grain: Vec<&'a Field> = if measures.is_empty() {
+        dimensions.clone()
+    } else {
+        let mut g = grain_dimensions(semantic, q, &dimension_measures);
+        for d in opts.required_dims.iter().chain(segment_keys.iter()) {
+            if !g.iter().any(|x| x.id == d.id) {
+                g.push(d);
+            }
+        }
+        g
+    };
+    let dim_ids: Vec<Id> = grain.iter().map(|f| f.id).collect();
     let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
     let ds_ids = universes.datasources_with_all_measures(semantic, &measures);
     if ds_ids.is_empty() {
@@ -150,7 +175,7 @@ fn resolve_inner<'a>(
         .bases
         .iter()
         .filter(|u| {
-            if dimensions.is_empty() {
+            if grain.is_empty() {
                 ds_ids.contains(&u.datasource.id) && u.any_measures(&msr_ids)
             } else if measures.is_empty() {
                 u.all_dimensions(&dim_ids)
@@ -172,11 +197,12 @@ fn resolve_inner<'a>(
     }
 
     let dim_filters: Vec<_> = q.filters.iter().filter(|f| f.is_dimension()).cloned().collect();
-    let chosen = {
+    let (mut chosen, sorted) = {
         let _t = crate::profile::span("resolve.rank");
         let sorted = sort_for_max_hints_and_dims(candidates, &measures, &dimensions, &q.hints, &dim_filters, semantic);
-        prune_to_minimum(sorted, &measures, &[])?
+        (prune_to_minimum(sorted.clone(), &measures, &[])?, sorted)
     };
+    let hosts = host_dimension_measures(&mut chosen, &sorted, &dimension_measures, q)?;
 
     let datasource = chosen[0].datasource;
     let dialect = dialects.get(&datasource.adapter)?.with_overrides(q.def.db_settings.iter().map(|(k, v)| (k.as_str(), v)));
@@ -200,7 +226,8 @@ fn resolve_inner<'a>(
     } else {
         let merge_filters = q.filters.iter().filter(|f| f.is_measure() && graph.dialect.final_measure_filter()).cloned().collect();
         let mut merge = Node::merge(q.projections.clone(), merge_filters, graph.dialect.final_pass_measure_join_type().to_string());
-        if q.projections.iter().any(|p| p.is_calculation() && p.is_measure()) {
+        // A hosted dimension measure arrives as a column, like any measure.
+        if q.projections.iter().any(|p| p.is_calculation() && p.is_measure() && !hosts.iter().any(|(pid, _)| *pid == p.pid)) {
             merge.should_group_by = Some(true);
         }
         let to = graph.add_node(merge);
@@ -226,11 +253,23 @@ fn resolve_inner<'a>(
                 }
             }
             projections.extend(local_calcs.iter().cloned());
+            // A dimension measure aggregates here and nowhere else.
+            let hosted: Vec<Rc<ResolvedProjection<'a>>> = dimension_measures
+                .iter()
+                .filter(|c| hosts.iter().any(|(pid, host)| *pid == c.pid && *host == u.identity()))
+                .cloned()
+                .collect();
+            projections.extend(hosted.iter().cloned());
 
             // Materialize every field the merge-level calculations reference
             // that this universe resolves, so the merge reads it as a column.
-            let merge_calcs: Vec<&Rc<ResolvedProjection<'a>>> =
-                q.projections.iter().filter(|p| p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid)).collect();
+            let merge_calcs: Vec<&Rc<ResolvedProjection<'a>>> = q
+                .projections
+                .iter()
+                .filter(|p| {
+                    p.is_calculation() && !local_calcs.iter().any(|l| l.pid == p.pid) && !hosts.iter().any(|(pid, _)| *pid == p.pid)
+                })
+                .collect();
             let ref_uids: Vec<&str> =
                 merge_calcs.iter().flat_map(|c| c.def.measure_refs.iter().chain(c.def.dimension_refs.iter()).map(String::as_str)).collect();
             let calc_measures = calculation_fields(semantic, q, FieldKind::Measure);
@@ -269,6 +308,68 @@ fn resolve_inner<'a>(
         }
     }
     Ok(graph)
+}
+
+/// The dimensions that shape the grain: `dimensions` without those only a
+/// dimension measure reads.
+fn grain_dimensions<'a>(
+    semantic: &'a SemanticModel,
+    q: &ResolvedQuery<'a>,
+    dimension_measures: &[Rc<ResolvedProjection<'a>>],
+) -> Vec<&'a Field> {
+    let mut uids: Vec<&str> = Vec::new();
+    for p in q.projections.iter().filter(|p| !p.is_calculation() && !p.is_carried() && p.is_dimension()) {
+        uids.push(p.def.field_uid.as_deref().unwrap_or(""));
+    }
+    for f in q.filters.iter().filter(|f| f.is_dimension()) {
+        uids.push(&f.def.field_uid);
+    }
+    for p in q.projections.iter().filter(|p| p.is_calculation() && !dimension_measures.iter().any(|d| d.pid == p.pid)) {
+        for u in &p.def.dimension_refs {
+            uids.push(u);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    uids.retain(|u| seen.insert(*u));
+    uniq_fields(uids.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension))).collect())
+}
+
+/// Which universe aggregates each dimension measure, as (pid, universe
+/// identity). One already chosen for a projected measure comes first, then
+/// any chosen one, then the best ranked candidate that reaches the
+/// measure's inputs, which joins the chosen.
+fn host_dimension_measures<'a>(
+    chosen: &mut Vec<Arc<Base<'a>>>,
+    sorted: &[Arc<Base<'a>>],
+    dimension_measures: &[Rc<ResolvedProjection<'a>>],
+    q: &ResolvedQuery<'a>,
+) -> Result<Vec<(usize, String)>> {
+    let projected: Vec<Id> = q.projections.iter().filter(|p| !p.is_calculation() && p.is_measure()).filter_map(|p| p.field_id()).collect();
+    let mut hosts = Vec::new();
+    for c in dimension_measures {
+        let host = chosen
+            .iter()
+            .find(|u| resolvable_in(u, c, q) && projected.iter().any(|m| u.has_field(*m)))
+            .or_else(|| chosen.iter().find(|u| resolvable_in(u, c, q)))
+            .cloned();
+        let host = match host {
+            Some(u) => u,
+            None => {
+                let u = sorted.iter().find(|u| resolvable_in(u, c, q)).cloned().ok_or_else(|| {
+                    let names: Vec<&str> = c.field_refs.iter().map(|f| f.name.as_str()).collect();
+                    Error::Resolution(format!(
+                        "Calculation \"{}\" aggregates {}, which no table holding the query's measures reaches together with the query's dimensions, so it cannot be computed.",
+                        c.alias(),
+                        names.join(", ")
+                    ))
+                })?;
+                chosen.push(u.clone());
+                u
+            }
+        };
+        hosts.push((c.pid, host.identity().to_string()));
+    }
+    Ok(hosts)
 }
 
 /// Measures (or dimensions) named by calculations, in reference order, unique.

@@ -24,6 +24,34 @@ pub fn has_aggregates(sql: &str, aggregates: &[&str]) -> bool {
     FUNCTION_CALL.captures_iter(&body).any(|c| aggregates.contains(&&c[1]))
 }
 
+/// Whether the formula aggregates, has no window, and keeps every bracket
+/// reference inside an aggregate call: `count(distinct [Customer]@d)` does,
+/// `count(distinct [Customer]@d) + [Region]@d` and `sum(x) over (...)` do not.
+pub fn aggregates_every_reference(sql: &str, aggregates: &[&str]) -> bool {
+    static TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]+\](?:@[md])?|([a-z_][a-z0-9_]*)?\(|\)").unwrap());
+    let scrubbed = scrub(&sql.to_lowercase(), "\"", "\"", &mut |_| {});
+    if WINDOW_CLAUSE.is_match(&BRACKET_REF.replace_all(&scrubbed, "")) {
+        return false;
+    }
+    let mut stack: Vec<bool> = Vec::new();
+    let mut aggregated = false;
+    for c in TOKEN.captures_iter(&scrubbed) {
+        let token = &c[0];
+        if token.starts_with('[') {
+            if !stack.iter().any(|a| *a) {
+                return false;
+            }
+        } else if token == ")" {
+            stack.pop();
+        } else {
+            let is_agg = aggregates.contains(&c.get(1).map(|m| m.as_str()).unwrap_or(""));
+            aggregated |= is_agg;
+            stack.push(is_agg);
+        }
+    }
+    aggregated
+}
+
 /// Bracket references in a formula: (`@m` names, `@d` names, untyped aliases).
 pub fn parse_refs(sql: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let stripped = scrub(sql, "\"", "\"", &mut |_| {});
@@ -258,6 +286,17 @@ mod parser_tests {
         .collect();
         let aggregates: Vec<String> = ["sum", "count", "avg", "min", "max"].iter().map(|s| s.to_string()).collect();
         ParsedExpression::parse(sql, &reserved, &aggregates, "\"@exp\"")
+    }
+
+    #[test]
+    fn aggregates_every_reference_wants_each_reference_under_an_aggregate() {
+        let aggs = ["sum", "count", "avg", "min", "max"];
+        assert!(aggregates_every_reference("count(distinct [Customer ID]@d)", &aggs));
+        assert!(aggregates_every_reference("count(distinct lower([Customer ID]@d)) * 1.0 / max([Region]@d)", &aggs));
+        assert!(!aggregates_every_reference("count(distinct [Customer ID]@d) + [Region]@d", &aggs));
+        assert!(!aggregates_every_reference("lower([Region]@d)", &aggs));
+        assert!(!aggregates_every_reference("sum([Units]@d) over (order by [Date]@d)", &aggs));
+        assert!(!aggregates_every_reference("upper('count(') || [Region]@d", &aggs));
     }
 
     #[test]
