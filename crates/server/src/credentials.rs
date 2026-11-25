@@ -20,9 +20,12 @@ use zsql_core::Model;
 use zsql_semantic::Datasource;
 
 /// The settings that say how a datasource is used and not where it is
-/// or who is asking: changing one keeps the credential. Every other
-/// setting, known or not, is part of the place.
-const NOT_THE_PLACE: [&str; 14] = [
+/// or who is asking. A request may send one and still connect with the
+/// deployed credential; any other setting it sends, a host or a
+/// username or how the connection is secured, could carry that
+/// credential somewhere it was never meant for, so the request then
+/// connects with what it sent and nothing deployed.
+pub(crate) const HOW_IT_IS_USED: [&str; 10] = [
     "schema",
     "dataset",
     "warehouse",
@@ -32,19 +35,29 @@ const NOT_THE_PLACE: [&str; 14] = [
     "s3_output_location",
     "cache_ttl",
     "query_wait_time",
-    // How the connection is secured, not where it goes.
-    "sslmode",
-    "ssl_mode",
-    "ca_file",
-    "sslrootcert",
-    "ssl_ca",
+    "query_timeout",
 ];
+
+/// What a deploy may change besides and keep the credential: how the
+/// connection is secured. Whoever deploys is trusted with that, where
+/// a request is not.
+const HOW_IT_IS_SECURED: [&str; 5] = ["sslmode", "ssl_mode", "ca_file", "sslrootcert", "ssl_ca"];
+
+/// The secret-shaped settings that only say who is asking and are no
+/// use alone. They are often written in `datasources.yml`, in git, with
+/// the secret beside them kept in `.zsql`; an entry that carries only
+/// these has not carried a credential.
+const IDENTIFIERS: [&str; 2] = ["oauth_client_id", "access_key_id"];
 
 /// Whether two deploys of a datasource point at the same place as the
 /// same user: the adapter and every setting but the ones above.
 fn same_place(old: &Datasource, new: &Datasource) -> bool {
     let place = |d: &Datasource| -> Map<String, Value> {
-        d.connection.iter().filter(|(key, _)| !NOT_THE_PLACE.contains(&key.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+        d.connection
+            .iter()
+            .filter(|(key, _)| !HOW_IT_IS_USED.contains(&key.as_str()) && !HOW_IT_IS_SECURED.contains(&key.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     };
     old.adapter.eq_ignore_ascii_case(&new.adapter) && place(old) == place(new)
 }
@@ -59,12 +72,17 @@ pub(crate) fn settle(deployed: &mut Model, previous: Option<&Model>, clear: bool
     for new in &datasources {
         let uid = new.uid.to_lowercase();
         let had = previous.and_then(|p| Some((p.datasource(&uid)?, p.secrets_of(&uid)?)));
-        let became = if deployed.secrets.contains_key(&uid) {
+        let carried = deployed.secrets.get(&uid).is_some_and(|held| held.keys().any(|key| !IDENTIFIERS.contains(&key.as_str())));
+        let became = if carried {
             "set"
         } else {
             match had {
                 Some((old, held)) if !clear && same_place(old, new) => {
-                    deployed.secrets.insert(uid.clone(), held.clone());
+                    // What was kept, under whatever identifier this
+                    // deploy did carry.
+                    let mut kept = held.clone();
+                    kept.extend(deployed.secrets.remove(&uid).unwrap_or_default());
+                    deployed.secrets.insert(uid.clone(), kept);
                     "kept"
                 }
                 Some(_) => "dropped",

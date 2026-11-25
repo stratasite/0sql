@@ -30,7 +30,7 @@ pub fn deploy(at: Where, how: How) -> Result<()> {
     }
     let action = if dry_run { "validate" } else { "deploy" };
     let once = |t: &Target| -> Result<bool> {
-        let archive = project::archive(&p.dir)?;
+        let archive = project::archive(&p.dir, if dry_run { project::For::Validate } else { project::For::Deploy })?;
         let note = if t.branch == p.production_branch { " (the production branch)" } else { "" };
         println!("{action} {} ({} bytes) as {}{note} to {}", p.name, archive.len(), t.name(), t.client.server);
         // Said before it goes: a deploy carries the secrets this machine

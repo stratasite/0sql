@@ -273,7 +273,7 @@ pub fn serve(args: ServeArgs, at: Where) -> Result<()> {
         let org = p.org.as_deref().filter(|o| *o != remote::DEFAULT_ORG).map(|o| format!("{o}/")).unwrap_or_default();
         eprintln!("zsql: serving {} as {org}{}/{branch}; redeploying as its files change", p.dir.display(), p.uid);
         let deploy = || -> Result<()> {
-            let archive = project::archive(&p.dir)?;
+            let archive = project::archive(&p.dir, project::For::Deploy)?;
             let v = client.post_bytes(
                 &format!("{}/deploy", remote::branch_path(p.org.as_deref(), &p.uid, &branch)),
                 "application/gzip",

@@ -46,6 +46,10 @@ branch ("The credential of a datasource" in `docs/operating.md`).
   bucket or a database table a secret is readable by whoever can read
   that bucket or table. That means a key every node is given, where it
   comes from, and how it is rotated.
+- **The work directory a deploy is unpacked into holds its secrets**
+  for as long as the load and the tests take. It is the server user's
+  alone and is removed however the deploy ends; a node killed
+  mid-deploy leaves it in the temporary directory.
 - **Rotation is a redeploy,** to every node, of every branch that holds
   the credential.
 - **Nodes that disagree run as different identities.** Between a

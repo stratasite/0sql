@@ -61,8 +61,10 @@ it was deployed with. "The credential of a datasource" in
 | nothing | nothing | refused before connecting, naming the datasource and the fields it takes |
 | an expired or wrong one | anything | the warehouse's refusal, as it gave it; never a fall back to the deployed one |
 
-The server reads no credential from its environment. The rules are the
-same for both kinds of run.
+The server reads no `ZSQL_DS_<UID>_<FIELD>` from its environment. What
+its own process can reach as a cloud identity, for Athena and BigQuery
+with no secret at all, is still reachable: `docs/operating.md` says
+what that means. The rules are the same for both kinds of run.
 
 ## Connections
 

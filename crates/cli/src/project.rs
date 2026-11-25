@@ -38,6 +38,8 @@ pub fn stamps_under(dir: &Path) -> Vec<Stamp> {
             }
         }
     }
+    // The one dot file a deploy reads: a secret fixed there is a change.
+    files.push(dir.join(".zsql"));
     files.sort();
     stamps(&files)
 }
@@ -69,7 +71,9 @@ fn with_secrets(project: &Path, v: &mut serde_yaml::Value) -> Vec<String> {
     let Some(entries) = v.as_mapping_mut() else { return carried };
     for (uid, entry) in entries.iter_mut() {
         let (Some(uid), Some(entry)) = (uid.as_str(), entry.as_mapping_mut()) else { continue };
-        let held = zsql_datasource::secrets(Some(project), uid);
+        // Under the uid as everything else spells it: `Warehouse:` here
+        // is `warehouse` in `.zsql` and to a query run on this machine.
+        let held = zsql_datasource::secrets(Some(project), &uid.trim().to_lowercase());
         for (field, secret) in held.fields() {
             entry.insert(field.into(), secret.into());
         }
@@ -87,10 +91,33 @@ pub fn carries_secrets_for(project: &Path) -> Vec<String> {
     with_secrets(project, &mut v)
 }
 
+/// Takes every secret out of the datasources, at any depth: for a
+/// validation, which keeps nothing and connects to nothing.
+fn without_secrets(v: &mut serde_yaml::Value) {
+    if let Some(map) = v.as_mapping_mut() {
+        map.retain(|k, _| !k.as_str().is_some_and(zsql_core::is_secret));
+        for (_, inner) in map.iter_mut() {
+            without_secrets(inner);
+        }
+    } else if let Some(items) = v.as_sequence_mut() {
+        items.iter_mut().for_each(without_secrets);
+    }
+}
+
+/// What an archive is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum For {
+    /// A deploy: each datasource's secrets go with it.
+    Deploy,
+    /// A validation: no secret leaves this machine.
+    Validate,
+}
+
 /// The project as a tar.gz: YAML models, tests, security, datasources.yml
-/// with each datasource's secrets in its entry, and
-/// samples/values.jsonl.gz. Never .zsql, .strata, .git or data files.
-pub fn archive(project: &Path) -> Result<Vec<u8>> {
+/// and samples/values.jsonl.gz. For a deploy each datasource's secrets
+/// are in its entry; for a validation none is. Never .zsql, .strata,
+/// .git or data files.
+pub fn archive(project: &Path, purpose: For) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -110,7 +137,12 @@ pub fn archive(project: &Path) -> Result<Vec<u8>> {
         }
         if let Ok(text) = std::fs::read_to_string(project.join("datasources.yml")) {
             let mut v: serde_yaml::Value = serde_yaml::from_str(&text)?;
-            with_secrets(project, &mut v);
+            match purpose {
+                For::Deploy => {
+                    with_secrets(project, &mut v);
+                }
+                For::Validate => without_secrets(&mut v),
+            }
             add("datasources.yml", serde_yaml::to_string(&v)?.as_bytes())?;
         }
         if let Ok(bytes) = std::fs::read(project.join("samples").join("values.jsonl.gz")) {
@@ -164,17 +196,33 @@ mod tests {
         std::fs::write(dir.join("project.yml"), "name: P\nuid: p\n").unwrap();
         std::fs::write(
             dir.join("datasources.yml"),
-            "wh:\n  adapter: postgres\n  host: db\n  password: written-here\nlake:\n  adapter: duckdb\n  file: lake.db\n",
+            "Wh:\n  adapter: postgres\n  host: db\n  password: written-here\nlake:\n  adapter: duckdb\n  file: lake.db\n",
         )
         .unwrap();
         std::fs::write(dir.join(".zsql"), "wh:\n  password: from-dot-zsql\n  oauth_token: tok\n").unwrap();
         let mut v: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(dir.join("datasources.yml")).unwrap()).unwrap();
-        assert_eq!(with_secrets(&dir, &mut v), ["wh"]);
-        assert_eq!((v["wh"]["password"].as_str(), v["wh"]["oauth_token"].as_str()), (Some("from-dot-zsql"), Some("tok")));
-        assert_eq!((v["wh"]["host"].as_str(), v["lake"].get("password")), (Some("db"), None));
-        assert_eq!(carries_secrets_for(&dir), ["wh"]);
+        // The entry is `Wh`; `.zsql` and a query run here call it `wh`.
+        assert_eq!(with_secrets(&dir, &mut v), ["Wh"]);
+        assert_eq!((v["Wh"]["password"].as_str(), v["Wh"]["oauth_token"].as_str()), (Some("from-dot-zsql"), Some("tok")));
+        assert_eq!((v["Wh"]["host"].as_str(), v["lake"].get("password")), (Some("db"), None));
+        assert_eq!(carries_secrets_for(&dir), ["Wh"]);
+        assert!(stamps_under(&dir).iter().any(|(path, seen)| path.ends_with(".zsql") && seen.is_some()), "a changed .zsql is a change");
         // And the archive holds them, and not the file they came from.
-        let bytes = archive(&dir).unwrap();
+        let text_of = |bytes: &[u8]| {
+            let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+            let mut text = String::new();
+            for entry in tar.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                if entry.path().unwrap().display().to_string() == "datasources.yml" {
+                    std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+                }
+            }
+            text
+        };
+        // A validation carries none, written in the entry or not.
+        let validated = text_of(&archive(&dir, For::Validate).unwrap());
+        assert!(validated.contains("host: db") && !validated.contains("password") && !validated.contains("tok"), "{validated}");
+        let bytes = archive(&dir, For::Deploy).unwrap();
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
         let mut names = Vec::new();
         for entry in tar.entries().unwrap() {

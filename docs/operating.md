@@ -233,7 +233,8 @@ on the node that ran it, and another node runs the statement again.
 
 A datasource's credential arrives with a deploy. There is no setting
 for one on the server: `ZSQL_DS_<UID>_<FIELD>` in the server's
-environment is not read.
+environment is not read. (The one exception is the cloud identity of
+the server's own process, below.)
 
 - **A deploy carries it.** `zsql deploy` sends, in each datasource's
   entry, the secrets written there and the ones the deploying machine
@@ -249,6 +250,27 @@ environment is not read.
   secret in `connection` connects with exactly the secrets it sent;
   nothing deployed is blended in. Settings that are not secrets, such
   as `role`, are still laid over the deployed entry one by one.
+- **It goes only where it was deployed for.** A request may lay
+  `schema`, `dataset`, `warehouse`, `role`, `workgroup`,
+  `output_location`, `cache_ttl`, `query_wait_time` or `query_timeout`
+  over the entry and still connect with the deployed credential. A
+  request that sends any other setting, a `host`, a `username`, a
+  `file`, an `sslmode`, connects with the secrets it sent and no
+  deployed one: otherwise anyone who reaches the port could have the
+  deployed secret presented to a server of their choosing.
+- **An identifier alone is not a credential.** `oauth_client_id` and
+  `access_key_id` are often written in `datasources.yml` with the
+  secret beside them in `.zsql`. A deploy that carries only those keeps
+  the secret the branch had, under the identifier it carried.
+- **A validation carries none.** `zsql deploy --dry-run` and `zsql
+  check -r` send the datasources with every secret taken out.
+- **What the server's own account can reach is not a deployed
+  credential, and is everyone's.** With no secret at all, Athena falls
+  back to the AWS identity of the server's process (its environment,
+  profile or instance role) and BigQuery to its application-default
+  credentials. Any org can deploy a datasource that uses them. Run the
+  server as an identity that can reach nothing you would not give
+  every caller.
 - **A deploy that carries none keeps it,** so a pipeline can deploy a
   model without holding the secret. It is kept only while the
   datasource points where it did: a changed adapter, host, database,

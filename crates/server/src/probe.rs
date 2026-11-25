@@ -228,9 +228,16 @@ pub(crate) fn connection_of(
     }
     // The credential is one or the other, never a blend: what the
     // request sent, when it sent any secret at all, and otherwise what
-    // the datasource was deployed with.
+    // the datasource was deployed with. And the deployed one goes only
+    // where it was deployed for: a request that names another host,
+    // user, file or way of securing the connection connects with what
+    // it sent, so nobody who reaches the port can have the deployed
+    // secret presented to a server of their choosing.
     let sent_one = sent.keys().any(|key| SECRET_FIELDS.contains(&key.as_str()));
-    if !sent_one {
+    let elsewhere = sent.keys().any(|key| {
+        key != "adapter" && !SECRET_FIELDS.contains(&key.as_str()) && !crate::credentials::HOW_IT_IS_USED.contains(&key.as_str())
+    });
+    if !sent_one && !elsewhere {
         for (key, value) in d.secrets_of(datasource).into_iter().flatten() {
             if let Some(value) = scalar(key, value) {
                 settings.insert(key.clone(), value);

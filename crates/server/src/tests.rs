@@ -1726,6 +1726,14 @@ async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
     assert_eq!(connects(&s, "default", "main", json!({ "password": "theirs" })), (Some("theirs".to_string()), None));
     assert_eq!(connects(&s, "default", "main", json!({ "oauth_token": "t" })), (None, None));
     assert_eq!(connects(&s, "default", "main", json!({ "role": "analyst" })), both());
+    // And the deployed one goes only where it was deployed for: a
+    // request that names another host, user, file or way of securing
+    // the connection is not handed it to present there.
+    for elsewhere in [json!({ "host": "evil.example" }), json!({ "username": "x" }), json!({ "sslmode": "disable" }), json!({ "port": 1 })]
+    {
+        assert_eq!(connects(&s, "default", "main", elsewhere.clone()), (None, None), "{elsewhere}");
+    }
+    assert_eq!(connects(&s, "default", "main", json!({ "schema": "marts", "query_timeout": 5 })), both());
 
     // A deploy that carries none keeps it, and a restart finds it.
     let a = s.deploy(CS, "main", without.clone()).await;
@@ -1740,8 +1748,19 @@ async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
     let a =
         s.deploy(CS, "main", entry("  username: svc\n  schema: marts\n  cache_ttl: 60\n  query_timeout: 45\n  sslmode: require\n")).await;
     assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
-    let a = s.deploy(CS, "main", entry("  username: someone_else\n")).await;
-    assert_eq!(a.body["credentials"], json!({ "dw": "dropped" }), "{}", a.body);
+    // An identifier alone, as one written in datasources.yml beside a
+    // secret kept in .zsql, is not a credential: what was kept stays,
+    // under the identifier this deploy carried.
+    let a = s.deploy(CS, "main", entry("  username: svc\n  oauth_client_id: app-2\n")).await;
+    assert_eq!(a.body["credentials"], json!({ "dw": "kept" }), "{}", a.body);
+    assert_eq!(connects(&s, "default", "main", json!({})), both());
+    let listed = s.get(&format!("/projects/{CS}/branches/main/datasources")).await;
+    assert_eq!(listed.body["datasources"][0]["secrets"], json!(["oauth_client_id", "oauth_client_secret", "password"]));
+    for moved in ["  username: svc\n  host: other.internal\n", "  username: someone_else\n"] {
+        assert_eq!(s.deploy(CS, "main", with.clone()).await.body["credentials"], json!({ "dw": "set" }));
+        let a = s.deploy(CS, "main", entry(moved)).await;
+        assert_eq!(a.body["credentials"], json!({ "dw": "dropped" }), "{moved}: {}", a.body);
+    }
     assert_eq!(connects(&s, "default", "main", json!({})), (None, None));
     assert!(!dir.join("secrets.json").exists(), "and no file is left for none");
     let a = s.deploy(CS, "main", without.clone()).await;

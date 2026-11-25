@@ -79,7 +79,19 @@ fn deploy_or_validate(
     static WORK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = WORK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let work = std::env::temp_dir().join(format!("zsqld-deploy-{}-{seq}", std::process::id()));
-    std::fs::create_dir_all(&work).map_err(|e| bad(e.to_string()))?;
+    // The archive carries secrets now, so the directory is this
+    // user's alone and is one nobody made first: an existing one is
+    // somebody else's, or a leftover, and is not unpacked into.
+    let _ = std::fs::remove_dir_all(&work);
+    let mut made = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        made.mode(0o700);
+    }
+    made.create(&work).map_err(|e| bad(format!("a directory to unpack into: {e}")))?;
+    // Removed however this ends, a panic in a load or a test included.
+    let _swept = Swept(work.clone());
     // Paths in what the loader says are inside the work directory; the
     // caller knows their project by its own layout, not by where the
     // server unpacked it.
@@ -113,8 +125,16 @@ fn deploy_or_validate(
         }
         Ok(out)
     })();
-    let _ = std::fs::remove_dir_all(&work);
     result.map(Json)
+}
+
+/// A directory removed when this is dropped.
+struct Swept(PathBuf);
+
+impl Drop for Swept {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The most an archive may hold once decompressed, and the most entries.

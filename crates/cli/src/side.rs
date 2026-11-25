@@ -138,7 +138,7 @@ impl Side for Target {
 
     fn check(&mut self) -> Result<Value> {
         let Some(p) = &self.project else { anyhow::bail!("validating on the server needs a project directory") };
-        let archive = crate::project::archive(&p.dir)?;
+        let archive = crate::project::archive(&p.dir, crate::project::For::Validate)?;
         self.client.post_bytes(
             &format!("{}/validate", remote::branch_path(self.org.as_deref(), &self.uid, &self.branch)),
             "application/gzip",
