@@ -55,8 +55,7 @@ fn archive_with_secrets(uid: &str) -> Vec<u8> {
         "    - host: other.internal",
         "      api_key: hunter2-listed",
         "  private_key_file: /keys/dw.p8",
-        "  url: https://reader:hunter2-url@db.internal/path",
-        "  passphrase: hunter2-phrase",
+        "  url: https://db.internal/path",
         "token_store:",
         "  name: Tokens",
         "  adapter: duckdb",
@@ -111,7 +110,7 @@ async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
         for kept in ["db.internal", "reader", "other.internal", "scope", "/keys/dw.p8", "https://db.internal/path", "tokens.internal"] {
             assert!(text.contains(kept), "{name} lost {kept}:\n{text}");
         }
-        for gone in ["password", "client_secret", "api_key", "passphrase"] {
+        for gone in ["password", "client_secret", "api_key"] {
             assert!(!text.contains(gone), "{name} still names {gone}:\n{text}");
         }
     }

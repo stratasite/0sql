@@ -15,17 +15,17 @@
 //! No secret is meant to go with it. The store is read by more than
 //! the server, and kept longer than a credential is good for, so every
 //! setting of a datasource that names a secret is left out of both
-//! `datasources.yml` and the snapshot, and a URL loses its password.
-//! That is a test of names, wider than the one that decides what is
-//! served and still a test of names: a credential under a key nobody
-//! would take for one is kept as it was written. Only the files the
-//! loader read are taken from the archive that was sent: whatever else
-//! it carried, a `.zsql` among it, stays behind.
+//! `datasources.yml` and the snapshot. That is the test of names that
+//! decides what is served, [`zsql_core::is_secret`]: a credential under
+//! a key nobody would take for one, or written into a `url`, is kept as
+//! it was written. Only the files the loader read are taken from the
+//! archive that was sent: whatever else it carried, a `.zsql` among
+//! it, stays behind.
 
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use zsql_core::{is_secret_to_a_copy, without_url_secrets, Model};
+use zsql_core::{is_secret, Model};
 
 /// What every kept deploy's key starts with.
 pub(crate) const PREFIX: &str = "deploys";
@@ -109,12 +109,11 @@ fn without_secrets(yaml: &[u8]) -> Result<Vec<u8>, String> {
     fn strip(value: &mut serde_yaml::Value) {
         match value {
             serde_yaml::Value::Mapping(map) => {
-                map.retain(|key, _| !key.as_str().is_some_and(is_secret_to_a_copy));
+                map.retain(|key, _| !key.as_str().is_some_and(is_secret));
                 map.iter_mut().for_each(|(_, inner)| strip(inner));
             }
             serde_yaml::Value::Sequence(items) => items.iter_mut().for_each(strip),
             serde_yaml::Value::Tagged(tagged) => strip(&mut tagged.value),
-            serde_yaml::Value::String(text) => *text = without_url_secrets(text),
             _ => {}
         }
     }
@@ -142,31 +141,25 @@ mod tests {
         let yaml = [
             "token_store:",
             "  adapter: postgres",
-            "  url: postgres://reader:hunt/er2@db.internal:5432/shop?sslmode=require&password=hunter2#top",
-            "  jdbc_url: jdbc:sqlserver://sql.internal:1433;database=shop;password=hunter2;encrypt=true",
-            "  endpoint: https://hunter2@api.internal/v1",
-            "  passphrase: hunter2",
-            "  Password: hunter2",
-            "  private-key: hunter2",
-            "  apiKey: hunter2",
-            "  key: hunter2",
-            "  keyfile_json: '{\"k\": \"hunter2\"}'",
+            "  url: https://api.internal/v1",
+            "  password: hunter2",
+            "  Private_Key: hunter2",
+            "  oauth:",
+            "    client_secret: hunter2",
+            "    scope: read",
+            "  fallbacks:",
+            "    - host: other.internal",
+            "      api_key: hunter2",
             "  note: !env HOME",
             "  private_key_file: /keys/a.p8",
             "",
         ]
         .join("\n");
         let out = String::from_utf8(without_secrets(yaml.as_bytes()).unwrap()).unwrap();
-        assert!(!out.contains("hunter2") && !out.contains("hunt/er2"), "{out}");
-        for kept in [
-            "token_store:",
-            "adapter: postgres",
-            "postgres://db.internal:5432/shop?sslmode=require#top",
-            "jdbc:sqlserver://sql.internal:1433;database=shop;encrypt=true",
-            "https://api.internal/v1",
-            "/keys/a.p8",
-            "!env HOME",
-        ] {
+        assert!(!out.contains("hunter2"), "{out}");
+        for kept in
+            ["token_store:", "adapter: postgres", "https://api.internal/v1", "scope: read", "other.internal", "/keys/a.p8", "!env HOME"]
+        {
             assert!(out.contains(kept), "lost {kept}:\n{out}");
         }
     }

@@ -127,20 +127,18 @@ What to keep in mind whichever path is used:
   the model was loaded from, and nothing else the archive carried) and
   `compiled/` (the snapshot, the sampled values and the tests, as the
   data directory has them). Every setting of a datasource whose name
-  says secret (`password`, `token`, `private_key`, `passphrase`,
-  `dsn`, `keyfile_json` and their like) is left out of both
-  `project/datasources.yml` and the snapshot, at any depth, and a URL
-  loses whoever it names before the host and every parameter that
-  names a secret. The test is wider than the one for what is served,
-  however a name is spelled (`private-key`, `apiKey`), and will drop
-  a setting that was no secret before it keeps one that was. It is a test of names: a credential written
-  under a key nobody would take for one is kept as written, so the
-  bucket is still worth guarding. `datasources.yml` is written again,
-  and so without its comments. The deploy's answer names the zip under
-  `archive`. A deploy that cannot be kept is refused with `502
-  ArchiveError` and replaces nothing; a put is given a minute. A zip
-  is only ever put where nothing is, so no deploy's zip replaces
-  another's. The zip is put while the deploy
+  says secret (`password`, `token`, `private_key`, `api_key` and
+  their like) is left out of both `project/datasources.yml` and the
+  snapshot, at any depth. The test is the one that decides what is
+  served, and it is a test of names: a credential written under a key
+  nobody would take for one, or into a `url`, is kept as written, so
+  the bucket is still worth guarding. `datasources.yml` is written
+  again, and so without its comments. The deploy's answer names the
+  zip under `archive`. A deploy that cannot be kept is refused with
+  `502 ArchiveError` and replaces nothing; a put is given a minute,
+  and one that failed or was given up is cleared away. A zip is only
+  ever put where nothing is, so no deploy's zip replaces another's.
+  The zip is put while the deploy
   lock is held, so the zips of a branch are in the order its deploys
   went live, and a slow store slows every deploy behind it. Nothing
   clears these away: how long they are kept is the bucket's lifecycle

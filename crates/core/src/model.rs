@@ -94,85 +94,19 @@ fn shown(settings: &serde_json::Map<String, Value>, under: &str, secrets: &mut V
     }
     Value::Object(out)
 }
-/// Whether a datasource setting is left out of a copy that leaves the
-/// server: every [`is_secret`], and the names a credential goes by
-/// however they are spelled, `private-key` and `apiKey` as much as
-/// `private_key` and `api_key`. Wider than what is served on purpose,
-/// and willing to drop a setting that was no secret: a copy in a bucket
-/// outlives the server's say over who reads it.
-pub fn is_secret_to_a_copy(key: &str) -> bool {
-    if is_secret(key) {
-        return true;
-    }
-    let lower = key.to_lowercase();
-    if lower.ends_with("_file") || lower.ends_with("_path") || lower.ends_with("-file") || lower.ends_with("-path") {
-        return false;
-    }
-    let plain: String = lower.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    ["key", "sas", "pat"].contains(&plain.as_str())
-        || [
-            "pass",
-            "pwd",
-            "secret",
-            "token",
-            "privatekey",
-            "accesskey",
-            "accountkey",
-            "apikey",
-            "credential",
-            "dsn",
-            "connectionstring",
-            "connectionuri",
-            "keyfilejson",
-            "jwt",
-        ]
-        .iter()
-        .any(|word| plain.contains(word))
-}
-
-/// A URL as a copy that leaves the server may hold it: nobody's name
-/// or password before the host, and no parameter that names a secret
-/// after it, whether the parameters are a query's or JDBC's. Text that
-/// is not a URL is as it was.
-pub fn without_url_secrets(text: &str) -> String {
-    let Some(start) = text.find("://").map(|i| i + 3) else { return text.to_string() };
-    // Where the parameters begin, when there are any. A password may
-    // hold a `/`, so whoever is named is everything up to the last `@`
-    // before them.
-    let params = text[start..].find(['?', ';', '#']).map_or(text.len(), |i| start + i);
-    let host = text[start..params].rfind('@').map_or(start, |i| start + i + 1);
-    let mut out = format!("{}{}", &text[..start], &text[host..params]);
-    let (tail, fragment) = match text[params..].find('#') {
-        Some(i) => (&text[params..params + i], &text[params + i..]),
-        None => (&text[params..], ""),
-    };
-    if let Some(lead) = tail.chars().next() {
-        let joiner = if lead == ';' { ";" } else { "&" };
-        let kept: Vec<&str> = tail[1..]
-            .split(['&', ';'])
-            .filter(|pair| !pair.is_empty() && !is_secret_to_a_copy(pair.split('=').next().unwrap_or(pair)))
-            .collect();
-        if !kept.is_empty() {
-            out.push(lead);
-            out.push_str(&kept.join(joiner));
-        }
-    }
-    out.push_str(fragment);
-    out
-}
 
 /// Takes every secret out of a datasource's settings for a copy that
-/// leaves the server, at any depth: a key that names one goes with its
-/// value, in a mapping inside a list as much as one at the top, and a
-/// URL loses whoever it names and every secret parameter.
+/// leaves the server, at any depth: a key that [`is_secret`] goes with
+/// its value, in a mapping inside a list as much as one at the top.
+/// The test is the one that decides what is served, so a copy holds
+/// what a caller could have read and no more.
 pub fn strip_secrets(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.retain(|key, _| !is_secret_to_a_copy(key));
+            map.retain(|key, _| !is_secret(key));
             map.values_mut().for_each(strip_secrets);
         }
         Value::Array(items) => items.iter_mut().for_each(strip_secrets),
-        Value::String(text) => *text = without_url_secrets(text),
         _ => {}
     }
 }

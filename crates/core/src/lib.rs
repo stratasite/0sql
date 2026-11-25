@@ -21,7 +21,7 @@ mod time;
 mod tests;
 
 pub use error::{Error, Kind, LoadError, Result, StoredError};
-pub use model::{holds, is_secret, is_secret_to_a_copy, load, strip_secrets, without_url_secrets, Model, Trust, SNAPSHOT_FILE, TESTS_FILE};
+pub use model::{holds, is_secret, load, strip_secrets, Model, Trust, SNAPSHOT_FILE, TESTS_FILE};
 pub use request::{
     spec_of, unlimited, ExplainResponse, ExploreRequest, ExploreResponse, Planned, ShapeCheck, SqlRequest, SqlResponse, Timings,
 };

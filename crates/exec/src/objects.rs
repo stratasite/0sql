@@ -135,7 +135,9 @@ impl Objects {
     /// [`Objects::delete`] takes, or `None` when something is there
     /// already, which is left as it was. A store that cannot be asked
     /// for that is simply put to. A put that has not ended in
-    /// `PUT_WITHIN` is given up: its caller is holding something.
+    /// `PUT_WITHIN` is given up: its caller is holding something. A put
+    /// that failed or was given up is cleared away as well as it can
+    /// be, since it may have landed all the same.
     /// For what is kept beside the results and is not one: nothing here
     /// ever clears it away.
     pub fn put_new(&self, path: &[&str], bytes: Vec<u8>) -> Result<Option<String>> {
@@ -151,10 +153,17 @@ impl Objects {
                     Err(e) => Err(e),
                 }
             };
-            match tokio::time::timeout(PUT_WITHIN, putting).await {
+            let put = match tokio::time::timeout(PUT_WITHIN, putting).await {
                 Ok(done) => done.map_err(|e| failed(&key, e)),
                 Err(_) => Err(failed(&key, format!("not put within {} seconds", PUT_WITHIN.as_secs()))),
+            };
+            if put.is_err() {
+                // The store may have taken the bytes and the answer been
+                // lost, or the put been given up as it landed: the caller
+                // is told nothing was put, so nothing is left there.
+                let _ = tokio::time::timeout(PUT_WITHIN, self.store.delete(&at)).await;
             }
+            put
         })
         .map(|put| put.then_some(key))
     }
