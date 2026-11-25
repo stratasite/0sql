@@ -115,6 +115,7 @@ pub const SNAPSHOT_FILE: &str = "snapshot.json.gz";
 pub fn is_secret(key: &str) -> bool {
     let key = key.to_lowercase();
     key == "oauth_client_id"
+        || key == "client_email"
         || ["password", "passwd", "secret", "token", "private_key", "access_key", "api_key", "credential"]
             .iter()
             .any(|word| key.contains(word) && !key.ends_with("_file") && !key.ends_with("_path"))

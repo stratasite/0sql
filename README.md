@@ -218,9 +218,13 @@ connection are one org's. An org is a directory of the data directory
 and nothing more, and `zsql` reads it from `org:` in `project.yml` or
 `--org`.
 
-**Credentials.** `zsql deploy` carries each datasource's secrets from
-`.zsql`, and on the server they are that datasource's credential for
-the branch: kept apart from the compiled model, never served. A
+**Credentials.** On your machine a datasource is its entry in
+`datasources.yml` with what `.zsql` holds under the same key laid over
+it: secrets, and any other setting you would rather not commit. Where
+both say one, `.zsql` is read. `zsql deploy` carries each datasource's
+entry that way, and on the server its secrets are that datasource's
+credential for the branch: kept apart from the compiled model, never
+served. A
 request that sends a secret of its own connects with that and nothing
 else. A later deploy that carries none keeps what the branch had, so a
 pipeline can deploy without holding the secret.

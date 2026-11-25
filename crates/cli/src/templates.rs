@@ -52,6 +52,8 @@ pub const DATASOURCES_YML: &str = "\
 # on the server they are that datasource's credential for the branch,\n\
 # used by a run whose request sends none. Use an account you mean the\n\
 # server to run as, or have your own service send one with each request.\n\
+# Any other key of an entry may be kept in .zsql the same way, a\n\
+# username say, and one written in both places is read from .zsql.\n\
 #\n\
 # warehouse:\n\
 #   name: Warehouse\n\
@@ -104,6 +106,7 @@ pub const DATASOURCES_YML: &str = "\
 #   project: my-project\n\
 #   dataset: analytics            # optional; introspect reads the whole region without it\n\
 #   location: US                  # the region, for a whole-region read\n\
+#   # a service account's key goes in .zsql as private_key, with client_email beside it; or its JSON key file:\n\
 #   key_file: ./service-account.json   # or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`\n\
 \n\
 # lakehouse:\n\

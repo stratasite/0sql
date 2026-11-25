@@ -111,6 +111,7 @@ impl Connector for Local_ {
         // The credential's own file, which picks the principal and so the
         // rows, for BigQuery. Its contents are not read here.
         put("key_file", file(c.key_file));
+        put("client_email", c.client_email);
         (!parts.is_empty()).then(|| serde_json::Value::Object(parts).to_string())
     }
 

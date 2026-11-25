@@ -117,6 +117,9 @@ pub struct Connection {
     /// BigQuery's service-account key file, or an application-default
     /// credentials file.
     pub key_file: Option<PathBuf>,
+    /// BigQuery's service account, when its key is in `.zsql` as
+    /// `private_key` and not in a file: the address the key signs for.
+    pub client_email: Option<String>,
     /// An AWS region, for Athena.
     pub region: Option<String>,
     /// An Athena workgroup.
@@ -138,7 +141,8 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Every datasource in a project's `datasources.yml`, in file order.
+    /// Every datasource in a project's `datasources.yml`, in file order,
+    /// each with what `.zsql` holds for it laid over its entry.
     pub fn read_all(project_dir: &Path) -> Result<Vec<Connection>> {
         let path = project_dir.join("datasources.yml");
         let text = std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
@@ -147,7 +151,12 @@ impl Connection {
         let mut out = Vec::new();
         for (key, d) in map {
             let Some(uid) = key.as_str() else { continue };
-            out.push(Connection::from_value(uid, d)?);
+            // What this machine holds for it in `.zsql` goes over what
+            // the file says, so a setting kept out of the repository
+            // is still a setting.
+            let mut entry = d.as_mapping().cloned().unwrap_or_default();
+            overlay(&mut entry, crate::secret::local_entry(Some(project_dir), &uid.trim().to_lowercase()));
+            out.push(Connection::from_value(uid, &serde_yaml::Value::Mapping(entry))?);
         }
         Ok(out)
     }
@@ -185,6 +194,7 @@ impl Connection {
             project: s("project").or_else(|| s("project_id")),
             location: s("location"),
             key_file: s("key_file").or_else(|| s("credentials_file")).map(PathBuf::from),
+            client_email: s("client_email"),
             region: s("region"),
             workgroup: s("workgroup"),
             output_location: s("output_location").or_else(|| s("s3_output_location")),
@@ -243,7 +253,7 @@ impl Connection {
 
 /// Every key [`Connection::from_value`] reads, aliases included, for a
 /// caller that refuses a key it would otherwise read past.
-pub const CONNECTION_KEYS: [&str; 36] = [
+pub const CONNECTION_KEYS: [&str; 37] = [
     "adapter",
     "host",
     "port",
@@ -273,6 +283,7 @@ pub const CONNECTION_KEYS: [&str; 36] = [
     "location",
     "key_file",
     "credentials_file",
+    "client_email",
     "region",
     "workgroup",
     "output_location",
@@ -281,3 +292,33 @@ pub const CONNECTION_KEYS: [&str; 36] = [
     "cache_ttl",
     "query_wait_time",
 ];
+
+/// The settings that are numbers; every other one is text.
+pub const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
+
+/// The settings with more than one spelling, the one read first first.
+pub const ALIASES: [&[&str]; 9] = [
+    &["schema", "dataset"],
+    &["sslmode", "ssl_mode"],
+    &["ca_file", "sslrootcert", "ssl_ca"],
+    &["account", "account_identifier"],
+    &["private_key_file", "private_key_path"],
+    &["client_id", "oauth_client_id"],
+    &["project", "project_id"],
+    &["key_file", "credentials_file"],
+    &["output_location", "s3_output_location"],
+];
+
+/// Lays one entry over another: each setting of `over` replaces that
+/// setting in `entry` under any of its spellings, so a `project` laid
+/// over a `project_id` is the one that is read.
+pub fn overlay(entry: &mut serde_yaml::Mapping, over: serde_yaml::Mapping) {
+    for (key, value) in over {
+        if let Some(names) = key.as_str().and_then(|k| ALIASES.iter().find(|names| names.contains(&k))) {
+            for name in names.iter() {
+                entry.remove(*name);
+            }
+        }
+        entry.insert(key, value);
+    }
+}

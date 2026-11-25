@@ -3,14 +3,16 @@
 //! the request's own wait, the rows paged by token. Every cell arrives
 //! as a string, which is how the API already sends them.
 //!
-//! Neither strata nor `dwh` has this one, so the credentials are 0sql's
-//! own design, and they are files: a service account's JSON key, whose
-//! private key signs a JWT the token endpoint trades for an access token
-//! with the read-only BigQuery scope; or the application-default
-//! credentials `gcloud auth application-default login` writes, whose
-//! refresh token is traded the same way. The file is named by `key_file`
-//! in `datasources.yml`, by `GOOGLE_APPLICATION_CREDENTIALS`, or found
-//! where gcloud leaves it.
+//! The credential is a service account's or a user's. A service
+//! account's private key signs a JWT the token endpoint trades for an
+//! access token with the read-only BigQuery scope; the key and the
+//! address it signs for are either `private_key` and `client_email`
+//! in `.zsql`, which is where strata kept them, or in the JSON key file
+//! Google hands out. A user's is the application-default credentials
+//! `gcloud auth application-default login` writes, whose refresh token
+//! is traded the same way. A file is named by `key_file` in
+//! `datasources.yml`, by `GOOGLE_APPLICATION_CREDENTIALS`, or found
+//! where gcloud leaves it; a key in `.zsql` is used before any file.
 
 use crate::rows::{Batcher, Capped, RowSink};
 use crate::{http, jwt, Connection, Deadline, Error, Result, Rows, Secrets, Sink, Source};
@@ -32,7 +34,7 @@ pub struct BigQuery {
     warnings: Vec<String>,
 }
 
-/// What the credentials file held.
+/// What the credential turned out to be.
 enum Credential {
     /// An access token obtained elsewhere, sent as it is: nothing here
     /// can refresh it, so the connection is good for as long as it is.
@@ -67,26 +69,30 @@ impl BigQuery {
         if conn.project.is_none() {
             missing.push("project".into());
         }
-        let file = conn
-            .key_file
-            .clone()
-            .or_else(|| env("GOOGLE_APPLICATION_CREDENTIALS").map(PathBuf::from))
-            .or_else(|| default_file.filter(|p| p.exists()));
-        let credential = match (secrets.oauth_token, file) {
-            // A token from upstream is the end user's; a file on this
-            // machine is somebody else, and is not consulted.
-            (Some(token), _) => Some(Credential::AccessToken(token)),
-            (None, Some(path)) => match credential(&conn.uid, &path) {
+        let credential = match (secrets.oauth_token, &secrets.private_key, file(conn, env, default_file)) {
+            // A token from upstream is the end user's; a key or a file on
+            // this machine is somebody else, and is not consulted.
+            (Some(token), _, _) => Some(Credential::AccessToken(token)),
+            // The key held for this datasource, before any file.
+            (None, Some(key), _) => match inline(conn, key) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    missing.push(e);
+                    None
+                }
+            },
+            (None, None, Some(path)) => match credential(&conn.uid, &path) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     missing.push(e.to_string());
                     None
                 }
             },
-            (None, None) => {
-                missing.push(
-                    "credentials: key_file in datasources.yml naming a service account's JSON key, or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`".into(),
-                );
+            (None, None, None) => {
+                missing.push(format!(
+                    "credentials: a service account's private_key and client_email in .zsql under {uid}, or key_file in datasources.yml naming its JSON key, or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`",
+                    uid = conn.uid
+                ));
                 None
             }
         };
@@ -258,6 +264,52 @@ impl BigQuery {
         }
         Ok(())
     }
+}
+
+/// The credentials file this connection would read: the one it names,
+/// the environment's, or gcloud's own where there is one.
+fn file(conn: &Connection, env: &dyn Fn(&str) -> Option<String>, default_file: Option<PathBuf>) -> Option<PathBuf> {
+    conn.key_file
+        .clone()
+        .or_else(|| env("GOOGLE_APPLICATION_CREDENTIALS").filter(|p| !p.trim().is_empty()).map(PathBuf::from))
+        .or_else(|| default_file.filter(|p| p.exists()))
+}
+
+/// Whether a key in `.zsql` is this connection's credential: both
+/// halves of a service account are held.
+pub(crate) fn has_inline(conn: &Connection, secrets: &Secrets) -> bool {
+    secrets.private_key.is_some() && conn.client_email.is_some()
+}
+
+/// Whether a credential is at hand, without reading or trading it.
+pub(crate) fn at_hand(conn: &Connection, secrets: &Secrets) -> bool {
+    // A key held is used before any file, so half a service account is
+    // no credential even beside a file that would have been one.
+    match (&secrets.oauth_token, &secrets.private_key) {
+        (Some(_), _) => true,
+        (None, Some(_)) => conn.client_email.is_some(),
+        (None, None) => file(conn, &|k| std::env::var(k).ok(), gcloud_default()).is_some(),
+    }
+}
+
+/// A service account from `.zsql`: `private_key`, the PEM or a path to
+/// it, and the `client_email` it signs for.
+fn inline(conn: &Connection, key: &crate::Secret) -> std::result::Result<Credential, String> {
+    let Some(email) = conn.client_email.clone() else {
+        return Err(format!(
+            "client_email, the service account the private_key signs for: beside it in .zsql under {}, or in datasources.yml",
+            conn.uid
+        ));
+    };
+    let pem = if key.expose().contains("-----BEGIN") {
+        // A key copied out of the JSON file keeps that file's escapes
+        // unless the YAML around it is double-quoted.
+        key.expose().replace("\\n", "\n")
+    } else {
+        std::fs::read_to_string(key.expose()).map_err(|e| format!("private_key is neither a PEM nor a file that can be read: {e}"))?
+    };
+    let signer = jwt::Signer::from_pem(&conn.uid, pem.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(Credential::ServiceAccount { email, signer: Box::new(signer), token_uri: DEFAULT_TOKEN_URI.into() })
 }
 
 /// The credentials file, by its `type`.
