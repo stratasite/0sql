@@ -227,6 +227,7 @@ and some lack:
 | BigQuery | the project | the dataset |
 | MySQL, ClickHouse | refused: there is none | the database |
 | DuckDB | refused | the schema |
+| Druid | refused: there is none | `druid` or `lookup` |
 | SQLite | refused | refused: a file has neither |
 
 One table is named in the path as `table`, `schema.table` or
