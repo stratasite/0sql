@@ -320,6 +320,96 @@ async fn combining_datasets_through_the_routes() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
 }
 
+/// Budget against actual: the model's part run in the warehouse, the
+/// dataset beside it in DuckDB, rows from both sides kept.
+#[tokio::test]
+async fn a_blend_sets_a_dataset_beside_the_model() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let file = sales("blend");
+    let connection = json!({ "file": file.to_str().unwrap() });
+    let base = format!("/projects/{CS}/datasets");
+    let budget =
+        s.upload(&base, Some("user-ann"), "category,amount\nbooks,40\ngames,5\nmusic,7\n").await.body["id"].as_str().unwrap().to_string();
+    let targets = s.upload(&base, Some("user-ann"), "category\nbooks\n").await.body["id"].as_str().unwrap().to_string();
+    let route = format!("/projects/{CS}/branches/main/blend");
+    let ask = |datasets: Value, blend: Value, projections: Value| json!({ "spec": { "projections": projections }, "datasets": datasets, "blend": blend, "connection": connection });
+    let enrich = ask(
+        json!([{ "id": budget, "as": "budget" }]),
+        json!([{ "join": "budget", "to": "model", "on": [{ "left": "Category", "right": "budget.category" }], "kind": "enrich" }]),
+        json!([{ "field": "Category" }, { "field": "Revenue" }, { "field": "budget.amount" }]),
+    );
+    let a = s.post_as_ann(&route, enrich.clone()).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let mut rows = a.body["rows"].as_array().unwrap().clone();
+    rows.sort_by_key(|r| r.to_string());
+    assert_eq!(
+        rows,
+        [json!(["books", "30.50", 40]), json!(["games", "5.25", 5]), json!(["music", null, 7]), json!(["toys", "1.00", null]),],
+        "a category with a budget and no sales still shows"
+    );
+    assert_eq!(a.body["columns"][2]["name"], "budget.amount");
+    assert_eq!(a.body["cache"], "miss");
+    assert_eq!(a.body["datasets"][0]["id"], budget.as_str());
+    assert!(a.body["model"]["sql"].as_str().unwrap().contains("sales"));
+    let again = s.post_as_ann(&route, enrich.clone()).await;
+    assert_eq!(again.body["cache"], "hit", "{}", again.body);
+
+    let filter = ask(
+        json!([{ "id": targets, "as": "targets" }]),
+        json!([{ "join": "targets", "to": "model", "on": [{ "left": "Category", "right": "targets.category" }], "kind": "filter" }]),
+        json!([{ "field": "Category" }, { "field": "Revenue" }]),
+    );
+    let a = s.post_as_ann(&route, filter).await;
+    assert_eq!(a.body["rows"], json!([["books", "30.50"]]), "{}", a.body);
+
+    // Attached and joined to nothing, an alias the model has, another owner's.
+    let lonely = ask(json!([{ "id": budget, "as": "budget" }]), json!([]), json!([{ "field": "Category" }]));
+    let a = s.post_as_ann(&route, lonely).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(a.error().contains("joined to nothing"), "{}", a.body);
+    let clash = ask(
+        json!([{ "id": budget, "as": "sales" }]),
+        json!([{ "join": "sales", "to": "model", "on": [{ "left": "Category", "right": "sales.category" }], "kind": "enrich" }]),
+        json!([{ "field": "Category" }]),
+    );
+    let a = s.post_as_ann(&route, clash).await;
+    assert!(a.error().contains("is a name in the model"), "{}", a.body);
+    let a = s
+        .send(Method::POST, &route, &[(crate::OWNER_HEADER, "user-bob")], Some(("application/json", serde_json::to_vec(&enrich).unwrap())))
+        .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+}
+
+/// Datasets are in no catalog and change no plan: a model plans byte
+/// for byte the same with datasets present and none attached.
+#[tokio::test]
+async fn datasets_change_nothing_the_model_plans() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let (sql, fields, tables_path) = (
+        format!("/projects/{CS}/branches/main/sql"),
+        format!("/projects/{CS}/branches/main/fields?hidden=true"),
+        format!("/projects/{CS}/branches/main/tables"),
+    );
+    let plan = || s.post(&sql, json!({ "expr": "category asc, revenue" }));
+    let catalog = || s.get(&fields);
+    let tables = || s.get(&tables_path);
+    let before = (plan().await.body, catalog().await.body, tables().await.body);
+    for csv in ["category,amount\nbooks,1\n", "Revenue,Category\n1,x\n"] {
+        let a = s.upload(&format!("/projects/{CS}/datasets?name=category"), Some("user-ann"), csv).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    }
+    let after = (plan().await.body, catalog().await.body, tables().await.body);
+    assert_eq!(before.0["sql"], after.0["sql"], "the same SQL, byte for byte");
+    assert_eq!(before, after);
+    // An MCP client is told of no dataset either.
+    let listed = s.mcp(&[], json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await;
+    assert!(!listed.body.to_string().contains("dataset"), "{}", listed.body);
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));

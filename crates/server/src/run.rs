@@ -164,6 +164,7 @@ fn of_an_org(upload_limit: usize) -> Router<Shared> {
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
         .route("/projects/{uid}/branches/{branch}/run", post(exec::run))
         .route("/projects/{uid}/branches/{branch}/sql-exec", post(exec::sql_exec))
+        .route("/projects/{uid}/branches/{branch}/blend", post(datasets::blend))
         .route("/results/{id}", get(exec::result).delete(exec::cancel))
         .route("/cache/invalidate", post(exec::invalidate))
         .route(mcp::PATH, post(mcp::endpoint))

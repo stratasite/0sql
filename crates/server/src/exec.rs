@@ -270,9 +270,22 @@ pub(crate) fn submit_fresh(
     connection: Map<String, Value>,
     wait: Option<f64>,
 ) -> Result<(Record, Duration), ApiError> {
-    let req = RunRequest { spec, expr, context, connection, wait, fresh: true, ..RunRequest::default() };
-    let (record, _, wait) = submit(app, org, uid, branch, req)?;
-    Ok((record, wait))
+    submit_spec(app, (org, uid, branch), (spec, expr), context, connection, wait, true).map(|(r, _, w)| (r, w))
+}
+
+/// A spec run as `/run` runs it: answered from a kept result unless
+/// `fresh`. What a blend's model part is run by.
+pub(crate) fn submit_spec(
+    app: &Shared,
+    (org, uid, branch): (&str, &str, &str),
+    (spec, expr): (Option<Value>, Option<String>),
+    context: Option<SecurityContext>,
+    connection: Map<String, Value>,
+    wait: Option<f64>,
+    fresh: bool,
+) -> Result<(Record, How, Duration), ApiError> {
+    let req = RunRequest { spec, expr, context, connection, wait, fresh, ..RunRequest::default() };
+    submit(app, org, uid, branch, req)
 }
 
 /// The record once the run is over, or as it stands when `wait` is up.

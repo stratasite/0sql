@@ -476,6 +476,7 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 | `.cache/records/` | the record of each run, when the records are not in a database |
 | `<org>/<project>/.datasets/` | the project's datasets: snapshots, recipe versions and materializations, each owner's apart (`docs/ingestion.md`). Never taken for a branch; removed with the project |
 | `.cache/prep/` | where a data prep engine spills what does not fit in its memory |
+| `.cache/blends/` | the answers of blends, kept by the model's SQL, each dataset's id and version, and the joins; a dataset's delete removes the ones that read it |
 
 A deploy is staged beside the branch and swapped in by rename, so a
 reader of the directory sees a branch as it was or as it is, never half

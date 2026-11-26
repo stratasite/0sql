@@ -23,6 +23,7 @@
 //! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
 //! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 //! DELETE /datasets                                        every dataset of this owner in the org
+//! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "offset", "limit"}
 //! ```
 //!
 //! Every one needs the [`OWNER_HEADER`]: the application's reference
@@ -605,6 +606,221 @@ pub(crate) async fn downstream(
         let below: Vec<Value> =
             prep.downstream(&scope, &id)?.iter().map(|d| json!({ "id": d.id, "name": d.name, "live": d.live })).collect();
         Ok(Json(json!({ "downstream": below })))
+    })
+    .await
+}
+
+/// A query of the model with datasets beside it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BlendRequest {
+    spec: Value,
+    datasets: Vec<zsql_prep::blend::Attach>,
+    blend: Vec<zsql_prep::blend::Join>,
+    #[serde(default)]
+    context: Option<SecurityContext>,
+    #[serde(default)]
+    connection: Map<String, Value>,
+    #[serde(default)]
+    wait: Option<f64>,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// The model's part of a blend: the spec the planner is given, with
+/// every projection named so its column can be found, and the answer's
+/// columns in order.
+struct Split {
+    spec: Value,
+    outputs: Vec<zsql_prep::blend::Output>,
+    keys: std::collections::BTreeMap<String, String>,
+    key_only: Vec<String>,
+}
+
+/// The field a spec names, and whether it is a measure and one that
+/// adds up: a sum or a count on every table it is on.
+fn field_kind(model: &zsql_core::Model, written: &str) -> (bool, bool) {
+    let (name, suffix) = match written.rsplit_once('@') {
+        Some((n, s)) => (n, Some(s)),
+        None => (written, None),
+    };
+    let sem = model.semantic();
+    let field = sem.fields().iter().find(|f| f.uid.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(name));
+    let measure = match (suffix, field) {
+        (Some("m"), _) => true,
+        (Some("d"), _) => false,
+        (_, Some(f)) => f.kind == zsql_semantic::FieldKind::Measure,
+        _ => false,
+    };
+    let additive = field.is_some_and(|f| {
+        let sqls: Vec<String> = sem
+            .tables()
+            .iter()
+            .filter_map(|t| sem.expression_for(t.id, f.id))
+            .filter_map(|e| e.sql.as_ref())
+            .map(|s| s.trim().to_lowercase())
+            .collect();
+        !sqls.is_empty() && sqls.iter().all(|s| (s.starts_with("sum(") || s.starts_with("count(")) && !s.contains("distinct"))
+    });
+    (measure, additive)
+}
+
+fn invalid(m: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "Invalid", m.into())
+}
+
+/// Splits a blend's spec: projections of an attached alias are the
+/// datasets'; the rest, and the model keys the joins name, are the
+/// model's, each given an alias so its column is known.
+fn split(model: &zsql_core::Model, req: &BlendRequest) -> Result<Split, ApiError> {
+    let aliases: Vec<&str> = req.datasets.iter().map(|a| a.alias.as_str()).collect();
+    let sem = model.semantic();
+    for a in &aliases {
+        zsql_prep::blend::check_alias(a)?;
+        let clash = sem.tables().iter().any(|t| t.uid.eq_ignore_ascii_case(a) || t.name.eq_ignore_ascii_case(a))
+            || sem.fields().iter().any(|f| {
+                f.name.eq_ignore_ascii_case(a)
+                    || f.uid.eq_ignore_ascii_case(a)
+                    || f.uid.to_lowercase().starts_with(&format!("{}.", a.to_lowercase()))
+            });
+        if clash {
+            return Err(invalid(format!(
+                "'{a}' is a name in the model, so it cannot be a dataset's alias: a bare name never means a dataset"
+            )));
+        }
+    }
+    let Some(obj) = req.spec.as_object() else { return Err(invalid("a blend's spec is an object")) };
+    if obj.get("calculations").and_then(Value::as_array).is_some_and(|c| !c.is_empty()) {
+        return Err(invalid("a blend's model part takes projections, not calculations, for now"));
+    }
+    let projections = obj.get("projections").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut spec = req.spec.clone();
+    let mut model_projections: Vec<Value> = Vec::new();
+    let mut outputs = Vec::new();
+    let mut written_of: Vec<(String, String)> = Vec::new();
+    for p in projections {
+        let written = p.get("field").and_then(Value::as_str).map(str::to_string);
+        let shown = p.get("alias").and_then(Value::as_str).map(str::to_string);
+        let alias_of: Option<String> =
+            written.as_deref().and_then(|w| w.split_once('.')).map(|(a, _)| a).filter(|a| aliases.contains(a)).map(str::to_string);
+        match (written, alias_of) {
+            (Some(w), Some(a)) => {
+                let column = w[a.len() + 1..].to_string();
+                outputs.push(zsql_prep::blend::Output::Dataset { alias: a, column, name: shown.unwrap_or(w) });
+            }
+            (written, _) => {
+                let column = format!("__m{}", model_projections.len());
+                let w = written.clone().unwrap_or_default();
+                let (measure, additive) = field_kind(model, &w);
+                let mut p = p.clone();
+                p["alias"] = json!(column);
+                model_projections.push(p);
+                if !w.is_empty() {
+                    written_of.push((w.to_lowercase(), column.clone()));
+                }
+                outputs.push(zsql_prep::blend::Output::Model { column, name: shown.unwrap_or(w), measure, additive });
+            }
+        }
+    }
+    let mut keys = std::collections::BTreeMap::new();
+    let mut key_only = Vec::new();
+    for j in req.blend.iter().filter(|j| j.to == "model") {
+        for on in &j.on {
+            if keys.contains_key(&on.left) {
+                continue;
+            }
+            let column = match written_of.iter().find(|(w, _)| *w == on.left.to_lowercase()) {
+                Some((_, c)) => c.clone(),
+                None => {
+                    let c = format!("__k{}", key_only.len());
+                    model_projections.push(json!({ "field": on.left, "alias": c }));
+                    key_only.push(c.clone());
+                    c
+                }
+            };
+            keys.insert(on.left.clone(), column);
+        }
+    }
+    spec["projections"] = Value::Array(model_projections);
+    Ok(Split { spec, outputs, keys, key_only })
+}
+
+pub(crate) async fn blend(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, branch)): Params<(String, String)>,
+    headers: HeaderMap,
+    Input(req): Input<BlendRequest>,
+) -> Result<Response, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let model = app.model(&scope.org, &scope.project, &branch)?;
+    let page = crate::exec::page_of(req.offset, req.limit)?;
+    let split = split(&model, &req)?;
+    let (record, _, wait) = {
+        let (app, scope, branch, spec) = (app.clone(), scope.clone(), branch.clone(), split.spec.clone());
+        let (context, connection, wait, fresh) = (req.context.clone(), req.connection.clone(), req.wait, req.fresh);
+        blocking(move || {
+            crate::exec::submit_spec(&app, (&scope.org, &scope.project, &branch), (Some(spec), None), context, connection, wait, fresh)
+        })
+        .await?
+    };
+    let record = crate::exec::settled(&app, record, wait).await?;
+    if !record.status.is_final() {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "running",
+                "model": { "result": record.id },
+                "message": "the model's part is still running in the warehouse; send the same request again, and it is joined to the run",
+            })),
+        )
+            .into_response());
+    }
+    if record.status != Status::Succeeded {
+        let why = record.error.clone().unwrap_or_else(|| format!("{:?}", record.status).to_lowercase());
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable", format!("the model's part did not succeed: {why}")));
+    }
+    let plan = zsql_prep::blend::Blend { datasets: req.datasets, joins: req.blend, outputs: split.outputs };
+    blocking(move || {
+        let path = app.runs.rows(&record).map_err(crate::exec::internal)?;
+        let rows = zsql_exec::page(&path, 0, u64::MAX).map_err(crate::exec::internal)?;
+        let part = zsql_prep::blend::ModelPart { rows, keys: split.keys, key_only: split.key_only };
+        let b = prep.blend(&scope, &plan, &part, &record.sql)?;
+        let (offset, limit) = page;
+        let total = b.rows.num_rows() as u64;
+        let mut skip = offset as usize;
+        let mut left = limit as usize;
+        let mut batches = Vec::new();
+        for batch in &b.rows.batches {
+            if left == 0 {
+                break;
+            }
+            if skip >= batch.num_rows() {
+                skip -= batch.num_rows();
+                continue;
+            }
+            let take = (batch.num_rows() - skip).min(left);
+            batches.push(batch.slice(skip, take));
+            left -= take;
+            skip = 0;
+        }
+        let shown = zsql_datasource::Batches { schema: b.rows.schema.clone(), batches };
+        let rows = zsql_exec::json::rows(&shown).map_err(crate::exec::internal)?;
+        Ok(Json(json!({
+            "columns": zsql_exec::json::columns(&b.rows.schema),
+            "rows": rows,
+            "total": total,
+            "offset": offset,
+            "complete": offset + (rows.len() as u64) >= total,
+            "cache": if b.hit { "hit" } else { "miss" },
+            "model": { "result": record.id, "sql": record.sql },
+            "datasets": b.datasets,
+        }))
+        .into_response())
     })
     .await
 }

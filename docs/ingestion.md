@@ -298,6 +298,17 @@ a change would break, before it is made).
 
 ## Blending with the model at query time
 
+`POST /projects/{uid}/branches/{branch}/blend`, with the owner header:
+a spec whose projections may name `alias.column`, the `datasets`
+attached, and the `blend` joins; `context`, `connection`, `wait` and
+`fresh` as `/run` takes them. The server splits the spec: projections of
+an attached alias are the datasets', the rest and the model keys the
+joins name are the model's, each given an alias of its own so its
+column is known. It plans and runs that as `/run` does, and data prep
+joins the rest. A model part still running is answered 202; the same
+request again is joined to the run. A blend's model part takes no
+calculations yet.
+
 A request attaches one or more datasets, each by id and an alias, and
 **states every join itself**. Datasets are only ever there because the
 request named them, and they are only ever joined the way the request
@@ -570,8 +581,9 @@ know about datasets.
 - [x] **4. A semantic query as a source,** refreshed fresh, by request.
 - [x] **5. Combining datasets.** Joins and appends, the DAG and its
   cascade.
-- [ ] **6. Blends.** Attachment in the spec, the owner header on `/mcp`,
-  the isolation golden test, `filter`, `enrich` with budget against
-  actual, the cache.
+- [x] **6. Blends.** Attachment in the request, the isolation golden
+  test, `filter`, `enrich` as a look-up and as budget against actual,
+  regrouping only what adds up, the cache. The owner header on `/mcp`
+  went with MCP to "Later".
 - [ ] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.
