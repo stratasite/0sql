@@ -387,3 +387,53 @@ fn a_measure_inside_an_aggregate_over_a_truncated_dimension_is_refused_but_a_win
     .unwrap();
     assert!(sql.contains("AS \"Change\""), "{sql}");
 }
+
+/// What explore offers for the spec, as (dimension uids, measure uids).
+fn offers(spec: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let dialects = Dialects::builtin();
+    let lowered = zsql_spec::lower(&zsql_spec::Spec::from_value(spec.clone()).unwrap(), semantic(), &dialects.base().unwrap()).unwrap();
+    let planner = zsql_planner::Planner::new(semantic(), &dialects, None);
+    let e = planner.explore(lowered).unwrap();
+    (e.dimensions.iter().map(|f| f.uid.clone()).collect(), e.measures.iter().map(|f| f.uid.clone()).collect())
+}
+
+#[test]
+fn explore_counts_a_dimension_measure_as_a_measure_not_as_grain() {
+    let plain = serde_json::json!({"projections": [{"field": "store net paid"}]});
+    let with = serde_json::json!({"projections": [{"field": "store net paid"}, customers()]});
+    // Beside a measure whose table reaches the customer, the calculation
+    // takes nothing away: the customer is not a dimension the other
+    // measures must reach.
+    assert_eq!(offers(&with), offers(&plain));
+    // And a query that plans is not answered with nothing.
+    let (dims, measures) = offers(&serde_json::json!({"projections": [{"field": "inventory quantity on hand"}, customers()]}));
+    assert!(!dims.is_empty() && !measures.is_empty());
+    // A synthetic measure is never offered.
+    assert!(!measures.iter().any(|m| m.starts_with("synmsr:")));
+}
+
+#[test]
+fn what_explore_offers_beside_a_dimension_measure_plans() {
+    for base in [
+        serde_json::json!([{"field": "store net paid"}, customers()]),
+        serde_json::json!([{"field": "inventory quantity on hand"}, customers()]),
+        serde_json::json!([customers()]),
+    ] {
+        let (dims, measures) = offers(&serde_json::json!({ "projections": base }));
+        let mut failed = Vec::new();
+        for (uid, kind) in dims.iter().map(|d| (d, "@d")).chain(measures.iter().map(|m| (m, "@m"))) {
+            let mut projections = base.as_array().unwrap().clone();
+            projections.push(serde_json::json!({"field": format!("{uid}{kind}")}));
+            if let Err(e) = plan(serde_json::json!({ "projections": projections })) {
+                failed.push(format!("{uid}{kind}: {e}"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "{} of {} offers do not plan beside {base}:\n{}",
+            failed.len(),
+            dims.len() + measures.len(),
+            failed.join("\n")
+        );
+    }
+}
