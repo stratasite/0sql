@@ -232,7 +232,7 @@ pub fn print_deploy(v: &Value) -> bool {
             "dropped" => {
                 "the credential the server had is gone: this deploy carried none, and it was cleared or the datasource points elsewhere"
             }
-            _ => "no credential: a run needs one in its request",
+            _ => "no credential held: a run sends one in its request where the warehouse asks for one",
         };
         println!("{datasource}: {said}");
     }

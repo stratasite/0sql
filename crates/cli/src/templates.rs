@@ -121,6 +121,16 @@ pub const DATASOURCES_YML: &str = "\
 #   # keys: access_key_id and secret_access_key in .zsql (session_token too), or AWS_ACCESS_KEY_ID and\n\
 #   # AWS_SECRET_ACCESS_KEY, or a profile in ~/.aws/credentials (profile: name, or AWS_PROFILE)\n\
 \n\
+# events:\n\
+#   name: Druid\n\
+#   adapter: druid\n\
+#   tier: hot\n\
+#   host: druid.internal          # the router (8888) or a broker; or url: https://...\n\
+#   port: 8888\n\
+#   schema: druid                 # optional; introspect reads druid and lookup without it\n\
+#   username: zsql                # only when the cluster has an authenticator: the password in .zsql,\n\
+#                                 # or an oauth_token there for one that takes a bearer\n\
+\n\
 # local:\n\
 #   name: Local DuckDB\n\
 #   adapter: duckdb\n\

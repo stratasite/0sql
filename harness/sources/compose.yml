@@ -1,6 +1,7 @@
 # The warehouses zsql-datasource can be proven against without a cloud
 # account, one per transport and then some: Postgres, MySQL and SQL Server
-# on the wire, ClickHouse and Trino over HTTP. SQLite needs no server.
+# on the wire, ClickHouse and Trino over HTTP, and Druid behind a profile
+# (below). SQLite needs no server.
 #
 #   docker compose -f harness/sources/compose.yml up -d --wait
 #   ZSQL_TEST_PG_HOST=localhost ZSQL_TEST_PG_PORT=5466 \
@@ -92,3 +93,54 @@ services:
       timeout: 10s
       retries: 60
       start_period: 120s
+
+  # Druid is five JVMs and a ZooKeeper, about two gigabytes at the
+  # nano-quickstart sizes, which is more than the runner that holds the
+  # five above has to spare. So it is behind a profile: a plain `up`
+  # leaves it out, and its test runs in a job of its own.
+  #
+  #   docker compose -f harness/sources/compose.yml --profile druid up -d --wait druid
+  #   ZSQL_TEST_DRUID_URL=http://localhost:8888 \
+  #     cargo test -p zsql-datasource a_real_druid -- --ignored
+  #
+  # The image has no ZooKeeper and no perl for its own supervisor, so the
+  # processes are started by a shell here, and Druid shares ZooKeeper's
+  # network so the quickstart's `localhost:2181` is ZooKeeper unchanged.
+  # Derby keeps the metadata and a directory the segments, both inside
+  # the one container, which is what makes a single container enough.
+  zookeeper:
+    image: zookeeper:3.9
+    profiles: [druid]
+    # Druid's router, published from here because Druid has no network
+    # of its own.
+    ports: ["8888:8888"]
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: ruok
+
+  druid:
+    image: apache/druid:33.0.0
+    profiles: [druid]
+    network_mode: "service:zookeeper"
+    depends_on: [zookeeper]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        cd /opt/druid
+        conf=conf/druid/single-server/nano-quickstart
+        for s in coordinator-overlord broker router historical middleManager; do
+          bin/run-druid "$$s" "$$conf" &
+        done
+        wait -n
+        exit 1
+    # Ready when the router answers a statement, which needs the broker
+    # behind it to have joined the cluster.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- --header 'Content-Type: application/json'
+          --post-data '{"query":"SELECT 1"}' http://localhost:8888/druid/v2/sql | grep -q EXPR
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 60s

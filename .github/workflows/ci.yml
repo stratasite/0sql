@@ -103,7 +103,8 @@ jobs:
           # ones that need a BigQuery project are run by hand; see
           # docs/exec-layer.md.
           export ADBC_DRIVER_PATH=$(bin/adbc-drivers)
-          cargo test --locked -p zsql-datasource -- --ignored --skip live_bigquery
+          # Druid has a job of its own, below.
+          cargo test --locked -p zsql-datasource -- --ignored --skip live_bigquery --skip a_real_druid
           # The records of runs, in the same Postgres.
           cargo test --locked -p zsql-exec --test postgres -- --ignored
           cargo test --locked -p zsql-cli --test serve -- --ignored
@@ -126,6 +127,34 @@ jobs:
       - name: Warehouses down
         if: always()
         run: docker compose -f harness/sources/compose.yml down -v
+
+  # Druid, apart: five JVMs and a ZooKeeper would crowd the runner the
+  # warehouses above share. The datasource test loads the tables the CLI
+  # test then plans and runs against, so it goes first.
+  druid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Druid
+        run: docker compose -f harness/sources/compose.yml --profile druid up -d --wait --wait-timeout 420 druid
+      - name: The transport, the catalog, and the planner's SQL against it
+        env:
+          ZSQL_TEST_DRUID_URL: http://localhost:8888
+        run: |
+          cargo test --locked -p zsql-datasource a_real_druid -- --ignored
+          cargo test --locked -p zsql-cli --test druid -- --ignored
+      - name: What Druid said
+        if: failure()
+        run: |
+          docker compose -f harness/sources/compose.yml --profile druid ps -a
+          free -m
+          docker compose -f harness/sources/compose.yml --profile druid logs --no-color --tail=120 druid zookeeper
+      - name: Druid down
+        if: always()
+        run: docker compose -f harness/sources/compose.yml --profile druid down -v
 
   # Advisories, licenses and sources of every crate in the tree, from
   # deny.toml. No build, so it is quick and runs on its own.
