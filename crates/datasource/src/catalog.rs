@@ -156,6 +156,7 @@ impl Catalog {
             "mysql" => mysql(src, f)?,
             "sqlserver" => sqlserver(src, f)?,
             "trino" => trino(src, f)?,
+            "druid" => druid(src, f)?,
             "athena" => athena(src, f)?,
             "snowflake" => snowflake(src, f)?,
             "databricks" => databricks(src, f)?,
@@ -201,6 +202,7 @@ impl Catalog {
             "mysql" => mysql(src, &f)?,
             "sqlserver" => sqlserver(src, &f)?,
             "trino" => trino(src, &f)?,
+            "druid" => druid(src, &f)?,
             "athena" => athena(src, &f)?,
             "snowflake" => snowflake(src, &f)?,
             "databricks" => databricks(src, &f)?,
@@ -854,6 +856,59 @@ fn trino(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
         scope_clause("table_schema", "table_name", f)
     );
     assemble(src, f, &tables, &columns)
+}
+
+/// `INFORMATION_SCHEMA` for the shape, as Druid's broker answers it:
+/// the `druid` schema is the datasources, `lookup` the lookups, `view`
+/// any views; `sys` and `INFORMATION_SCHEMA` are left out with the other
+/// system schemas. Druid keeps no comments and no constraints. Two things
+/// come from elsewhere: a datasource's row count from `sys.segments`,
+/// where a user may not be allowed to look and so is read on a best
+/// effort, and a lookup's key, which is `k` by construction.
+fn druid(src: &mut dyn Source, f: &Filter) -> Result<Vec<Table>> {
+    let tables = format!(
+        "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, \
+         CASE WHEN TABLE_TYPE = 'VIEW' THEN 'view' ELSE 'table' END AS table_kind, \
+         CAST(NULL AS VARCHAR) AS row_estimate, CAST(NULL AS VARCHAR) AS table_comment \
+         FROM INFORMATION_SCHEMA.TABLES WHERE {} ORDER BY 1, 2",
+        scope_clause("TABLE_SCHEMA", "TABLE_NAME", f)
+    );
+    // `position` is a function's name in Druid's SQL, so the alias is quoted.
+    let columns = format!(
+        "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, COLUMN_NAME AS column_name, \
+         DATA_TYPE AS data_type, IS_NULLABLE AS is_nullable, \
+         CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) AS max_length, CAST(ORDINAL_POSITION AS VARCHAR) AS \"position\", \
+         CAST(NULL AS VARCHAR) AS column_comment \
+         FROM INFORMATION_SCHEMA.COLUMNS WHERE {} ORDER BY 1, 2, ORDINAL_POSITION",
+        scope_clause("TABLE_SCHEMA", "TABLE_NAME", f)
+    );
+    let mut tables = assemble(src, f, &tables, &columns)?;
+    if tables.iter().any(|t| t.schema.as_deref() == Some("druid")) {
+        let counts = "SELECT \"datasource\" AS table_name, CAST(SUM(\"num_rows\") AS VARCHAR) AS row_estimate \
+                      FROM sys.segments WHERE is_published = 1 AND is_overshadowed = 0 GROUP BY 1";
+        if let Ok(c) = src.query(counts, MAX_TABLES) {
+            apply_druid_counts(&mut tables, &c);
+        }
+    }
+    for t in tables.iter_mut().filter(|t| t.schema.as_deref() == Some("lookup")) {
+        if t.columns.iter().any(|c| c.name == "k") {
+            t.primary_key = vec!["k".into()];
+        }
+    }
+    Ok(tables)
+}
+
+/// The row counts `sys.segments` gives, by datasource, onto the tables of
+/// the `druid` schema.
+pub(crate) fn apply_druid_counts(tables: &mut [Table], c: &Rows) {
+    for r in &c.rows {
+        let (Some(name), Some(n)) = (c.get(r, "table_name"), c.get(r, "row_estimate").and_then(|n| n.parse::<f64>().ok())) else {
+            continue;
+        };
+        if let Some(t) = tables.iter_mut().find(|t| t.schema.as_deref() == Some("druid") && t.name == name) {
+            t.rows = Some(n.max(0.0) as i64).filter(|n| *n > 0);
+        }
+    }
 }
 
 /// `INFORMATION_SCHEMA` of the session's database for the tables and

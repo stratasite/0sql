@@ -21,8 +21,7 @@ Phases are the checklist; tick them off here.
 | MySQL | wire protocol (`mysql_async`) | text |
 | SQL Server | TDS (`tiberius`) | text |
 | SQLite | in this process (`rusqlite`) | text |
-| ClickHouse, Databricks, Trino, Athena | their HTTP APIs | text |
-| Druid | none | none |
+| ClickHouse, Databricks, Trino, Athena, Druid | their HTTP APIs | text |
 
 "Text" means every column is `Utf8`: the truth about what that transport
 is told today. Giving those transports their types is work this plan

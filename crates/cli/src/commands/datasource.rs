@@ -23,7 +23,7 @@ pub enum DatasourceWhat {
     Add {
         /// The key other files refer to it by.
         key: Option<String>,
-        /// The adapter: postgres, mysql, sqlserver, clickhouse, trino, sqlite, duckdb, snowflake, databricks, bigquery, athena, redshift.
+        /// The adapter: postgres, mysql, sqlserver, clickhouse, trino, druid, sqlite, duckdb, snowflake, databricks, bigquery, athena, redshift.
         #[arg(long)]
         adapter: Option<String>,
         /// hot, warm or cold; hot when unsaid.
@@ -105,6 +105,9 @@ fn shape(adapter: &str) -> (&'static [&'static str], Option<&'static str>) {
         "sqlserver" => (&["host", "port", "database", "username", "schema"], Some("password")),
         "clickhouse" => (&["host", "port", "database", "username"], Some("password")),
         "trino" => (&["host", "port", "database", "schema", "username"], Some("password")),
+        // Many clusters run without an authenticator; username is asked
+        // for and may be left empty.
+        "druid" => (&["host", "port", "schema", "username"], Some("password")),
         "sqlite" | "duckdb" => (&["file"], None),
         "snowflake" => (&["account", "database", "warehouse", "schema"], Some("personal_access_token")),
         "databricks" => (&["host", "warehouse", "catalog", "schema"], Some("personal_access_token")),
@@ -120,7 +123,7 @@ fn shape(adapter: &str) -> (&'static [&'static str], Option<&'static str>) {
 fn takes(adapter: &str) -> &'static [&'static str] {
     match adapter {
         "postgres" | "redshift" | "mysql" | "clickhouse" => &["password"],
-        "sqlserver" | "trino" => &["password", "oauth_token"],
+        "sqlserver" | "trino" | "druid" => &["password", "oauth_token"],
         "snowflake" => &["personal_access_token", "private_key", "oauth_token"],
         "databricks" => &["personal_access_token", "oauth_client_id", "oauth_client_secret", "oauth_token"],
         "bigquery" => &["private_key", "client_email", "oauth_token"],
@@ -137,12 +140,13 @@ fn secret_from_stdin() -> Result<String> {
     Ok(s.trim().to_string())
 }
 
-const ADAPTERS: [&str; 12] = [
+const ADAPTERS: [&str; 13] = [
     "postgres",
     "mysql",
     "sqlserver",
     "clickhouse",
     "trino",
+    "druid",
     "sqlite",
     "duckdb",
     "snowflake",
@@ -393,7 +397,8 @@ fn test(dir: &Path, datasource: Option<&str>) -> Result<()> {
     for w in src.warnings() {
         eprintln!("warning: {w}");
     }
-    src.query("SELECT 1 AS one", 1).with_context(|| format!("{}: the connection opened but a statement did not run", conn.uid))?;
+    // `x`, not `one`: Druid reserves that word.
+    src.query("SELECT 1 AS x", 1).with_context(|| format!("{}: the connection opened but a statement did not run", conn.uid))?;
     // The schemas it can see: a read of every schema's tables, counted.
     let cat =
         Catalog::read_filtered(src.as_mut(), &conn.uid, &Filter::schema(None)).with_context(|| format!("{}: listing schemas", conn.uid))?;
@@ -465,9 +470,11 @@ fn add(
                         "sqlserver" => Some("1433"),
                         "clickhouse" => Some("8123"),
                         "trino" => Some("8080"),
+                        "druid" => Some("8888"),
                         _ => None,
                     },
                     "schema" => Some(""),
+                    "username" if adapter == "druid" => Some(""),
                     "warehouse" | "catalog" | "key_file" => Some(""),
                     _ => None,
                 };
@@ -514,7 +521,9 @@ fn add(
     if let Some((field, value)) = secret {
         config::write_secret(dir, &format!("{key}_{field}"), &value)?;
         println!("saved   {field} for {key} in .zsql");
-    } else if let Some(field) = secret_field {
+    } else if let Some(field) = secret_field.filter(|_| adapter != "druid" || values.iter().any(|(k, _)| k == "username")) {
+        // A Druid with no username is a cluster without an authenticator,
+        // and a password is not missing from it.
         println!("note    no {field} yet: put it in .zsql under {key}, or in {}", zsql_datasource::secret_env_var(&key, field));
     }
     if adapter == "bigquery" && !values.iter().any(|(k, _)| k == "key_file") {

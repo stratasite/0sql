@@ -31,7 +31,7 @@ mod sigv4;
 mod source;
 mod tls;
 
-use adapters::{athena, bigquery, clickhouse, databricks, duckdb, mysql, postgres, snowflake, sqlite, sqlserver, trino};
+use adapters::{athena, bigquery, clickhouse, databricks, druid, duckdb, mysql, postgres, snowflake, sqlite, sqlserver, trino};
 
 pub use adapters::postgres::settings as postgres_settings;
 pub use batch::Batches;
@@ -85,7 +85,7 @@ pub fn drivers() -> Option<Vec<(&'static str, Driver)>> {
 /// access token obtained elsewhere and sent as the credential. The ones
 /// that cannot have no bearer login on the protocol spoken here.
 pub fn takes_oauth_token(adapter: &str) -> bool {
-    matches!(adapter, "snowflake" | "bigquery" | "databricks" | "trino" | "sqlserver")
+    matches!(adapter, "snowflake" | "bigquery" | "databricks" | "trino" | "sqlserver" | "druid")
 }
 
 /// Whether what this adapter logs in with is at hand, without
@@ -99,6 +99,9 @@ pub fn credentials_at_hand(conn: &Connection, secrets: &Secrets) -> Option<bool>
         "databricks" => token || secrets.personal_access_token.is_some() || secrets.oauth_client_secret.is_some(),
         "bigquery" => bigquery::at_hand(conn, secrets),
         "athena" => secrets.secret_access_key.is_some(),
+        // A cluster without an authenticator takes nothing; one that has
+        // one is named by the username a password goes with.
+        "druid" => token || secrets.password.is_some() || conn.username.is_none(),
         _ => token || secrets.password.is_some(),
     })
 }
@@ -131,6 +134,7 @@ fn open_adapter(conn: &Connection, secrets: Secrets) -> Result<Box<dyn Source>> 
         "clickhouse" => Ok(Box::new(clickhouse::ClickHouse::open(conn, secret)?)),
         "mysql" => Ok(Box::new(mysql::MySql::open(conn, secret)?)),
         "trino" => Ok(Box::new(trino::Trino::open(conn, secret, secrets.oauth_token)?)),
+        "druid" => Ok(Box::new(druid::Druid::open(conn, secret, secrets.oauth_token)?)),
         "athena" => Ok(Box::new(athena::Athena::open(conn, secrets)?)),
         "sqlserver" => Ok(Box::new(sqlserver::SqlServer::open(conn, secret, secrets.oauth_token)?)),
         "snowflake" => {

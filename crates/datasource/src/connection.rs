@@ -210,8 +210,8 @@ impl Connection {
     /// have. On Postgres, Redshift, SQL Server, Snowflake and Trino it
     /// is the database; on Databricks and Athena the catalog; on
     /// BigQuery the project. MySQL and ClickHouse call their one level
-    /// a database and it is the schema here; SQLite and DuckDB are a
-    /// file. Those four refuse a catalog rather than read past it.
+    /// a database and it is the schema here; Druid has schemas and
+    /// nothing above them; SQLite and DuckDB are a file. Those five refuse a catalog rather than read past it.
     pub fn in_catalog(&mut self, catalog: &str) -> Result<()> {
         let catalog = Some(catalog.trim().to_string());
         match self.adapter.as_str() {
@@ -220,6 +220,7 @@ impl Connection {
             "bigquery" => self.project = catalog,
             "mysql" => return Err(Error::NoCatalogs("MySQL")),
             "clickhouse" => return Err(Error::NoCatalogs("ClickHouse")),
+            "druid" => return Err(Error::NoCatalogs("Druid")),
             "sqlite" => return Err(Error::NoCatalogs("SQLite")),
             "duckdb" => return Err(Error::NoCatalogs("DuckDB")),
             other => return Err(Error::Unsupported(other.to_string())),

@@ -991,8 +991,11 @@ fn filter_to_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Res
         }
         Between => {
             let sql = filter_expression_sql(cx, node, f)?;
-            // Rails passes the node as is_ending for the start value: truthy.
-            format!("{} BETWEEN {} AND {}", sql, lit(cx, f, &value, true)?, lit(cx, f, f.filter_value_end.as_deref().unwrap_or(""), true)?)
+            // The start is a start. Rails passed the node here, which is
+            // truthy, so a relative start snapped to the end of its month
+            // or week and a fixed one on Druid was moved to 23:59:59, each
+            // dropping most of the first period from the range.
+            format!("{} BETWEEN {} AND {}", sql, lit(cx, f, &value, false)?, lit(cx, f, f.filter_value_end.as_deref().unwrap_or(""), true)?)
         }
         InList | ExcludeList => {
             let sql = filter_expression_sql(cx, node, f)?;

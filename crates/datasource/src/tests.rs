@@ -104,9 +104,9 @@ fn a_connection_is_the_keys_the_model_reads_past() {
 
 #[test]
 fn an_unknown_adapter_is_named_rather_than_guessed() {
-    let conn = Connection { uid: "wh".into(), adapter: "druid".into(), ..Default::default() };
+    let conn = Connection { uid: "wh".into(), adapter: "vertica".into(), ..Default::default() };
     let err = open(&conn, Secrets::default()).err().unwrap().to_string();
-    assert!(err.contains("druid is not an adapter this build can reach"), "{err}");
+    assert!(err.contains("vertica is not an adapter this build can reach"), "{err}");
 }
 
 #[test]
@@ -2470,7 +2470,7 @@ fn a_duckdb_catalog_reads_tables_views_columns_comments_and_keys() {
 /// anything: no token endpoint is called and no file is read.
 #[test]
 fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
-    for adapter in ["snowflake", "bigquery", "databricks", "trino", "sqlserver"] {
+    for adapter in ["snowflake", "bigquery", "databricks", "trino", "sqlserver", "druid"] {
         assert!(takes_oauth_token(adapter), "{adapter}");
     }
     for adapter in ["postgres", "redshift", "mysql", "clickhouse", "athena", "sqlite", "duckdb"] {
@@ -2483,6 +2483,7 @@ fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
         ("POST", "/bigquery/v2/projects/p/queries") => (200, bq_result("j0", true, &["one"], serde_json::json!([["1"]]), 1, None)),
         ("POST", "/api/2.0/sql/statements") => (200, dbx_result("s0", "SUCCEEDED", &["one"], serde_json::json!([["1"]]), 1, None, false)),
         ("POST", "/v1/statement") => (200, serde_json::json!({"columns": [{"name": "one"}], "data": [["1"]]}).to_string()),
+        ("POST", "/druid/v2/sql") => (200, "[\"one\"]\n[1]\n\n".to_string()),
         _ => (404, format!("{{\"message\":\"no route {method} {path}\"}}")),
     });
     let token = || Secrets { oauth_token: Some(Secret("user-token".into())), ..Default::default() };
@@ -2493,6 +2494,8 @@ fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
         Connection { uid: "bq".into(), adapter: "bigquery".into(), project: Some("p".into()), ..base.clone() },
         Connection { uid: "dbx".into(), adapter: "databricks".into(), warehouse: Some("w1".into()), ..base.clone() },
         Connection { uid: "trino".into(), adapter: "trino".into(), username: Some("ada".into()), ..base.clone() },
+        // A token wins over a username, which then has nothing to say.
+        Connection { uid: "druid".into(), adapter: "druid".into(), username: Some("ada".into()), ..base.clone() },
     ];
     for conn in cases {
         let before = server.seen.lock().unwrap().len();
@@ -2508,6 +2511,258 @@ fn an_oauth_token_from_upstream_is_the_credential_wherever_one_is_taken() {
         }
     }
 }
+// -------------------------------------------------------------------- druid
+
+/// A Druid on a loopback port that answers every statement with `body`,
+/// and a connection to it.
+fn druid_fake(status: u16, body: &'static str) -> (Fake, Connection) {
+    let server = fake(move |method, path, _| match (method, path) {
+        ("POST", "/druid/v2/sql") => (status, body.to_string()),
+        ("DELETE", p) if p.starts_with("/druid/v2/sql/") => (202, String::new()),
+        _ => (404, format!("{{\"errorMessage\":\"no route {method} {path}\"}}")),
+    });
+    let conn = Connection {
+        uid: "dr".into(),
+        adapter: "druid".into(),
+        url: Some(server.url.clone()),
+        sslmode: SslMode::Disable,
+        query_timeout: Some(7),
+        ..Default::default()
+    };
+    (server, conn)
+}
+
+/// A statement goes as `arrayLines` with a header, in UTC, under Druid's
+/// own timeout, with an id to cancel it by and, for a capped read, one
+/// row past the cap; the answer is read a line a row, nulls as none.
+#[test]
+fn druid_is_asked_for_lines_and_its_rows_are_read_as_they_come() {
+    let (server, conn) = druid_fake(200, "[\"x\",\"y\",\"z\"]\n[1,\"two\",null]\n[2,\"three\",4.5]\n\n");
+    let password = Secrets::password(Some(Secret("pw".into())));
+    let mut src = open(&Connection { username: Some("ada".into()), ..conn.clone() }, password).unwrap();
+    let rows = src.query("SELECT x, y, z FROM t", 10).unwrap();
+    assert_eq!(rows.columns, ["x", "y", "z"]);
+    assert_eq!(rows.rows[0], vec![Some("1".into()), Some("two".into()), None]);
+    assert_eq!(rows.get(&rows.rows[1], "z"), Some("4.5"));
+    assert_eq!((src.adapter(), src.transport()), ("druid", "rest"));
+
+    let seen = server.seen.lock().unwrap();
+    let (_, _, head, body) = &seen[0];
+    assert!(head.to_lowercase().contains("authorization: basic YWRhOnB3".to_lowercase().as_str()), "ada:pw, Basic: {head}");
+    let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(sent["query"], "SELECT x, y, z FROM t");
+    assert_eq!((sent["resultFormat"].as_str(), sent["header"].as_bool()), (Some("arrayLines"), Some(true)));
+    let context = &sent["context"];
+    assert_eq!(context["sqlTimeZone"], "Etc/UTC");
+    assert_eq!(context["timeout"], 7000, "query_timeout, in Druid's milliseconds");
+    assert_eq!(context["sqlOuterLimit"], 11, "one past the cap, so too many is seen and no more is computed");
+    assert!(context["sqlQueryId"].as_str().is_some_and(|id| id.starts_with("zsql-")), "{context}");
+    drop(seen);
+
+    // Streamed, there is no cap and so no outer limit.
+    crate::rows::batch_rows_for_tests(1);
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT x, y, z FROM t").num_rows(), 2);
+    let seen = server.seen.lock().unwrap();
+    let last: serde_json::Value = serde_json::from_str(&seen.last().unwrap().3).unwrap();
+    assert!(last["context"].get("sqlOuterLimit").is_none(), "{last}");
+}
+
+/// A 200 is sent before Druid knows the statement will finish; the
+/// blank line at the end is what says it did. Without it the result is
+/// refused, capped or streamed, never taken for the whole.
+#[test]
+fn a_druid_result_without_its_closing_blank_line_was_cut_short() {
+    let (_server, conn) = druid_fake(200, "[\"x\"]\n[1]\n[2]\n");
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let err = src.query("SELECT x FROM t", 10).unwrap_err().to_string();
+    assert!(err.contains("cut short"), "{err}");
+    let err = src.stream("SELECT x FROM t", &mut Kept::default()).unwrap_err().to_string();
+    assert!(err.contains("cut short"), "{err}");
+    // A line that is not a row is Druid's error in place of one.
+    let (_server, conn) = druid_fake(200, "[\"x\"]\n[1]\n{\"error\":\"Unknown exception\"\n");
+    let err = open(&conn, Secrets::default()).unwrap().query("SELECT x FROM t", 10).unwrap_err().to_string();
+    assert!(err.contains("Unknown exception"), "{err}");
+}
+
+/// Past the cap the read refuses, and the statement is cancelled by its
+/// id rather than left to run.
+#[test]
+fn a_druid_read_past_its_cap_refuses_and_cancels_the_statement() {
+    let (server, conn) = druid_fake(200, "[\"x\"]\n[1]\n[2]\n[3]\n\n");
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let err = src.query("SELECT x FROM t", 2).unwrap_err().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    let seen = server.seen.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&seen[0].3).unwrap();
+    let id = sent["context"]["sqlQueryId"].as_str().unwrap();
+    assert_eq!(seen.get(1).map(|s| (s.0.as_str(), s.1.clone())), Some(("DELETE", format!("/druid/v2/sql/{id}"))));
+}
+
+/// A refusal says what Druid said, with its category; a write is
+/// refused before anything is sent; a password with no user to go with
+/// it is named rather than sent as half a login.
+#[test]
+fn druid_refusals_are_its_own_words_and_writes_never_leave() {
+    let (server, conn) = druid_fake(
+        400,
+        r#"{"error":"druidException","errorCode":"invalidInput","persona":"USER","category":"INVALID_INPUT","errorMessage":"Column 'nope' not found in any table"}"#,
+    );
+    let mut src = open(&conn, Secrets::default()).unwrap();
+    let err = src.query("SELECT nope FROM t", 10).unwrap_err().to_string();
+    assert!(err.contains("400: Column 'nope' not found in any table (INVALID_INPUT)"), "{err}");
+    assert!(src.query("INSERT INTO t SELECT * FROM u", 10).is_err());
+    assert_eq!(server.seen.lock().unwrap().len(), 1, "the write was never sent");
+    assert!(!server.seen.lock().unwrap()[0].2.to_lowercase().contains("authorization"), "no authenticator, no header");
+
+    let err = open(&conn, Secrets::password(Some(Secret("pw".into())))).err().unwrap().to_string();
+    assert!(err.contains("has no username to go with its password"), "{err}");
+}
+
+/// The counts `sys.segments` gives land on the datasources they name,
+/// and only in the `druid` schema.
+#[test]
+fn druid_row_counts_land_on_their_datasources() {
+    let table = |schema: &str, name: &str| Table {
+        schema: Some(schema.into()),
+        name: name.into(),
+        kind: "table".into(),
+        rows: None,
+        comment: None,
+        columns: vec![],
+        primary_key: vec![],
+        foreign_keys: vec![],
+    };
+    let mut tables = vec![table("druid", "posts"), table("lookup", "posts"), table("druid", "empty")];
+    let counts = Rows {
+        columns: vec!["table_name".into(), "row_estimate".into()],
+        rows: vec![vec![Some("posts".into()), Some("4".into())], vec![Some("empty".into()), Some("0".into())]],
+    };
+    catalog::apply_druid_counts(&mut tables, &counts);
+    assert_eq!(tables.iter().map(|t| t.rows).collect::<Vec<_>>(), [Some(4), None, None]);
+}
+
+/// Druid against a router the environment names, `ZSQL_TEST_DRUID_URL`:
+/// the profile `druid` in harness/sources/compose.yml. The tables it
+/// reads are loaded here when they are not there yet, through SQL
+/// ingestion and the lookup API, so a fresh container is enough.
+#[test]
+#[ignore]
+fn a_real_druid_answers_streams_cancels_and_its_catalog_reads() {
+    let url = std::env::var("ZSQL_TEST_DRUID_URL").expect("ZSQL_TEST_DRUID_URL");
+    druid_seed(&url);
+    let conn = Connection { uid: "dr".into(), adapter: "druid".into(), url: Some(url), sslmode: SslMode::Disable, ..Default::default() };
+    let mut src = open(&conn, Secrets::default()).expect("opens");
+    // `one` is a keyword in Druid's SQL, so these are letters.
+    let rows = src.query("SELECT 1 AS x, 'two' AS y, CAST(NULL AS VARCHAR) AS z", 10).expect("reads");
+    assert_eq!(rows.columns, ["x", "y", "z"]);
+    assert_eq!((rows.get(&rows.rows[0], "x"), rows.get(&rows.rows[0], "z")), (Some("1"), None));
+    let err = src.query("SELECT title FROM posts", 2).err().unwrap().to_string();
+    assert!(err.contains("more than the 2 rows"), "{err}");
+    let all = src.query("SELECT title FROM posts", 4).expect("exactly at the cap");
+    assert_eq!(all.rows.len(), 4);
+    crate::rows::batch_rows_for_tests(2);
+    assert_eq!(streams_as_it_queries(src.as_mut(), "SELECT title FROM posts ORDER BY __time").num_rows(), 4);
+    streams_as_it_queries(src.as_mut(), "SELECT title FROM posts WHERE id < 0");
+    let ts = src.query("SELECT __time FROM posts ORDER BY __time LIMIT 1", 1).unwrap();
+    assert_eq!(ts.rows[0][0].as_deref(), Some("2024-01-01T13:00:00.000Z"), "UTC, as the dialect assumes");
+    let err = src.query("SELECT nope FROM posts", 1).err().unwrap().to_string();
+    assert!(err.contains("nope") && err.contains("400"), "{err}");
+    assert!(src.query("INSERT INTO posts SELECT * FROM posts", 1).is_err());
+
+    let cat = Catalog::read(src.as_mut(), "dr", Some("druid")).expect("reads");
+    pages_agree(src.as_mut(), &cat, Some("druid"), 2);
+    a_search_means_its_underscores(src.as_mut(), Some("druid"), "ST_T", "post_tags", "s_s");
+    let posts = cat.table(Some("druid"), "posts").expect("druid.posts");
+    assert_eq!((posts.kind.as_str(), posts.rows), ("table", Some(4)), "the count from sys.segments");
+    let names: Vec<&str> = posts.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["__time", "id", "user_id", "title", "published", "views"]);
+    assert_eq!(posts.columns[0].data_type, "TIMESTAMP");
+    assert!(!posts.columns[0].nullable);
+    assert!(posts.primary_key.is_empty() && posts.foreign_keys.is_empty(), "Druid keeps no constraints");
+
+    // Every schema but the system ones: the lookups too, keyed on k.
+    let every = Catalog::read(src.as_mut(), "dr", None).expect("reads");
+    assert!(every.tables.iter().all(|t| !matches!(t.schema.as_deref(), Some("sys" | "INFORMATION_SCHEMA"))));
+    let status = every.table(Some("lookup"), "post_status").expect("lookup.post_status");
+    assert_eq!(status.primary_key, ["k"]);
+    assert_eq!(status.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["k", "v"]);
+}
+
+/// The tables the live test reads, loaded once: three datasources by SQL
+/// ingestion and one lookup, waited for until a query sees each.
+fn druid_seed(url: &str) {
+    let agent = ureq::Agent::new_with_config(ureq::config::Config::builder().http_status_as_error(false).build());
+    let sql = |q: &str| -> serde_json::Value {
+        let mut r = agent.post(&format!("{url}/druid/v2/sql")).send_json(serde_json::json!({ "query": q })).expect("sql");
+        r.body_mut().read_json().unwrap_or_default()
+    };
+    let present = |schema: &str, names: &[&str]| -> usize {
+        let list = names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+        sql(&format!("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME IN ({list})"))
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    let datasources = [
+        (
+            "posts",
+            "created_at,id,user_id,title,published,views\n2024-01-01 13:00:00,1,1,First Post,1,10\n2024-01-01 14:00:00,2,1,Draft Post,0,0\n\
+             2024-01-02 09:00:00,3,2,Second Post,1,25\n2024-01-03 10:00:00,4,3,Third Post,1,7",
+            "id BIGINT, user_id BIGINT, title VARCHAR, published VARCHAR, views BIGINT",
+        ),
+        (
+            "users",
+            "created_at,id,name,email\n2024-01-01 10:00:00,1,John Doe,john@example.com\n2024-01-01 11:00:00,2,Jane Smith,jane@example.com\n\
+             2024-01-01 12:00:00,3,Bob Johnson,bob@example.com",
+            "id BIGINT, name VARCHAR, email VARCHAR",
+        ),
+        ("post_tags", "created_at,post_id,tag\n2024-01-01 13:00:00,1,intro\n2024-01-02 09:00:00,3,news", "post_id BIGINT, tag VARCHAR"),
+    ];
+    let names: Vec<&str> = datasources.iter().map(|d| d.0).collect();
+    if present("druid", &names) < names.len() {
+        for (name, csv, columns) in datasources {
+            let cols: Vec<&str> = columns.split(", ").map(|c| c.split(' ').next().unwrap()).collect();
+            let source = serde_json::json!({"type": "inline", "data": csv}).to_string().replace('\'', "''");
+            let q = format!(
+                "REPLACE INTO {name} OVERWRITE ALL SELECT TIME_PARSE(created_at, 'yyyy-MM-dd HH:mm:ss') AS __time, {} \
+                 FROM TABLE(EXTERN('{source}', '{{\"type\":\"csv\",\"findColumnsFromHeader\":true}}')) \
+                 EXTEND (created_at VARCHAR, {columns}) PARTITIONED BY DAY",
+                cols.join(", ")
+            );
+            let body = serde_json::json!({"query": q, "context": {"maxNumTasks": 2, "waitUntilSegmentsLoad": true}});
+            let mut r = agent.post(&format!("{url}/druid/v2/sql/task")).send_json(body).expect("submits");
+            let task: serde_json::Value = r.body_mut().read_json().expect("a task");
+            let id = task["taskId"].as_str().unwrap_or_else(|| panic!("{name}: {task}")).to_string();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(240);
+            loop {
+                let mut r = agent.get(&format!("{url}/druid/indexer/v1/task/{id}/status")).call().expect("status");
+                let v: serde_json::Value = r.body_mut().read_json().unwrap_or_default();
+                match v.pointer("/status/statusCode").and_then(|s| s.as_str()) {
+                    Some("SUCCESS") => break,
+                    Some("FAILED") => panic!("{name}: {v}"),
+                    _ if std::time::Instant::now() > until => panic!("{name}: still {v}"),
+                    _ => std::thread::sleep(std::time::Duration::from_secs(2)),
+                }
+            }
+        }
+    }
+    if present("lookup", &["post_status"]) == 0 {
+        let config = format!("{url}/druid/coordinator/v1/lookups/config");
+        // The lookup configuration has to exist before a lookup is put in it.
+        let _ = agent.post(&config).send_json(serde_json::json!({}));
+        let lookup = serde_json::json!({"__default": {"post_status": {
+            "version": "v1",
+            "lookupExtractorFactory": {"type": "map", "map": {"0": "draft", "1": "published"}}
+        }}});
+        let r = agent.post(&config).send_json(lookup).expect("a lookup");
+        assert!(r.status().is_success(), "{}", r.status());
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while present("druid", &names) < names.len() || present("lookup", &["post_status"]) == 0 {
+        assert!(std::time::Instant::now() < until, "the datasources and the lookup never became queryable");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 // ------------------------------------------------------------------ listing
 
 /// A listing walked page by page names exactly the tables a whole read
@@ -2578,6 +2833,7 @@ fn a_page_is_cut_in_each_engines_own_words() {
     assert_eq!(list("trino"), "SELECT 1 ORDER BY 1, 2 OFFSET 200 LIMIT 101");
     assert_eq!(list("athena"), list("trino"));
     assert_eq!(list("sqlserver"), "SELECT 1 ORDER BY 1, 2 OFFSET 200 ROWS FETCH NEXT 101 ROWS ONLY");
+    assert_eq!(list("druid"), list("postgres"));
 }
 
 #[test]
@@ -2620,7 +2876,7 @@ fn a_connection_sent_whole_is_read_as_the_file_is_and_a_catalog_lands_where_the_
         };
         assert_eq!(got.as_deref(), Some("x"), "{adapter}");
     }
-    for adapter in ["mysql", "clickhouse", "sqlite", "duckdb"] {
+    for adapter in ["mysql", "clickhouse", "druid", "sqlite", "duckdb"] {
         let err = Connection { adapter: adapter.into(), ..Default::default() }.in_catalog("x").unwrap_err().to_string();
         assert!(err.contains("has no catalogs"), "{adapter}: {err}");
     }
@@ -2703,4 +2959,10 @@ fn a_credential_is_at_hand_only_when_the_adapter_takes_it() {
     let token = Secrets { oauth_token: secret("t"), ..Default::default() };
     assert_eq!((credentials_at_hand(&of("trino"), &token), credentials_at_hand(&of("mysql"), &token)), (Some(true), Some(false)));
     assert_eq!(credentials_at_hand(&of("bigquery"), &token), Some(true));
+    // A Druid cluster without an authenticator takes nothing; naming a
+    // user says it has one, and then the password or a token is wanted.
+    assert_eq!(credentials_at_hand(&of("druid"), &Secrets::default()), Some(true));
+    let named = Connection { username: Some("ada".into()), ..of("druid") };
+    assert_eq!(credentials_at_hand(&named, &Secrets::default()), Some(false));
+    assert_eq!((credentials_at_hand(&named, &password), credentials_at_hand(&named, &token)), (Some(true), Some(true)));
 }

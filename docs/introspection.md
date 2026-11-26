@@ -409,7 +409,7 @@ statements.
 **What splits the thirteen is not difficulty but verifiability.** Five
 cannot be tested without a real account and a real bill: Snowflake,
 BigQuery, Databricks, Redshift and Athena. The other eight run here and in
-CI — Postgres, MySQL, SQL Server, ClickHouse and Trino in containers,
+CI — Postgres, MySQL, SQL Server, ClickHouse, Trino and Druid in containers,
 SQLite and DuckDB with no server at all — and between them they exercise
 **all three transports**, HTTP included, through ClickHouse and Trino. That
 is why the phases below build every transport at once against containers,
