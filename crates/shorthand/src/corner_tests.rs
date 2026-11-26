@@ -257,6 +257,18 @@ fn decorators_nest_and_check_their_arguments() {
 }
 
 #[test]
+fn an_unaliased_calculation_is_named_by_its_words() {
+    let s = spec("calc(sum([Net Paid]@m) / count([Order Id]@m)), calc(1000), calc('%'), calc(a) as \"Net (gross)\"");
+    let c = s["calculations"].as_array().unwrap();
+    assert_eq!(c[0]["alias"], "sum_net_paid_count_order_id", "never the formula: BigQuery refuses it as a column name");
+    assert_eq!(c[1]["alias"], "calc_1000", "a name does not begin with a digit");
+    assert_eq!(c[2]["alias"], "calc", "nor is it empty");
+    assert_eq!(c[3]["alias"], "Net (gross)", "an alias given is kept as written");
+    let long = spec(&format!("calc({})", ["[Some Measure]@m"; 10].join(" + ")));
+    assert!(long["calculations"][0]["alias"].as_str().unwrap().len() <= 63);
+}
+
+#[test]
 fn calculations_at_their_edges() {
     let s = spec("calc(a) as X, calc(a, integer), calc('a, )b' || ')'), calc((1 + (2))), calc(\"a)\"), calc([a)]@m), calc(a) desc, calc(a) as X {\"data_type\": \"string\"}");
     let c = s["calculations"].as_array().unwrap();

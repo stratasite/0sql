@@ -332,7 +332,10 @@ calc(1000) as Target
 A calculation is `calc(...)` around its SQL, and nothing else is: `=`
 only ever means a filter, so the parser never reads SQL to classify
 an item. The alias follows as `as`, and when none is given the
-formula's text is its own alias, as now. The result type is an
+formula's words, lower-cased and joined by `_`, name it:
+`calc(sum([Net Paid]@m) / 100)` is `sum_net_paid_100`. The formula
+itself is no name a warehouse is sure to take; BigQuery refuses it.
+The result type is an
 optional last argument after a top-level comma. The lexer finds the
 closing parenthesis by balancing parentheses and single quotes, so
 `coalesce([A]@m, 0)` and `'a, b'` keep their commas; a top-level comma

@@ -137,7 +137,7 @@ fn projection(p: &Projection) -> Result<(Value, bool), String> {
         }
         Expr::Calc { sql, data_type } => {
             m.insert("calculation".into(), Value::Bool(true));
-            m.insert("alias".into(), Value::String(p.alias.clone().unwrap_or_else(|| sql.clone())));
+            m.insert("alias".into(), Value::String(p.alias.clone().unwrap_or_else(|| calc_alias(sql))));
             m.insert("sql".into(), Value::String(sql.clone()));
             if let Some(t) = data_type {
                 m.insert("data_type".into(), Value::String(t.clone()));
@@ -158,6 +158,24 @@ fn projection(p: &Projection) -> Result<(Value, bool), String> {
         m.insert("decorators".into(), Value::Array(decorators));
     }
     Ok((Value::Object(m), is_calc))
+}
+
+/// The name an unaliased calculation goes by: the formula's words,
+/// lower-cased and joined by `_`, so `sum([Net Paid]@m) / 100` is
+/// `sum_net_paid_100`. A formula is not a column name any warehouse is
+/// sure to accept; this is. Capped at 63 characters, Postgres's limit.
+fn calc_alias(sql: &str) -> String {
+    let sql = sql.replace("]@m", "]").replace("]@d", "]").replace("]@M", "]").replace("]@D", "]");
+    let words: Vec<String> = sql.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    let mut alias = words.join("_");
+    if alias.is_empty() || alias.starts_with(|c: char| c.is_ascii_digit()) {
+        alias = if alias.is_empty() { "calc".into() } else { format!("calc_{alias}") };
+    }
+    if alias.len() > 63 {
+        alias.truncate(63);
+        alias = alias.trim_end_matches('_').to_string();
+    }
+    alias
 }
 
 fn decorator(func: &str, n: Option<i64>, by: &[Field], order: &[(Field, String)]) -> Value {
