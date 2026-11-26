@@ -52,6 +52,17 @@ pub struct Dataset {
     /// What the last job said: a column gone, a type widened.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Set when the latest snapshots lack columns the recipe reads: the
+    /// recipe has not run on them, and what is live is older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
+}
+
+/// Why a dataset's latest snapshots have not been made into a version.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Held {
+    pub since: String,
+    pub unresolved: Vec<crate::compile::Unresolved>,
 }
 
 /// A source of a dataset, as it stands.

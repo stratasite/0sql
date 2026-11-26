@@ -9,10 +9,13 @@
 //! GET    /projects/{uid}/datasets/{id}
 //! DELETE /projects/{uid}/datasets/{id}                    a hard delete
 //! PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV, a new snapshot, and the recipe run over it
-//! GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=
+//! GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=&sort=col:desc,col&filter=<formula>
 //! GET    /projects/{uid}/datasets/{id}/lineage            ?version=
 //! GET    /projects/{uid}/datasets/{id}/recipe             ?version=
 //! POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
+//! POST   /projects/{uid}/datasets/{id}/preview            {"steps": [...], "roles": {...}, "upto": n, "limit": n}: over a sample, kept nowhere
+//! GET    /projects/{uid}/datasets/{id}/impact             ?column=: what reads it
+//! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
 //! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 //! DELETE /datasets                                        every dataset of this owner in the org
 //! ```
@@ -30,7 +33,7 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use zsql_prep::{Change, CsvOptions, Owner, Prep, Scope, Upload};
+use zsql_prep::{Change, CsvOptions, Owner, Prep, Preview, Scope, SortKey, Upload, View};
 
 /// The header that names whose datasets a request is about.
 pub const OWNER_HEADER: &str = "zsql-owner";
@@ -186,6 +189,26 @@ pub(crate) struct PageQuery {
     offset: Option<u64>,
     limit: Option<u64>,
     version: Option<u32>,
+    /// `column`, or `column:desc`, comma-separated.
+    sort: Option<String>,
+    /// A formula, true for the rows shown.
+    filter: Option<String>,
+}
+
+fn sort_keys(sort: Option<&str>) -> Result<Vec<SortKey>, ApiError> {
+    let Some(sort) = sort else { return Ok(Vec::new()) };
+    sort.split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            let (column, dir) = k.rsplit_once(':').unwrap_or((k, "asc"));
+            match dir {
+                "asc" => Ok(SortKey { column: column.to_string(), desc: false }),
+                "desc" => Ok(SortKey { column: column.to_string(), desc: true }),
+                _ => Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{k}' sorts by a column, then :asc or :desc"))),
+            }
+        })
+        .collect()
 }
 
 /// The most rows a page holds.
@@ -203,8 +226,10 @@ pub(crate) async fn rows(
     if limit == 0 || limit > PAGE_MAX {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("limit is 1 to {PAGE_MAX}")));
     }
+    let sort = sort_keys(q.sort.as_deref())?;
     blocking(move || {
-        let page = prep.page(&scope, &id, q.version, q.offset.unwrap_or(0), limit)?;
+        let view = View { sort: &sort, filter: q.filter.as_deref() };
+        let page = prep.page(&scope, &id, q.version, q.offset.unwrap_or(0), limit, &view)?;
         let rows = zsql_exec::json::rows(&page.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
         Ok(Json(json!({
             "version": page.version,
@@ -254,6 +279,62 @@ pub(crate) async fn change(
 ) -> Result<Json<Value>, ApiError> {
     let (prep, scope) = scope(&app, org, uid, &headers)?;
     blocking(move || Ok(Json(shown(&prep.change(&scope, &id, change)?)))).await
+}
+
+pub(crate) async fn preview(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    headers: HeaderMap,
+    Input(preview): Input<Preview>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || {
+        let p = prep.preview(&scope, &id, preview)?;
+        let rows = zsql_exec::json::rows(&p.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
+        let unresolved: Vec<String> = p.unresolved.iter().map(zsql_prep::Unresolved::describe).collect();
+        Ok(Json(json!({ "columns": p.columns, "rows": rows, "unresolved": unresolved, "sample": p.sample })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImpactQuery {
+    column: String,
+}
+
+pub(crate) async fn impact(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    Search(q): Search<ImpactQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || {
+        let readers = prep.impact(&scope, &id, &q.column)?;
+        let said: Vec<String> = readers.iter().map(zsql_prep::Unresolved::describe).collect();
+        Ok(Json(json!({ "column": q.column, "readers": readers, "said": said })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Against {
+    against: u32,
+}
+
+pub(crate) async fn confirm(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    headers: HeaderMap,
+    Input(a): Input<Against>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || Ok(Json(shown(&prep.confirm(&scope, &id, a.against)?)))).await
 }
 
 #[derive(Deserialize, Default)]

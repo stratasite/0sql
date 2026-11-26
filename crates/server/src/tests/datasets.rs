@@ -161,6 +161,58 @@ async fn a_dataset_through_its_routes() {
     assert_eq!(a.body["datasets"].as_array().unwrap().len(), 1, "another org's are not touched");
 }
 
+impl Server {
+    async fn post_as_ann(&self, path: &str, body: Value) -> Answer {
+        self.send(Method::POST, path, &[ann()], Some(("application/json", serde_json::to_vec(&body).unwrap()))).await
+    }
+}
+
+/// Steps, a preview, a page sorted and filtered for viewing, what reads
+/// a column, and a hold confirmed.
+#[tokio::test]
+async fn a_recipe_of_steps_through_its_routes() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let base = format!("/projects/{CS}/datasets");
+    let a = s.upload(&base, Some("user-ann"), "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n").await;
+    let id = a.body["id"].as_str().unwrap().to_string();
+    let steps = json!([
+        { "op": "remap", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
+        { "op": "formula", "column": "label", "formula": "region & '/' & store" },
+    ]);
+
+    let a = s.post_as_ann(&format!("{base}/{id}/preview"), json!({ "steps": steps, "limit": 1 })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["rows"], json!([["New York", "a", 10, "New York/a"]]));
+    let a = s.post_as_ann(&format!("{base}/{id}/preview"), json!({ "steps": [{ "op": "sql", "sql": "select 1" }] })).await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "an unknown step is not a step: {}", a.body);
+
+    let a = s.post_as_ann(&format!("{base}/{id}/recipe"), json!({ "against": 1, "steps": steps })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/rows?sort=amount:desc&filter=amount%20%3C%2010")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["total"], 2);
+    assert_eq!(a.body["rows"], json!([["New York", "c", 7, "New York/c"], ["CA", "b", 5, "CA/b"]]));
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/rows?sort=amount:sideways")).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/impact?column=store")).await;
+    assert_eq!(a.body["said"], json!(["step 2 (formula) reads column 'store', which is not there at that step"]), "{}", a.body);
+
+    // A new snapshot without `store` holds the dataset; confirming drops the formula.
+    let a = s.send(Method::PUT, &format!("{base}/{id}/upload"), &[ann()], Some(("text/csv", b"region,amount\nNY,1\n".to_vec()))).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["held"]["unresolved"][0]["column"], "store", "{}", a.body);
+    assert_eq!(a.body["live"], 2);
+    let a = s.post_as_ann(&format!("{base}/{id}/confirm"), json!({ "against": 2 })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(a.body.get("held").is_none());
+    assert_eq!((a.body["live"].as_u64(), a.body["recipe"].as_u64()), (Some(3), Some(3)));
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/rows")).await;
+    assert_eq!(a.body["rows"], json!([["New York", 1]]));
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));

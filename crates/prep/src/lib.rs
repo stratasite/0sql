@@ -22,15 +22,17 @@
 //! - `snapshot`: rows that arrived, typed and met with their source's
 //! - `schema`: column types and roles, and how a type evolves
 //! - `recipe`: recipe versions and their steps
-//! - `compile`: a recipe as the engine's SQL
+//! - `formula`: the formula language, compiled to the engine's SQL
+//! - `compile`: a recipe as the engine's SQL, and the column graph
 //! - `engine`: DuckDB, in memory, with external access off
 //! - `materialize`: running a recipe, and pages of what it made
 //! - `lineage`: what each materialization was made from
 //! - `store`: where datasets are kept, and the only module that knows
 
-mod compile;
+pub mod compile;
 pub mod engine;
 pub mod error;
+pub mod formula;
 pub mod lineage;
 mod materialize;
 pub mod recipe;
@@ -40,13 +42,15 @@ pub mod source;
 pub mod store;
 pub mod time;
 
+pub use compile::Unresolved;
 pub use engine::{Engine, EngineLimits};
 pub use error::{Error, Result};
 pub use lineage::Lineage;
-pub use recipe::{Change, Recipe};
+pub use materialize::View;
+pub use recipe::{Change, Recipe, SortKey, Step};
 pub use schema::{Column, ColumnType, Role};
 pub use source::CsvOptions;
-pub use store::{Dataset, Materialization, Snapshot, Store, DIR};
+pub use store::{Dataset, Held, Materialization, Snapshot, Store, DIR};
 
 use sha2::Digest;
 use std::collections::HashSet;
@@ -126,6 +130,28 @@ pub struct Page {
     pub offset: u64,
     pub rows: Batches,
 }
+
+/// What a preview is asked for.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preview {
+    pub steps: Option<Vec<Step>>,
+    pub roles: Option<std::collections::BTreeMap<String, Role>>,
+    pub upto: Option<usize>,
+    pub limit: Option<u64>,
+}
+
+/// A preview's answer.
+pub struct Previewed {
+    pub columns: Vec<Column>,
+    pub rows: Batches,
+    pub unresolved: Vec<Unresolved>,
+    /// How many rows of each source it was made from, at most.
+    pub sample: usize,
+}
+
+/// How many rows of each source a preview reads.
+const PREVIEW_SAMPLE: usize = 1000;
 
 /// The longest name a dataset is given.
 const NAME_LIMIT: usize = 200;
@@ -224,10 +250,13 @@ impl Prep {
                 columns: Vec::new(),
                 rows: 0,
                 notes: Vec::new(),
+                held: None,
             };
             let recipe = Recipe::first(now);
             store::write_json(&store::recipe_path(&staging, 1), &recipe)?;
-            self.materialize(&staging, &mut dataset, &recipe)?;
+            if self.materialize(&staging, &mut dataset, &recipe)?.is_some() {
+                return Err(Error::Internal("a first recipe has no steps to hold it".into()));
+            }
             store::write_json(&staging.join(store::MANIFEST), &dataset)?;
             let target = root.join(&id);
             std::fs::rename(&staging, &target).map_err(|e| Error::io(&target, e))?;
@@ -266,10 +295,25 @@ impl Prep {
         dataset.updated = time::now();
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let made = self.materialize(&dir, &mut dataset, &recipe);
-        if made.is_err() {
-            // The snapshot is what arrived, and stays; what is live does not change.
-            dataset.notes =
-                vec![format!("snapshot {n} was taken and the recipe failed on it; version {} is still live", dataset.live.unwrap_or(0))];
+        match &made {
+            Ok(None) => dataset.held = None,
+            Ok(Some(unresolved)) => {
+                // Columns the recipe reads are gone: nothing is made, what
+                // is live stays, and each reader is named.
+                dataset.notes = snapshot_notes(&dir, &dataset);
+                dataset.notes.push(format!(
+                    "snapshot {n} is held: {}; change the recipe, or confirm to drop those steps",
+                    unresolved.iter().map(Unresolved::describe).collect::<Vec<_>>().join("; ")
+                ));
+                dataset.held = Some(Held { since: time::now(), unresolved: unresolved.clone() });
+            }
+            Err(_) => {
+                // The snapshot is what arrived, and stays; what is live does not change.
+                dataset.notes = vec![format!(
+                    "snapshot {n} was taken and the recipe failed on it; version {} is still live",
+                    dataset.live.unwrap_or(0)
+                )];
+            }
         }
         store::write_json(&dir.join(store::MANIFEST), &dataset)?;
         made?;
@@ -277,24 +321,115 @@ impl Prep {
     }
 
     /// A new version of the recipe, made against the latest, and run.
-    /// Nothing is kept unless the run succeeds.
+    /// Nothing is kept unless the run succeeds; a recipe that reads a
+    /// column not there at its step is refused, naming each.
     pub fn change(&self, scope: &Scope, id: &str, change: Change) -> Result<Dataset> {
         let (dir, _) = self.find(scope, id)?;
         let _job = self.job(&dir)?;
         let (_, dataset) = self.find(scope, id)?;
         let current: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let recipe = current.changed(change, time::now())?;
-        let known: Vec<&str> = dataset.columns.iter().map(|c| c.name.as_str()).collect();
-        if let Some(name) = recipe.roles.keys().find(|n| !known.contains(&n.as_str())) {
-            return Err(Error::Invalid(format!("a role is given to column '{name}', which the dataset does not have")));
+        self.commit(&dir, dataset, recipe)
+    }
+
+    /// Takes a held dataset past what held it: a recipe version without
+    /// the steps and roles that read the columns that are gone, run
+    /// over the latest snapshots.
+    pub fn confirm(&self, scope: &Scope, id: &str, against: u32) -> Result<Dataset> {
+        let (dir, _) = self.find(scope, id)?;
+        let _job = self.job(&dir)?;
+        let (_, dataset) = self.find(scope, id)?;
+        let Some(held) = dataset.held.clone() else {
+            return Err(Error::Invalid(format!("dataset {id} is not held; there is nothing to confirm")));
+        };
+        let current: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
+        let dropped: Vec<usize> = held.unresolved.iter().map(|u| u.step).collect();
+        let roles = current.roles.iter().filter(|(n, _)| !held.unresolved.iter().any(|u| u.step == 0 && &u.column == *n));
+        let change = Change {
+            against,
+            roles: roles.map(|(n, r)| (n.clone(), *r)).collect(),
+            steps: current.steps.iter().enumerate().filter(|(i, _)| !dropped.contains(&(i + 1))).map(|(_, s)| s.clone()).collect(),
+        };
+        let recipe = current.changed(change, time::now())?;
+        self.commit(&dir, dataset, recipe)
+    }
+
+    /// Runs a new recipe version and, when it makes a materialization,
+    /// keeps both.
+    fn commit(&self, dir: &Path, dataset: Dataset, recipe: Recipe) -> Result<Dataset> {
+        let mut next = dataset;
+        if let Some(unresolved) = self.materialize(dir, &mut next, &recipe)? {
+            return Err(Error::Invalid(format!(
+                "the recipe reads columns that are not there: {}",
+                unresolved.iter().map(Unresolved::describe).collect::<Vec<_>>().join("; ")
+            )));
         }
-        let mut next = dataset.clone();
-        self.materialize(&dir, &mut next, &recipe)?;
-        store::write_json(&store::recipe_path(&dir, recipe.version), &recipe)?;
+        store::write_json(&store::recipe_path(dir, recipe.version), &recipe)?;
         next.recipe = recipe.version;
         next.updated = time::now();
+        next.held = None;
         store::write_json(&dir.join(store::MANIFEST), &next)?;
         Ok(next)
+    }
+
+    /// A recipe's result over a sample of the latest snapshots, kept
+    /// nowhere: what the grid shows while a step is being made. The
+    /// steps are the recipe's, the first `upto` of them, or the ones
+    /// given.
+    pub fn preview(&self, scope: &Scope, id: &str, preview: Preview) -> Result<Previewed> {
+        let (dir, dataset) = self.find(scope, id)?;
+        let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
+        let mut steps = preview.steps.unwrap_or(recipe.steps);
+        if steps.len() > recipe::STEPS_LIMIT {
+            return Err(Error::Invalid(format!("a recipe has at most {} steps", recipe::STEPS_LIMIT)));
+        }
+        if let Some(n) = preview.upto {
+            steps.truncate(n);
+        }
+        let roles = preview.roles.unwrap_or(recipe.roles);
+        let pinned_at = time::now();
+        let compiled = compile::compile_steps(&steps, &roles, &dataset.sources, &pinned_at)?;
+        let session = self.engine.session()?;
+        materialize::load_sources(&session, &dir, &dataset, Some(PREVIEW_SAMPLE))?;
+        materialize::prepare(&session, &compiled)?;
+        let list: Vec<String> = compiled.columns.iter().map(|c| schema::ident(&c.name)).collect();
+        let limit = preview.limit.unwrap_or(100).min(PREVIEW_SAMPLE as u64);
+        let rows = session.query(&format!("SELECT {} FROM {} LIMIT {limit}", list.join(", "), compiled.last))?;
+        Ok(Previewed { columns: compiled.columns, rows, unresolved: compiled.unresolved, sample: PREVIEW_SAMPLE })
+    }
+
+    /// What reads a column: the steps and roles of the recipe that would
+    /// not resolve if it were gone from where it is made.
+    pub fn impact(&self, scope: &Scope, id: &str, column: &str) -> Result<Vec<Unresolved>> {
+        let (dir, dataset) = self.find(scope, id)?;
+        let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
+        let pinned_at = time::now();
+        let empty = std::collections::BTreeMap::new();
+        // Where the column is first there: a source, or the step that makes it.
+        let mut made_at = None;
+        for k in 0..=recipe.steps.len() {
+            let c = compile::compile_steps(&recipe.steps[..k], &empty, &dataset.sources, &pinned_at)?;
+            if c.columns.iter().any(|x| x.name.eq_ignore_ascii_case(column)) {
+                made_at = Some(k);
+                break;
+            }
+        }
+        let Some(k) = made_at else {
+            return Err(Error::NotFound(format!("dataset {id} has no column '{column}' at any step")));
+        };
+        let mut steps = recipe.steps.clone();
+        steps.insert(k, Step::Remove { columns: vec![column.to_string()] });
+        let c = compile::compile_steps(&steps, &recipe.roles, &dataset.sources, &pinned_at)?;
+        // Told by the recipe's own numbers, without the removal put in.
+        Ok(c.unresolved
+            .into_iter()
+            .map(|mut u| {
+                if u.step > k {
+                    u.step -= 1;
+                }
+                u
+            })
+            .collect())
     }
 
     /// A recipe version: the latest, or the one asked for.
@@ -308,11 +443,11 @@ impl Prep {
     }
 
     /// A page of a materialization: the live one, or the one asked for.
-    pub fn page(&self, scope: &Scope, id: &str, version: Option<u32>, offset: u64, limit: u64) -> Result<Page> {
+    pub fn page(&self, scope: &Scope, id: &str, version: Option<u32>, offset: u64, limit: u64, view: &View<'_>) -> Result<Page> {
         let (dir, dataset) = self.find(scope, id)?;
         let k = self.version_of(&dir, &dataset, version)?;
-        let (manifest, rows) = materialize::page(self, &dir, k, offset, limit)?;
-        Ok(Page { version: k, columns: manifest.columns, total: manifest.rows, offset, rows })
+        let (manifest, total, rows) = materialize::page(self, &dir, k, offset, limit, view)?;
+        Ok(Page { version: k, columns: manifest.columns, total, offset, rows })
     }
 
     /// What made a materialization: the live one, or the one asked for.
@@ -418,25 +553,33 @@ impl Prep {
         Ok(taken.columns)
     }
 
-    /// Runs the recipe as the next version and makes it live.
-    fn materialize(&self, dir: &Path, dataset: &mut Dataset, recipe: &Recipe) -> Result<()> {
+    /// Runs the recipe as the next version and makes it live; or, when
+    /// the recipe reads columns that are not there, makes nothing and
+    /// says which.
+    fn materialize(&self, dir: &Path, dataset: &mut Dataset, recipe: &Recipe) -> Result<Option<Vec<Unresolved>>> {
         let k = dataset.made + 1;
-        let mut made = materialize::run(self, dir, dataset, recipe, k)?;
+        let mut made = match materialize::run(self, dir, dataset, recipe, k)? {
+            materialize::Run::Made(m) => m,
+            materialize::Run::Held(unresolved) => return Ok(Some(unresolved)),
+        };
         materialize::keep(self, dir, &mut made)?;
-        let mut notes: Vec<String> = Vec::new();
-        for s in &dataset.sources {
-            if let Ok(snap) = store::read_json::<Snapshot>(&store::snapshot_paths(dir, &s.id, s.snapshot).1) {
-                notes.extend(snap.changes);
-            }
-        }
-        notes.extend(made.lineage.notes.iter().cloned());
         dataset.made = k;
         dataset.live = Some(k);
         dataset.columns = made.manifest.columns;
         dataset.rows = made.manifest.rows;
-        dataset.notes = notes;
-        Ok(())
+        dataset.notes = snapshot_notes(dir, dataset);
+        Ok(None)
     }
+}
+
+/// What the latest snapshots said of their columns: new, gone, widened.
+fn snapshot_notes(dir: &Path, dataset: &Dataset) -> Vec<String> {
+    dataset
+        .sources
+        .iter()
+        .filter_map(|s| store::read_json::<Snapshot>(&store::snapshot_paths(dir, &s.id, s.snapshot).1).ok())
+        .flat_map(|snap| snap.changes)
+        .collect()
 }
 
 /// A dataset's id: `ds_` and sixteen hex digits, unguessable enough

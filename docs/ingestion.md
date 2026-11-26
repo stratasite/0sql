@@ -118,18 +118,34 @@ forces a change, and the change is reported.
 A **closed set** of declarative operations. Each declares the columns it
 reads and writes and compiles to SQL for DuckDB. No user SQL, anywhere.
 
-- **Columns:** rename, retype, remove, reorder, a formula column.
-- **Rows:** filter, sort, remove duplicates, fill empty values.
-- **Values:** find and replace, remap a value, trim, change case.
-- **Shape:** group and aggregate, append.
+- **Columns:** rename, retype, remove, reorder, a formula column
+  (`rename`, `retype`, `remove`, `reorder`, `formula`).
+- **Rows:** filter, sort, remove duplicates, fill empty values
+  (`filter`, `sort`, `dedupe`, `fill`).
+- **Values:** find and replace, remap a value, trim, change case
+  (`replace`, `remap`, `trim`, `case`).
+- **Shape:** group and aggregate (`group`: sum, min, max, avg, count,
+  count_distinct), append.
 - **Combine:** join or look up another dataset.
 - **Edits:** see "Editing a cell".
+
+A step is JSON with an `op`: `{"op": "remap", "column": "region",
+"values": [{"from": "NY", "to": "New York"}]}`. A step with any other
+`op`, or a field its op does not have, is refused. A retype keeps a
+value only if it converts: text read as a number or a date (with a
+strptime format when it is not ISO), a number narrowed only when it
+comes back the same; the run fails naming the step, the column, both
+types and the first values that do not.
 
 **Formulas have their own language.** A formula column or a filter is
 written in a small expression language of data prep's own: column
 references, literals, operators, and an **allowlist** of functions
 (text, numbers, dates, conditionals), compiled to DuckDB's SQL by data
-prep's compiler. It does not reuse `calc(...)` from the query
+prep's compiler. A column is a bare name or `[any name]`; text is
+quoted; `&` joins text; `and`, `or`, `not`, `is null`, `in (...)`.
+Every formula is typed before it runs, every result is cast to its
+type, a division by zero is empty rather than an error, and `today()`
+is the time the run was pinned to. It does not reuse `calc(...)` from the query
 shorthand, which carries raw SQL. DuckDB is opened in memory with
 external access off and its configuration locked, and it touches no
 file at all: data prep reads and writes every snapshot and
@@ -152,11 +168,14 @@ result has an **ancestry**.
   and each dependent, and the user fixes the recipe or confirms. A
   rename upstream (`region` to `area`) is the common case: the user
   points the steps at the new name, and their work carries over.
+  Confirming (`POST .../confirm`) makes a recipe version without the
+  steps and roles that held it and runs that.
 
 **A column the user deletes in the grid** is a remove step, checked by
 the same graph first. With no dependents it is removed; with some, the
 removal is refused, naming them, with the choice to remove them too.
-The rows stay in the snapshot, so undo brings the column back.
+`GET .../impact?column=` names a column's readers before anything is
+changed. The rows stay in the snapshot, so undo brings the column back.
 
 **A column that appears upstream** is added at the end and reported.
 
@@ -425,10 +444,13 @@ POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file
 GET    /projects/{uid}/datasets/{id}
 DELETE /projects/{uid}/datasets/{id}
 PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV: a new snapshot, the recipe run over it
-GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=
+GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=&sort=col:desc&filter=<formula>
 GET    /projects/{uid}/datasets/{id}/lineage            ?version=
 GET    /projects/{uid}/datasets/{id}/recipe             ?version=
 POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
+POST   /projects/{uid}/datasets/{id}/preview            {"steps": [...], "upto": n, "limit": n}: over a sample, kept nowhere
+GET    /projects/{uid}/datasets/{id}/impact             ?column=: what reads it
+POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold
 GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 DELETE /datasets                                        every dataset of this owner in the org
 ```
@@ -499,7 +521,7 @@ know about datasets.
   the CSV contract, roles and types, snapshots, recipes and
   materializations, the caps, lineage records, hard delete, the engine
   with external access off.
-- [ ] **2. Steps, formulas and the grid.** The formula language and its
+- [x] **2. Steps, formulas and the grid.** The formula language and its
   compiler; the first steps; the column graph, held materializations;
   pages, previews, recipe versions.
 - [ ] **3. Edits.** Investigate the open questions first; then remaps,
