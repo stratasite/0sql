@@ -1811,3 +1811,85 @@ async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
     assert_eq!(s.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}/branches/main"), &[], None).await.status, StatusCode::OK);
     assert!(!acme.exists());
 }
+
+// ------------------------------------------------------- a deploy told as it goes
+
+/// The lines of a streamed answer, each parsed.
+fn lines_of(a: &Answer) -> Vec<Value> {
+    String::from_utf8_lossy(&a.raw).lines().map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l}: {e}"))).collect()
+}
+
+fn events_of(lines: &[Value]) -> Vec<&str> {
+    lines.iter().map(|l| l["event"].as_str().unwrap()).collect()
+}
+
+const STREAM: (&str, &str) = ("accept", "application/x-ndjson");
+
+/// Asked for NDJSON, a deploy says each step as it is done, then the
+/// answer it would have given whole, and is made as one that was not
+/// streamed is.
+#[tokio::test]
+async fn a_deploy_streams_its_steps_when_asked() {
+    let s = server();
+    let path = format!("/projects/{CS}/branches/main/deploy");
+    let a = s.send(Method::POST, &path, &[STREAM], Some(("application/gzip", archive(CS, "one")))).await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(a.headers["content-type"], "application/x-ndjson");
+    let lines = lines_of(&a);
+    assert_eq!(events_of(&lines), ["unpacked", "loaded", "compiled", "test", "tested", "live", "done"], "{lines:?}");
+    assert_eq!(lines[2]["tables"], 1);
+    assert_eq!(lines[3]["name"], "smoke");
+    assert_eq!(lines[3]["status"], "passed");
+    assert!(lines.iter().take(6).all(|l| l["ms"].is_u64()), "{lines:?}");
+    let done = &lines[6]["result"];
+    let whole = s.deploy(CS, "main", archive(CS, "one")).await.body;
+    for k in ["project", "branch", "tables", "fields", "test_results", "validated_only", "credentials"] {
+        assert_eq!(done[k], whole[k], "{k}");
+    }
+    assert_eq!(s.listing().await, ["customer-service/main"]);
+
+    // A validation streams the same steps and makes nothing live.
+    let path = format!("/projects/{CS}/branches/other/validate");
+    let a = s
+        .send(
+            Method::POST,
+            &path,
+            &[("accept", "application/json, application/x-ndjson;q=0.9")],
+            Some(("application/gzip", archive(CS, "two"))),
+        )
+        .await;
+    let lines = lines_of(&a);
+    assert_eq!(events_of(&lines), ["unpacked", "loaded", "compiled", "test", "tested", "done"], "{lines:?}");
+    assert_eq!(lines[5]["result"]["validated_only"], true);
+    assert_eq!(s.listing().await, ["customer-service/main"]);
+
+    // Not asked, the answer is the one JSON object it always was.
+    let a = s.deploy(CS, "main", archive(CS, "one")).await;
+    assert!(a.headers["content-type"].to_str().unwrap().starts_with("application/json"));
+}
+
+/// What is refused before any work keeps its status on a stream; what
+/// is refused once the stream is open is its last line, with the status
+/// it would have had.
+#[tokio::test]
+async fn a_streamed_deploy_says_how_it_failed() {
+    let s = server();
+    let path = format!("/projects/{CS}/branches/main/deploy");
+    let a = s.send(Method::POST, &path, &[STREAM], Some(("application/gzip", Vec::new()))).await;
+    assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "DeployError"), "{:?}", a.raw);
+    let a = s
+        .send(Method::POST, &format!("/projects/{CS}/branches/..%2Fx/deploy"), &[STREAM], Some(("application/gzip", archive(CS, "x"))))
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{:?}", a.raw);
+
+    let mut files = fixture_files(CS, "broken");
+    files.retain(|(p, _)| p != "project.yml");
+    let a = s.send(Method::POST, &path, &[STREAM], Some(("application/gzip", archive_of(&files)))).await;
+    assert_eq!(a.status, StatusCode::OK);
+    let lines = lines_of(&a);
+    assert_eq!(events_of(&lines), ["unpacked", "error"], "{lines:?}");
+    assert_eq!(lines[1]["status"], 400);
+    assert_eq!(lines[1]["error"]["class"], "DeployError");
+    assert!(lines[1]["error"]["message"].as_str().unwrap().contains("project.yml"), "{lines:?}");
+    assert!(s.listing().await.is_empty());
+}

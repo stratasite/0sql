@@ -391,7 +391,7 @@ fn arrow_stream(path: std::path::PathBuf, record: &Record) -> Response {
 }
 
 /// The channel a blocking reader fills, as the stream a body is.
-struct Chunks(tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>);
+pub(crate) struct Chunks(pub(crate) tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>);
 
 impl futures_core::Stream for Chunks {
     type Item = Result<Vec<u8>, std::io::Error>;

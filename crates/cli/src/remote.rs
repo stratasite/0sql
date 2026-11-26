@@ -66,6 +66,38 @@ impl Client {
         self.send(&format!("POST {url}"), || self.slow.post(&url).header("content-type", content_type).send(bytes))
     }
 
+    /// A deploy or a validation told as it goes: each step the server
+    /// sends is handed to `on` as it arrives, and the answer is the last
+    /// line's. A server from before the stream answers whole, and is read
+    /// as it always was, with no steps.
+    pub fn post_bytes_streamed(&self, path: &str, content_type: &str, bytes: &[u8], on: &mut dyn FnMut(&Value)) -> Result<Value> {
+        let url = self.url(path);
+        let what = format!("POST {url}");
+        let mut waited = 0;
+        let r = loop {
+            let r = self
+                .slow
+                .post(&url)
+                .header("content-type", content_type)
+                .header("accept", NDJSON)
+                .send(bytes)
+                .with_context(|| what.clone())?;
+            match retry_after(&r) {
+                Some(secs) if waited < RETRIES => {
+                    waited += 1;
+                    eprintln!("{what}: the server is at its limit, waiting {secs}s ({waited} of {RETRIES})");
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
+                _ => break r,
+            }
+        };
+        let streamed = r.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with(NDJSON));
+        if !streamed || !r.status().is_success() {
+            return read(r);
+        }
+        read_stream(std::io::BufReader::new(r.into_body().into_reader()), on).with_context(|| what.clone())
+    }
+
     pub fn delete(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
         self.send(&format!("DELETE {url}"), || self.agent.delete(&url).call())
@@ -111,6 +143,36 @@ fn read(mut r: ureq::http::Response<ureq::Body>) -> Result<Value> {
         bail!("server answered {status}: {brief}{}", if text.len() > 200 { "..." } else { "" });
     }
     Ok(value)
+}
+
+/// The media type of a deploy told as it goes: one JSON object a line.
+pub const NDJSON: &str = "application/x-ndjson";
+
+/// Reads a streamed deploy to its last line: `done` is the answer,
+/// `error` the refusal as a whole answer would have said it, and any
+/// other line a step for `on`. A stream that stops before either is a
+/// deploy whose end nobody heard, and is said to be one.
+fn read_stream(reader: impl std::io::BufRead, on: &mut dyn FnMut(&Value)) -> Result<Value> {
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(&line).with_context(|| format!("a line the server sent: {line}"))?;
+        match v["event"].as_str() {
+            Some("done") => return Ok(v["result"].clone()),
+            Some("error") => {
+                let e = &v["error"];
+                return Err(Refusal {
+                    class: e["class"].as_str().unwrap_or("error").to_string(),
+                    message: e["message"].as_str().unwrap_or("").to_string(),
+                }
+                .into());
+            }
+            _ => on(&v),
+        }
+    }
+    bail!("the server stopped before it said how the deploy ended; `zsql deployments` says what is live")
 }
 
 /// What every path of an org starts with: `/orgs/{org}`, and nothing
@@ -189,4 +251,41 @@ pub fn explore(
 /// server resolves the name.
 pub fn values_for(client: &Client, org: Option<&str>, uid: &str, branch: &str, dim: &str) -> Result<Value> {
     client.get(&format!("{}/values/{}", branch_path(org, uid, branch), urlencode(dim)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_all(text: &str) -> (Result<Value>, Vec<String>) {
+        let mut seen = Vec::new();
+        let got = read_stream(std::io::Cursor::new(text.to_string()), &mut |v| seen.push(v["event"].as_str().unwrap_or("").to_string()));
+        (got, seen)
+    }
+
+    /// The steps go to the caller as they come; the last line is the answer.
+    #[test]
+    fn a_stream_is_its_steps_then_its_answer() {
+        let (got, seen) = read_all("{\"event\":\"unpacked\"}\n\n{\"event\":\"someday\"}\n{\"event\":\"done\",\"result\":{\"tables\":3}}\n");
+        assert_eq!(got.unwrap()["tables"], 3);
+        assert_eq!(seen, ["unpacked", "someday"]);
+    }
+
+    /// A refusal on the stream is the refusal a whole answer would be.
+    #[test]
+    fn a_streamed_refusal_keeps_its_class() {
+        let (got, _) =
+            read_all("{\"event\":\"error\",\"status\":400,\"error\":{\"class\":\"DeployError\",\"message\":\"no project.yml\"}}\n");
+        let e = got.unwrap_err();
+        let refusal = e.downcast_ref::<Refusal>().unwrap();
+        assert_eq!((refusal.class.as_str(), refusal.message.as_str()), ("DeployError", "no project.yml"));
+    }
+
+    /// A stream cut off before its end says so, rather than succeeding.
+    #[test]
+    fn a_stream_with_no_end_is_an_error() {
+        let (got, seen) = read_all("{\"event\":\"unpacked\"}\n");
+        assert!(got.unwrap_err().to_string().contains("stopped before"));
+        assert_eq!(seen, ["unpacked"]);
+    }
 }

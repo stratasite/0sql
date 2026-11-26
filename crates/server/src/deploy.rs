@@ -6,10 +6,10 @@ use crate::error::{not_found, ApiError, Org, Params, Search};
 use crate::guard::Held;
 use crate::names::{check_branch, check_uid};
 use crate::{blocking, lock, write, Shared};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
-use axum::response::Json;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,13 +21,10 @@ pub(crate) async fn deploy(
     Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
     Search(q): Search<DeployQuery>,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    blocking(move || {
-        let _held = held;
-        deploy_or_validate(app, org, uid, branch, body, Some(q))
-    })
-    .await
+) -> Result<Response, ApiError> {
+    answer(app, held, Asked { org, uid, branch, body, keep: Some(q) }, wants_stream(&headers)).await
 }
 
 pub(crate) async fn validate(
@@ -35,13 +32,87 @@ pub(crate) async fn validate(
     held: Option<Extension<Held>>,
     Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    blocking(move || {
+) -> Result<Response, ApiError> {
+    answer(app, held, Asked { org, uid, branch, body, keep: None }, wants_stream(&headers)).await
+}
+
+/// The media type of a deploy told as it goes: one JSON object a line.
+pub(crate) const NDJSON: &str = "application/x-ndjson";
+
+/// Whether the caller asked to be told each step as it is done.
+fn wants_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case(NDJSON)))
+}
+
+/// What a deploy or a validation was asked to do.
+struct Asked {
+    org: String,
+    uid: String,
+    branch: String,
+    body: Bytes,
+    /// How a deploy is kept; without it this is a validation.
+    keep: Option<DeployQuery>,
+}
+
+/// The whole answer at the end, or, when `stream`, a line for each step
+/// as it is done and the answer as the last line.
+///
+/// A stream's status is 200 once the first line is sent, so a refusal
+/// after that is a line of its own: `{"event":"error","status":...,
+/// "error":{"class","message"}}`. What can be refused before any work is
+/// refused with its status either way. A caller that goes away does not
+/// stop the deploy: it runs to its end, made or not, as one whose answer
+/// was never read would.
+async fn answer(app: Shared, held: Option<Extension<Held>>, asked: Asked, stream: bool) -> Result<Response, ApiError> {
+    if !stream {
+        return blocking(move || {
+            let _held = held;
+            deploy_or_validate(app, asked, &mut |_| {})
+        })
+        .await
+        .map(|v| Json(v).into_response());
+    }
+    precheck(&asked.body, &asked.uid, &asked.branch)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    tokio::task::spawn_blocking(move || {
         let _held = held;
-        deploy_or_validate(app, org, uid, branch, body, None)
-    })
-    .await
+        let send = |v: Value| {
+            let mut line = serde_json::to_vec(&v).unwrap_or_default();
+            line.push(b'\n');
+            // Nobody reading is no reason to stop half way.
+            let _ = tx.blocking_send(Ok(line));
+        };
+        let last = match deploy_or_validate(app, asked, &mut |event| send(event)) {
+            Ok(v) => json!({ "event": "done", "result": v }),
+            Err(ApiError(status, class, message)) => {
+                json!({ "event": "error", "status": status.as_u16(), "error": { "class": class, "message": message } })
+            }
+        };
+        send(last);
+    });
+    let mut response = Response::new(Body::from_stream(crate::exec::Chunks(rx)));
+    response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static(NDJSON));
+    // A proxy that buffers would hold every line to the end.
+    response.headers_mut().insert("x-accel-buffering", header::HeaderValue::from_static("no"));
+    Ok(response)
+}
+
+/// What is refused before an archive is unpacked: answered without doing
+/// work, and, on a stream, with its status rather than a line.
+fn precheck(body: &[u8], uid: &str, branch: &str) -> Result<(), ApiError> {
+    if body.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "DeployError", "the body must be a tar.gz of the project directory".into()));
+    }
+    check_uid(uid)?;
+    check_branch(branch)?;
+    Ok(())
 }
 
 /// How a deploy is to treat what the branch already has.
@@ -56,23 +127,20 @@ pub(crate) struct DeployQuery {
 }
 
 /// `keep` is how a deploy is kept; without it this is a validation,
-/// which keeps nothing.
-fn deploy_or_validate(
-    app: Shared,
-    org: String,
-    uid: String,
-    branch: String,
-    body: Bytes,
-    keep: Option<DeployQuery>,
-) -> Result<Json<Value>, ApiError> {
+/// which keeps nothing. `on` is told each step as it is done, with the
+/// milliseconds since the start: `unpacked`, `loaded`, `compiled`, a
+/// `test` for each test and `tested`, then, for a deploy, `kept` when
+/// there is an object store, and `live`.
+fn deploy_or_validate(app: Shared, asked: Asked, on: &mut dyn FnMut(Value)) -> Result<Value, ApiError> {
+    let Asked { org, uid, branch, body, keep } = asked;
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, "DeployError", m);
-    if body.is_empty() {
-        return Err(bad("the body must be a tar.gz of the project directory".into()));
-    }
-    // Before the archive is unpacked: a bad name is answered without
-    // doing work.
-    check_uid(&uid)?;
-    check_branch(&branch)?;
+    let started = std::time::Instant::now();
+    let mut step = |event: &str, mut v: Value| {
+        v["event"] = json!(event);
+        v["ms"] = json!(started.elapsed().as_millis() as u64);
+        on(v);
+    };
+    precheck(&body, &uid, &branch)?;
     // Named by a counter, not the clock: two deploys in one process at
     // the same instant must not share a directory, and the second to
     // unpack into a shared one would be refused for files that exist.
@@ -97,13 +165,22 @@ fn deploy_or_validate(
     // server unpacked it.
     let work_prefix = format!("{}/", work.display());
     let result = (|| -> Result<Value, ApiError> {
-        unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
+        let entries = unpack_archive(&body, &work).map_err(|m| bad(m.replace(&work_prefix, "")))?;
+        step("unpacked", json!({ "bytes": body.len(), "entries": entries }));
         let root = project_root(&work).ok_or_else(|| bad("the archive holds no project.yml".into()))?;
         let loaded = zsql_core::load(&root, Trust::Untrusted, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
+        step("loaded", json!({}));
         let mut deployed =
             Model::from_loaded(&uid, &branch, loaded, app.dialects).map_err(|e| bad(e.to_string().replace(&work_prefix, "")))?;
         let mut out = deployed.summary();
-        out["test_results"] = deployed.run_tests()?;
+        let counts = ["tables", "fields", "joins", "paths", "policies", "values", "tests"];
+        step("compiled", Value::Object(counts.iter().map(|k| (k.to_string(), out[*k].clone())).collect()));
+        let tested = deployed.run_tests()?;
+        for r in tested["results"].as_array().into_iter().flatten() {
+            step("test", json!({ "name": r["name"], "status": r["status"] }));
+        }
+        step("tested", json!({ "passed": tested["passed"], "failed": tested["failed"] }));
+        out["test_results"] = tested;
         out["validated_only"] = Value::Bool(keep.is_none());
         // What is kept in the object store is made ready outside
         // the lock, since zipping a project is the slow half and
@@ -189,7 +266,7 @@ fn deploy_or_validate(
                         Err(e) => return Err(unkept(e.to_string())),
                     }
                 };
-                let _ = path;
+                step("kept", json!({ "archive": path }));
                 kept = Some((objects, key));
             }
             if let Err(e) = swap_in(&staged, &live) {
@@ -206,10 +283,11 @@ fn deploy_or_validate(
             }
             write(&app.models).insert(crate::key(&org, &uid, &branch), deployed);
             tracing::info!("deployed {org}/{uid}/{branch}");
+            step("live", json!({}));
         }
         Ok(out)
     })();
-    result.map(Json)
+    result
 }
 
 /// A directory removed when this is dropped.
@@ -258,7 +336,7 @@ impl<R: std::io::Read> std::io::Read for Capped<R> {
 /// directory, or to anything on the host, would be read as part of the
 /// project and shown back in the model or its errors. The CLI never
 /// writes one.
-fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<(), String> {
+fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<usize, String> {
     let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let decoder = Capped { inner: flate2::read::GzDecoder::new(body), left: UNPACKED_LIMIT, tripped: tripped.clone() };
     let mut archive = tar::Archive::new(decoder);
@@ -289,7 +367,7 @@ fn unpack_archive(body: &[u8], work: &std::path::Path) -> Result<(), String> {
             return Err(format!("the archive holds {path}, which would land outside the project; only paths inside it are deployed"));
         }
     }
-    Ok(())
+    Ok(n)
 }
 
 /// The directory holding project.yml: the archive root, or its single top folder.
