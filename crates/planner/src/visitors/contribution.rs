@@ -257,5 +257,5 @@ fn denominator_filters<'a>(c: &Decorator, q: &ResolvedQuery<'a>, measure: &Field
     let dim_uids: Vec<String> = q.projections.iter().filter(|p| p.is_dimension()).filter_map(|p| p.def.field_uid.clone()).collect();
     let denom_uids: Vec<String> = denominator_dimensions(c, q).iter().filter_map(|p| p.def.field_uid.clone()).collect();
     let ignorable: Vec<&String> = dim_uids.iter().filter(|u| !denom_uids.contains(u)).collect();
-    filters.into_iter().filter(|f| f.is_date() || !ignorable.contains(&&f.def.field_uid)).collect()
+    filters.into_iter().filter(|f| f.is_date() || f.fields().all(|x| !ignorable.contains(&&x.uid))).collect()
 }

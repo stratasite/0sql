@@ -468,6 +468,7 @@ fn describe_reads_back_to_the_same_spec() {
         "include (k, m@m, f > 1 or g = 2) for (m1, m2) as \"For keeps\", expand (k, f = 1) with (c as \"Also, bought\", d) left dedupe none as E",
         "limit 5, hints (t1, t2), {\"name\": \"n\"}, x {\"format\": {\"type\": \"pct\"}}",
         "rank(x by order date order by order date desc, [created by] asc) as [Row in region], custom('lower(@expression)', y)",
+        "ship date > [order date], n@m >= [cost]@m, a not starts with [b], d between [lo] and [hi], (e = [f] or g != [h]@d)",
     ];
     for line in lines {
         let (first, items) = parse_line(line).unwrap_or_else(|e| panic!("{line}: {e}"));
@@ -478,4 +479,26 @@ fn describe_reads_back_to_the_same_spec() {
     let (_, items) = parse_line("x, y = 1, calc(a) as B, include (k), limit 1, hints t, {\"a\": 1}").unwrap();
     let kinds: Vec<String> = describe(&items).iter().map(|d| d[..12].trim().to_string()).collect();
     assert_eq!(kinds, ["projection", "filter", "calculation", "segment", "setting", "setting", "spec"]);
+}
+
+#[test]
+fn a_bracketed_name_in_a_values_place_is_a_field_to_compare_with() {
+    let s = spec("ship date > [order date], net paid@m >= [Wholesale Cost]@m, bill city not contains [ship city]");
+    assert_eq!(
+        s["filters"],
+        json!([
+            {"field": "ship date", "predicate": "greater_than", "value_field": "order date"},
+            {"field": "net paid", "field_type": "measure", "predicate": "greater_than_or_equal_to", "value_field": "Wholesale Cost@m"},
+            {"field": "bill city", "predicate": "does_not_contain", "value_field": "ship city"}
+        ])
+    );
+    let s = spec("event date between [start date] and [end date]");
+    assert_eq!(s["filters"][0]["value_field"], "start date");
+    assert_eq!(s["filters"][0]["value_end_field"], "end date");
+    assert!(s["filters"][0].get("value").is_none(), "{s}");
+    // A bare name stays a value, and the echo brackets the field.
+    assert_eq!(spec("a = order date")["filters"][0]["value"], "order date");
+    let (_, items) = parse_line("ship date > [order date]@d").unwrap();
+    assert_eq!(describe(&items), ["filter       ship date > [order date]@d"]);
+    errs(&[("x = \"order date\"", "bracketed: [Name]")]);
 }

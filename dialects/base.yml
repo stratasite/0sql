@@ -47,6 +47,12 @@ cast: "CAST(@exp AS @type)"
 trim: "TRIM(@exp)"
 lower_case: "LOWER(@exp)"
 upper_case: "UPPER(@exp)"
+# A string holding another column's value: a filter comparing two string
+# fields. Positions are 1-based; a search function rather than LIKE, so a
+# `%` or `_` in the data is not a wildcard.
+string_contains: "STRPOS(@exp, @needle) > 0"
+string_starts_with: "STRPOS(@exp, @needle) = 1"
+string_ends_with: "STRPOS(REVERSE(@exp), REVERSE(@needle)) = 1"
 
 # null handling
 if_null: "COALESCE(@exp, @when_null)"

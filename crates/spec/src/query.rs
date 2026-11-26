@@ -220,11 +220,32 @@ pub struct Filter {
     pub filter_value: Option<String>,
     pub filter_value_end: Option<String>,
     pub top_n_measure: Option<String>,
+    /// The field the filter compares against instead of a value:
+    /// `Event Date > Sold Date`. Where one side is a measure, lowering
+    /// puts it in `field_uid`, so the filter's own field says whether it
+    /// is a HAVING.
+    pub value_field: Option<Operand>,
+    /// `between`'s upper bound, as a field; set exactly when `value_field` is.
+    pub value_end_field: Option<Operand>,
     /// Position among the query's filters, so the WHERE clause order is
     /// the order the spec listed them in.
     pub ordinal: i64,
     /// The field reference as written in a spec; see `Projection::source_ref`.
     pub source_ref: Option<String>,
+}
+
+impl Filter {
+    /// Whether the filter compares its field with another field.
+    pub fn is_comparison(&self) -> bool {
+        self.value_field.is_some()
+    }
+}
+
+/// A field on the value side of a filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operand {
+    pub field_uid: String,
+    pub field_kind: FieldKind,
 }
 
 /// A filter logic tree: `and`/`or` groups over filter refs.

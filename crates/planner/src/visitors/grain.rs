@@ -90,7 +90,9 @@ pub fn move_measure_components<'a>(
 ) -> (Vec<Projected<'a>>, Vec<Filtered<'a>>) {
     let projs: Vec<Projected<'a>> =
         graph.nodes[from].projections.iter().filter(|p| p.field().map(|f| f.id == measure.id).unwrap_or(false)).cloned().collect();
-    let filters: Vec<Filtered<'a>> = graph.nodes[from].filters.iter().filter(|f| f.field().id == measure.id).cloned().collect();
+    // A comparison stays behind; `comparison::run` lifts it to where both sides meet.
+    let filters: Vec<Filtered<'a>> =
+        graph.nodes[from].filters.iter().filter(|f| f.field().id == measure.id && !f.is_comparison()).cloned().collect();
     for p in &projs {
         if !graph.nodes[to].has_proj(p.proj.pid) {
             graph.nodes[to].projections.push(p.clone());

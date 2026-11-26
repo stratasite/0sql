@@ -127,3 +127,8 @@ extra_aggregate_functions:
   - deltasum
   - deltasumtimestamp
   - exponentialmovingaverage
+
+# string search, for a filter comparing two string fields
+string_contains: "position(@exp, @needle) > 0"
+string_starts_with: "position(@exp, @needle) = 1"
+string_ends_with: "position(reverse(@exp), reverse(@needle)) = 1"

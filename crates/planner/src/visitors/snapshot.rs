@@ -28,8 +28,12 @@ pub fn run<'a>(graph: &mut Graph<'a>, semantic: &'a SemanticModel, q: &ResolvedQ
 /// A snapshot measure that is only filtered still needs a projection so
 /// the as-of machinery sees it.
 fn materialize_filtered_snapshots<'a>(graph: &mut Graph<'a>, id: NodeId) {
-    let fields: Vec<&'a Field> =
-        graph.nodes[id].filters.iter().filter(|f| f.is_measure() && f.field().snapshot.is_some()).map(|f| f.field()).collect();
+    let fields: Vec<&'a Field> = graph.nodes[id]
+        .filters
+        .iter()
+        .flat_map(|f| f.fields().collect::<Vec<_>>())
+        .filter(|f| f.is_measure() && f.snapshot.is_some())
+        .collect();
     for f in fields {
         let projected = graph.nodes[id].projections.iter().any(|p| p.field().map(|x| x.id == f.id).unwrap_or(false));
         if !projected {
@@ -212,16 +216,17 @@ fn snapshot_date_filter<'a>(
 ) -> Option<crate::dag::Filtered<'a>> {
     if let Some(p) = proj {
         let fid = p.field()?.id;
-        return node.filters.iter().find(|f| f.field().id == fid).cloned();
+        return node.filters.iter().find(|f| !f.is_comparison() && f.field().id == fid).cloned();
     }
-    if let Some(f) = node.filters.iter().find(|f| f.field().id == expected.id) {
+    let node_filters = || node.filters.iter().filter(|f| !f.is_comparison());
+    if let Some(f) = node_filters().find(|f| f.field().id == expected.id) {
         return Some(f.clone());
     }
     let candidates = blendables(expected, semantic);
-    if let Some(f) = node.filters.iter().find(|f| candidates.iter().any(|c| c.id == f.field().id)) {
+    if let Some(f) = node_filters().find(|f| candidates.iter().any(|c| c.id == f.field().id)) {
         return Some(f.clone());
     }
-    node.filters.iter().find(|f| f.is_date()).cloned()
+    node_filters().find(|f| f.is_date()).cloned()
 }
 
 /// Daily or finer grains already resolve to one snapshot per row.

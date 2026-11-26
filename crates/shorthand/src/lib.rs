@@ -83,11 +83,13 @@ Forms:
                category in (Books, Music) | category not in (Toys) | name contains foo | name not starts with x
                date is null | category top 10 by store net paid | description keyword (sale, clearance)
                (country = Canada or region = West) and store net paid > 10
-  segment      include (customer id, catalog net paid > 0) as Buyers | exclude (customer id, net paid > 1000) for net paid
+               ship date > [order date] | store net paid > [store wholesale cost] | bill city contains [ship city]
+  segment     include (customer id, catalog net paid > 0) as Buyers | exclude (customer id, net paid > 1000) for net paid
                expand (customer id, item = Books) with (item as Also bought) left dedupe none
   settings     limit 100 | hints store-sales | {\"name\": \"...\"} merges spec JSON; after an item it merges into that item
 Fields are names or uids, matched without regard to case; add @d or @m when a name is both.
-[Name] or \"Name\" is always a field, 'text' is always a value. Reserved words, which end a bare name:
+[Name] or \"Name\" is always a field, 'text' is always a value; after a predicate, [Name] compares with that field.
+Reserved words, which end a bare name:
   and or not in is between top contains starts ends keyword as asc desc";
 
 /// The repl's dot commands.

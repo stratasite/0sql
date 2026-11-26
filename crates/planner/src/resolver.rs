@@ -26,8 +26,8 @@ pub fn measures<'a>(semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Vec<&
     for p in q.projections.iter().filter(|p| !p.is_calculation() && p.is_measure()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
     }
-    for f in q.filters.iter().filter(|f| f.is_measure()) {
-        uids.push(&f.def.field_uid);
+    for f in &q.filters {
+        uids.extend(f.fields().filter(|x| x.is_measure()).map(|x| x.uid.as_str()));
     }
     for p in q.projections.iter().filter(|p| p.is_calculation()) {
         for u in &p.def.measure_refs {
@@ -44,8 +44,8 @@ pub fn dimensions<'a>(semantic: &'a SemanticModel, q: &ResolvedQuery<'a>) -> Vec
     for p in q.projections.iter().filter(|p| !p.is_calculation() && !p.is_carried() && p.is_dimension()) {
         uids.push(p.def.field_uid.as_deref().unwrap_or(""));
     }
-    for f in q.filters.iter().filter(|f| f.is_dimension()) {
-        uids.push(&f.def.field_uid);
+    for f in &q.filters {
+        uids.extend(f.fields().filter(|x| x.is_dimension()).map(|x| x.uid.as_str()));
     }
     for p in q.projections.iter().filter(|p| p.is_calculation()) {
         for u in &p.def.dimension_refs {
@@ -189,7 +189,7 @@ fn resolve_inner<'a>(
             // Level the node to the universe: what it cannot reach drops out.
             (
                 q.projections.iter().filter(|p| p.field.map(|f| u.has_field(f.id)).unwrap_or(false) || p.is_carried()).cloned().collect(),
-                q.filters.iter().filter(|f| u.has_field(f.field.id)).cloned().collect(),
+                leveled_filters(u, q)?,
             )
         } else {
             (q.projections.clone(), q.filters.clone())
@@ -266,16 +266,22 @@ fn resolve_inner<'a>(
                 }
             }
             // Measure filters not cleanly projected get a column in the child.
-            for f in q.filters.iter().filter(|f| f.is_measure() && u.has_field(f.field.id)) {
-                let projected = q.projections.iter().any(|p| p.field_id() == Some(f.field.id) && p.def.decorators.is_empty());
-                if !projected {
-                    projections.push(Rc::new(ResolvedProjection::for_field(f.field)));
+            // A comparison of two measures reads both, from whichever
+            // universes hold them, at the merge.
+            for f in q.filters.iter().filter(|f| f.is_measure()) {
+                for m in f.fields().filter(|m| m.is_measure() && u.has_field(m.id)) {
+                    let clean = |p: &Rc<ResolvedProjection<'a>>| p.field_id() == Some(m.id) && p.def.decorators.is_empty();
+                    let projected = q.projections.iter().any(clean) || (f.is_comparison() && projections.iter().any(clean));
+                    if !projected {
+                        projections.push(Rc::new(ResolvedProjection::for_field(m)));
+                    }
                 }
             }
+            // A child applies a filter only when it reads every side of it.
             let filters = q
                 .filters
                 .iter()
-                .filter(|f| u.has_field(f.field.id) && (f.is_dimension() || graph.dialect.intermediate_measure_filter()))
+                .filter(|f| f.fields().all(|x| u.has_field(x.id)) && (f.is_dimension() || graph.dialect.intermediate_measure_filter()))
                 .cloned()
                 .collect();
             let node = Node::with_universe(NodeKind::Aggregation, u.clone(), projections, filters);
@@ -292,6 +298,28 @@ fn resolve_inner<'a>(
         }
     }
     Ok(graph)
+}
+
+/// The filters a leveled node keeps: those its universe reaches. A
+/// comparison it reaches one side of cannot be applied by halves, and
+/// dropping it would answer a different question, so it refuses.
+fn leveled_filters<'a>(u: &Arc<Base<'a>>, q: &ResolvedQuery<'a>) -> Result<Vec<Rc<crate::resolved::ResolvedFilter<'a>>>> {
+    let mut out = Vec::new();
+    for f in &q.filters {
+        let reached: Vec<bool> = f.fields().map(|x| u.has_field(x.id)).collect();
+        if reached.iter().all(|r| *r) {
+            out.push(f.clone());
+        } else if reached.iter().any(|r| *r) {
+            let names: Vec<&str> = f.fields().map(|x| x.name.as_str()).collect();
+            return Err(Error::Resolution(format!(
+                "The filter comparing {} cannot be applied where {} is aggregated: {} reaches only some of those fields.",
+                names.join(" with "),
+                q.def.name.clone().unwrap_or_else(|| "a component".into()),
+                u.root.name
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// Measures (or dimensions) named by calculations, in reference order, unique.
