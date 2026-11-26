@@ -55,10 +55,19 @@ pub struct EditStage {
 pub struct Check {
     pub step: usize,
     pub relation: String,
+    /// The column whose values are shown when it fails.
     pub column: String,
-    pub from: ColumnType,
-    pub to: ColumnType,
     pub failing: String,
+    /// What a failure says, `{n}` standing for how many failed.
+    pub says: String,
+}
+
+/// The other datasets a recipe reads: each one's columns, by id.
+pub type Inputs = std::collections::BTreeMap<String, Vec<Column>>;
+
+/// The table a dataset read by a step is loaded as.
+pub fn input_table(id: &str) -> String {
+    format!("d_{id}")
 }
 
 /// A step, or a role, that reads a column not there at its point.
@@ -71,11 +80,20 @@ pub struct Unresolved {
     /// The edit, when it is an edit that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<String>,
+    /// The dataset it is a column of, when it is another's; or, for a
+    /// reader, the dataset that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
 }
 
 impl Unresolved {
     pub fn describe(&self) -> String {
-        if let Some(id) = &self.edit {
+        if self.op == "reader" {
+            let d = self.dataset.as_deref().unwrap_or("?");
+            format!("dataset {d} reads column '{}' of this one", self.column)
+        } else if let Some(d) = &self.dataset {
+            format!("step {} ({}) reads column '{}' of dataset {d}, which it does not have", self.step, self.op, self.column)
+        } else if let Some(id) = &self.edit {
             format!("edit {id} reads column '{}', which is not there where it applies", self.column)
         } else if self.op == "key" {
             format!("the key names column '{}', which the dataset does not have", self.column)
@@ -120,8 +138,8 @@ impl Cols {
 
 /// Compiles a recipe over the sources as they now are, with `today()`
 /// pinned to `pinned_at`.
-pub fn compile(recipe: &Recipe, edits: &[(usize, Edit)], sources: &[SourceState], pinned_at: &str) -> Result<Compiled> {
-    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, sources, pinned_at)
+pub fn compile(recipe: &Recipe, edits: &[(usize, Edit)], sources: &[SourceState], inputs: &Inputs, pinned_at: &str) -> Result<Compiled> {
+    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, (sources, inputs), pinned_at)
 }
 
 /// Steps alone, with no edits and no key.
@@ -131,7 +149,7 @@ pub fn compile_steps(
     sources: &[SourceState],
     pinned_at: &str,
 ) -> Result<Compiled> {
-    compile_all(steps, roles, &[], &[], sources, pinned_at)
+    compile_all(steps, roles, &[], &[], (sources, &Inputs::new()), pinned_at)
 }
 
 pub fn compile_all(
@@ -139,7 +157,7 @@ pub fn compile_all(
     roles: &std::collections::BTreeMap<String, Role>,
     key: &[String],
     edits: &[(usize, Edit)],
-    sources: &[SourceState],
+    (sources, inputs): (&[SourceState], &Inputs),
     pinned_at: &str,
 ) -> Result<Compiled> {
     let [source] = sources else {
@@ -171,6 +189,7 @@ pub fn compile_all(
                     step: p,
                     op: "edit".into(),
                     edit: Some(e.id().to_string()),
+                    dataset: None,
                 }));
             }
         }
@@ -184,9 +203,30 @@ pub fn compile_all(
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         // What the step reads that is not there: it is passed over.
-        let missing: Vec<String> = reads(step)?.into_iter().filter(|c| cols.find(c).is_none()).collect();
+        let mut missing: Vec<Unresolved> = reads(step)?
+            .into_iter()
+            .filter(|c| cols.find(c).is_none())
+            .map(|column| Unresolved { column, step: n, op: step.op().into(), edit: None, dataset: None })
+            .collect();
+        if let Some(d) = step.dataset() {
+            let input = inputs.get(d).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "step {n} ({}) reads dataset {d}, which is not one of this owner's datasets in this project with a version",
+                    step.op()
+                ))
+            })?;
+            missing.extend(
+                step.needs().into_iter().filter(|c| !input.iter().any(|x| x.name.eq_ignore_ascii_case(c))).map(|column| Unresolved {
+                    column,
+                    step: n,
+                    op: step.op().into(),
+                    edit: None,
+                    dataset: Some(d.to_string()),
+                }),
+            );
+        }
         if !missing.is_empty() {
-            unresolved.extend(missing.into_iter().map(|column| Unresolved { column, step: n, op: step.op().into(), edit: None }));
+            unresolved.extend(missing);
             edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
             continue;
         }
@@ -194,7 +234,7 @@ pub fn compile_all(
             Error::Invalid(m) => Error::Invalid(format!("step {n} ({}): {m}", step.op())),
             other => other,
         };
-        let select = one(step, n, &prev, &mut cols, &mut checks, pinned_at).map_err(at)?;
+        let select = one(step, n, &prev, &mut cols, &mut checks, (inputs, pinned_at)).map_err(at)?;
         let name = format!("t{n}");
         views.push((name.clone(), select));
         prev = ident(&name);
@@ -203,12 +243,12 @@ pub fn compile_all(
     for (name, role) in roles {
         match cols.find(name) {
             Some(i) => cols.columns[i].role = *role,
-            None => unresolved.push(Unresolved { column: name.clone(), step: 0, op: "role".into(), edit: None }),
+            None => unresolved.push(Unresolved { column: name.clone(), step: 0, op: "role".into(), edit: None, dataset: None }),
         }
     }
     for k in key {
         if cols.find(k).is_none() {
-            unresolved.push(Unresolved { column: k.clone(), step: 0, op: "key".into(), edit: None });
+            unresolved.push(Unresolved { column: k.clone(), step: 0, op: "key".into(), edit: None, dataset: None });
         }
     }
     Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, edits: stages, unresolved })
@@ -224,6 +264,8 @@ pub fn reads(step: &Step) -> Result<Vec<String>> {
         Step::Formula { formula, .. } | Step::Filter { formula } => formula::names(formula)?,
         Step::Sort { by } => by.iter().map(|k| k.column.clone()).collect(),
         Step::Group { by, aggregates } => by.iter().cloned().chain(aggregates.iter().filter_map(|a| a.column.clone())).collect(),
+        Step::Join { on, .. } => on.iter().map(|k| k.left.clone()).collect(),
+        Step::Append { .. } => Vec::new(),
     })
 }
 
@@ -267,7 +309,14 @@ pub(crate) fn value_sql(v: &Value, ty: ColumnType, column: &str) -> Result<Strin
     Ok(format!("CAST({} AS {})", literal(text.trim_matches(|c: char| c.is_whitespace() && ty != ColumnType::Text)), ty.sql()))
 }
 
-fn one(step: &Step, n: usize, prev: &str, cols: &mut Cols, checks: &mut Vec<Check>, pinned_at: &str) -> Result<String> {
+fn one(
+    step: &Step,
+    n: usize,
+    prev: &str,
+    cols: &mut Cols,
+    checks: &mut Vec<Check>,
+    (inputs, pinned_at): (&Inputs, &str),
+) -> Result<String> {
     let found = |cols: &Cols, name: &str| cols.find(name).ok_or_else(|| Error::Internal(format!("'{name}' was resolved and is not there")));
     Ok(match step {
         Step::Rename { column, to } => {
@@ -311,7 +360,11 @@ fn one(step: &Step, n: usize, prev: &str, cols: &mut Cols, checks: &mut Vec<Chec
                 }
             };
             if failing != "FALSE" {
-                checks.push(Check { step: n, relation: prev.to_string(), column: cols.columns[i].name.clone(), from, to: *ty, failing });
+                let says = format!(
+                    "step {n} (retype) makes column '{}' {ty} from {from}, and {{n}} value(s) do not convert without loss",
+                    cols.columns[i].name
+                );
+                checks.push(Check { step: n, relation: prev.to_string(), column: cols.columns[i].name.clone(), failing, says });
             }
             cols.columns[i].ty = *ty;
             if !ty.is_number() && cols.columns[i].role == Role::Measure {
@@ -433,7 +486,117 @@ fn one(step: &Step, n: usize, prev: &str, cols: &mut Cols, checks: &mut Vec<Chec
             format!("SELECT {} FROM {prev}", list.join(", "))
         }
         Step::Group { by, aggregates } => group(by, aggregates, prev, cols)?,
+        Step::Join { dataset, on, kind, columns, prefix } => {
+            let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
+            join(n, prev, cols, checks, (dataset, input), (on, *kind, columns.as_deref(), prefix.as_deref()))?
+        }
+        Step::Append { dataset } => {
+            let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
+            append(prev, cols, dataset, input)?
+        }
     })
+}
+
+fn input_column<'a>(input: &'a [Column], name: &str) -> Result<&'a Column> {
+    input
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Internal(format!("'{name}' was resolved and is not there")))
+}
+
+/// Another dataset's columns beside these, by keys whose types meet;
+/// refused at run time when that side repeats a key.
+fn join(
+    n: usize,
+    prev: &str,
+    cols: &mut Cols,
+    checks: &mut Vec<Check>,
+    (id, input): (&str, &[Column]),
+    (on, kind, columns, prefix): (&[crate::recipe::JoinKey], crate::recipe::JoinKind, Option<&[String]>, Option<&str>),
+) -> Result<String> {
+    if on.is_empty() {
+        return Err(Error::Invalid("a join names its keys: on".into()));
+    }
+    let table = ident(&input_table(id));
+    let mut conds = Vec::new();
+    let mut right_keys = Vec::new();
+    for k in on {
+        let l = &cols.columns[cols.find(&k.left).ok_or_else(|| Error::Internal(format!("'{}' was resolved and is not there", k.left)))?];
+        let r = input_column(input, &k.right)?;
+        let t = crate::schema::common(l.ty, r.ty).ok_or_else(|| {
+            Error::Invalid(format!(
+                "its keys meet '{}' ({}) with '{}' of {id} ({}), which do not widen to one type",
+                l.name, l.ty, r.name, r.ty
+            ))
+        })?;
+        conds.push(format!("CAST(l.{} AS {}) = CAST(r.{} AS {})", ident(&l.name), t.sql(), ident(&r.name), t.sql()));
+        right_keys.push(r.name.clone());
+    }
+    let keys: Vec<String> = right_keys.iter().map(|k| ident(k)).collect();
+    checks.push(Check {
+        step: n,
+        relation: format!("(SELECT {k} FROM {table} GROUP BY {k} HAVING count(*) > 1)", k = keys.join(", ")),
+        column: right_keys[0].clone(),
+        failing: "TRUE".into(),
+        says: format!("step {n} (join): dataset {id} is not unique on its keys, and {{n}} key value(s) repeat; it would multiply rows"),
+    });
+    let brought: Vec<&Column> = match columns {
+        Some(names) => names.iter().map(|c| input_column(input, c)).collect::<Result<_>>()?,
+        None => input.iter().filter(|c| !right_keys.iter().any(|k| k.eq_ignore_ascii_case(&c.name))).collect(),
+    };
+    let mut select: Vec<String> = cols.columns.iter().map(|c| format!("l.{}", ident(&c.name))).collect();
+    for c in brought {
+        let name = format!("{}{}", prefix.unwrap_or(""), c.name);
+        check_name(&name, cols, &format!("it brings '{}' of {id} as", c.name))?;
+        select.push(format!("r.{} AS {}", ident(&c.name), ident(&name)));
+        cols.columns.push(Column { name, ..c.clone() });
+        cols.ancestry.push(vec![Origin { source: format!("dataset:{id}"), column: c.name.clone() }]);
+    }
+    let how = match kind {
+        crate::recipe::JoinKind::Left => "LEFT JOIN",
+        crate::recipe::JoinKind::Inner => "JOIN",
+    };
+    Ok(format!(
+        "SELECT {} FROM (SELECT *, row_number() OVER () AS \"__position\" FROM {prev}) l {how} {table} r ON {} ORDER BY l.\"__position\"",
+        select.join(", "),
+        conds.join(" AND ")
+    ))
+}
+
+/// Another dataset's rows after these: columns met by name, each at the
+/// type both widen to; a column only one side has is empty on the other.
+fn append(prev: &str, cols: &mut Cols, id: &str, input: &[Column]) -> Result<String> {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for (i, c) in cols.columns.iter_mut().enumerate() {
+        let x = ident(&c.name);
+        match input.iter().find(|r| r.name.eq_ignore_ascii_case(&c.name)) {
+            Some(r) => {
+                let t = crate::schema::common(c.ty, r.ty).ok_or_else(|| {
+                    Error::Invalid(format!("column '{}' is {} here and {} in {id}, which do not widen to one type", c.name, c.ty, r.ty))
+                })?;
+                left.push(format!("CAST({x} AS {}) AS {x}", t.sql()));
+                right.push(format!("CAST({} AS {}) AS {x}", ident(&r.name), t.sql()));
+                c.ty = t;
+                cols.ancestry[i].push(Origin { source: format!("dataset:{id}"), column: r.name.clone() });
+            }
+            None => {
+                left.push(x.clone());
+                right.push(format!("CAST(NULL AS {}) AS {x}", c.ty.sql()));
+            }
+        }
+    }
+    for r in input {
+        if cols.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&r.name)) {
+            continue;
+        }
+        let x = ident(&r.name);
+        left.push(format!("CAST(NULL AS {}) AS {x}", r.ty.sql()));
+        right.push(x);
+        cols.columns.push(r.clone());
+        cols.ancestry.push(vec![Origin { source: format!("dataset:{id}"), column: r.name.clone() }]);
+    }
+    Ok(format!("SELECT {} FROM {prev} UNION ALL SELECT {} FROM {}", left.join(", "), right.join(", "), ident(&input_table(id))))
 }
 
 fn order_by(by: &[SortKey], cols: &Cols) -> Result<String> {

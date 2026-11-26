@@ -295,6 +295,31 @@ async fn a_semantic_query_as_a_source() {
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
 }
 
+/// A dataset that reads another, and what that means for a delete.
+#[tokio::test]
+async fn combining_datasets_through_the_routes() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let base = format!("/projects/{CS}/datasets");
+    let budget = s.upload(&base, Some("user-ann"), BUDGET).await.body["id"].as_str().unwrap().to_string();
+    let owners = s.upload(&base, Some("user-ann"), "area,manager\nEMEA,kim\nAPAC,lee\n").await.body["id"].as_str().unwrap().to_string();
+    let a = s
+        .post_as_ann(
+            &format!("{base}/{budget}/recipe"),
+            json!({ "against": 1, "steps": [{ "op": "join", "dataset": owners, "on": [{ "left": "region", "right": "area" }] }] }),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["columns"][3]["name"], "manager");
+    let a = s.as_ann(Method::GET, &format!("{base}/{owners}/downstream")).await;
+    assert_eq!(a.body["downstream"][0]["id"], budget.as_str(), "{}", a.body);
+    let a = s.as_ann(Method::DELETE, &format!("{base}/{owners}")).await;
+    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
+    let a = s.as_ann(Method::DELETE, &format!("{base}/{owners}?confirm=true")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));

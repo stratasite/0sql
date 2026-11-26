@@ -22,6 +22,33 @@ pub(crate) struct Made {
     pub outcomes: Vec<Outcome>,
 }
 
+/// Another dataset a recipe reads: its live version, as this job found it.
+#[derive(Clone)]
+pub(crate) struct Input {
+    pub id: String,
+    pub version: u32,
+    pub dir: std::path::PathBuf,
+    pub columns: Vec<Column>,
+}
+
+pub(crate) fn inputs_map(inputs: &[Input]) -> compile::Inputs {
+    inputs.iter().map(|i| (i.id.clone(), i.columns.clone())).collect()
+}
+
+/// Loads each input's version as the table its steps read.
+pub(crate) fn load_inputs(session: &Session, inputs: &[Input], sample: Option<usize>) -> Result<()> {
+    for i in inputs {
+        let rows = store::read_rows(&store::version_dir(&i.dir, i.version).join(store::ROWS))?;
+        let batches = match sample {
+            Some(n) => first_rows(&rows.batches, n),
+            None => rows.batches,
+        };
+        let columns: Vec<(String, ColumnType)> = i.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
+        session.load(&compile::input_table(&i.id), &columns, &batches)?;
+    }
+    Ok(())
+}
+
 /// What a run came to: a materialization, or a recipe that reads
 /// columns the sources no longer have.
 pub(crate) enum Run {
@@ -92,29 +119,32 @@ pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<Vec<Outc
             let x = ident(&c.column);
             let examples = session.texts(&format!("SELECT CAST({x} AS VARCHAR) FROM {} WHERE {} LIMIT 3", c.relation, c.failing))?;
             let shown: Vec<String> = examples.iter().map(|v| format!("'{v}'")).collect();
-            return Err(Error::Unprocessable(format!(
-                "step {} (retype) makes column '{}' {} from {}, and {n} value(s) do not convert without loss, such as {}",
-                c.step,
-                c.column,
-                c.to,
-                c.from,
-                shown.join(", ")
-            )));
+            return Err(Error::Unprocessable(format!("{}, such as {}", c.says.replace("{n}", &n.to_string()), shown.join(", "))));
         }
     }
     Ok(outcomes)
 }
 
 /// Runs `recipe` over the dataset's latest snapshots as version `k`.
-pub(crate) fn run(prep: &Prep, dir: &Path, dataset: &Dataset, recipe: &Recipe, log: &[Entry], upto: u64, k: u32) -> Result<Run> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run(
+    prep: &Prep,
+    dir: &Path,
+    dataset: &Dataset,
+    recipe: &Recipe,
+    (log, upto): (&[Entry], u64),
+    inputs: &[Input],
+    k: u32,
+) -> Result<Run> {
     let pinned_at = crate::time::now();
     let edits = crate::edits::in_force(log, upto);
-    let compiled = compile::compile(recipe, &edits, &dataset.sources, &pinned_at)?;
+    let compiled = compile::compile(recipe, &edits, &dataset.sources, &inputs_map(inputs), &pinned_at)?;
     if !compiled.unresolved.is_empty() {
         return Ok(Run::Held(compiled.unresolved));
     }
     let session = prep.engine.session()?;
     let sources = load_sources(&session, dir, dataset, None)?;
+    load_inputs(&session, inputs, None)?;
     let outcomes = prepare(&session, &compiled)?;
     let list: Vec<String> = compiled.columns.iter().map(|c| ident(&c.name)).collect();
     let rows = session.query(&format!("SELECT {} FROM {}", list.join(", "), compiled.last))?;
@@ -140,7 +170,7 @@ pub(crate) fn run(prep: &Prep, dir: &Path, dataset: &Dataset, recipe: &Recipe, l
         recipe: recipe.version,
         edits: upto,
         sources,
-        datasets: Vec::new(),
+        datasets: inputs.iter().map(|i| crate::lineage::DatasetRead { id: i.id.clone(), version: i.version }).collect(),
         roles: columns.iter().map(|c| (c.name.clone(), c.role)).collect(),
         made_by: MadeBy { zsql: env!("CARGO_PKG_VERSION").to_string(), compiler: COMPILER_VERSION, duckdb: prep.duckdb_version.clone() },
         pinned_at: pinned_at.clone(),

@@ -171,6 +171,7 @@ fn of_an_org(upload_limit: usize) -> Router<Shared> {
         .route("/projects/{uid}/datasets/query", post(datasets::from_query))
         .route("/projects/{uid}/datasets/{id}", get(datasets::get).delete(datasets::delete))
         .route("/projects/{uid}/datasets/{id}/refresh", post(datasets::refresh))
+        .route("/projects/{uid}/datasets/{id}/downstream", get(datasets::downstream))
         .route("/projects/{uid}/datasets/{id}/upload", axum::routing::put(datasets::replace).layer(upload))
         .route("/projects/{uid}/datasets/{id}/rows", get(datasets::rows))
         .route("/projects/{uid}/datasets/{id}/lineage", get(datasets::lineage))

@@ -9,7 +9,8 @@
 //! POST   /projects/{uid}/datasets/query                   {"name", "branch", "spec" | "expr", "context", "connection", "wait"}: a dataset from a semantic query
 //! POST   /projects/{uid}/datasets/{id}/refresh            {"context", "connection", "wait"}: its query run again, fresh
 //! GET    /projects/{uid}/datasets/{id}
-//! DELETE /projects/{uid}/datasets/{id}                    a hard delete
+//! DELETE /projects/{uid}/datasets/{id}                    a hard delete; ?confirm=true when others read it
+//! GET    /projects/{uid}/datasets/{id}/downstream         the datasets that read it, in the order they run
 //! PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV, a new snapshot, and the recipe run over it
 //! GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=&sort=col:desc,col&filter=<formula>
 //! GET    /projects/{uid}/datasets/{id}/lineage            ?version=
@@ -352,15 +353,23 @@ async fn finish(
     .await
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeleteQuery {
+    #[serde(default)]
+    confirm: bool,
+}
+
 pub(crate) async fn delete(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
+    Search(q): Search<DeleteQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let (prep, scope) = scope(&app, org, uid, &headers)?;
     blocking(move || {
-        prep.delete(&scope, &id)?;
+        prep.delete(&scope, &id, q.confirm)?;
         Ok(Json(json!({ "removed": id })))
     })
     .await
@@ -583,6 +592,21 @@ pub(crate) async fn source(
 ) -> Result<Json<Value>, ApiError> {
     let (prep, scope) = scope(&app, org, uid, &headers)?;
     blocking(move || Ok(Json(serde_json::to_value(prep.snapshot(&scope, &id, &source, q.snapshot)?).unwrap_or(Value::Null)))).await
+}
+
+pub(crate) async fn downstream(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || {
+        let below: Vec<Value> =
+            prep.downstream(&scope, &id)?.iter().map(|d| json!({ "id": d.id, "name": d.name, "live": d.live })).collect();
+        Ok(Json(json!({ "downstream": below })))
+    })
+    .await
 }
 
 /// Every dataset of one owner in the org, in every project: what an

@@ -124,6 +124,11 @@ impl Store {
         Store { data_dir: data_dir.to_path_buf() }
     }
 
+    /// Where blends' answers are kept.
+    pub fn blends(&self) -> PathBuf {
+        self.data_dir.join(".cache").join("blends")
+    }
+
     /// Where one project's datasets are.
     pub fn root(&self, org: &str, project: &str) -> PathBuf {
         self.data_dir.join(org).join(project).join(DIR)

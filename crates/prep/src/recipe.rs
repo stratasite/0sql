@@ -102,6 +102,43 @@ pub enum Step {
         by: Vec<String>,
         aggregates: Vec<Aggregate>,
     },
+    /// Another dataset's rows after these, its columns met by name.
+    Append {
+        dataset: String,
+    },
+    // Combine.
+    /// Another dataset's columns beside these, by keys: `left` keeps every
+    /// row here (a look-up), `inner` only those that match. The other
+    /// side must be unique on its keys, so no row is multiplied.
+    Join {
+        dataset: String,
+        on: Vec<JoinKey>,
+        #[serde(default)]
+        kind: JoinKind,
+        /// The columns brought; all but its keys when not said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        columns: Option<Vec<String>>,
+        /// Put before each brought column's name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JoinKey {
+    /// A column here.
+    pub left: String,
+    /// A column of the other dataset.
+    pub right: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinKind {
+    #[default]
+    Left,
+    Inner,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -168,7 +205,37 @@ impl Step {
             Step::Trim { .. } => "trim",
             Step::Case { .. } => "case",
             Step::Group { .. } => "group",
+            Step::Append { .. } => "append",
+            Step::Join { .. } => "join",
         }
+    }
+
+    /// The dataset the step reads, when it reads one.
+    pub fn dataset(&self) -> Option<&str> {
+        match self {
+            Step::Append { dataset } | Step::Join { dataset, .. } => Some(dataset),
+            _ => None,
+        }
+    }
+
+    /// What the step needs of the dataset it reads, by name: a join's
+    /// keys and the columns it names. An append or a join that brings
+    /// every column needs no one column in particular.
+    pub fn needs(&self) -> Vec<String> {
+        match self {
+            Step::Join { on, columns, .. } => on.iter().map(|k| k.right.clone()).chain(columns.iter().flatten().cloned()).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl Recipe {
+    /// The datasets its steps read.
+    pub fn inputs(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.steps.iter().filter_map(Step::dataset).map(str::to_string).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 

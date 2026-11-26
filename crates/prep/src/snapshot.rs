@@ -48,10 +48,28 @@ pub(crate) fn from_rows(
     if rows.num_rows() > max_rows {
         return Err(Error::Unprocessable(format!("the query returned {} rows, more than the {max_rows} a dataset holds", rows.num_rows())));
     }
+    let (incoming, batches) = held(rows)?;
+    session.load("raw", &incoming, &batches)?;
+    let (exprs, mut columns, changes) = meet_established(session, "raw", &incoming, established)?;
+    for c in columns.iter_mut() {
+        if !established.iter().any(|e| e.name == c.name) {
+            if let Some(r) = roles.get(&c.name) {
+                c.role = *r;
+            }
+        }
+    }
+    let list = if exprs.is_empty() { "NULL AS \"_\"".to_string() } else { exprs.join(", ") };
+    let rows = session.query(&format!("SELECT {list} FROM raw"))?;
+    Ok(Taken { rows, columns, parse: None, changes })
+}
+
+/// Rows from elsewhere, each column cast to the type a dataset holds it
+/// as; the columns and the batches.
+pub(crate) fn held(rows: &Batches) -> Result<(Vec<(String, ColumnType)>, Vec<RecordBatch>)> {
     let mut incoming: Vec<(String, ColumnType)> = Vec::new();
     for f in rows.schema.fields() {
         if incoming.iter().any(|(n, _)| n.eq_ignore_ascii_case(f.name())) {
-            return Err(Error::Unprocessable(format!("the query returned two columns named '{}'", f.name())));
+            return Err(Error::Unprocessable(format!("two columns are named '{}'", f.name())));
         }
         incoming.push((f.name().clone(), held_as(f.data_type())));
     }
@@ -68,18 +86,7 @@ pub(crate) fn from_rows(
         }
         batches.push(RecordBatch::try_new(schema.clone(), arrays)?);
     }
-    session.load("raw", &incoming, &batches)?;
-    let (exprs, mut columns, changes) = meet_established(session, "raw", &incoming, established)?;
-    for c in columns.iter_mut() {
-        if !established.iter().any(|e| e.name == c.name) {
-            if let Some(r) = roles.get(&c.name) {
-                c.role = *r;
-            }
-        }
-    }
-    let list = if exprs.is_empty() { "NULL AS \"_\"".to_string() } else { exprs.join(", ") };
-    let rows = session.query(&format!("SELECT {list} FROM raw"))?;
-    Ok(Taken { rows, columns, parse: None, changes })
+    Ok((incoming, batches))
 }
 
 /// The type a dataset holds a warehouse's column as: the nearest of its

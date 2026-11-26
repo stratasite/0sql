@@ -131,8 +131,9 @@ reads and writes and compiles to SQL for DuckDB. No user SQL, anywhere.
 - **Values:** find and replace, remap a value, trim, change case
   (`replace`, `remap`, `trim`, `case`).
 - **Shape:** group and aggregate (`group`: sum, min, max, avg, count,
-  count_distinct), append.
-- **Combine:** join or look up another dataset.
+  count_distinct), append (`append`).
+- **Combine:** join or look up another dataset (`join`, `left` or
+  `inner`, with `on` keys, the `columns` brought and a `prefix`).
 - **Edits:** see "Editing a cell".
 
 A step is JSON with an `op`: `{"op": "remap", "column": "region",
@@ -260,7 +261,18 @@ form a **DAG**:
   A semantic source reached by a cascade is not re-run (there is no
   context to run it under); its last snapshot is used.
 - One job per dataset at a time.
-- Reading an input is checked as reading it directly would be.
+- Reading an input is checked as reading it directly would be: an
+  input is one of the same owner's datasets in the same project, read
+  at its live version, which the lineage records.
+- An append meets columns by name, each at the type both widen to; a
+  column only one side has is empty on the other.
+- **What a reader names is a dependency.** A join's keys and the columns
+  it names are what it reads of its input. A new version of the input
+  without one is held, naming the reader; confirming it lets the
+  reader be held in turn when the cascade reaches it.
+- A dataset others read is deleted only with `confirm=true`; they keep
+  their last version and fail when run again.
+  `GET .../downstream` lists what reads a dataset, in cascade order.
 
 ## Lineage
 
@@ -556,7 +568,7 @@ know about datasets.
 - [x] **3. Edits.** Investigate the open questions first; then remaps,
   measure overrides, the edit log, orphans and flags.
 - [x] **4. A semantic query as a source,** refreshed fresh, by request.
-- [ ] **5. Combining datasets.** Joins and appends, the DAG and its
+- [x] **5. Combining datasets.** Joins and appends, the DAG and its
   cascade.
 - [ ] **6. Blends.** Attachment in the spec, the owner header on `/mcp`,
   the isolation golden test, `filter`, `enrich` with budget against
