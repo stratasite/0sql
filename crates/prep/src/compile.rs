@@ -10,6 +10,7 @@
 //! upstream with nothing reading it is a note, and one with readers
 //! holds the run, naming each.
 
+use crate::edits::Edit;
 use crate::error::{Error, Result};
 use crate::formula;
 use crate::lineage::Origin;
@@ -32,9 +33,21 @@ pub struct Compiled {
     pub ancestry: Vec<Vec<Origin>>,
     /// Conversions to check before the result is read.
     pub checks: Vec<Check>,
+    /// The edits, each set applied once the views before it exist.
+    pub edits: Vec<EditStage>,
     /// Steps and roles that read a column not there; empty when the
     /// recipe runs.
     pub unresolved: Vec<Unresolved>,
+}
+
+/// Edits that apply at one point of the recipe: after the first `at`
+/// views, as the view `name`, which the later views read.
+pub struct EditStage {
+    pub at: usize,
+    pub input: String,
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub edits: Vec<Edit>,
 }
 
 /// A retype that keeps a value only if it converts: the rows of
@@ -55,11 +68,18 @@ pub struct Unresolved {
     /// The step, from 1; 0 for a role the recipe gives.
     pub step: usize,
     pub op: String,
+    /// The edit, when it is an edit that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<String>,
 }
 
 impl Unresolved {
     pub fn describe(&self) -> String {
-        if self.step == 0 {
+        if let Some(id) = &self.edit {
+            format!("edit {id} reads column '{}', which is not there where it applies", self.column)
+        } else if self.op == "key" {
+            format!("the key names column '{}', which the dataset does not have", self.column)
+        } else if self.step == 0 {
             format!("the role given to column '{}'", self.column)
         } else {
             format!("step {} ({}) reads column '{}', which is not there at that step", self.step, self.op, self.column)
@@ -100,13 +120,25 @@ impl Cols {
 
 /// Compiles a recipe over the sources as they now are, with `today()`
 /// pinned to `pinned_at`.
-pub fn compile(recipe: &Recipe, sources: &[SourceState], pinned_at: &str) -> Result<Compiled> {
-    compile_steps(&recipe.steps, &recipe.roles, sources, pinned_at)
+pub fn compile(recipe: &Recipe, edits: &[(usize, Edit)], sources: &[SourceState], pinned_at: &str) -> Result<Compiled> {
+    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, sources, pinned_at)
 }
 
+/// Steps alone, with no edits and no key.
 pub fn compile_steps(
     steps: &[Step],
     roles: &std::collections::BTreeMap<String, Role>,
+    sources: &[SourceState],
+    pinned_at: &str,
+) -> Result<Compiled> {
+    compile_all(steps, roles, &[], &[], sources, pinned_at)
+}
+
+pub fn compile_all(
+    steps: &[Step],
+    roles: &std::collections::BTreeMap<String, Role>,
+    key: &[String],
+    edits: &[(usize, Edit)],
     sources: &[SourceState],
     pinned_at: &str,
 ) -> Result<Compiled> {
@@ -120,13 +152,42 @@ pub fn compile_steps(
     let mut views: Vec<(String, String)> = Vec::new();
     let mut checks = Vec::new();
     let mut unresolved = Vec::new();
+    let mut stages = Vec::new();
     let mut prev = ident(&source.id);
+    // The edits made after `p` steps, applied there; one made after
+    // more steps than the recipe now has applies at its end.
+    let mut edit_stage = |p: usize, prev: &mut String, cols: &Cols, views: &Vec<(String, String)>, unresolved: &mut Vec<Unresolved>| {
+        let mut here = Vec::new();
+        for (after, e) in edits {
+            if (*after).min(steps.len()) != p {
+                continue;
+            }
+            let missing: Vec<String> = e.reads().into_iter().filter(|c| cols.find(c).is_none()).collect();
+            if missing.is_empty() {
+                here.push(e.clone());
+            } else {
+                unresolved.extend(missing.into_iter().map(|column| Unresolved {
+                    column,
+                    step: p,
+                    op: "edit".into(),
+                    edit: Some(e.id().to_string()),
+                }));
+            }
+        }
+        if !here.is_empty() {
+            let name = format!("e{p}");
+            stages.push(EditStage { at: views.len(), input: prev.clone(), name: name.clone(), columns: cols.columns.clone(), edits: here });
+            *prev = ident(&name);
+        }
+    };
+    edit_stage(0, &mut prev, &cols, &views, &mut unresolved);
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         // What the step reads that is not there: it is passed over.
         let missing: Vec<String> = reads(step)?.into_iter().filter(|c| cols.find(c).is_none()).collect();
         if !missing.is_empty() {
-            unresolved.extend(missing.into_iter().map(|column| Unresolved { column, step: n, op: step.op().into() }));
+            unresolved.extend(missing.into_iter().map(|column| Unresolved { column, step: n, op: step.op().into(), edit: None }));
+            edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
             continue;
         }
         let at = |e: Error| match e {
@@ -137,14 +198,20 @@ pub fn compile_steps(
         let name = format!("t{n}");
         views.push((name.clone(), select));
         prev = ident(&name);
+        edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
     }
     for (name, role) in roles {
         match cols.find(name) {
             Some(i) => cols.columns[i].role = *role,
-            None => unresolved.push(Unresolved { column: name.clone(), step: 0, op: "role".into() }),
+            None => unresolved.push(Unresolved { column: name.clone(), step: 0, op: "role".into(), edit: None }),
         }
     }
-    Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, unresolved })
+    for k in key {
+        if cols.find(k).is_none() {
+            unresolved.push(Unresolved { column: k.clone(), step: 0, op: "key".into(), edit: None });
+        }
+    }
+    Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, edits: stages, unresolved })
 }
 
 /// The columns a step reads, by name as the step writes them.
@@ -182,7 +249,7 @@ fn text_column(cols: &Cols, i: usize, what: &str) -> Result<()> {
 
 /// A value from a request as a literal of a column's type, refused when
 /// it is not one.
-fn value_sql(v: &Value, ty: ColumnType, column: &str) -> Result<String> {
+pub(crate) fn value_sql(v: &Value, ty: ColumnType, column: &str) -> Result<String> {
     let text = match v {
         Value::Null => return Ok("NULL".into()),
         Value::String(s) => s.clone(),

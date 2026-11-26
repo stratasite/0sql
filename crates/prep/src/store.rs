@@ -56,6 +56,9 @@ pub struct Dataset {
     /// recipe has not run on them, and what is live is older.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<Held>,
+    /// How much of the edit log is in force.
+    #[serde(default)]
+    pub edits: u64,
 }
 
 /// Why a dataset's latest snapshots have not been made into a version.

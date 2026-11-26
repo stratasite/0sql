@@ -24,12 +24,14 @@
 //! - `recipe`: recipe versions and their steps
 //! - `formula`: the formula language, compiled to the engine's SQL
 //! - `compile`: a recipe as the engine's SQL, and the column graph
+//! - `edits`: the edit log: remaps, overrides, rows added and deleted
 //! - `engine`: DuckDB, in memory, with external access off
 //! - `materialize`: running a recipe, and pages of what it made
 //! - `lineage`: what each materialization was made from
 //! - `store`: where datasets are kept, and the only module that knows
 
 pub mod compile;
+pub mod edits;
 pub mod engine;
 pub mod error;
 pub mod formula;
@@ -43,6 +45,7 @@ pub mod store;
 pub mod time;
 
 pub use compile::Unresolved;
+pub use edits::{Asked, Edit, Entry, Outcome, State};
 pub use engine::{Engine, EngineLimits};
 pub use error::{Error, Result};
 pub use lineage::Lineage;
@@ -129,6 +132,17 @@ pub struct Page {
     pub total: u64,
     pub offset: u64,
     pub rows: Batches,
+}
+
+/// What an edit is checked against: the live version, loaded as `v`,
+/// and the log so far.
+#[derive(Clone, Copy)]
+struct EditCx<'a> {
+    session: &'a engine::Session,
+    columns: &'a [Column],
+    identity: &'a [String],
+    in_force: &'a [(usize, Edit)],
+    log: &'a [Entry],
 }
 
 /// What a preview is asked for.
@@ -251,10 +265,11 @@ impl Prep {
                 rows: 0,
                 notes: Vec::new(),
                 held: None,
+                edits: 0,
             };
             let recipe = Recipe::first(now);
             store::write_json(&store::recipe_path(&staging, 1), &recipe)?;
-            if self.materialize(&staging, &mut dataset, &recipe)?.is_some() {
+            if self.materialize(&staging, &mut dataset, &recipe, &[])?.is_some() {
                 return Err(Error::Internal("a first recipe has no steps to hold it".into()));
             }
             store::write_json(&staging.join(store::MANIFEST), &dataset)?;
@@ -294,7 +309,8 @@ impl Prep {
         dataset.sources[index] = store::SourceState { snapshot: n, columns, ..source };
         dataset.updated = time::now();
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
-        let made = self.materialize(&dir, &mut dataset, &recipe);
+        let log = edits::read_log(&dir)?;
+        let made = self.materialize(&dir, &mut dataset, &recipe, &log);
         match &made {
             Ok(None) => dataset.held = None,
             Ok(Some(unresolved)) => {
@@ -329,7 +345,7 @@ impl Prep {
         let (_, dataset) = self.find(scope, id)?;
         let current: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let recipe = current.changed(change, time::now())?;
-        self.commit(&dir, dataset, recipe)
+        self.commit(&dir, dataset, recipe, None)
     }
 
     /// Takes a held dataset past what held it: a recipe version without
@@ -343,28 +359,52 @@ impl Prep {
             return Err(Error::Invalid(format!("dataset {id} is not held; there is nothing to confirm")));
         };
         let current: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
-        let dropped: Vec<usize> = held.unresolved.iter().map(|u| u.step).collect();
-        let roles = current.roles.iter().filter(|(n, _)| !held.unresolved.iter().any(|u| u.step == 0 && &u.column == *n));
+        let steps_of = |u: &&Unresolved| u.edit.is_none() && u.step > 0;
+        let dropped: Vec<usize> = held.unresolved.iter().filter(steps_of).map(|u| u.step).collect();
+        let gone = |op: &str, name: &str| held.unresolved.iter().any(|u| u.edit.is_none() && u.step == 0 && u.op == op && u.column == name);
         let change = Change {
             against,
-            roles: roles.map(|(n, r)| (n.clone(), *r)).collect(),
+            roles: current.roles.iter().filter(|(n, _)| !gone("role", n)).map(|(n, r)| (n.clone(), *r)).collect(),
             steps: current.steps.iter().enumerate().filter(|(i, _)| !dropped.contains(&(i + 1))).map(|(_, s)| s.clone()).collect(),
+            key: current.key.iter().filter(|k| !gone("key", k)).cloned().collect(),
         };
         let recipe = current.changed(change, time::now())?;
-        self.commit(&dir, dataset, recipe)
+        // The edits that held it are undone, as an entry of the log.
+        let mut undone: Vec<&str> = held.unresolved.iter().filter_map(|u| u.edit.as_deref()).collect();
+        undone.sort();
+        undone.dedup();
+        let entry = (!undone.is_empty()).then(|| {
+            let seq = dataset.edits + 1;
+            Entry {
+                seq,
+                at: time::now(),
+                recipe: recipe.version,
+                after: recipe.steps.len(),
+                edits: undone.iter().enumerate().map(|(i, u)| Edit::Undo { id: edits::id_of(seq, i), undoes: u.to_string() }).collect(),
+            }
+        });
+        self.commit(&dir, dataset, recipe, entry)
     }
 
     /// Runs a new recipe version and, when it makes a materialization,
     /// keeps both.
-    fn commit(&self, dir: &Path, dataset: Dataset, recipe: Recipe) -> Result<Dataset> {
+    fn commit(&self, dir: &Path, dataset: Dataset, recipe: Recipe, entry: Option<Entry>) -> Result<Dataset> {
         let mut next = dataset;
-        if let Some(unresolved) = self.materialize(dir, &mut next, &recipe)? {
+        let mut log = edits::read_log(dir)?;
+        if let Some(e) = &entry {
+            log.push(e.clone());
+            next.edits = e.seq;
+        }
+        if let Some(unresolved) = self.materialize(dir, &mut next, &recipe, &log)? {
             return Err(Error::Invalid(format!(
                 "the recipe reads columns that are not there: {}",
                 unresolved.iter().map(Unresolved::describe).collect::<Vec<_>>().join("; ")
             )));
         }
         store::write_json(&store::recipe_path(dir, recipe.version), &recipe)?;
+        if let Some(e) = &entry {
+            edits::append(dir, e)?;
+        }
         next.recipe = recipe.version;
         next.updated = time::now();
         next.held = None;
@@ -388,7 +428,9 @@ impl Prep {
         }
         let roles = preview.roles.unwrap_or(recipe.roles);
         let pinned_at = time::now();
-        let compiled = compile::compile_steps(&steps, &roles, &dataset.sources, &pinned_at)?;
+        let log = edits::read_log(&dir)?;
+        let compiled =
+            compile::compile_all(&steps, &roles, &recipe.key, &edits::in_force(&log, dataset.edits), &dataset.sources, &pinned_at)?;
         let session = self.engine.session()?;
         materialize::load_sources(&session, &dir, &dataset, Some(PREVIEW_SAMPLE))?;
         materialize::prepare(&session, &compiled)?;
@@ -419,7 +461,10 @@ impl Prep {
         };
         let mut steps = recipe.steps.clone();
         steps.insert(k, Step::Remove { columns: vec![column.to_string()] });
-        let c = compile::compile_steps(&steps, &recipe.roles, &dataset.sources, &pinned_at)?;
+        let log = edits::read_log(&dir)?;
+        let in_force: Vec<(usize, Edit)> =
+            edits::in_force(&log, dataset.edits).into_iter().map(|(a, e)| (if a >= k { a + 1 } else { a }, e)).collect();
+        let c = compile::compile_all(&steps, &recipe.roles, &recipe.key, &in_force, &dataset.sources, &pinned_at)?;
         // Told by the recipe's own numbers, without the removal put in.
         Ok(c.unresolved
             .into_iter()
@@ -511,6 +556,177 @@ impl Prep {
         Ok(removed)
     }
 
+    /// Edits made in the grid, against the latest recipe version: one
+    /// entry of the log, and the recipe run with it. Each is checked
+    /// against the live version first, so an edit that names no row, or
+    /// more rows than it was made for, is refused before it is kept.
+    pub fn edit(&self, scope: &Scope, id: &str, request: edits::Request) -> Result<(Dataset, Vec<Outcome>)> {
+        let (dir, _) = self.find(scope, id)?;
+        let _job = self.job(&dir)?;
+        let (_, dataset) = self.find(scope, id)?;
+        if request.against != dataset.recipe {
+            return Err(Error::Conflict(format!(
+                "these edits were made against recipe version {}, and the recipe is at version {} now; read it again",
+                request.against, dataset.recipe
+            )));
+        }
+        if let Some(held) = &dataset.held {
+            return Err(Error::Conflict(format!(
+                "dataset {id} is held ({}); change the recipe or confirm before editing",
+                held.unresolved.iter().map(Unresolved::describe).collect::<Vec<_>>().join("; ")
+            )));
+        }
+        if request.edits.is_empty() || request.edits.len() > edits::ENTRY_LIMIT {
+            return Err(Error::Invalid(format!("an entry holds 1 to {} edits", edits::ENTRY_LIMIT)));
+        }
+        let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
+        let log = edits::read_log(&dir)?;
+        let in_force = edits::in_force(&log, dataset.edits);
+        let k = dataset.live.ok_or_else(|| Error::Internal(format!("dataset {id} has no live version")))?;
+        let manifest: Materialization = store::read_json(&store::version_dir(&dir, k).join("manifest.json"))?;
+        let rows = store::read_rows(&store::version_dir(&dir, k).join(store::ROWS))?;
+        let session = self.engine.session()?;
+        let typed: Vec<(String, ColumnType)> = manifest.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
+        session.load("v", &typed, &rows.batches)?;
+        let columns = &manifest.columns;
+        let identity = edits::identity(columns, &recipe.key);
+        let seq = dataset.edits + 1;
+        let mut made = Vec::new();
+        for (i, asked) in request.edits.into_iter().enumerate() {
+            let eid = edits::id_of(seq, i);
+            let at = |e: Error| match e {
+                Error::Invalid(m) => Error::Invalid(format!("edit {} : {m}", i + 1).replacen(" :", ":", 1)),
+                other => other,
+            };
+            let cx = EditCx { session: &session, columns, identity: &identity, in_force: &in_force, log: &log };
+            made.push(Self::one_edit(&cx, eid, asked).map_err(at)?);
+        }
+        let entry = Entry { seq, at: time::now(), recipe: dataset.recipe, after: recipe.steps.len(), edits: made };
+        let mut next = dataset.clone();
+        let mut log = log;
+        log.push(entry.clone());
+        next.edits = seq;
+        if let Some(u) = self.materialize(&dir, &mut next, &recipe, &log)? {
+            return Err(Error::Invalid(format!(
+                "the edits read columns that are not there: {}",
+                u.iter().map(Unresolved::describe).collect::<Vec<_>>().join("; ")
+            )));
+        }
+        edits::append(&dir, &entry)?;
+        next.updated = time::now();
+        store::write_json(&dir.join(store::MANIFEST), &next)?;
+        let outcomes = edits::read_outcomes(&dir, next.live.unwrap_or(0));
+        Ok((next, outcomes))
+    }
+
+    fn one_edit(cx: &EditCx<'_>, id: String, asked: Asked) -> Result<Edit> {
+        let EditCx { session, columns, identity, in_force, log } = *cx;
+        let column_of = |name: &str| {
+            columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)).ok_or_else(|| Error::Invalid(format!("there is no column '{name}'")))
+        };
+        // The rows of the live version a key names, and the first one's
+        // value of `column`.
+        let matching = |key: &std::collections::BTreeMap<String, serde_json::Value>,
+                        column: Option<&Column>|
+         -> Result<(u64, serde_json::Value)> {
+            let mut conds = Vec::new();
+            for (c, v) in key {
+                let col = column_of(c)?;
+                compile::value_sql(v, col.ty, &col.name)?;
+                match edits::text_of(v) {
+                    Some(t) => conds.push(format!("{} = TRY_CAST({} AS {})", schema::ident(&col.name), schema::literal(&t), col.ty.sql())),
+                    None => conds.push(format!("{} IS NULL", schema::ident(&col.name))),
+                }
+            }
+            let cond = if conds.is_empty() { "TRUE".to_string() } else { conds.join(" AND ") };
+            let n = session.count(&format!("SELECT count(*) FROM v WHERE {cond}"))?;
+            let value = match column {
+                Some(c) if n > 0 => {
+                    let r = session.query(&format!("SELECT {} FROM v WHERE {cond} LIMIT 1", schema::ident(&c.name)))?;
+                    zsql_exec::json::rows(&r)
+                        .map_err(|e| Error::Internal(e.to_string()))?
+                        .first()
+                        .and_then(|row| row.get(0).cloned())
+                        .unwrap_or_default()
+                }
+                _ => serde_json::Value::Null,
+            };
+            Ok((n, value))
+        };
+        let names_one = |n: u64, all: bool| -> Result<()> {
+            match n {
+                0 => Err(Error::Invalid("no row has these values".into())),
+                1 => Ok(()),
+                _ if all => Ok(()),
+                _ => Err(Error::Invalid(format!(
+                    "{n} rows have these values: the dimensions do not name one row; mark a key in the recipe, or send all: true to edit every one"
+                ))),
+            }
+        };
+        Ok(match asked {
+            Asked::Cell { column, row, from, to, one, all } => {
+                let c = column_of(&column)?.clone();
+                compile::value_sql(&to, c.ty, &c.name)?;
+                if c.role == Role::Dimension && !one {
+                    let from = from
+                        .or_else(|| {
+                            row.as_ref().and_then(|r| r.iter().find(|(n, _)| n.eq_ignore_ascii_case(&c.name)).map(|(_, v)| v.clone()))
+                        })
+                        .ok_or_else(|| Error::Invalid(format!("a remap of '{}' says the value it changes: from, or the row", c.name)))?;
+                    compile::value_sql(&from, c.ty, &c.name)?;
+                    Edit::Remap { id, column: c.name, from, to }
+                } else {
+                    let row = row.ok_or_else(|| Error::Invalid(format!("an edit of '{}' for one row says which row: row", c.name)))?;
+                    let key = edits::key_of(&row, identity)?;
+                    let (n, current) = matching(&key, Some(&c))?;
+                    names_one(n, all)?;
+                    // The value first replaced is what a sync is checked against.
+                    let earlier = in_force.iter().rev().find_map(|(_, e)| match e {
+                        Edit::Set { column: col, key: k, was, .. } if *col == c.name && *k == key => Some(was.clone()),
+                        _ => None,
+                    });
+                    let was = earlier.unwrap_or(if n == 1 { current } else { serde_json::Value::Null });
+                    Edit::Set { id, column: c.name, key, was, to, all: all && n > 1 }
+                }
+            }
+            Asked::Delete { row, all } => {
+                let key = edits::key_of(&row, identity)?;
+                names_one(matching(&key, None)?.0, all)?;
+                Edit::Delete { id, key, all }
+            }
+            Asked::Add { values } => {
+                let key = edits::key_of(&values, identity)?;
+                for (name, v) in &values {
+                    let c = column_of(name)?;
+                    compile::value_sql(v, c.ty, &c.name)?;
+                }
+                if matching(&key, None)?.0 > 0 {
+                    return Err(Error::Invalid("a row with these values is there already; edit it instead".into()));
+                }
+                let key: std::collections::BTreeMap<_, _> = key.into_iter().collect();
+                let values = values.into_iter().filter(|(n, _)| !key.contains_key(n)).collect();
+                Edit::Add { id, key, values }
+            }
+            Asked::Undo { edit } => {
+                let known = log.iter().flat_map(|e| e.edits.iter()).any(|e| e.id() == edit && !matches!(e, Edit::Undo { .. }));
+                if !known {
+                    return Err(Error::Invalid(format!("there is no edit {edit} to undo")));
+                }
+                if !in_force.iter().any(|(_, e)| e.id() == edit) {
+                    return Err(Error::Invalid(format!("edit {edit} is undone already")));
+                }
+                Edit::Undo { id, undoes: edit }
+            }
+        })
+    }
+
+    /// The edit log, and how each edit fared in the live version.
+    pub fn edit_log(&self, scope: &Scope, id: &str) -> Result<(Vec<Entry>, Vec<Outcome>)> {
+        let (dir, dataset) = self.find(scope, id)?;
+        let log: Vec<Entry> = edits::read_log(&dir)?.into_iter().filter(|e| e.seq <= dataset.edits).collect();
+        Ok((log, dataset.live.map(|k| edits::read_outcomes(&dir, k)).unwrap_or_default()))
+    }
+
     fn version_of(&self, dir: &Path, dataset: &Dataset, version: Option<u32>) -> Result<u32> {
         let k = match version.or(dataset.live) {
             Some(k) => k,
@@ -556,9 +772,9 @@ impl Prep {
     /// Runs the recipe as the next version and makes it live; or, when
     /// the recipe reads columns that are not there, makes nothing and
     /// says which.
-    fn materialize(&self, dir: &Path, dataset: &mut Dataset, recipe: &Recipe) -> Result<Option<Vec<Unresolved>>> {
+    fn materialize(&self, dir: &Path, dataset: &mut Dataset, recipe: &Recipe, log: &[Entry]) -> Result<Option<Vec<Unresolved>>> {
         let k = dataset.made + 1;
-        let mut made = match materialize::run(self, dir, dataset, recipe, k)? {
+        let mut made = match materialize::run(self, dir, dataset, recipe, log, dataset.edits, k)? {
             materialize::Run::Made(m) => m,
             materialize::Run::Held(unresolved) => return Ok(Some(unresolved)),
         };
@@ -568,6 +784,7 @@ impl Prep {
         dataset.columns = made.manifest.columns;
         dataset.rows = made.manifest.rows;
         dataset.notes = snapshot_notes(dir, dataset);
+        dataset.notes.extend(made.lineage.notes.iter().cloned());
         Ok(None)
     }
 }

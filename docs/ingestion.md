@@ -201,15 +201,32 @@ What an edit means depends on the column's role.
 - **Adding and deleting rows** follow the measure rule: a row is named by
   its dimension members.
 
-**Still to investigate before edits are built:** a dimension edit meant
-for one row only, not every row with that value; measure edits on a
-dataset whose dimensions do not identify rows, which may need the user
-to mark a key or the edit to apply to all matching rows; and edits on
-a result past a join or an append.
+**Settled when edits were built** (they were the open questions):
+
+- **A dimension edit for one row only** is an override of that row
+  (`"one": true`), named by its identity like a measure edit, with the
+  edited value's original among its members. Without `one`, a
+  dimension edit is a remap.
+- **A row's identity** is the recipe's `key` when the user marks one,
+  else every dimension column. An edit that names more than one row is
+  refused when it is made, saying so and offering both ways out: mark a
+  key, or send `"all": true` to edit every row with those values. At a
+  later sync an edit made for one row that now names several is listed
+  as *ambiguous* and not applied; nothing guesses.
+- **Edits past a join or an append** need no rule of their own. An edit
+  applies after the steps the recipe had when it was made, and names
+  its row by what is there at that point. A step added later runs after
+  it and sees the edited value.
+- **An edit is a reader.** An edit on a column gone upstream holds the
+  dataset like a step does; confirming undoes it, as an entry of the
+  log.
 
 **Edits are a log, not a recipe version each.** An edit appends to the
 recipe's edit log; pasting five thousand cells is one append. The log is
-folded into the recipe at its position when the recipe runs.
+folded into the recipe at its position when the recipe runs. Undo is an
+entry too (`{"op": "undo", "edit": "3.2"}`), and every edit's state in
+the live version (applied, orphaned, ambiguous, flagged, or for an
+added row, in conflict) is kept beside it and listed.
 
 ## The grid
 
@@ -450,6 +467,8 @@ GET    /projects/{uid}/datasets/{id}/recipe             ?version=
 POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
 POST   /projects/{uid}/datasets/{id}/preview            {"steps": [...], "upto": n, "limit": n}: over a sample, kept nowhere
 GET    /projects/{uid}/datasets/{id}/impact             ?column=: what reads it
+GET    /projects/{uid}/datasets/{id}/edits              the edit log, and each edit's state
+POST   /projects/{uid}/datasets/{id}/edits              {"against": m, "edits": [{"op": "cell" | "delete" | "add" | "undo", ...}]}
 POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold
 GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 DELETE /datasets                                        every dataset of this owner in the org
@@ -524,7 +543,7 @@ know about datasets.
 - [x] **2. Steps, formulas and the grid.** The formula language and its
   compiler; the first steps; the column graph, held materializations;
   pages, previews, recipe versions.
-- [ ] **3. Edits.** Investigate the open questions first; then remaps,
+- [x] **3. Edits.** Investigate the open questions first; then remaps,
   measure overrides, the edit log, orphans and flags.
 - [ ] **4. A semantic query as a source,** refreshed fresh, by request.
 - [ ] **5. Combining datasets.** Joins and appends, the DAG and its

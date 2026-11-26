@@ -176,6 +176,7 @@ fn of_an_org(upload_limit: usize) -> Router<Shared> {
         .route("/projects/{uid}/datasets/{id}/preview", post(datasets::preview))
         .route("/projects/{uid}/datasets/{id}/impact", get(datasets::impact))
         .route("/projects/{uid}/datasets/{id}/confirm", post(datasets::confirm))
+        .route("/projects/{uid}/datasets/{id}/edits", get(datasets::edit_log).post(datasets::edit))
         .route("/projects/{uid}/datasets/{id}/sources/{source}", get(datasets::source))
         .route("/datasets", delete(datasets::delete_owner))
 }

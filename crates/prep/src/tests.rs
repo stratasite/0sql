@@ -121,13 +121,13 @@ fn roles_change_through_a_recipe_version_made_against_the_latest() {
     let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
     let mut roles = std::collections::BTreeMap::new();
     roles.insert("amount".to_string(), Role::Dimension);
-    let d2 = prep.change(&ann, &d.id, Change { against: 1, roles: roles.clone(), steps: vec![] }).unwrap();
+    let d2 = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: roles.clone(), steps: vec![] }).unwrap();
     assert_eq!((d2.recipe, d2.live), (2, Some(2)));
     assert_eq!(d2.columns[2].role, Role::Dimension);
-    let stale = prep.change(&ann, &d.id, Change { against: 1, roles: roles.clone(), steps: vec![] });
+    let stale = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: roles.clone(), steps: vec![] });
     assert!(matches!(stale, Err(Error::Conflict(_))));
     roles.insert("nope".to_string(), Role::Measure);
-    assert!(matches!(prep.change(&ann, &d.id, Change { against: 2, roles, steps: vec![] }), Err(Error::Invalid(_))));
+    assert!(matches!(prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles, steps: vec![] }), Err(Error::Invalid(_))));
     // Undo is the old version, which is kept.
     assert!(prep.recipe(&ann, &d.id, Some(1)).unwrap().roles.is_empty());
     // A new snapshot keeps the user's role.
@@ -185,6 +185,7 @@ fn a_recipe_of_steps_makes_each_version() {
     let ann = scope("ann");
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let change = Change {
+        key: vec![],
         against: 1,
         roles: Default::default(),
         steps: steps(serde_json::json!([
@@ -220,6 +221,7 @@ fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
     assert!(d.notes.iter().any(|n| n.contains("'store' is not in this snapshot")), "{:?}", d.notes);
     // A step reads `region`: its going holds the dataset, and v2 stays live.
     let change = Change {
+        key: vec![],
         against: 1,
         roles: Default::default(),
         steps: steps(serde_json::json!([{ "op": "formula", "column": "label", "formula": "upper(region)" }])),
@@ -245,10 +247,10 @@ fn a_rename_upstream_is_fixed_by_pointing_the_steps_at_the_new_name() {
     let ann = scope("ann");
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let remap = |column: &str| serde_json::json!([{ "op": "remap", "column": column, "values": [{ "from": "NY", "to": "New York" }] }]);
-    let d = prep.change(&ann, &d.id, Change { against: 1, roles: Default::default(), steps: steps(remap("region")) }).unwrap();
+    let d = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: steps(remap("region")) }).unwrap();
     let d = prep.replace(&ann, &d.id, csv("area,amount\nNY,1\n")).unwrap();
     assert!(d.held.is_some());
-    let d = prep.change(&ann, &d.id, Change { against: 2, roles: Default::default(), steps: steps(remap("area")) }).unwrap();
+    let d = prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles: Default::default(), steps: steps(remap("area")) }).unwrap();
     assert!(d.held.is_none());
     let page = prep.page(&ann, &d.id, None, 0, 10, &View::default()).unwrap();
     assert_eq!(json_rows(&page), [serde_json::json!([1, "New York"])]);
@@ -264,7 +266,9 @@ fn a_removal_with_readers_is_refused_naming_them() {
         v.extend(extra.as_array().cloned().unwrap_or_default());
         steps(Value::Array(v))
     };
-    let d = prep.change(&ann, &d.id, Change { against: 1, roles: Default::default(), steps: with(serde_json::json!([])) }).unwrap();
+    let d = prep
+        .change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: with(serde_json::json!([])) })
+        .unwrap();
     let impact = prep.impact(&ann, &d.id, "store").unwrap();
     assert_eq!(
         impact.iter().map(Unresolved::describe).collect::<Vec<_>>(),
@@ -275,14 +279,19 @@ fn a_removal_with_readers_is_refused_naming_them() {
     // A removal put before its reader is refused, naming it.
     let mut bad = steps(serde_json::json!([{ "op": "remove", "columns": ["store"] }]));
     bad.extend(with(serde_json::json!([])));
-    let e = prep.change(&ann, &d.id, Change { against: 2, roles: Default::default(), steps: bad }).err().unwrap();
+    let e = prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles: Default::default(), steps: bad }).err().unwrap();
     assert!(e.to_string().contains("step 2 (formula) reads column 'store'"), "{e}");
     // At the end it removes the column.
     let d = prep
         .change(
             &ann,
             &d.id,
-            Change { against: 2, roles: Default::default(), steps: with(serde_json::json!([{ "op": "remove", "columns": ["store"] }])) },
+            Change {
+                key: vec![],
+                against: 2,
+                roles: Default::default(),
+                steps: with(serde_json::json!([{ "op": "remove", "columns": ["store"] }])),
+            },
         )
         .unwrap();
     assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "amount", "label"]);
@@ -322,4 +331,146 @@ fn a_preview_runs_a_step_over_a_sample_and_keeps_nothing() {
         .err()
         .unwrap();
     assert!(e.to_string().contains("do not convert without loss, such as 'NY'"), "{e}");
+}
+
+fn edits(against: u32, v: Value) -> edits::Request {
+    edits::Request { against, edits: serde_json::from_value(v).unwrap() }
+}
+
+const BUDGETS: &str = "region,month,amount\nNY,2026-01-01,100\nCA,2026-01-01,80\nNY,2026-02-01,90\n";
+
+fn rows_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Value> {
+    json_rows(&prep.page(scope, id, None, 0, 100, &View::default()).unwrap())
+}
+
+#[test]
+fn a_dimension_edit_is_a_remap_and_holds_through_a_sync() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
+    let (d, out) = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
+        .unwrap();
+    assert_eq!((d.edits, d.recipe, d.live), (1, 1, Some(2)), "an edit is a log entry, not a recipe version");
+    assert_eq!(out[0].state, State::Applied);
+    let rows = rows_of(&prep, &ann, &d.id);
+    assert_eq!(rows[0][0], "New York");
+    assert_eq!(rows[2][0], "New York");
+    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-03-01,1\n")).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["New York", "2026-03-01", 1])]);
+    assert_eq!(prep.lineage(&ann, &d.id, None).unwrap().edits, 1);
+}
+
+#[test]
+fn a_measure_edit_overrides_one_row_and_is_flagged_when_upstream_moves() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
+    let row = serde_json::json!({ "region": "NY", "month": "2026-01-01", "amount": 100 });
+    let (d, out) =
+        prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 120 }]))).unwrap();
+    assert_eq!(out[0].state, State::Applied);
+    assert_eq!(rows_of(&prep, &ann, &d.id)[0], serde_json::json!(["NY", "2026-01-01", 120]));
+    // Upstream moves the value it replaced: the user's value wins, flagged.
+    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-01-01,105\nCA,2026-01-01,80\n")).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id)[0], serde_json::json!(["NY", "2026-01-01", 120]));
+    let (_, outcomes) = prep.edit_log(&ann, &d.id).unwrap();
+    assert_eq!(outcomes[0].state, State::Flagged, "{outcomes:?}");
+    assert!(d.notes.iter().any(|n| n.contains("flagged")), "{:?}", d.notes);
+    // The row goes upstream: orphaned, kept, not applied.
+    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nCA,2026-01-01,80\n")).unwrap();
+    let (log, outcomes) = prep.edit_log(&ann, &d.id).unwrap();
+    assert_eq!((log.len(), outcomes[0].state.clone()), (1, State::Orphaned));
+    // It comes back, and so does the edit.
+    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-01-01,100\n")).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id)[0][2], 120);
+}
+
+#[test]
+fn an_edit_that_does_not_name_one_row_is_refused_unless_a_key_or_all_says() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv("region,store,amount\nNY,a,1\nNY,a,2\nCA,b,3\n")).unwrap();
+    let row = serde_json::json!({ "region": "NY", "store": "a" });
+    let e = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 9 }]))).err().unwrap();
+    assert!(e.to_string().contains("2 rows have these values") && e.to_string().contains("mark a key"), "{e}");
+    let e = prep
+        .edit(
+            &ann,
+            &d.id,
+            edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": { "region": "TX", "store": "z" }, "to": 9 }])),
+        )
+        .err();
+    assert!(e.unwrap().to_string().contains("no row has these values"));
+    let (d, _) = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 9, "all": true }])))
+        .unwrap();
+    let amounts: Vec<Value> = rows_of(&prep, &ann, &d.id).iter().map(|r| r[2].clone()).collect();
+    assert_eq!(amounts, [9, 9, 3]);
+}
+
+#[test]
+fn a_dimension_edit_for_one_row_rows_added_and_deleted_and_undo() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
+    let (d, out) = prep
+        .edit(
+            &ann,
+            &d.id,
+            edits(
+                1,
+                serde_json::json!([
+                    { "op": "cell", "column": "region", "row": { "region": "NY", "month": "2026-02-01" }, "to": "NJ", "one": true },
+                    { "op": "delete", "row": { "region": "CA", "month": "2026-01-01" } },
+                    { "op": "add", "values": { "region": "TX", "month": "2026-01-01", "amount": 5 } },
+                ]),
+            ),
+        )
+        .unwrap();
+    assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
+    let rows = rows_of(&prep, &ann, &d.id);
+    assert_eq!(
+        rows,
+        [
+            serde_json::json!(["NY", "2026-01-01", 100]),
+            serde_json::json!(["NJ", "2026-02-01", 90]),
+            serde_json::json!(["TX", "2026-01-01", 5]),
+        ]
+    );
+    let e =
+        prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "add", "values": { "region": "NY", "month": "2026-01-01" } }]))).err();
+    assert!(e.unwrap().to_string().contains("is there already"));
+    let (d, _) = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "undo", "edit": "1.2" }]))).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 4, "the deleted row is back");
+    let e = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "undo", "edit": "1.2" }]))).err().unwrap();
+    assert!(e.to_string().contains("undone already"), "{e}");
+    assert!(matches!(prep.edit(&ann, &d.id, edits(2, serde_json::json!([{ "op": "undo", "edit": "1.1" }]))), Err(Error::Conflict(_))));
+}
+
+#[test]
+fn edits_apply_where_they_were_made_and_an_edit_on_a_gone_column_holds() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
+    let (d, _) = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
+        .unwrap();
+    // A step added later runs after the edit: it sees the remapped value.
+    let change = Change {
+        key: vec![],
+        against: 1,
+        roles: Default::default(),
+        steps: steps(serde_json::json!([{ "op": "filter", "formula": "region = 'New York'" }])),
+    };
+    let d = prep.change(&ann, &d.id, change).unwrap();
+    assert_eq!(d.rows, 2, "the filter runs after the edit made before it");
+    // The edited column goes upstream: the edit holds the dataset; confirming undoes it.
+    let d = prep.replace(&ann, &d.id, csv("area,month,amount\nNY,2026-01-01,1\n")).unwrap();
+    let held = d.held.clone().unwrap();
+    assert!(held.unresolved.iter().any(|u| u.edit.as_deref() == Some("1.1")), "{:?}", held.unresolved);
+    let d = prep.confirm(&ann, &d.id, 2).unwrap();
+    assert!(d.held.is_none());
+    let (log, _) = prep.edit_log(&ann, &d.id).unwrap();
+    assert!(matches!(&log.last().unwrap().edits[0], Edit::Undo { undoes, .. } if undoes == "1.1"));
 }

@@ -2,6 +2,7 @@
 //! made.
 
 use crate::compile::{self, Compiled, Unresolved};
+use crate::edits::{Entry, Outcome, State};
 use crate::engine::Session;
 use crate::error::{Error, Result};
 use crate::lineage::{Ancestry, Lineage, MadeBy, SourceRead, COMPILER_VERSION};
@@ -18,6 +19,7 @@ pub(crate) struct Made {
     pub manifest: Materialization,
     pub lineage: Lineage,
     pub rows: Batches,
+    pub outcomes: Vec<Outcome>,
 }
 
 /// What a run came to: a materialization, or a recipe that reads
@@ -70,10 +72,19 @@ fn first_rows(batches: &[RecordBatch], n: usize) -> Vec<RecordBatch> {
 /// Creates a compiled recipe's views in the session, and runs its
 /// checks: a conversion that would lose a value fails here, naming the
 /// column, both types and the first values.
-pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<()> {
-    for (name, sql) in &compiled.views {
+pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<Vec<Outcome>> {
+    let mut outcomes = Vec::new();
+    let apply_edits = |at: usize, outcomes: &mut Vec<Outcome>| -> Result<()> {
+        for stage in compiled.edits.iter().filter(|s| s.at == at) {
+            outcomes.extend(crate::edits::apply(session, &stage.input, &stage.name, &stage.columns, &stage.edits)?);
+        }
+        Ok(())
+    };
+    for (i, (name, sql)) in compiled.views.iter().enumerate() {
+        apply_edits(i, &mut outcomes)?;
         session.execute(&format!("CREATE VIEW {} AS {sql}", ident(name)))?;
     }
+    apply_edits(compiled.views.len(), &mut outcomes)?;
     for c in &compiled.checks {
         let n = session.count(&format!("SELECT count(*) FROM {} WHERE {}", c.relation, c.failing))?;
         if n > 0 {
@@ -90,21 +101,31 @@ pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    Ok(outcomes)
 }
 
 /// Runs `recipe` over the dataset's latest snapshots as version `k`.
-pub(crate) fn run(prep: &Prep, dir: &Path, dataset: &Dataset, recipe: &Recipe, k: u32) -> Result<Run> {
+pub(crate) fn run(prep: &Prep, dir: &Path, dataset: &Dataset, recipe: &Recipe, log: &[Entry], upto: u64, k: u32) -> Result<Run> {
     let pinned_at = crate::time::now();
-    let compiled = compile::compile(recipe, &dataset.sources, &pinned_at)?;
+    let edits = crate::edits::in_force(log, upto);
+    let compiled = compile::compile(recipe, &edits, &dataset.sources, &pinned_at)?;
     if !compiled.unresolved.is_empty() {
         return Ok(Run::Held(compiled.unresolved));
     }
     let session = prep.engine.session()?;
     let sources = load_sources(&session, dir, dataset, None)?;
-    prepare(&session, &compiled)?;
+    let outcomes = prepare(&session, &compiled)?;
     let list: Vec<String> = compiled.columns.iter().map(|c| ident(&c.name)).collect();
     let rows = session.query(&format!("SELECT {} FROM {}", list.join(", "), compiled.last))?;
+    let mut notes = Vec::new();
+    for (state, what) in
+        [(State::Orphaned, "orphaned"), (State::Ambiguous, "ambiguous"), (State::Flagged, "flagged"), (State::Conflict, "in conflict")]
+    {
+        let ids: Vec<&str> = outcomes.iter().filter(|o| o.state == state).map(|o| o.id.as_str()).collect();
+        if !ids.is_empty() {
+            notes.push(format!("{} edit(s) {what}: {}", ids.len(), ids.join(", ")));
+        }
+    }
     let n = rows.num_rows();
     if n > prep.settings.max_rows {
         return Err(Error::Unprocessable(format!("the recipe makes {n} rows, more than the {} a dataset holds", prep.settings.max_rows)));
@@ -116,17 +137,17 @@ pub(crate) fn run(prep: &Prep, dir: &Path, dataset: &Dataset, recipe: &Recipe, k
         dataset: dataset.id.clone(),
         version: k,
         recipe: recipe.version,
-        edits: 0,
+        edits: upto,
         sources,
         datasets: Vec::new(),
         roles: columns.iter().map(|c| (c.name.clone(), c.role)).collect(),
         made_by: MadeBy { zsql: env!("CARGO_PKG_VERSION").to_string(), compiler: COMPILER_VERSION, duckdb: prep.duckdb_version.clone() },
         pinned_at: pinned_at.clone(),
-        notes: Vec::new(),
+        notes,
         columns: ancestry,
     };
     let manifest = Materialization { version: k, made: pinned_at, columns, rows: n as u64, bytes: 0 };
-    Ok(Run::Made(Box::new(Made { manifest, lineage, rows })))
+    Ok(Run::Made(Box::new(Made { manifest, lineage, rows, outcomes })))
 }
 
 /// Keeps a materialization as `v<k>`, whole or not at all, refused
@@ -135,6 +156,11 @@ pub(crate) fn keep(prep: &Prep, dir: &Path, made: &mut Made) -> Result<()> {
     let k = made.manifest.version;
     let target = store::version_dir(dir, k);
     let staging = dir.join(format!(".v{k}.staging-{}", crate::time::nanos()));
+    // A version there that the manifest never pointed at was left by a
+    // job that did not finish, and is not a version.
+    if target.exists() {
+        std::fs::remove_dir_all(&target).map_err(|e| Error::io(&target, e))?;
+    }
     let result = (|| {
         let bytes = store::write_rows(&staging.join(store::ROWS), &made.rows)?;
         if bytes > prep.settings.max_bytes {
@@ -146,6 +172,7 @@ pub(crate) fn keep(prep: &Prep, dir: &Path, made: &mut Made) -> Result<()> {
         made.manifest.bytes = bytes;
         store::write_json(&staging.join("manifest.json"), &made.manifest)?;
         store::write_json(&staging.join("lineage.json"), &made.lineage)?;
+        store::write_json(&staging.join("edits.json"), &made.outcomes)?;
         std::fs::rename(&staging, &target).map_err(|e| Error::io(&target, e))
     })();
     if result.is_err() {

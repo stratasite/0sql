@@ -19,6 +19,10 @@ pub struct Recipe {
     pub roles: BTreeMap<String, Role>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
+    /// The columns that name a row, for edits, when the dimensions do
+    /// not; none means every dimension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key: Vec<String>,
 }
 
 /// One operation of a recipe: a closed set, each declaring the columns
@@ -181,12 +185,14 @@ pub struct Change {
     pub roles: BTreeMap<String, Role>,
     #[serde(default)]
     pub steps: Vec<Step>,
+    #[serde(default)]
+    pub key: Vec<String>,
 }
 
 impl Recipe {
     /// The recipe a dataset starts with: its sources as they are.
     pub fn first(created: String) -> Recipe {
-        Recipe { version: 1, created, roles: BTreeMap::new(), steps: Vec::new() }
+        Recipe { version: 1, created, roles: BTreeMap::new(), steps: Vec::new(), key: Vec::new() }
     }
 
     /// The recipe a change makes of this one, refused when the change
@@ -201,7 +207,7 @@ impl Recipe {
         if change.steps.len() > STEPS_LIMIT {
             return Err(Error::Invalid(format!("a recipe has at most {STEPS_LIMIT} steps")));
         }
-        Ok(Recipe { version: self.version + 1, created, roles: change.roles, steps: change.steps })
+        Ok(Recipe { version: self.version + 1, created, roles: change.roles, steps: change.steps, key: change.key })
     }
 
     /// The result's columns, with the user's roles over the ones they

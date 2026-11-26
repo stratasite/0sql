@@ -15,6 +15,8 @@
 //! POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
 //! POST   /projects/{uid}/datasets/{id}/preview            {"steps": [...], "roles": {...}, "upto": n, "limit": n}: over a sample, kept nowhere
 //! GET    /projects/{uid}/datasets/{id}/impact             ?column=: what reads it
+//! GET    /projects/{uid}/datasets/{id}/edits              the edit log, and how each edit fared
+//! POST   /projects/{uid}/datasets/{id}/edits              {"against": m, "edits": [{"op": "cell" | "delete" | "add" | "undo", ...}]}
 //! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
 //! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 //! DELETE /datasets                                        every dataset of this owner in the org
@@ -316,6 +318,35 @@ pub(crate) async fn impact(
         let readers = prep.impact(&scope, &id, &q.column)?;
         let said: Vec<String> = readers.iter().map(zsql_prep::Unresolved::describe).collect();
         Ok(Json(json!({ "column": q.column, "readers": readers, "said": said })))
+    })
+    .await
+}
+
+pub(crate) async fn edit(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    headers: HeaderMap,
+    Input(request): Input<zsql_prep::edits::Request>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || {
+        let (d, outcomes) = prep.edit(&scope, &id, request)?;
+        Ok(Json(json!({ "dataset": shown(&d), "outcomes": outcomes })))
+    })
+    .await
+}
+
+pub(crate) async fn edit_log(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    blocking(move || {
+        let (log, outcomes) = prep.edit_log(&scope, &id)?;
+        Ok(Json(json!({ "entries": log, "outcomes": outcomes })))
     })
     .await
 }

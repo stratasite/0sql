@@ -213,6 +213,40 @@ async fn a_recipe_of_steps_through_its_routes() {
     assert_eq!(a.body["rows"], json!([["New York", 1]]));
 }
 
+/// Edits through the route: a remap, an override, and the log.
+#[tokio::test]
+async fn edits_through_their_routes() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let base = format!("/projects/{CS}/datasets");
+    let id = s.upload(&base, Some("user-ann"), BUDGET).await.body["id"].as_str().unwrap().to_string();
+    let a = s
+        .post_as_ann(
+            &format!("{base}/{id}/edits"),
+            json!({ "against": 1, "edits": [
+                { "op": "cell", "column": "region", "from": "EMEA", "to": "Europe" },
+                { "op": "cell", "column": "amount", "row": { "region": "APAC", "month": "2026-01-01" }, "to": 81 },
+            ]}),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["outcomes"].as_array().unwrap().len(), 2);
+    assert_eq!(a.body["dataset"]["edits"], 1);
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/rows")).await;
+    assert_eq!(a.body["rows"], json!([["Europe", "2026-01-01", 100], ["APAC", "2026-01-01", 81]]));
+    let a = s.as_ann(Method::GET, &format!("{base}/{id}/edits")).await;
+    assert_eq!(a.body["entries"][0]["edits"][1]["was"], 80, "{}", a.body);
+    let a = s
+        .post_as_ann(
+            &format!("{base}/{id}/edits"),
+            json!({ "against": 1, "edits": [{ "op": "cell", "column": "nope", "from": "x", "to": "y" }] }),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(a.error().contains("edit 1: there is no column 'nope'"), "{}", a.body);
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));
