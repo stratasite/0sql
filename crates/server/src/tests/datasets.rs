@@ -410,6 +410,15 @@ async fn datasets_change_nothing_the_model_plans() {
     assert!(!listed.body.to_string().contains("dataset"), "{}", listed.body);
 }
 
+/// A restore needs an object store to restore from.
+#[tokio::test]
+async fn a_restore_without_an_object_store_is_refused() {
+    let s = server();
+    let a = s.post("/datasets/restore", json!({})).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(a.error().contains("ZSQL_OBJECT_STORE"), "{}", a.body);
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));

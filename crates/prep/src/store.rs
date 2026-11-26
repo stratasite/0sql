@@ -59,6 +59,9 @@ pub struct Dataset {
     /// How much of the edit log is in force.
     #[serde(default)]
     pub edits: u64,
+    /// Where its copy in the object store stands, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<crate::backup::Backup>,
 }
 
 /// Why a dataset's latest snapshots have not been made into a version.
@@ -122,6 +125,10 @@ pub struct Store {
 impl Store {
     pub fn new(data_dir: &Path) -> Store {
         Store { data_dir: data_dir.to_path_buf() }
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
     }
 
     /// Where blends' answers are kept.

@@ -23,6 +23,7 @@
 //! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
 //! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
 //! DELETE /datasets                                        every dataset of this owner in the org
+//! POST   /datasets/restore                                every dataset of the org the object store has and this node does not
 //! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "offset", "limit"}
 //! ```
 //!
@@ -823,6 +824,14 @@ pub(crate) async fn blend(
         .into_response())
     })
     .await
+}
+
+/// Brings back from the object store every dataset of the org this
+/// node does not have: the restore of the backup. No owner: it is the
+/// org's, as a deploy is.
+pub(crate) async fn restore(State(app): State<Shared>, Org(org): Org) -> Result<Json<Value>, ApiError> {
+    let prep = prep(&app)?;
+    blocking(move || Ok(Json(json!({ "restored": prep.restore(&org)? })))).await
 }
 
 /// Every dataset of one owner in the org, in every project: what an

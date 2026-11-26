@@ -183,6 +183,7 @@ fn of_an_org(upload_limit: usize) -> Router<Shared> {
         .route("/projects/{uid}/datasets/{id}/edits", get(datasets::edit_log).post(datasets::edit))
         .route("/projects/{uid}/datasets/{id}/sources/{source}", get(datasets::source))
         .route("/datasets", delete(datasets::delete_owner))
+        .route("/datasets/restore", post(datasets::restore))
 }
 
 async fn root() -> String {
@@ -295,7 +296,11 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     let prep = match config.datasets.clone() {
         Some(settings) => {
             let dir = config.data_dir.clone();
-            Some(Arc::new(tokio::task::spawn_blocking(move || zsql_prep::Prep::open(&dir, settings)).await??))
+            // With an object store, each dataset is copied there as it changes.
+            let objects = runs.objects().cloned();
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || zsql_prep::Prep::open(&dir, settings).map(|p| p.with_backup(objects))).await??,
+            ))
         }
         None => {
             tracing::info!("datasets are off");

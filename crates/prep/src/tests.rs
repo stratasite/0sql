@@ -847,3 +847,43 @@ mod blends {
         assert!(matches!(f.prep.blend(&scope("bob"), &plan, &m, "q"), Err(Error::NotFound(_))));
     }
 }
+
+#[test]
+fn every_dataset_is_copied_to_the_object_store_and_restored_from_it() {
+    let (dir, _) = prep();
+    let store_dir = dir.0.join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let objects = std::sync::Arc::new(zsql_exec::Objects::open(&format!("file://{}", store_dir.display()), &[]).unwrap());
+    let data = dir.0.join("data");
+    let open = || {
+        let mut s = Settings::defaults(&data);
+        s.engine.threads = 1;
+        Prep::open(&data, s).unwrap().with_backup(Some(objects.clone()))
+    };
+    let prep = open();
+    let ann = scope("ann");
+    let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
+    assert_eq!(d.backup.as_ref().map(|b| b.failed.clone()), Some(None), "{:?}", d.backup);
+    let (d, _) = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "EMEA", "to": "Europe" }])))
+        .unwrap();
+    let copied: Vec<String> = objects.list(&["datasets", "default", "shop", &d.id]).unwrap().into_iter().map(|k| k.join("/")).collect();
+    for f in ["dataset.json", "edits.log", "recipe/r1.json", "sources/s1/1.arrow", "v1/rows.arrow", "v2/lineage.json"] {
+        assert!(copied.contains(&f.to_string()), "{f} not in {copied:?}");
+    }
+
+    // The disk is lost; a restore brings the dataset back whole.
+    std::fs::remove_dir_all(data.join("default")).unwrap();
+    let prep = open();
+    assert!(prep.get(&ann, &d.id).is_err());
+    assert_eq!(prep.restore("default").unwrap(), [format!("shop/{}", d.id)]);
+    assert_eq!(rows_of(&prep, &ann, &d.id)[0][0], "Europe");
+    assert!(prep.restore("default").unwrap().is_empty(), "what is here is not brought back again");
+
+    // A delete removes the copy too.
+    prep.delete(&ann, &d.id, false).unwrap();
+    assert!(objects.list(&["datasets", "default", "shop", &d.id]).unwrap().is_empty());
+    // With no object store there is nothing to restore from.
+    let (_d2, plain) = self::prep();
+    assert!(matches!(plain.restore("default"), Err(Error::Invalid(_))));
+}

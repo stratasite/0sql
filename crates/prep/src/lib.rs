@@ -30,7 +30,9 @@
 //! - `materialize`: running a recipe, and pages of what it made
 //! - `lineage`: what each materialization was made from
 //! - `store`: where datasets are kept, and the only module that knows
+//! - `backup`: each dataset's copy in the object store, and its restore
 
+pub mod backup;
 pub mod blend;
 pub mod compile;
 pub mod edits;
@@ -209,6 +211,8 @@ pub struct Prep {
     /// Queries still running for a dataset, or that failed after their
     /// request was answered, by the dataset's directory.
     pending: Mutex<std::collections::HashMap<PathBuf, Pending>>,
+    /// The object store each dataset is copied to.
+    backup: Option<std::sync::Arc<zsql_exec::Objects>>,
 }
 
 /// A query a dataset waits on, run after its request was answered.
@@ -246,8 +250,49 @@ impl Prep {
             settings,
             duckdb_version,
             busy: Mutex::new(HashSet::new()),
+            backup: None,
             pending: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// The same, copying each dataset to the object store as it changes.
+    pub fn with_backup(mut self, objects: Option<std::sync::Arc<zsql_exec::Objects>>) -> Prep {
+        self.backup = objects;
+        self
+    }
+
+    /// Copies a dataset to the object store, when there is one, and says
+    /// in its manifest how that went. A copy that fails fails nothing.
+    fn backed_up(&self, dir: &Path, dataset: &mut Dataset) {
+        let Some(objects) = &self.backup else { return };
+        let failed = backup::copy(objects, dir).err().map(|e| e.to_string());
+        if let Some(why) = &failed {
+            tracing::warn!("dataset {} is not backed up: {why}", dataset.id);
+        }
+        dataset.backup = Some(backup::Backup { at: time::now(), failed });
+        if let Err(e) = store::write_json(&dir.join(store::MANIFEST), dataset) {
+            tracing::warn!("dataset {}: {e}", dataset.id);
+        }
+    }
+
+    /// Removes a dataset's copy in the object store, when there is one.
+    fn forget_backup(&self, org: &str, project: &str, id: &str) {
+        if let Some(objects) = &self.backup {
+            if let Err(e) = backup::forget(objects, org, project, id) {
+                tracing::warn!("dataset {id} was removed and its copy in the object store was not: {e}");
+            }
+        }
+    }
+
+    /// Brings back every dataset of an org the object store has whole and
+    /// this node does not: after a disk is lost, or on a new node. The
+    /// ones brought back, as `project/id`.
+    pub fn restore(&self, org: &str) -> Result<Vec<String>> {
+        let objects =
+            self.backup.as_ref().ok_or_else(|| Error::Invalid("there is no object store to restore from (ZSQL_OBJECT_STORE)".into()))?;
+        let restored = backup::restore(objects, &self.store.data_dir(), org)?;
+        tracing::info!("{} dataset(s) of {org} restored from the object store", restored.len());
+        Ok(restored)
     }
 
     pub fn settings(&self) -> &Settings {
@@ -375,6 +420,7 @@ impl Prep {
                 notes: Vec::new(),
                 held: None,
                 edits: 0,
+                backup: None,
             };
             let recipe = Recipe::first(now);
             store::write_json(&store::recipe_path(&staging, 1), &recipe)?;
@@ -384,6 +430,7 @@ impl Prep {
             store::write_json(&staging.join(store::MANIFEST), &dataset)?;
             let target = root.join(&id);
             std::fs::rename(&staging, &target).map_err(|e| Error::io(&target, e))?;
+            self.backed_up(&target, &mut dataset);
             Ok(dataset)
         })();
         if result.is_err() {
@@ -478,6 +525,8 @@ impl Prep {
         store::write_json(&dir.join(store::MANIFEST), &dataset)?;
         if made?.is_none() {
             self.after(&dir, &mut dataset)?;
+        } else {
+            self.backed_up(&dir, &mut dataset);
         }
         Ok(dataset)
     }
@@ -706,6 +755,7 @@ impl Prep {
         let _job = self.job(&dir)?;
         store::remove(&dir)?;
         self.forget_blends(&scope.org, &scope.project, id);
+        self.forget_backup(&scope.org, &scope.project, id);
         tracing::info!("dataset {id} removed from {}/{}", scope.org, scope.project);
         Ok(())
     }
@@ -732,6 +782,7 @@ impl Prep {
         for (dir, d) in self.store.all(org, project) {
             store::remove(&dir)?;
             self.forget_blends(org, project, &d.id);
+            self.forget_backup(org, project, &d.id);
             removed.push(d.id);
         }
         let root = self.store.root(org, project);
@@ -1178,7 +1229,9 @@ impl Prep {
             d.updated = time::now();
             if let Err(e) = store::write_json(&d_dir.join(store::MANIFEST), &d) {
                 notes.push(format!("dataset {} could not be written: {e}", d.id));
+                continue;
             }
+            self.backed_up(&d_dir, &mut d);
         }
         notes
     }
@@ -1191,6 +1244,7 @@ impl Prep {
             dataset.notes.extend(notes);
             store::write_json(&dir.join(store::MANIFEST), dataset)?;
         }
+        self.backed_up(dir, dataset);
         Ok(())
     }
 

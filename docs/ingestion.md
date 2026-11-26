@@ -476,9 +476,13 @@ The data directory keeps the layout it has ("What is on disk" in
   them to a volume of their own later touches nothing else.
 - **Backup.** With `ZSQL_OBJECT_STORE` set, each committed recipe
   version, edit log, snapshot and materialization is copied under
-  `datasets/` there: a backup, read back only by a restore command. A
-  failed copy is retried, does not fail the job, and the dataset says it
-  is not backed up.
+  `datasets/<org>/<project>/<id>/` there: a backup, read back only by
+  a restore (`POST /datasets/restore`, for the org, bringing back every
+  dataset the store has whole and this node does not). What is
+  immutable is sent once; the edit log and the manifest every time, the
+  manifest last, so a dataset in the store is whole once it is there. A
+  failed copy is retried, does not fail the job, and the dataset's
+  `backup` says it is not backed up. A delete removes the copy.
 
 Routes are under `/projects/{uid}/datasets`, and under `/orgs/{org}`;
 with no org the org is `default`. The owner reference is the
@@ -585,5 +589,5 @@ know about datasets.
   test, `filter`, `enrich` as a look-up and as budget against actual,
   regrouping only what adds up, the cache. The owner header on `/mcp`
   went with MCP to "Later".
-- [ ] **7. The object-store backup** and restore.
+- [x] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.

@@ -197,6 +197,63 @@ impl Objects {
         }
     }
 
+    fn path_key(&self, path: &[&str]) -> String {
+        path.iter().fold(self.base.clone(), |at, part| at.join(*part)).to_string()
+    }
+
+    /// Puts `bytes` at `path` beneath the store's own prefix, over
+    /// whatever is there: for what is kept beside the results and is
+    /// changed in place, as a dataset's backup is. Given up after
+    /// `PUT_WITHIN`.
+    pub fn put(&self, path: &[&str], bytes: Vec<u8>) -> Result<String> {
+        let key = self.path_key(path);
+        let at = Key::parse(&key).map_err(|e| failed(&key, e))?;
+        self.on(async {
+            match tokio::time::timeout(PUT_WITHIN, self.store.put(&at, PutPayload::from(bytes))).await {
+                Ok(done) => done.map(|_| ()).map_err(|e| failed(&key, e)),
+                Err(_) => Err(failed(&key, format!("not put within {} seconds", PUT_WITHIN.as_secs()))),
+            }
+        })?;
+        Ok(key)
+    }
+
+    /// What is at `path` beneath the store's own prefix.
+    pub fn get(&self, path: &[&str]) -> Result<Vec<u8>> {
+        let key = self.path_key(path);
+        let at = Key::parse(&key).map_err(|e| failed(&key, e))?;
+        self.on(async {
+            let got = self.store.get(&at).await.map_err(|e| failed(&key, e))?;
+            got.bytes().await.map(|b| b.to_vec()).map_err(|e| failed(&key, e))
+        })
+    }
+
+    /// Everything beneath `path`, each as its parts below it.
+    pub fn list(&self, path: &[&str]) -> Result<Vec<Vec<String>>> {
+        let key = self.path_key(path);
+        let at = Key::parse(&key).map_err(|e| failed(&key, e))?;
+        let depth = at.parts().count();
+        self.on(async {
+            let mut out = Vec::new();
+            let mut listing = self.store.list(Some(&at));
+            while let Some(meta) = listing.next().await {
+                let meta = meta.map_err(|e| failed(&key, e))?;
+                out.push(meta.location.parts().skip(depth).map(|p| p.as_ref().to_string()).collect());
+            }
+            Ok(out)
+        })
+    }
+
+    /// Removes everything beneath `path`; how many it removed.
+    pub fn delete_under(&self, path: &[&str]) -> Result<usize> {
+        let below = self.list(path)?;
+        for rest in &below {
+            let mut full: Vec<&str> = path.to_vec();
+            full.extend(rest.iter().map(String::as_str));
+            self.delete(&self.path_key(&full))?;
+        }
+        Ok(below.len())
+    }
+
     /// Removes a result's rows. One that is already gone is gone.
     pub fn delete(&self, key: &str) -> Result<()> {
         let at = Key::parse(key).map_err(|e| failed(key, e))?;
