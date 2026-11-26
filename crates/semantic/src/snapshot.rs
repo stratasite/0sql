@@ -311,7 +311,52 @@ pub struct Field {
     pub rank: i64,
 }
 
+impl DataType {
+    /// The type a name spells, as a snapshot and a spec write it.
+    pub fn from_name(name: &str) -> Option<DataType> {
+        Some(match name {
+            "string" => DataType::String,
+            "integer" => DataType::Integer,
+            "decimal" => DataType::Decimal,
+            "date" => DataType::Date,
+            "date_time" => DataType::DateTime,
+            "boolean" => DataType::Boolean,
+            "bigint" => DataType::Bigint,
+            "binary" => DataType::Binary,
+            _ => return None,
+        })
+    }
+}
+
 impl Field {
+    /// A measure that is only its identity and type: no rules, tags,
+    /// format or sampling. What the planner makes for a query, where a
+    /// model's field is loaded from its file.
+    pub fn measure(id: Id, uid: String, name: String, data_type: Option<DataType>) -> Field {
+        Field {
+            id,
+            uid,
+            name,
+            kind: FieldKind::Measure,
+            data_type,
+            hidden: false,
+            tags: vec![],
+            grains: vec![],
+            format: None,
+            exclusion_type: None,
+            exclusions: vec![],
+            inclusions: None,
+            extended_blend_group: None,
+            snapshot: None,
+            enable_sampling: false,
+            sample_size: default_sample_size(),
+            sample_sql: None,
+            synonyms: vec![],
+            description: None,
+            rank: 0,
+        }
+    }
+
     pub fn is_measure(&self) -> bool {
         self.kind == FieldKind::Measure
     }
@@ -369,6 +414,25 @@ pub struct Expression {
     pub measure_ref_ids: Vec<Id>,
 }
 
+impl Expression {
+    /// A formula on a table that reads dimensions by name and no column
+    /// of its own, as `count(distinct [Customer ID])` does.
+    pub fn over_dimensions(id: Id, table_id: Id, field_id: Id, sql: String, dimension_ref_ids: Vec<Id>) -> Expression {
+        Expression {
+            id,
+            table_id,
+            field_id,
+            sql: Some(sql),
+            lookup: false,
+            primary_key: false,
+            array: false,
+            column_refs: vec![],
+            dimension_ref_ids,
+            measure_ref_ids: vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinDef {
@@ -404,6 +468,29 @@ pub struct Path {
     pub datasource_id: Id,
     pub blending_field_id: Option<Id>,
     pub extended_blend_group: Option<String>,
+}
+
+impl Path {
+    /// The path that reaches a field at the root itself, with no join:
+    /// how a field mapped on a table is reached from that table.
+    pub fn at_root(id: Id, table: &Table, field_id: Id, field_type: FieldKind) -> Path {
+        Path {
+            id,
+            root_table_id: table.id,
+            target_table_id: table.id,
+            from_table_id: None,
+            field_id,
+            field_type,
+            step_number: Some(0),
+            cost: table.cost,
+            tier: Some(0),
+            joins: vec![],
+            table_nodes: vec![table.id],
+            datasource_id: table.datasource_id,
+            blending_field_id: None,
+            extended_blend_group: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

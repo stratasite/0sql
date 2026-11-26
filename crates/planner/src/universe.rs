@@ -81,6 +81,75 @@ impl<'a> Base<'a> {
         Base { root, datasource, paths, field_ids, field_set, measure_ids, dimension_ids, table_nodes, local_field_ids, identity, groups }
     }
 
+    /// This universe with more paths from its root, which the layered
+    /// model `semantic` knows the fields of. The paths already here keep
+    /// their order and are not ranked again; each new one is placed where
+    /// the ranking puts it.
+    fn with_paths<'b>(&self, semantic: &'b SemanticModel, added: &[&'b Path]) -> Base<'b>
+    where
+        'a: 'b,
+    {
+        let mut paths: Vec<&'b Path> = self.paths.clone();
+        let mut field_ids = self.field_ids.clone();
+        let mut field_set = self.field_set.clone();
+        let mut measure_ids = self.measure_ids.clone();
+        let mut dimension_ids = self.dimension_ids.clone();
+        let mut table_nodes = self.table_nodes.clone();
+        let mut local_field_ids = self.local_field_ids.clone();
+        let mut groups: Vec<Arc<PathGroup<'b>>> = self.groups.clone();
+        for &p in added {
+            let key = (p.cost, semantic.path_signature(p));
+            let at = paths.partition_point(|q| (q.cost, semantic.path_signature(q)) <= key);
+            paths.insert(at, p);
+            if field_set.insert(p.field_id) {
+                field_ids.push(p.field_id);
+                match p.field_type {
+                    FieldKind::Measure => measure_ids.insert(p.field_id),
+                    FieldKind::Dimension => dimension_ids.insert(p.field_id),
+                };
+            }
+            for t in &p.table_nodes {
+                if !table_nodes.contains(t) {
+                    table_nodes.push(*t);
+                }
+            }
+            if p.target_table_id == self.root.id {
+                local_field_ids.insert(p.field_id);
+            }
+            // Its group, again in ranked order; a join path not seen yet
+            // opens a group of its own.
+            let members: Vec<&'b Path> = paths.iter().copied().filter(|q| q.joins == p.joins).collect();
+            match groups.iter().position(|g| g.join_path == p.joins) {
+                Some(i) => {
+                    let g = &groups[i];
+                    groups[i] = Arc::new(PathGroup {
+                        join_path: g.join_path.clone(),
+                        paths: members,
+                        join_cost: g.join_cost,
+                        route: g.route.clone(),
+                    });
+                }
+                None => {
+                    let (join_cost, route) = route_of(semantic, &p.joins);
+                    groups.push(Arc::new(PathGroup { join_path: p.joins.clone(), paths: members, join_cost, route }));
+                }
+            }
+        }
+        Base {
+            root: self.root,
+            datasource: self.datasource,
+            paths,
+            field_ids,
+            field_set,
+            measure_ids,
+            dimension_ids,
+            table_nodes,
+            local_field_ids,
+            identity: self.identity.clone(),
+            groups,
+        }
+    }
+
     /// The paths grouped by join path, cheapest path first within each.
     pub fn groups(&self) -> &[Arc<PathGroup<'a>>] {
         &self.groups
@@ -299,6 +368,28 @@ impl<'a> Universes<'a> {
             .map(|t| {
                 let paths = all_paths.iter().filter(|p| p.root_table_id == t.id).collect();
                 Arc::new(Base::new(semantic, t, paths))
+            })
+            .collect();
+        Universes { bases }
+    }
+
+    /// These universes with more paths laid over them, for a layered
+    /// model: a root the paths start from gets a universe of its own,
+    /// built over its paths and the new ones, and every other universe is
+    /// shared as it is.
+    pub fn layered<'b>(&self, semantic: &'b SemanticModel, extra: &'b [Path]) -> Universes<'b>
+    where
+        'a: 'b,
+    {
+        let bases = self
+            .bases
+            .iter()
+            .map(|base| -> Arc<Base<'b>> {
+                let added: Vec<&'b Path> = extra.iter().filter(|p| p.root_table_id == base.root.id).collect();
+                if added.is_empty() {
+                    return base.clone();
+                }
+                Arc::new(base.with_paths(semantic, &added))
             })
             .collect();
         Universes { bases }

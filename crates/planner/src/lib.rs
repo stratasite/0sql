@@ -7,6 +7,7 @@
 //! wrong, so the golden scoreboard stays honest.
 
 pub mod dag;
+pub mod lift;
 pub mod profile;
 pub mod pruner;
 pub mod resolved;
@@ -201,14 +202,45 @@ impl<'a> Planner<'a> {
     /// every dimension of the query. A dimension can be added when that
     /// still holds; so can a measure, counting itself among the measures.
     /// Without measures, one universe must reach every dimension.
+    ///
+    /// A calculation that is a measure on dimensions is explored as the
+    /// planner plans it: lifted, so it counts as a measure and what it
+    /// aggregates is not a dimension every other measure must reach.
     pub fn explore(&self, query: zsql_spec::Query) -> Result<Exploration<'a>> {
+        if let Some(lifted) = self.lift(&query)? {
+            let semantic = self.semantic.layered(lifted.fields, lifted.expressions);
+            let universes = self.universes.layered(&semantic, &lifted.paths);
+            return self.explore_over(&semantic, &universes, lifted.query);
+        }
+        self.explore_over(self.semantic, &self.universes, query)
+    }
+
+    /// The synthetic measures the query's calculations become, if any. A
+    /// query with no calculation has none, and pays nothing to learn it.
+    fn lift(&self, query: &zsql_spec::Query) -> Result<Option<lift::Lifted>> {
+        if !query.projections.iter().any(|p| p.is_calculation()) {
+            return Ok(None);
+        }
+        let aggregates = self.dialects.base().map_err(|e| Error::Resolution(e.to_string()))?.aggregate_functions();
+        lift::lift(self.semantic, &self.universes, &aggregates, query)
+    }
+
+    /// The walk, over the model and universes the query resolves in. What
+    /// it offers is always the planner's own model's fields: a layer is
+    /// never listed, so a synthetic measure is never offered.
+    fn explore_over<'l>(
+        &self,
+        semantic: &'l SemanticModel,
+        universes: &universe::Universes<'l>,
+        query: zsql_spec::Query,
+    ) -> Result<Exploration<'a>> {
         use zsql_semantic::Id;
-        let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
-        let measures = resolver::measures(self.semantic, &rquery);
-        let dimensions = resolver::dimensions(self.semantic, &rquery);
+        let rquery = resolved::ResolvedQuery::resolve(semantic, query)?;
+        let measures = resolver::measures(semantic, &rquery);
+        let dimensions = resolver::dimensions(semantic, &rquery);
         let dim_ids: Vec<Id> = dimensions.iter().map(|f| f.id).collect();
         let msr_ids: Vec<Id> = measures.iter().map(|f| f.id).collect();
-        let bases: Vec<&universe::Base<'a>> = self.universes.bases.iter().map(|b| b.as_ref()).collect();
+        let bases: Vec<&universe::Base<'l>> = universes.bases.iter().map(|b| b.as_ref()).collect();
         let mut ds_ids: Vec<Id> = Vec::new();
         for b in &bases {
             if !ds_ids.contains(&b.datasource.id) {
@@ -216,7 +248,7 @@ impl<'a> Planner<'a> {
             }
         }
         // A datasource holds a measure when one of its root tables does.
-        let holds = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && self.semantic.expression_for(b.root.id, m).is_some());
+        let holds = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && semantic.expression_for(b.root.id, m).is_some());
         // Every measure resolves in a datasource when a base there reaching
         // the query's dimensions carries it.
         let resolves = |ds: Id, m: Id| bases.iter().any(|b| b.datasource.id == ds && b.all_dimensions(&dim_ids) && b.has_measure(m));
@@ -254,6 +286,18 @@ impl<'a> Planner<'a> {
     /// As `plan_query`; with `explain` the plan also carries every
     /// node's alias and the identity string it hashes from.
     pub fn plan_query_explained(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
+        // A calculation that is a measure on dimensions is planned as one:
+        // a synthetic field laid over the model for this query alone.
+        if let Some(lifted) = self.lift(&query)? {
+            let semantic = self.semantic.layered(lifted.fields, lifted.expressions);
+            let universes = self.universes.layered(&semantic, &lifted.paths);
+            let planner = Planner { semantic: &semantic, dialects: self.dialects, universes };
+            return planner.plan_resolved(lifted.query, principal, explain);
+        }
+        self.plan_resolved(query, principal, explain)
+    }
+
+    fn plan_resolved(&self, query: zsql_spec::Query, principal: Option<&SecurityContext>, explain: bool) -> Result<Plan> {
         let rquery = resolved::ResolvedQuery::resolve(self.semantic, query)?;
         resolved::check_supported(&rquery, self.semantic, principal)?;
         match run_plan(self.semantic, &self.universes, self.dialects, &rquery, principal, vec![], explain) {

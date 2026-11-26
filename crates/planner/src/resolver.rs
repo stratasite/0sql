@@ -208,12 +208,35 @@ fn resolve_inner<'a>(
         let pushdown: Vec<Rc<ResolvedProjection<'a>>> = q.projections.iter().filter(|c| pushable(c, q)).cloned().collect();
         let mut pushed: Vec<usize> = Vec::new();
 
+        // A synthetic measure, one the planner laid over the model for this
+        // query, is mapped on every table that reaches its dimensions, so
+        // several of the chosen universes may hold it. It
+        // aggregates in one: a universe that also holds a projected model
+        // measure, else the first that holds it.
+        let model_measures: Vec<Id> = q
+            .projections
+            .iter()
+            .filter(|p| !p.is_calculation() && p.is_measure() && !p.field.map(|f| semantic.is_layer_field(f.id)).unwrap_or(false))
+            .filter_map(|p| p.field_id())
+            .collect();
+        let host_of = |f: &Field| -> Option<String> {
+            chosen
+                .iter()
+                .find(|u| u.has_field(f.id) && model_measures.iter().any(|m| u.has_field(*m)))
+                .or_else(|| chosen.iter().find(|u| u.has_field(f.id)))
+                .map(|u| u.identity().to_string())
+        };
+
         for u in &chosen {
             let mut projections: Vec<Rc<ResolvedProjection<'a>>> = q
                 .projections
                 .iter()
                 .filter(|p| !p.is_calculation())
                 .filter(|p| p.field.map(|f| u.has_field(f.id)).unwrap_or(false) || p.is_carried())
+                .filter(|p| match p.field.filter(|f| semantic.is_layer_field(f.id)) {
+                    Some(f) => host_of(f) == Some(u.identity().to_string()),
+                    None => true,
+                })
                 .cloned()
                 .collect();
 

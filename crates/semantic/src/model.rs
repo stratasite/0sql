@@ -3,8 +3,24 @@ use std::collections::HashMap;
 
 /// A branch's semantic model, indexed for lookup and checked for
 /// referential integrity. Immutable once built; share it behind an `Arc`.
+///
+/// A model may carry a layer: fields and expressions that exist for one
+/// query, over the same shared records (see [`SemanticModel::layered`]).
 #[derive(Debug)]
 pub struct SemanticModel {
+    core: std::sync::Arc<Core>,
+    layer: Layer,
+}
+
+/// What a layer adds. Small, so it is searched, not indexed.
+#[derive(Debug, Default, Clone)]
+struct Layer {
+    fields: Vec<Field>,
+    expressions: Vec<Expression>,
+}
+
+#[derive(Debug)]
+struct Core {
     snap: Snapshot,
     tables_by_id: HashMap<Id, usize>,
     tables_by_uid: HashMap<String, usize>,
@@ -148,38 +164,63 @@ impl SemanticModel {
         }
 
         Ok(Self {
-            snap,
-            tables_by_id,
-            tables_by_uid,
-            fields_by_id,
-            fields_by_uid,
-            fields_by_name,
-            datasources_by_id,
-            joins_by_id,
-            expressions_by_table,
-            expression_by_table_field,
-            warnings,
+            core: std::sync::Arc::new(Core {
+                snap,
+                tables_by_id,
+                tables_by_uid,
+                fields_by_id,
+                fields_by_uid,
+                fields_by_name,
+                datasources_by_id,
+                joins_by_id,
+                expressions_by_table,
+                expression_by_table_field,
+                warnings,
+            }),
+            layer: Layer::default(),
         })
     }
 
+    /// This model with more fields and expressions laid over it, for the
+    /// one query that needs them: the planner's synthetic measures. The
+    /// shared records are not copied and not changed, so nothing else that
+    /// holds the model can see the layer, and it goes when the returned
+    /// model is dropped. Lookups by id, uid, name and table find the
+    /// layer's records first. `snapshot`, `fields` and the other listings
+    /// stay the model's own: a layer is never listed.
+    ///
+    /// The caller answers for the layer's integrity: ids that the model
+    /// does not use, and expressions on tables and fields that exist.
+    pub fn layered(&self, fields: Vec<Field>, expressions: Vec<Expression>) -> SemanticModel {
+        let mut layer = self.layer.clone();
+        layer.fields.extend(fields);
+        layer.expressions.extend(expressions);
+        SemanticModel { core: self.core.clone(), layer }
+    }
+
+    /// Whether the field is one a layer added, not one of the model's own.
+    pub fn is_layer_field(&self, id: Id) -> bool {
+        self.layer.fields.iter().any(|f| f.id == id)
+    }
+
     pub fn snapshot(&self) -> &Snapshot {
-        &self.snap
+        &self.core.snap
     }
 
     pub fn warnings(&self) -> &[String] {
-        &self.warnings
+        &self.core.warnings
     }
 
     pub fn datasource(&self, id: Id) -> Option<&Datasource> {
-        self.datasources_by_id.get(&id).map(|&i| &self.snap.datasources[i])
+        self.core.datasources_by_id.get(&id).map(|&i| &self.core.snap.datasources[i])
     }
 
     pub fn table(&self, id: Id) -> Option<&Table> {
-        self.tables_by_id.get(&id).map(|&i| &self.snap.tables[i])
+        self.core.tables_by_id.get(&id).map(|&i| &self.core.snap.tables[i])
     }
 
     pub fn table_by_uid(&self, uid: &str) -> Option<&Table> {
-        self.tables_by_uid.get(&uid.trim().to_lowercase()).map(|&i| &self.snap.tables[i])
+        self.core.tables_by_uid.get(&uid.trim().to_lowercase()).map(|&i| &self.core.snap.tables[i])
     }
 
     /// The tables a term could name: its uid exactly, else every table
@@ -195,7 +236,7 @@ impl SemanticModel {
         if want.is_empty() {
             return Vec::new();
         }
-        self.snap.tables.iter().filter(|t| squash(&t.name) == want || squash(&t.uid) == want).collect()
+        self.core.snap.tables.iter().filter(|t| squash(&t.name) == want || squash(&t.uid) == want).collect()
     }
 
     /// The one table a term names, when it names exactly one.
@@ -207,14 +248,23 @@ impl SemanticModel {
     }
 
     pub fn field(&self, id: Id) -> Option<&Field> {
-        self.fields_by_id.get(&id).map(|&i| &self.snap.fields[i])
+        if let Some(f) = self.layer.fields.iter().find(|f| f.id == id) {
+            return Some(f);
+        }
+        self.core.fields_by_id.get(&id).map(|&i| &self.core.snap.fields[i])
     }
 
     /// A field by uid. With `kind` unset, a dimension wins over a measure of
     /// the same uid; callers that must disambiguate pass the kind.
     pub fn field_by_uid(&self, uid: &str, kind: Option<FieldKind>) -> Option<&Field> {
         let key = uid.trim().to_lowercase();
-        let lookup = |k: FieldKind| self.fields_by_uid.get(&(k, key.clone())).map(|&i| &self.snap.fields[i]);
+        let lookup = |k: FieldKind| {
+            self.layer
+                .fields
+                .iter()
+                .find(|f| f.kind == k && f.uid.trim().to_lowercase() == key)
+                .or_else(|| self.core.fields_by_uid.get(&(k, key.clone())).map(|&i| &self.core.snap.fields[i]))
+        };
         match kind {
             Some(k) => lookup(k),
             None => lookup(FieldKind::Dimension).or_else(|| lookup(FieldKind::Measure)),
@@ -223,19 +273,32 @@ impl SemanticModel {
 
     /// A field by display name, case-insensitive (Rails `named`).
     pub fn field_by_name(&self, name: &str, kind: FieldKind) -> Option<&Field> {
-        self.fields_by_name.get(&(kind, name.trim().to_lowercase())).map(|&i| &self.snap.fields[i])
+        let key = name.trim().to_lowercase();
+        if let Some(f) = self.layer.fields.iter().find(|f| f.kind == kind && f.name.trim().to_lowercase() == key) {
+            return Some(f);
+        }
+        self.core.fields_by_name.get(&(kind, key)).map(|&i| &self.core.snap.fields[i])
     }
 
     pub fn join(&self, id: Id) -> Option<&JoinDef> {
-        self.joins_by_id.get(&id).map(|&i| &self.snap.join_defs[i])
+        self.core.joins_by_id.get(&id).map(|&i| &self.core.snap.join_defs[i])
     }
 
     pub fn expressions_of(&self, table_id: Id) -> impl Iterator<Item = &Expression> {
-        self.expressions_by_table.get(&table_id).into_iter().flatten().map(move |&i| &self.snap.expressions[i])
+        self.core
+            .expressions_by_table
+            .get(&table_id)
+            .into_iter()
+            .flatten()
+            .map(move |&i| &self.core.snap.expressions[i])
+            .chain(self.layer.expressions.iter().filter(move |e| e.table_id == table_id))
     }
 
     pub fn expression_for(&self, table_id: Id, field_id: Id) -> Option<&Expression> {
-        self.expression_by_table_field.get(&(table_id, field_id)).map(|&i| &self.snap.expressions[i])
+        if let Some(e) = self.layer.expressions.iter().find(|e| e.table_id == table_id && e.field_id == field_id) {
+            return Some(e);
+        }
+        self.core.expression_by_table_field.get(&(table_id, field_id)).map(|&i| &self.core.snap.expressions[i])
     }
 
     /// A path's stable identity: the table uids along its route from the
@@ -260,19 +323,19 @@ impl SemanticModel {
     }
 
     pub fn tables(&self) -> &[Table] {
-        &self.snap.tables
+        &self.core.snap.tables
     }
 
     pub fn fields(&self) -> &[Field] {
-        &self.snap.fields
+        &self.core.snap.fields
     }
 
     pub fn joins(&self) -> &[JoinDef] {
-        &self.snap.join_defs
+        &self.core.snap.join_defs
     }
 
     pub fn policies(&self) -> &[SecurityPolicy] {
-        &self.snap.security_policies
+        &self.core.snap.security_policies
     }
 }
 
