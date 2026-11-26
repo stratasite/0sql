@@ -126,6 +126,10 @@ pub fn org_path(org: Option<&str>) -> String {
 /// The org a project with no `org:` is deployed under.
 pub const DEFAULT_ORG: &str = "default";
 
+pub fn project_path(org: Option<&str>, uid: &str) -> String {
+    format!("{}/projects/{}", org_path(org), urlencode(uid))
+}
+
 pub fn branch_path(org: Option<&str>, uid: &str, branch: &str) -> String {
     format!("{}/projects/{}/branches/{}", org_path(org), urlencode(uid), urlencode(branch))
 }

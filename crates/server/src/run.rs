@@ -142,6 +142,7 @@ pub(crate) fn router(app: Shared) -> Router {
 fn of_an_org() -> Router<Shared> {
     Router::new()
         .route("/projects", get(reads::projects))
+        .route("/projects/{uid}", delete(deploy::remove_project))
         .route("/projects/{uid}/branches/{branch}", get(reads::branch_summary))
         .route("/projects/{uid}/branches/{branch}/deploy", post(deploy::deploy).layer(axum::extract::DefaultBodyLimit::max(ARCHIVE_LIMIT)))
         .route(
