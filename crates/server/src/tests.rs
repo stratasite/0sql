@@ -366,6 +366,16 @@ async fn each_branch_is_its_own_deployment() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.listing().await, ["billing/main", "customer-service/main"]);
     assert_eq!(s.fields(CS, "dev").await.unwrap_err().status, StatusCode::NOT_FOUND);
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/dev"), &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "gone is gone: {}", a.body);
+
+    // A branch on disk that never loaded can be removed by name too.
+    let stale = s.data_dir.join("default").join(CS).join("old");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("snapshot.json.gz"), b"not a snapshot").unwrap();
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/old"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(!stale.exists());
 
     // A restart finds what is on disk and nothing else.
     let again = app_over(&s.data_dir);

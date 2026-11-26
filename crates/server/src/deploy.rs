@@ -313,11 +313,18 @@ pub(crate) async fn remove(
         // would otherwise swap its directory in between the removal of
         // the model and of the files.
         let _writing = lock(&app.deploying);
-        let removed = write(&app.models).remove(&crate::key(&org, &uid, &branch)).is_some();
-        if !removed {
+        let loaded = write(&app.models).remove(&crate::key(&org, &uid, &branch)).is_some();
+        // A branch on disk that would not load at startup is removed
+        // too: it is not served, but it is still the branch's files.
+        let dir = app.dir(&org, &uid, &branch);
+        let on_disk = dir.is_dir();
+        if !loaded && !on_disk {
             return Err(not_found(&org, &uid, &branch));
         }
-        let _ = std::fs::remove_dir_all(app.dir(&org, &uid, &branch));
+        if on_disk {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not remove {uid}/{branch}: {e}")))?;
+        }
         tracing::info!("removed {org}/{uid}/{branch}");
         // Named as the log names it, with the org when it is not the default.
         let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
