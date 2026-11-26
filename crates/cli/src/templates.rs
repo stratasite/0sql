@@ -24,13 +24,13 @@ pub const DATASOURCES_YML: &str = "\
 # The warehouses this project's tables live in. One entry per datasource,\n\
 # keyed by a short id that table files refer to.\n\
 #\n\
-# The server never connects to your warehouse. It has no database driver\n\
-# in it at all: it takes a query spec and gives back SQL text, and nothing\n\
-# about your rows ever reaches it. The zsql command on this machine does\n\
-# connect, read-only, when you ask it to: `zsql catalog` reads the\n\
+# Two things connect to these warehouses. The zsql command on this\n\
+# machine does, read-only, when you ask it to: `zsql catalog` reads the\n\
 # catalog a model is drafted from, and `zsql sample` reads the values of\n\
-# the dimensions you turn sampling on for. Give it a credential with no\n\
-# write grant.\n\
+# the dimensions you turn sampling on for. The server does too, when it is\n\
+# asked to run a query rather than only plan one, with the credential the\n\
+# branch was deployed with or the one the request sends. Give both a\n\
+# credential with no write grant.\n\
 #\n\
 # So the settings below are two different things.\n\
 #\n\
@@ -40,8 +40,8 @@ pub const DATASOURCES_YML: &str = "\
 # compiled into the deployed model.\n\
 #\n\
 # Everything else here (host, port, database, username, schema, file and\n\
-# the keys each warehouse adds) is for the zsql command and for your own\n\
-# tools. A deploy sends this file, and the server keeps every key of an\n\
+# the keys each warehouse adds) is how to connect: for the zsql command,\n\
+# for the server's runs, and for your own tools. A deploy sends this file, and the server keeps every key of an\n\
 # entry: what it plans with, and what it connects with to run a query.\n\
 #\n\
 # Secrets stay out of git. Passwords, tokens and keys go in .zsql under\n\
@@ -57,9 +57,9 @@ pub const DATASOURCES_YML: &str = "\
 #\n\
 # warehouse:\n\
 #   name: Warehouse\n\
-#   adapter: postgres            # the dialect to generate; duckdb | postgres | snowflake | bigquery | databricks | trino | mysql | sqlserver | ...\n\
+#   adapter: postgres            # the dialect to generate; duckdb | postgres | snowflake | bigquery | databricks | trino | mysql | sqlserver | redshift | athena | druid | ...\n\
 #   tier: hot                    # hot | warm | cold; the planner prefers hotter tiers\n\
-#   host: localhost              # from here down: for your own tools; the server ignores it\n\
+#   host: localhost              # from here down: how to connect; the planner ignores it\n\
 #   port: 5432\n\
 #   database: analytics\n\
 #   username: analyst\n\
@@ -82,7 +82,7 @@ pub const DATASOURCES_YML: &str = "\
 #   account: myorg-myaccount      # the account identifier: <account>.snowflakecomputing.com\n\
 #   database: ANALYTICS           # as you would type it unquoted; \"Mixed Case\" in quotes to send it as written\n\
 #   warehouse: COMPUTE_WH         # optional; your user's default otherwise\n\
-#   schema: PUBLIC                # optional; introspect reads every schema without it\n\
+#   schema: PUBLIC                # optional; zsql catalog read reads every schema without it\n\
 #   role: ANALYST                 # optional\n\
 #   # a personal access token goes in .zsql as personal_access_token; or a key pair:\n\
 #   username: zsql                # the user the key is registered to\n\
@@ -94,7 +94,7 @@ pub const DATASOURCES_YML: &str = "\
 #   tier: warm\n\
 #   host: adb-1234567890123456.7.azuredatabricks.net   # the workspace\n\
 #   warehouse: abc123def456      # the SQL warehouse id\n\
-#   catalog: main                 # Unity Catalog; introspect reads its information_schema\n\
+#   catalog: main                 # Unity Catalog; zsql catalog read reads its information_schema\n\
 #   schema: default               # optional\n\
 #   # a personal access token goes in .zsql as personal_access_token; or a service principal:\n\
 #   client_id: 00000000-0000-0000-0000-000000000000   # with oauth_client_secret in .zsql\n\
@@ -104,7 +104,7 @@ pub const DATASOURCES_YML: &str = "\
 #   adapter: bigquery\n\
 #   tier: warm\n\
 #   project: my-project\n\
-#   dataset: analytics            # optional; introspect reads the whole region without it\n\
+#   dataset: analytics            # optional; zsql catalog read reads the whole region without it\n\
 #   location: US                  # the region, for a whole-region read\n\
 #   # a service account's key goes in .zsql as private_key, with client_email beside it; or its JSON key file:\n\
 #   key_file: ./service-account.json   # or GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`\n\
@@ -114,7 +114,7 @@ pub const DATASOURCES_YML: &str = "\
 #   adapter: athena\n\
 #   tier: cold\n\
 #   region: us-east-1             # or AWS_REGION, or the profile's config\n\
-#   database: default             # the Glue database; introspect reads it\n\
+#   database: default             # the Glue database; zsql catalog read reads it\n\
 #   catalog: AwsDataCatalog       # optional\n\
 #   workgroup: primary            # optional\n\
 #   output_location: s3://my-athena-results/zsql/   # unless the workgroup sets one\n\
@@ -127,7 +127,7 @@ pub const DATASOURCES_YML: &str = "\
 #   tier: hot\n\
 #   host: druid.internal          # the router (8888) or a broker; or url: https://...\n\
 #   port: 8888\n\
-#   schema: druid                 # optional; introspect reads druid and lookup without it\n\
+#   schema: druid                 # optional; zsql catalog read reads druid and lookup without it\n\
 #   username: zsql                # only when the cluster has an authenticator: the password in .zsql,\n\
 #                                 # or an oauth_token there for one that takes a bearer\n\
 \n\
@@ -306,9 +306,13 @@ what to change.
 - `project.yml` — the project's name, uid and production branch.
 - `datasources.yml` — one entry per warehouse: `adapter` picks the SQL
   dialect, `tier` ranks datasources when more than one could answer; the
-  other keys are how the `zsql` command on this machine connects.
+  other keys are how the `zsql` command on this machine, and the server
+  when it runs a query, connect.
   **Never put a password, token or key in this file.** Secrets belong in
-  `.zsql`, which is gitignored and never deployed.
+  `.zsql`, which is gitignored. The file itself is never sent, but
+  `zsql deploy` sends the secrets it holds for each datasource: on the
+  server they become that branch's credential for runs whose request
+  sends none.
 - `catalog/<datasource>.json` — what the warehouse holds, as `zsql catalog`
   read it. Committed: it is schema, not data, and `zsql check` validates
   the model against it.
