@@ -64,7 +64,12 @@ fn rebind_universe<'a>(
 
 /// Rails `Dag.materialize_filter_columns` onto a node.
 fn materialize_filter_columns<'a>(graph: &mut Graph<'a>, id: NodeId) {
-    let fields: Vec<&'a Field> = graph.nodes[id].filters.iter().filter(|f| f.is_measure()).map(|f| f.field()).collect();
+    let fields: Vec<&'a Field> = graph.nodes[id]
+        .filters
+        .iter()
+        .filter(|f| f.is_measure())
+        .flat_map(|f| f.fields().filter(|x| x.is_measure()).collect::<Vec<_>>())
+        .collect();
     for f in fields {
         let clean =
             graph.nodes[id].projections.iter().any(|p| p.field().map(|x| x.id == f.id).unwrap_or(false) && p.decorators().is_empty());
@@ -310,7 +315,7 @@ fn universe_for<'a>(
     let keys = keys_for(p, q);
     let field = p.field.expect("measure projection field");
     let mut required: Vec<&Field> = node.projections.iter().filter(|x| x.is_dimension()).filter_map(|x| x.field()).collect();
-    required.extend(node.filters.iter().filter(|f| f.is_dimension()).map(|f| f.field()));
+    required.extend(node.filters.iter().filter(|f| f.is_dimension()).flat_map(|f| f.fields().collect::<Vec<_>>()));
     required.push(field);
     let mut seen = std::collections::HashSet::new();
     required.retain(|f| seen.insert(f.id));

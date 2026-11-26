@@ -354,6 +354,7 @@ fn run_plan<'a>(
     phase!("temporal", visitors::temporal::run(&mut graph, semantic, rquery)?);
     phase!("top_n", visitors::top_n::run(&mut graph, semantic, universes, dialects, rquery)?);
     phase!("segment", visitors::segment::run(&mut graph, semantic, universes, dialects, rquery)?);
+    phase!("comparison", visitors::comparison::run(&mut graph, rquery)?);
     if let Some(user) = principal {
         phase!("security", visitors::security::run(&mut graph, semantic, user)?);
     }

@@ -63,7 +63,7 @@ fn process<'a>(
     // The node at the extended dimensionality.
     let base = graph.nodes[id].universe.clone().expect("agg universe");
     let all_local = projections.iter().all(|p| p.field.map(|f| base.has_field(f.id)).unwrap_or(true))
-        && filters.iter().all(|f| base.has_field(f.field().id));
+        && filters.iter().all(|f| f.fields().all(|x| base.has_field(x.id)));
     if !all_local {
         return Err(Error::Unimplemented("inclusion sub-plan outside the node's universe"));
     }
@@ -157,12 +157,13 @@ fn allowed_components<'a>(
     // measure then reaches the roll-up with no column to read: "The filter
     // on X cannot be applied at the final pass". Such a filter stays where
     // it was, on the node that still computes that measure.
-    let mut filters: Vec<Filtered<'a>> = node.filters.iter().filter(|f| f.is_measure() && f.field().id == measure.id).cloned().collect();
+    let mut filters: Vec<Filtered<'a>> =
+        node.filters.iter().filter(|f| f.is_measure() && !f.is_comparison() && f.field().id == measure.id).cloned().collect();
     let dim_filters = node.filters.iter().filter(|f| f.is_dimension());
     match rule.filter {
-        FilterMode::Ignore => filters.extend(dim_filters.filter(|f| !rule_ids.contains(&f.field().id)).cloned()),
+        FilterMode::Ignore => filters.extend(dim_filters.filter(|f| f.reads_none_of(&rule_ids)).cloned()),
         FilterMode::Apply => filters.extend(dim_filters.cloned()),
-        FilterMode::Only => filters.extend(dim_filters.filter(|f| rule_ids.contains(&f.field().id)).cloned()),
+        FilterMode::Only => filters.extend(dim_filters.filter(|f| f.reads_only(&rule_ids)).cloned()),
     }
     for did in rule_ids {
         if let Some(d) = semantic.field(did) {

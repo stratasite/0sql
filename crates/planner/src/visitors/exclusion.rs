@@ -80,7 +80,9 @@ fn allowed_components<'a>(
 ) -> Result<(Vec<Projected<'a>>, Vec<Filtered<'a>>)> {
     let node = &graph.nodes[id];
     let mut projections: Vec<Projected<'a>> = Vec::new();
-    let mut filters: Vec<Filtered<'a>> = node.filters.iter().filter(|f| f.is_measure()).cloned().collect();
+    // A comparison of measures is applied where they meet at the query's
+    // grain, by `comparison::run`, never at a rule's own grain.
+    let mut filters: Vec<Filtered<'a>> = node.filters.iter().filter(|f| f.is_measure() && !f.is_comparison()).cloned().collect();
     let add_p = |v: Vec<&Projected<'a>>, projections: &mut Vec<Projected<'a>>| {
         for p in v {
             if !projections.iter().any(|x| x.proj.pid == p.proj.pid) {
@@ -122,7 +124,7 @@ fn allowed_components<'a>(
                 match rule.filter {
                     FilterMode::Ignore => {
                         add_p(dim_projs.iter().copied().filter(|p| !excluded(p)).collect(), &mut projections);
-                        add_f(dim_filters.iter().copied().filter(|f| !rule_ids.contains(&f.field().id)).collect(), &mut filters);
+                        add_f(dim_filters.iter().copied().filter(|f| f.reads_none_of(&rule_ids)).collect(), &mut filters);
                     }
                     FilterMode::Apply => {
                         add_p(dim_projs.iter().copied().filter(|p| !excluded(p)).collect(), &mut projections);
@@ -130,7 +132,7 @@ fn allowed_components<'a>(
                     }
                     FilterMode::Only => {
                         add_p(dim_projs.clone(), &mut projections);
-                        add_f(dim_filters.iter().copied().filter(|f| !rule_ids.contains(&f.field().id)).collect(), &mut filters);
+                        add_f(dim_filters.iter().copied().filter(|f| f.reads_none_of(&rule_ids)).collect(), &mut filters);
                     }
                 }
             }
@@ -140,7 +142,7 @@ fn allowed_components<'a>(
                 match rule.filter {
                     FilterMode::Ignore => {
                         add_p(dim_projs.iter().copied().filter(|p| allowed(p)).collect(), &mut projections);
-                        add_f(dim_filters.iter().copied().filter(|f| rule_ids.contains(&f.field().id)).collect(), &mut filters);
+                        add_f(dim_filters.iter().copied().filter(|f| f.reads_only(&rule_ids)).collect(), &mut filters);
                     }
                     FilterMode::Apply => {
                         add_p(dim_projs.iter().copied().filter(|p| allowed(p)).collect(), &mut projections);
@@ -148,7 +150,7 @@ fn allowed_components<'a>(
                     }
                     FilterMode::Only => {
                         add_p(dim_projs.clone(), &mut projections);
-                        add_f(dim_filters.iter().copied().filter(|f| rule_ids.contains(&f.field().id)).collect(), &mut filters);
+                        add_f(dim_filters.iter().copied().filter(|f| f.reads_only(&rule_ids)).collect(), &mut filters);
                     }
                 }
             }

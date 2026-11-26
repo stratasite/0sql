@@ -296,6 +296,14 @@
         "top_n_measure": {
           "type": "string",
           "description": "top_n: the measure to rank by; row count when absent."
+        },
+        "value_field": {
+          "type": "string",
+          "description": "In place of value: a field to compare with (Ship Date greater_than Order Date). Both of one type: number, date (= != < <= > >= between), string (= != and the contains family, case-insensitive) or boolean (= !=). A measure compared with a dimension needs that dimension projected."
+        },
+        "value_end_field": {
+          "type": "string",
+          "description": "between, beside value_field: the upper bound as a field."
         }
       }
     },

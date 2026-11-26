@@ -221,6 +221,13 @@ pub struct FilterLeafSpec {
     /// rank by row count. May also be written into the value as `"N:measure"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n_measure: Option<Value>,
+    /// A field to compare with instead of a value (a uid or a name, with
+    /// an optional `@d`/`@m`): `Event Date > Sold Date`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_field: Option<Value>,
+    /// `between`'s upper bound as a field, beside `value_field`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_end_field: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1014,6 +1021,10 @@ fn lower_filter(cx: &Cx, leaf: &FilterLeafSpec, reference: String, ordinal: i64)
     let field = cx.resolve(&source, leaf.field_type.as_deref())?;
     let predicate: Predicate = serde_json::from_value(Value::String(leaf.predicate.trim().to_lowercase()))
         .map_err(|_| invalid(format!("'{}' is not a predicate (filter on {source})", leaf.predicate)))?;
+    let present = |v: &Option<Value>| v.as_ref().is_some_and(|v| !v.is_null());
+    if present(&leaf.value_field) || present(&leaf.value_end_field) {
+        return lower_comparison(cx, leaf, field, predicate, source, reference, ordinal);
+    }
     if !predicate_allowed(field, predicate) {
         return Err(record_invalid(format!("Predicate {} predicate is not supported for {}.", humanize(predicate.name()), field.name)));
     }
@@ -1080,6 +1091,169 @@ fn lower_filter(cx: &Cx, leaf: &FilterLeafSpec, reference: String, ordinal: i64)
         filter_value: value,
         filter_value_end: value_end,
         top_n_measure,
+        value_field: None,
+        value_end_field: None,
+        ordinal,
+        source_ref: Some(source),
+    })
+}
+
+/// What a field is compared as: two fields compare when they share one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Number,
+    Date,
+    String,
+    Boolean,
+}
+
+impl Family {
+    /// A measure without a type is a number, as a calculation is.
+    fn of(field: &Field) -> Option<Family> {
+        match field.data_type {
+            Some(DataType::Integer | DataType::Decimal | DataType::Bigint) => Some(Family::Number),
+            Some(DataType::Date | DataType::DateTime) => Some(Family::Date),
+            Some(DataType::String) => Some(Family::String),
+            Some(DataType::Boolean) => Some(Family::Boolean),
+            Some(DataType::Binary) => None,
+            None if field.kind == FieldKind::Measure => Some(Family::Number),
+            None => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Family::Number => "number",
+            Family::Date => "date",
+            Family::String => "string",
+            Family::Boolean => "boolean",
+        }
+    }
+
+    fn allows(self, p: Predicate) -> bool {
+        use Predicate::*;
+        let equality = matches!(p, Equals | DoesNotEqual);
+        match self {
+            Family::Number | Family::Date => {
+                equality || matches!(p, GreaterThan | GreaterThanOrEqualTo | LessThan | LessThanOrEqualTo | Between)
+            }
+            Family::String => {
+                equality || matches!(p, Contains | StartsWith | EndsWith | DoesNotContain | DoesNotStartWith | DoesNotEndWith)
+            }
+            Family::Boolean => equality,
+        }
+    }
+}
+
+/// The predicate read from the other side: `a > b` is `b < a`.
+fn flipped(p: Predicate) -> Predicate {
+    use Predicate::*;
+    match p {
+        GreaterThan => LessThan,
+        GreaterThanOrEqualTo => LessThanOrEqualTo,
+        LessThan => GreaterThan,
+        LessThanOrEqualTo => GreaterThanOrEqualTo,
+        other => other,
+    }
+}
+
+fn operand(field: &Field) -> crate::query::Operand {
+    crate::query::Operand { field_uid: field.uid.clone(), field_kind: field.kind }
+}
+
+fn measure_bound(name: &str) -> Error {
+    record_invalid(format!(
+        "Between with a measure for a bound filters a measure: put {name} in field and the bounds in value_field and value_end_field"
+    ))
+}
+
+/// A filter comparing its field with another field rather than a value.
+/// Both sides share a family, the predicate is one that family compares
+/// with, and a measure on either side ends up as the filter's own field.
+fn lower_comparison(
+    cx: &Cx,
+    leaf: &FilterLeafSpec,
+    field: &Field,
+    predicate: Predicate,
+    source: String,
+    reference: String,
+    ordinal: i64,
+) -> Result<Filter> {
+    let present = |v: &Option<Value>| v.as_ref().is_some_and(|v| !v.is_null());
+    if present(&leaf.value) || present(&leaf.value_end) {
+        return Err(record_invalid(format!(
+            "A filter compares {source} with a value or with a field, not both: give value or value_field"
+        )));
+    }
+    if present(&leaf.top_n_measure) {
+        return Err(record_invalid(format!("top_n_measure has no meaning on a filter comparing two fields ({source})")));
+    }
+    let resolve = |v: &Option<Value>| -> Result<Option<&Field>> {
+        match v.as_ref().filter(|v| !v.is_null()) {
+            Some(v) => Ok(Some(cx.resolve(&ref_text(v)?, None)?)),
+            None => Ok(None),
+        }
+    };
+    let (other, end) = (resolve(&leaf.value_field)?, resolve(&leaf.value_end_field)?);
+    let other = other.ok_or_else(|| record_invalid(format!("value_end_field needs a value_field beside it ({source})")))?;
+    if predicate == Predicate::Between && end.is_none() {
+        return Err(record_invalid(format!("Between two fields needs value_end_field as well as value_field ({source})")));
+    }
+    if predicate != Predicate::Between && end.is_some() {
+        return Err(record_invalid(format!("value_end_field is only for between ({source})")));
+    }
+
+    let family = Family::of(field).ok_or_else(|| {
+        record_invalid(format!("{} cannot be compared with another field: it is not a number, a date, a string or a boolean", field.name))
+    })?;
+    for o in std::iter::once(other).chain(end) {
+        if o.id == field.id && o.kind == field.kind {
+            return Err(record_invalid(format!("A filter compares {} with itself", field.name)));
+        }
+        if Family::of(o) != Some(family) {
+            let theirs = Family::of(o).map(|f| format!("a {}", f.name())).unwrap_or_else(|| "of no comparable type".into());
+            return Err(record_invalid(format!(
+                "{} is a {} and {} is {theirs}; a filter compares two numbers, two dates, two strings or two booleans",
+                field.name,
+                family.name(),
+                o.name
+            )));
+        }
+    }
+    if !family.allows(predicate) {
+        return Err(record_invalid(format!(
+            "Predicate {} does not compare two {} fields ({} and {})",
+            humanize(predicate.name()),
+            family.name(),
+            field.name,
+            other.name
+        )));
+    }
+
+    // A measure on the value side changes places, so the filter's own
+    // field is the measure and the filter is a HAVING wherever it goes.
+    let swap = field.kind == FieldKind::Dimension && other.kind == FieldKind::Measure;
+    if field.kind == FieldKind::Dimension && predicate == Predicate::Between {
+        if let Some(m) = std::iter::once(other).chain(end).find(|o| o.kind == FieldKind::Measure) {
+            return Err(measure_bound(&m.name));
+        }
+    }
+    let (field, other, predicate, source) = if swap {
+        (other, field, flipped(predicate), ref_text(leaf.value_field.as_ref().expect("value_field"))?)
+    } else {
+        (field, other, predicate, source)
+    };
+
+    Ok(Filter {
+        reference,
+        field_uid: field.uid.clone(),
+        field_kind: Some(field.kind),
+        predicate,
+        filter_value: None,
+        filter_value_end: None,
+        top_n_measure: None,
+        value_field: Some(operand(other)),
+        value_end_field: end.map(operand),
         ordinal,
         source_ref: Some(source),
     })
@@ -1417,8 +1591,20 @@ fn filter_leaf_spec(f: &Filter) -> Value {
         value: f.filter_value.clone().map(Value::String),
         value_end: f.filter_value_end.clone().map(Value::String),
         top_n_measure: f.top_n_measure.clone().map(Value::String),
+        value_field: f.value_field.as_ref().map(operand_spec),
+        value_end_field: f.value_end_field.as_ref().map(operand_spec),
     };
     serde_json::to_value(leaf).expect("filter serializes")
+}
+
+/// An operand as a reference that reads back to the same field: its uid,
+/// with the kind as a suffix since a dimension and a measure may share it.
+fn operand_spec(o: &crate::query::Operand) -> Value {
+    let suffix = match o.field_kind {
+        FieldKind::Dimension => "d",
+        FieldKind::Measure => "m",
+    };
+    Value::String(format!("{}@{suffix}", o.field_uid))
 }
 
 /// A flat AND of every filter serializes as an array in ordinal order;

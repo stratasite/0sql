@@ -109,7 +109,8 @@ pub fn partition_score(root: &Table, filters: &[Rc<ResolvedFilter>], semantic: &
     }
     let mut score = 0;
     for part in parts {
-        for f in filters {
+        // A comparison has no value to place inside or outside a partition.
+        for f in filters.iter().filter(|f| !f.is_comparison()) {
             if f.field.id == part.dimension_id {
                 score += if within_partition(part, f) { 1 } else { -1 };
             }
@@ -191,10 +192,9 @@ mod tests {
     }
 
     fn filter<'a>(field: &'a Field, predicate: Predicate, value: &str, end: Option<&str>) -> ResolvedFilter<'a> {
-        ResolvedFilter {
-            fid: 0,
-            field,
-            def: zsql_spec::Filter {
+        ResolvedFilter::new(
+            0,
+            zsql_spec::Filter {
                 reference: "f0".into(),
                 field_uid: field.uid.clone(),
                 field_kind: Some(field.kind),
@@ -202,10 +202,13 @@ mod tests {
                 filter_value: Some(value.into()),
                 filter_value_end: end.map(str::to_string),
                 top_n_measure: None,
+                value_field: None,
+                value_end_field: None,
                 ordinal: 0,
                 source_ref: None,
             },
-        }
+            field,
+        )
     }
 
     fn partition(predicate: Predicate, value: &str, end: Option<&str>) -> Partition {
