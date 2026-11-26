@@ -47,18 +47,26 @@ and at every materialization, so that the server's own engine never
 holds more than it was sized for. A source or a step that would pass
 the cap fails, saying so.
 
-## Who owns it
+## Who may use it
 
-- The application sends an **owner reference** with every data prep
-  request, an opaque string it chooses, trusted as `context` is. A
-  request without one is refused; there is no shared empty owner.
-- A dataset belongs to **(org, project, owner)**; under any other its id
-  answers 404. The reference is stored and logged only as a hash.
-- **Securing a dataset is its creator's.** The server keeps owners apart
-  and does nothing more.
-- **Who may create one is decided in front.** Datasets may be for
-  developers only; that is the application's choice, by the routes it
-  forwards. `ZSQL_DATASETS=off` turns the feature off as a whole.
+- **The server keeps no user.** A dataset belongs to an org and a
+  project and is addressed by its id, as a deployed branch or a result
+  is. Who may read, change or share which dataset is the application's
+  to decide, with its own records of who made what; the server answers
+  whoever reaches it, as it does for everything else.
+- **Sharing is the application's.** A user shown a chart built on a
+  dataset reads that dataset because the application lets them; the
+  server is not asked, and there is nothing to grant. (An owner header
+  scoping datasets per user was built first, and dropped on 2026-11-26
+  for this: it duplicated the application's access control and fitted
+  no sharing model.)
+- **What a semantic dataset holds is its creator's view.** Its snapshot
+  is what the creator's context could see; whoever the application lets
+  read it sees those rows, whatever their own context. The application
+  should say so before such a dataset is shared.
+- **Who may create one is decided in front** too: by the routes the
+  application forwards. `ZSQL_DATASETS=off` turns the feature off as a
+  whole.
 - **Per project, not per branch.** A deploy never takes a dataset away.
 
 ## Sources
@@ -262,7 +270,7 @@ form a **DAG**:
   context to run it under); its last snapshot is used.
 - One job per dataset at a time.
 - Reading an input is checked as reading it directly would be: an
-  input is one of the same owner's datasets in the same project, read
+  input is one of the datasets of the same project, read
   at its live version, which the lineage records.
 - An append meets columns by name, each at the type both widen to; a
   column only one side has is empty on the other.
@@ -298,7 +306,7 @@ a change would break, before it is made).
 
 ## Blending with the model at query time
 
-`POST /projects/{uid}/branches/{branch}/blend`, with the owner header:
+`POST /projects/{uid}/branches/{branch}/blend`:
 a spec whose projections may name `alias.column`, the `datasets`
 attached, and the `blend` joins; `context`, `connection`, `wait` and
 `fresh` as `/run` takes them. The server splits the spec: projections of
@@ -393,9 +401,8 @@ return fewer than N rows. This is deliberate, to protect the server.
 
 **The cache is reused.** A blend's result is cached by the model's SQL,
 each attached dataset's id and materialization version, and the joins.
-A dataset can be attached only by its owner, the owner check comes
-before the lookup, and a new materialization is a new key, so a match is
-the same question over the same data.
+Each dataset is found before the lookup, and a new materialization is
+a new key, so a match is the same question over the same data.
 
 ## Only when asked
 
@@ -407,11 +414,10 @@ the same question over the same data.
   resolves to a dataset column; corrections never suggest across.
 - **On `/mcp` the agent can use datasets, when asked.** Picking a
   dataset in conversation ("blend this with my budget") is the user
-  picking it. What the agent cannot do is choose whose datasets, or use
-  one without naming it:
-  - the owner comes only from a header the application sets on `/mcp`,
-    never from a tool's arguments, so the agent reaches only the
-    datasets of the user it acts for;
+  picking it. What the agent cannot do is use one without naming it,
+  or reach one the application has not let it:
+  - which datasets an agent may name is the application's to decide,
+    as which projects it may ask about is;
   - datasets are in no catalog or instruction the agent is given; it
     finds them only by calling a dataset tool, and uses one only by
     naming its id in `datasets:`;
@@ -432,8 +438,7 @@ the same question over the same data.
 and materialization of the dataset, and its copy in the object-store
 backup, are removed, and the cached blends that cite it are marked
 dirty. A dataset others read is deleted only after they are named and
-the user confirms; they go stale. Also: delete every dataset of one
-owner, for an application removing a user; and a project's removal,
+the user confirms; they go stale. A project's removal,
 `DELETE /projects/{uid}`, removes its datasets.
 
 ## Where it is kept
@@ -485,11 +490,10 @@ The data directory keeps the layout it has ("What is on disk" in
   `backup` says it is not backed up. A delete removes the copy.
 
 Routes are under `/projects/{uid}/datasets`, and under `/orgs/{org}`;
-with no org the org is `default`. The owner reference is the
-`zsql-owner` header.
+with no org the org is `default`.
 
 ```
-GET    /projects/{uid}/datasets                         this owner's datasets
+GET    /projects/{uid}/datasets                         the project's datasets
 POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file_name=&delimiter=&quote=&header=&max_bad_rows=
 POST   /projects/{uid}/datasets/query                   {"name", "branch", "spec" | "expr", "context", "connection", "wait"}
 POST   /projects/{uid}/datasets/{id}/refresh            {"context", "connection", "wait"}: its query again, fresh
@@ -506,7 +510,6 @@ GET    /projects/{uid}/datasets/{id}/edits              the edit log, and each e
 POST   /projects/{uid}/datasets/{id}/edits              {"against": m, "edits": [{"op": "cell" | "delete" | "add" | "undo", ...}]}
 POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold
 GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
-DELETE /datasets                                        every dataset of this owner in the org
 ```
 
 A dataset can be made only in a project deployed on some branch of
@@ -573,7 +576,7 @@ know about datasets.
 ## Phases
 
 - [x] **1. The core, fed by an upload.** `.datasets` under each project
-  and the test that pins it; The crate, the owner reference,
+  and the test that pins it; The crate,
   the CSV contract, roles and types, snapshots, recipes and
   materializations, the caps, lineage records, hard delete, the engine
   with external access off.
@@ -587,7 +590,6 @@ know about datasets.
   cascade.
 - [x] **6. Blends.** Attachment in the request, the isolation golden
   test, `filter`, `enrich` as a look-up and as budget against actual,
-  regrouping only what adds up, the cache. The owner header on `/mcp`
-  went with MCP to "Later".
+  regrouping only what adds up, the cache. MCP went to "Later".
 - [x] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.

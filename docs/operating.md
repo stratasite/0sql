@@ -474,7 +474,7 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 | `lock` | held by the running server; its pid, address and public URL, which `zsql server status` reads |
 | `.cache/results/` | the rows of each run the server made, an Arrow file each |
 | `.cache/records/` | the record of each run, when the records are not in a database |
-| `<org>/<project>/.datasets/` | the project's datasets: snapshots, recipe versions and materializations, each owner's apart (`docs/ingestion.md`). Never taken for a branch; removed with the project |
+| `<org>/<project>/.datasets/` | the project's datasets: snapshots, recipe versions and materializations (`docs/ingestion.md`). Never taken for a branch; removed with the project |
 | `.cache/prep/` | where a data prep engine spills what does not fit in its memory |
 | `.cache/blends/` | the answers of blends, kept by the model's SQL, each dataset's id and version, and the joins; a dataset's delete removes the ones that read it |
 

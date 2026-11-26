@@ -46,7 +46,6 @@
 //! GET  /results/{id}                                   a run: its record and a page of rows; DELETE cancels it
 //! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
 //! /projects/{uid}/datasets/...                      datasets: data prep, beside the model (see datasets.rs)
-//! DELETE /datasets                                   every dataset of one owner in the org
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! ANY  /orgs/{org}/...                                 any route above, for one org
 //! GET  /orgs                                           the orgs with something deployed
@@ -86,7 +85,6 @@ mod reads;
 mod run;
 
 pub use admission::AdmissionCounts;
-pub use datasets::OWNER_HEADER;
 pub use mcp::Settings as McpSettings;
 pub use run::{run, run_blocking, serve, Config, RunLimits};
 pub use zsql_prep::Settings as PrepSettings;

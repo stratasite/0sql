@@ -1,10 +1,9 @@
 //! Datasets: the routes of data prep, and nothing else of it. What a
 //! dataset is, where it is kept and how it is made is `zsql-prep`'s;
-//! this module reads the owner from its header, checks the names, and
-//! answers.
+//! this module checks the names and answers.
 //!
 //! ```text
-//! GET    /projects/{uid}/datasets                         this owner's datasets
+//! GET    /projects/{uid}/datasets                         the project's datasets
 //! POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file_name=&delimiter=&quote=&header=&max_bad_rows=
 //! POST   /projects/{uid}/datasets/query                   {"name", "branch", "spec" | "expr", "context", "connection", "wait"}: a dataset from a semantic query
 //! POST   /projects/{uid}/datasets/{id}/refresh            {"context", "connection", "wait"}: its query run again, fresh
@@ -22,31 +21,28 @@
 //! POST   /projects/{uid}/datasets/{id}/edits              {"against": m, "edits": [{"op": "cell" | "delete" | "add" | "undo", ...}]}
 //! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
 //! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
-//! DELETE /datasets                                        every dataset of this owner in the org
 //! POST   /datasets/restore                                every dataset of the org the object store has and this node does not
 //! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "offset", "limit"}
 //! ```
 //!
-//! Every one needs the [`OWNER_HEADER`]: the application's reference
-//! for whose datasets these are, trusted as the security context is.
+//! A dataset is its project's, addressed by its id. Who may read or
+//! change which is the application's to decide, as who may deploy or
+//! run is: the server keeps no user.
 
 use crate::error::{ApiError, Input, Org, Params, Search};
 use crate::names::check_uid;
 use crate::{blocking, Shared};
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use zsql_exec::{Record, Status};
-use zsql_prep::{Arrived, Change, CsvOptions, Owner, Prep, Preview, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
+use zsql_prep::{Arrived, Change, CsvOptions, Prep, Preview, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
 use zsql_spec::SecurityContext;
-
-/// The header that names whose datasets a request is about.
-pub const OWNER_HEADER: &str = "zsql-owner";
 
 impl From<zsql_prep::Error> for ApiError {
     fn from(e: zsql_prep::Error) -> Self {
@@ -68,33 +64,16 @@ fn prep(app: &Shared) -> Result<Arc<Prep>, ApiError> {
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", "datasets are turned off on this server (ZSQL_DATASETS=off)".into()))
 }
 
-fn owner(headers: &HeaderMap) -> Result<Owner, ApiError> {
-    let raw = headers.get(OWNER_HEADER).map(|v| v.to_str().map_err(|_| format!("the {OWNER_HEADER} header is not text")));
-    match raw {
-        None => Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "Invalid",
-            format!("datasets belong to an owner: send the {OWNER_HEADER} header with the application's reference for the user"),
-        )),
-        Some(Err(m)) => Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", m)),
-        Some(Ok(text)) => Ok(Owner::of(text)?),
-    }
-}
-
-/// Who a request on a project's datasets is for, checked.
-fn scope(app: &Shared, org: String, uid: String, headers: &HeaderMap) -> Result<(Arc<Prep>, Scope), ApiError> {
+/// The project a request's datasets are in, checked.
+fn scope(app: &Shared, org: String, uid: String) -> Result<(Arc<Prep>, Scope), ApiError> {
     let prep = prep(app)?;
     check_uid(&uid)?;
-    Ok((prep, Scope { org, project: uid, owner: owner(headers)? }))
+    Ok((prep, Scope { org, project: uid }))
 }
 
-/// A dataset as answered: its manifest, without the owner's hash.
+/// A dataset as answered: its manifest.
 fn shown(d: &zsql_prep::Dataset) -> Value {
-    let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
-    if let Some(o) = v.as_object_mut() {
-        o.remove("owner");
-    }
-    v
+    serde_json::to_value(d).unwrap_or(Value::Null)
 }
 
 #[derive(Deserialize, Default)]
@@ -114,13 +93,8 @@ impl UploadQuery {
     }
 }
 
-pub(crate) async fn list(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid,)): Params<(String,)>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+pub(crate) async fn list(State(app): State<Shared>, Org(org): Org, Params((uid,)): Params<(String,)>) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(json!({ "datasets": prep.list(&scope).iter().map(shown).collect::<Vec<_>>() })))).await
 }
 
@@ -129,10 +103,9 @@ pub(crate) async fn create(
     Org(org): Org,
     Params((uid,)): Params<(String,)>,
     Search(q): Search<UploadQuery>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     // A dataset is a project's, so the project has to be one: deployed
     // on some branch of this org.
     if !app.of_org(&scope.org).iter().any(|m| m.uid == scope.project) {
@@ -156,9 +129,8 @@ pub(crate) async fn get(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let pending = prep.pending(&scope, &id);
         match prep.get(&scope, &id) {
@@ -223,10 +195,9 @@ pub(crate) async fn from_query(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid,)): Params<(String,)>,
-    headers: HeaderMap,
     Input(req): Input<FromQuery>,
 ) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     if req.spec.is_some() == req.expr.is_some() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", "a query is a spec or an expr, one of them".into()));
     }
@@ -239,10 +210,9 @@ pub(crate) async fn refresh(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(req): Input<Refresh>,
 ) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     let query = {
         let (prep, scope, id) = (prep.clone(), scope.clone(), id.clone());
         blocking(move || Ok(prep.query(&scope, &id)?)).await?
@@ -367,9 +337,8 @@ pub(crate) async fn delete(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<DeleteQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         prep.delete(&scope, &id, q.confirm)?;
         Ok(Json(json!({ "removed": id })))
@@ -382,10 +351,9 @@ pub(crate) async fn replace(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<UploadQuery>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     if q.name.is_some() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", "a replacement keeps the dataset's name; name is for a new one".into()));
     }
@@ -432,9 +400,8 @@ pub(crate) async fn rows(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<PageQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     let limit = q.limit.unwrap_or(100);
     if limit == 0 || limit > PAGE_MAX {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("limit is 1 to {PAGE_MAX}")));
@@ -466,9 +433,8 @@ pub(crate) async fn lineage(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<VersionQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(serde_json::to_value(prep.lineage(&scope, &id, q.version)?).unwrap_or(Value::Null)))).await
 }
 
@@ -477,9 +443,8 @@ pub(crate) async fn recipe(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<VersionQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(serde_json::to_value(prep.recipe(&scope, &id, q.version)?).unwrap_or(Value::Null)))).await
 }
 
@@ -487,10 +452,9 @@ pub(crate) async fn change(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(change): Input<Change>,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(shown(&prep.change(&scope, &id, change)?)))).await
 }
 
@@ -498,10 +462,9 @@ pub(crate) async fn preview(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(preview): Input<Preview>,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let p = prep.preview(&scope, &id, preview)?;
         let rows = zsql_exec::json::rows(&p.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
@@ -522,9 +485,8 @@ pub(crate) async fn impact(
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
     Search(q): Search<ImpactQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let readers = prep.impact(&scope, &id, &q.column)?;
         let said: Vec<String> = readers.iter().map(zsql_prep::Unresolved::describe).collect();
@@ -537,10 +499,9 @@ pub(crate) async fn edit(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(request): Input<zsql_prep::edits::Request>,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let (d, outcomes) = prep.edit(&scope, &id, request)?;
         Ok(Json(json!({ "dataset": shown(&d), "outcomes": outcomes })))
@@ -552,9 +513,8 @@ pub(crate) async fn edit_log(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let (log, outcomes) = prep.edit_log(&scope, &id)?;
         Ok(Json(json!({ "entries": log, "outcomes": outcomes })))
@@ -572,10 +532,9 @@ pub(crate) async fn confirm(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(a): Input<Against>,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(shown(&prep.confirm(&scope, &id, a.against)?)))).await
 }
 
@@ -590,9 +549,8 @@ pub(crate) async fn source(
     Org(org): Org,
     Params((uid, id, source)): Params<(String, String, String)>,
     Search(q): Search<SnapshotQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || Ok(Json(serde_json::to_value(prep.snapshot(&scope, &id, &source, q.snapshot)?).unwrap_or(Value::Null)))).await
 }
 
@@ -600,9 +558,8 @@ pub(crate) async fn downstream(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
         let below: Vec<Value> =
             prep.downstream(&scope, &id)?.iter().map(|d| json!({ "id": d.id, "name": d.name, "live": d.live })).collect();
@@ -754,10 +711,9 @@ pub(crate) async fn blend(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, branch)): Params<(String, String)>,
-    headers: HeaderMap,
     Input(req): Input<BlendRequest>,
 ) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid, &headers)?;
+    let (prep, scope) = scope(&app, org, uid)?;
     let model = app.model(&scope.org, &scope.project, &branch)?;
     let page = crate::exec::page_of(req.offset, req.limit)?;
     let split = split(&model, &req)?;
@@ -827,17 +783,8 @@ pub(crate) async fn blend(
 }
 
 /// Brings back from the object store every dataset of the org this
-/// node does not have: the restore of the backup. No owner: it is the
-/// org's, as a deploy is.
+/// node does not have: the restore of the backup.
 pub(crate) async fn restore(State(app): State<Shared>, Org(org): Org) -> Result<Json<Value>, ApiError> {
     let prep = prep(&app)?;
     blocking(move || Ok(Json(json!({ "restored": prep.restore(&org)? })))).await
-}
-
-/// Every dataset of one owner in the org, in every project: what an
-/// application does when it removes a user.
-pub(crate) async fn delete_owner(State(app): State<Shared>, Org(org): Org, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let prep = prep(&app)?;
-    let owner = owner(&headers)?;
-    blocking(move || Ok(Json(json!({ "removed": prep.delete_owner(&org, &owner)? })))).await
 }

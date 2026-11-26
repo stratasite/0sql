@@ -8,10 +8,10 @@
 //! the recipe and never a stored row, and a new snapshot runs the same
 //! recipe again.
 //!
-//! A dataset belongs to an org, a project and an owner: an opaque
-//! reference the application sends with every request, trusted as the
-//! security context is, and kept only as a hash. Under any other owner
-//! a dataset's id is not found.
+//! A dataset belongs to an org and a project, and is addressed by its
+//! id, as a deployed branch or a result is. Who may read or change
+//! which dataset is the application's to decide: the server keeps no
+//! user, as it keeps none for anything else.
 //!
 //! Dependencies point one way: this crate reads the model only as any
 //! caller does, and nothing that plans a query knows this crate is
@@ -86,40 +86,11 @@ impl Settings {
     }
 }
 
-/// Who a request is for: an org, a project, and the owner the
-/// application named.
+/// Where a request's datasets are: an org and a project.
 #[derive(Clone, Debug)]
 pub struct Scope {
     pub org: String,
     pub project: String,
-    pub owner: Owner,
-}
-
-/// An owner, by the hash of the reference the application sent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Owner(String);
-
-/// The longest owner reference accepted.
-const OWNER_LIMIT: usize = 1024;
-
-impl Owner {
-    /// The owner a reference names. An empty one is refused: there is
-    /// no shared owner that a missing header falls back to.
-    pub fn of(reference: &str) -> Result<Owner> {
-        if reference.trim().is_empty() {
-            return Err(Error::Invalid("an owner reference is needed for datasets, and the request has none".into()));
-        }
-        if reference.len() > OWNER_LIMIT {
-            return Err(Error::Invalid(format!("an owner reference is at most {OWNER_LIMIT} bytes")));
-        }
-        let digest = sha2::Sha256::digest(format!("zsql-prep-owner\n{reference}").as_bytes());
-        Ok(Owner(digest.iter().map(|b| format!("{b:02x}")).collect()))
-    }
-
-    /// The hash, which is all that is kept or logged.
-    pub fn hash(&self) -> &str {
-        &self.0
-    }
 }
 
 /// An upload: its bytes, the name it had, and how to read it.
@@ -218,8 +189,6 @@ pub struct Prep {
 /// A query a dataset waits on, run after its request was answered.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Pending {
-    #[serde(skip)]
-    owner: String,
     /// The run, by its id under `/results`.
     pub result: String,
     pub since: String,
@@ -307,7 +276,7 @@ impl Prep {
         Ok(Job { prep: self, dir: dir.to_path_buf() })
     }
 
-    /// The directory of a dataset this owner has, or not found.
+    /// The directory of a dataset of the project, or not found.
     fn find(&self, scope: &Scope, id: &str) -> Result<(PathBuf, Dataset)> {
         let missing = || Error::NotFound(format!("no dataset {id} in project {}", scope.project));
         if !is_id(id) {
@@ -319,9 +288,6 @@ impl Prep {
             Err(_) if !dir.join(store::MANIFEST).exists() => return Err(missing()),
             Err(e) => return Err(e),
         };
-        if dataset.owner != scope.owner.hash() {
-            return Err(missing());
-        }
         Ok((dir, dataset))
     }
 
@@ -330,7 +296,7 @@ impl Prep {
     /// it made one.
     pub fn waiting(&self, scope: &Scope, id: &str, result: &str) {
         let dir = self.store.root(&scope.org, &scope.project).join(id);
-        let p = Pending { owner: scope.owner.hash().to_string(), result: result.to_string(), since: time::now(), failed: None };
+        let p = Pending { result: result.to_string(), since: time::now(), failed: None };
         self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir, p);
     }
 
@@ -346,15 +312,15 @@ impl Prep {
         self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&dir);
     }
 
-    /// The query a dataset of this owner waits on, if one does.
+    /// The query a dataset waits on, if one does.
     pub fn pending(&self, scope: &Scope, id: &str) -> Option<Pending> {
         let dir = self.store.root(&scope.org, &scope.project).join(id);
-        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&dir).filter(|p| p.owner == scope.owner.hash()).cloned()
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&dir).cloned()
     }
 
-    /// This owner's datasets in the project.
+    /// The project's datasets.
     pub fn list(&self, scope: &Scope) -> Vec<Dataset> {
-        self.store.all(&scope.org, &scope.project).into_iter().map(|(_, d)| d).filter(|d| d.owner == scope.owner.hash()).collect()
+        self.store.all(&scope.org, &scope.project).into_iter().map(|(_, d)| d).collect()
     }
 
     pub fn get(&self, scope: &Scope, id: &str) -> Result<Dataset> {
@@ -408,7 +374,6 @@ impl Prep {
             let mut dataset = Dataset {
                 id: id.clone(),
                 name,
-                owner: scope.owner.hash().to_string(),
                 created: now.clone(),
                 updated: now.clone(),
                 recipe: 1,
@@ -437,14 +402,7 @@ impl Prep {
             let _ = std::fs::remove_dir_all(&staging);
         }
         let dataset = result?;
-        tracing::info!(
-            "dataset {} made in {}/{} for owner {}: {} rows",
-            dataset.id,
-            scope.org,
-            scope.project,
-            &scope.owner.hash()[..12],
-            dataset.rows
-        );
+        tracing::info!("dataset {} made in {}/{}: {} rows", dataset.id, scope.org, scope.project, dataset.rows);
         Ok(dataset)
     }
 
@@ -540,7 +498,7 @@ impl Prep {
         let (_, dataset) = self.find(scope, id)?;
         let current: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let recipe = current.changed(change, time::now())?;
-        self.check_cycle(&dir, &dataset.owner, id, &recipe.inputs())?;
+        self.check_cycle(&dir, id, &recipe.inputs())?;
         self.commit(&dir, dataset, recipe, None, false)
     }
 
@@ -629,7 +587,7 @@ impl Prep {
         let pinned_at = time::now();
         let log = edits::read_log(&dir)?;
         let input_ids: Vec<String> = steps.iter().filter_map(Step::dataset).map(str::to_string).collect();
-        let inputs = self.inputs(&dir, &dataset.owner, &input_ids)?;
+        let inputs = self.inputs(&dir, &input_ids)?;
         let compiled = compile::compile_all(
             &steps,
             &roles,
@@ -657,7 +615,7 @@ impl Prep {
         let empty = std::collections::BTreeMap::new();
         // Where the column is first there: a source, or the step that makes it.
         let mut made_at = None;
-        let all_inputs = materialize::inputs_map(&self.inputs(&dir, &dataset.owner, &recipe.inputs())?);
+        let all_inputs = materialize::inputs_map(&self.inputs(&dir, &recipe.inputs())?);
         for k in 0..=recipe.steps.len() {
             let c = compile::compile_all(&recipe.steps[..k], &empty, &[], &[], (&dataset.sources, &all_inputs), &pinned_at)?;
             if c.columns.iter().any(|x| x.name.eq_ignore_ascii_case(column)) {
@@ -673,12 +631,12 @@ impl Prep {
         let log = edits::read_log(&dir)?;
         let in_force: Vec<(usize, Edit)> =
             edits::in_force(&log, dataset.edits).into_iter().map(|(a, e)| (if a >= k { a + 1 } else { a }, e)).collect();
-        let inputs = materialize::inputs_map(&self.inputs(&dir, &dataset.owner, &recipe.inputs())?);
+        let inputs = materialize::inputs_map(&self.inputs(&dir, &recipe.inputs())?);
         let c = compile::compile_all(&steps, &recipe.roles, &recipe.key, &in_force, (&dataset.sources, &inputs), &pinned_at)?;
         // And the datasets that read it, by what they name of it.
         let mut c = c;
         if k == recipe.steps.len() {
-            for (reader, needs) in self.readers(&dir, &dataset.owner, id) {
+            for (reader, needs) in self.readers(&dir, id) {
                 if needs.iter().any(|n| n.eq_ignore_ascii_case(column)) {
                     c.unresolved.push(Unresolved {
                         column: column.to_string(),
@@ -744,8 +702,8 @@ impl Prep {
     /// Removes a dataset: every snapshot, recipe version and
     /// materialization of it.
     pub fn delete(&self, scope: &Scope, id: &str, confirmed: bool) -> Result<()> {
-        let (dir, dataset) = self.find(scope, id)?;
-        let readers: Vec<String> = self.readers(&dir, &dataset.owner, id).into_iter().map(|(r, _)| r).collect();
+        let (dir, _) = self.find(scope, id)?;
+        let readers: Vec<String> = self.readers(&dir, id).into_iter().map(|(r, _)| r).collect();
         if !readers.is_empty() && !confirmed {
             return Err(Error::Conflict(format!(
                 "datasets {} read dataset {id}; delete it with confirm=true and they keep their last version, and fail when run again",
@@ -760,22 +718,7 @@ impl Prep {
         Ok(())
     }
 
-    /// Removes every dataset an owner has in an org, in every project:
-    /// what an application does when it removes a user. The ids
-    /// removed.
-    pub fn delete_owner(&self, org: &str, owner: &Owner) -> Result<Vec<String>> {
-        let mut removed = Vec::new();
-        for project in self.store.projects(org) {
-            let scope = Scope { org: org.to_string(), project, owner: owner.clone() };
-            for d in self.list(&scope) {
-                self.delete(&scope, &d.id, true)?;
-                removed.push(d.id);
-            }
-        }
-        Ok(removed)
-    }
-
-    /// Removes every dataset of a project, whoever owns it: part of
+    /// Removes every dataset of a project: part of
     /// removing the project. The ids removed.
     pub fn delete_project(&self, org: &str, project: &str) -> Result<Vec<String>> {
         let mut removed = Vec::new();
@@ -1064,7 +1007,7 @@ impl Prep {
         readers_go_stale: bool,
     ) -> Result<Option<Vec<Unresolved>>> {
         let k = dataset.made + 1;
-        let inputs = self.inputs(dir, &dataset.owner, &recipe.inputs())?;
+        let inputs = self.inputs(dir, &recipe.inputs())?;
         let mut made = match materialize::run(self, dir, dataset, recipe, (log, dataset.edits), &inputs, k)? {
             materialize::Run::Made(m) => m,
             materialize::Run::Held(unresolved) => return Ok(Some(unresolved)),
@@ -1073,7 +1016,7 @@ impl Prep {
             // A column another dataset names, gone from this version,
             // holds this one: its readers are named, and nothing is made.
             let mut lost = Vec::new();
-            for (reader, needs) in self.readers(dir, &dataset.owner, &dataset.id) {
+            for (reader, needs) in self.readers(dir, &dataset.id) {
                 for n in needs {
                     if !made.manifest.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&n)) {
                         lost.push(Unresolved { column: n, step: 0, op: "reader".into(), edit: None, dataset: Some(reader.clone()) });
@@ -1096,10 +1039,10 @@ impl Prep {
 }
 
 impl Prep {
-    /// The live versions of the datasets `ids` names that belong to the
-    /// same owner and project as `dir`. One that is not, or has no
-    /// version, is left out, and the step that reads it is refused.
-    fn inputs(&self, dir: &Path, owner: &str, ids: &[String]) -> Result<Vec<materialize::Input>> {
+    /// The live versions of the datasets `ids` names in the same project
+    /// as `dir`. One that is not there, or has no version, is left out,
+    /// and the step that reads it is refused.
+    fn inputs(&self, dir: &Path, ids: &[String]) -> Result<Vec<materialize::Input>> {
         let root = dir.parent().unwrap_or(dir);
         let mut out = Vec::new();
         for id in ids {
@@ -1108,15 +1051,15 @@ impl Prep {
             }
             let d_dir = root.join(id);
             let Ok(d) = store::read_json::<Dataset>(&d_dir.join(store::MANIFEST)) else { continue };
-            let Some(version) = d.live.filter(|_| d.owner == owner) else { continue };
+            let Some(version) = d.live else { continue };
             let m: Materialization = store::read_json(&store::version_dir(&d_dir, version).join("manifest.json"))?;
             out.push(materialize::Input { id: id.clone(), version, dir: d_dir, columns: m.columns });
         }
         Ok(out)
     }
 
-    /// The datasets of this owner, beside `dir`, with their latest recipes.
-    fn siblings(&self, dir: &Path, owner: &str) -> Vec<(PathBuf, Dataset, Recipe)> {
+    /// The datasets beside `dir`, with their latest recipes.
+    fn siblings(&self, dir: &Path) -> Vec<(PathBuf, Dataset, Recipe)> {
         let root = dir.parent().unwrap_or(dir);
         let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
         let mut out: Vec<(PathBuf, Dataset, Recipe)> = entries
@@ -1124,9 +1067,6 @@ impl Prep {
             .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| {
                 let d: Dataset = store::read_json(&e.path().join(store::MANIFEST)).ok()?;
-                if d.owner != owner {
-                    return None;
-                }
                 let r: Recipe = store::read_json(&store::recipe_path(&e.path(), d.recipe)).ok()?;
                 Some((e.path(), d, r))
             })
@@ -1137,8 +1077,8 @@ impl Prep {
 
     /// The datasets whose recipes read `id`, each with the columns of it
     /// they name.
-    fn readers(&self, dir: &Path, owner: &str, id: &str) -> Vec<(String, Vec<String>)> {
-        self.siblings(dir, owner)
+    fn readers(&self, dir: &Path, id: &str) -> Vec<(String, Vec<String>)> {
+        self.siblings(dir)
             .into_iter()
             .filter_map(|(_, d, r)| {
                 let reads: Vec<&Step> = r.steps.iter().filter(|s| s.dataset() == Some(id)).collect();
@@ -1149,8 +1089,8 @@ impl Prep {
 
     /// Every dataset downstream of `id`, in an order where each comes
     /// after everything it reads.
-    fn downstream_of(&self, dir: &Path, owner: &str, id: &str) -> Vec<(PathBuf, Dataset, Recipe)> {
-        let all = self.siblings(dir, owner);
+    fn downstream_of(&self, dir: &Path, id: &str) -> Vec<(PathBuf, Dataset, Recipe)> {
+        let all = self.siblings(dir);
         let mut below: Vec<String> = vec![id.to_string()];
         let mut grew = true;
         while grew {
@@ -1175,11 +1115,11 @@ impl Prep {
     }
 
     /// Refused when making `id` read `inputs` would close a loop.
-    fn check_cycle(&self, dir: &Path, owner: &str, id: &str, inputs: &[String]) -> Result<()> {
+    fn check_cycle(&self, dir: &Path, id: &str, inputs: &[String]) -> Result<()> {
         if inputs.iter().any(|i| i == id) {
             return Err(Error::Invalid(format!("dataset {id} cannot read itself")));
         }
-        let below: Vec<String> = self.downstream_of(dir, owner, id).into_iter().map(|(_, d, _)| d.id).collect();
+        let below: Vec<String> = self.downstream_of(dir, id).into_iter().map(|(_, d, _)| d.id).collect();
         if let Some(i) = inputs.iter().find(|i| below.contains(i)) {
             return Err(Error::Invalid(format!("dataset {i} reads dataset {id}, so {id} reading {i} would make a cycle")));
         }
@@ -1190,10 +1130,10 @@ impl Prep {
     /// the versions this job made. One that fails or is held stops its
     /// own descendants, which keep their last version. What happened to
     /// each, as notes.
-    fn cascade(&self, dir: &Path, owner: &str, id: &str) -> Vec<String> {
+    fn cascade(&self, dir: &Path, id: &str) -> Vec<String> {
         let mut notes = Vec::new();
         let mut stopped: Vec<String> = Vec::new();
-        for (d_dir, _, _) in self.downstream_of(dir, owner, id) {
+        for (d_dir, _, _) in self.downstream_of(dir, id) {
             // Read again: an earlier step of this cascade may have moved it.
             let Ok(mut d) = store::read_json::<Dataset>(&d_dir.join(store::MANIFEST)) else { continue };
             let Ok(recipe) = store::read_json::<Recipe>(&store::recipe_path(&d_dir, d.recipe)) else { continue };
@@ -1239,7 +1179,7 @@ impl Prep {
     /// Runs what is downstream of a dataset just made, and keeps what
     /// happened among its notes.
     fn after(&self, dir: &Path, dataset: &mut Dataset) -> Result<()> {
-        let notes = self.cascade(dir, &dataset.owner.clone(), &dataset.id.clone());
+        let notes = self.cascade(dir, &dataset.id.clone());
         if !notes.is_empty() {
             dataset.notes.extend(notes);
             store::write_json(&dir.join(store::MANIFEST), dataset)?;
@@ -1249,7 +1189,7 @@ impl Prep {
     }
 
     /// A blend: the model's part, run, and the attached datasets joined
-    /// to it as the request says. Each dataset is found for this owner
+    /// to it as the request says. Each dataset is found in the project
     /// before anything is looked up, and the answer is kept by the
     /// model's SQL, each dataset's id and version, and the joins, so a
     /// match is the same question over the same data.
@@ -1319,8 +1259,8 @@ impl Prep {
     /// The datasets that read this one, directly or through others, in
     /// the order a cascade runs them.
     pub fn downstream(&self, scope: &Scope, id: &str) -> Result<Vec<Dataset>> {
-        let (dir, dataset) = self.find(scope, id)?;
-        Ok(self.downstream_of(&dir, &dataset.owner, id).into_iter().map(|(_, d, _)| d).collect())
+        let (dir, _) = self.find(scope, id)?;
+        Ok(self.downstream_of(&dir, id).into_iter().map(|(_, d, _)| d).collect())
     }
 }
 

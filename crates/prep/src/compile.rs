@@ -210,10 +210,7 @@ pub fn compile_all(
             .collect();
         if let Some(d) = step.dataset() {
             let input = inputs.get(d).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "step {n} ({}) reads dataset {d}, which is not one of this owner's datasets in this project with a version",
-                    step.op()
-                ))
+                Error::Invalid(format!("step {n} ({}) reads dataset {d}, which is not a dataset of this project with a version", step.op()))
             })?;
             missing.extend(
                 step.needs().into_iter().filter(|c| !input.iter().any(|x| x.name.eq_ignore_ascii_case(c))).map(|column| Unresolved {

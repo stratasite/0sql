@@ -22,8 +22,8 @@ fn prep() -> (Dir, Prep) {
     (Dir(dir), prep)
 }
 
-fn scope(owner: &str) -> Scope {
-    Scope { org: "default".into(), project: "shop".into(), owner: Owner::of(owner).unwrap() }
+fn scope() -> Scope {
+    Scope { org: "default".into(), project: "shop".into() }
 }
 
 fn csv(text: &str) -> Upload<'_> {
@@ -39,7 +39,7 @@ fn json_rows(page: &Page) -> Vec<Value> {
 #[test]
 fn an_upload_becomes_a_dataset_with_a_live_version() {
     let (dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
     assert!(is_id(&d.id));
     assert_eq!(d.name, "budget");
@@ -74,29 +74,24 @@ fn an_upload_becomes_a_dataset_with_a_live_version() {
 }
 
 #[test]
-fn another_owner_finds_nothing() {
+fn a_dataset_is_its_projects() {
     let (_dir, prep) = prep();
-    let d = prep.create(&scope("ann"), None, csv(BUDGET)).unwrap();
-    let bob = scope("bob");
-    assert!(matches!(prep.get(&bob, &d.id), Err(Error::NotFound(_))));
-    assert!(matches!(prep.page(&bob, &d.id, None, 0, 1, &View::default()), Err(Error::NotFound(_))));
-    assert!(matches!(prep.delete(&bob, &d.id, false), Err(Error::NotFound(_))));
-    assert!(prep.list(&bob).is_empty());
-    assert_eq!(prep.list(&scope("ann")).len(), 1);
-    assert!(Owner::of(" ").is_err());
-    // The reference is never kept, only its hash.
-    let text = std::fs::read_to_string(_dir.0.join("default/shop").join(DIR).join(&d.id).join("dataset.json")).unwrap();
-    assert!(!text.contains("\"ann\""));
-    // Another project of the same owner is another place.
-    let elsewhere = Scope { project: "other".into(), ..scope("ann") };
-    assert!(prep.get(&elsewhere, &d.id).is_err());
-    assert!(matches!(prep.get(&scope("ann"), "../../etc"), Err(Error::NotFound(_))));
+    let d = prep.create(&scope(), None, csv(BUDGET)).unwrap();
+    assert_eq!(prep.list(&scope()).len(), 1);
+    // Another project, or another org, is another place.
+    let elsewhere = Scope { project: "other".into(), ..scope() };
+    assert!(matches!(prep.get(&elsewhere, &d.id), Err(Error::NotFound(_))));
+    assert!(prep.list(&elsewhere).is_empty());
+    let other_org = Scope { org: "acme".into(), ..scope() };
+    assert!(matches!(prep.get(&other_org, &d.id), Err(Error::NotFound(_))));
+    // An id is checked before it names a directory.
+    assert!(matches!(prep.get(&scope(), "../../etc"), Err(Error::NotFound(_))));
 }
 
 #[test]
 fn a_replacement_is_a_new_snapshot_and_a_new_version() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
     let d = prep.replace(&ann, &d.id, csv("region,month,amount,owner\nEMEA,2026-01-01,100.5,kim\n")).unwrap();
     assert_eq!((d.live, d.sources[0].snapshot, d.rows), (Some(2), 2, 1));
@@ -117,7 +112,7 @@ fn a_replacement_is_a_new_snapshot_and_a_new_version() {
 #[test]
 fn roles_change_through_a_recipe_version_made_against_the_latest() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
     let mut roles = std::collections::BTreeMap::new();
     roles.insert("amount".to_string(), Role::Dimension);
@@ -141,12 +136,12 @@ fn the_caps_hold_at_import_and_after() {
     let mut settings = Settings::defaults(&dir.0);
     settings.max_rows = 1;
     let prep = Prep::open(&dir.0, settings).unwrap();
-    let e = prep.create(&scope("ann"), None, csv(BUDGET)).err().unwrap();
+    let e = prep.create(&scope(), None, csv(BUDGET)).err().unwrap();
     assert!(e.to_string().contains("more than 1 rows"), "{e}");
     let mut settings = Settings::defaults(&dir.0);
     settings.max_bytes = 10;
     let prep = Prep::open(&dir.0, settings).unwrap();
-    assert!(prep.create(&scope("ann"), None, csv(BUDGET)).err().unwrap().to_string().contains("bytes"));
+    assert!(prep.create(&scope(), None, csv(BUDGET)).err().unwrap().to_string().contains("bytes"));
     // A failed creation leaves nothing behind.
     let root = dir.0.join("default/shop").join(DIR);
     assert_eq!(std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0), 0);
@@ -155,22 +150,15 @@ fn the_caps_hold_at_import_and_after() {
 #[test]
 fn deletes_are_hard() {
     let (dir, prep) = prep();
-    let ann = scope("ann");
-    let a = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    let b = prep.create(&Scope { project: "other".into(), ..scope("ann") }, None, csv(BUDGET)).unwrap();
-    let c = prep.create(&scope("bob"), None, csv(BUDGET)).unwrap();
-    prep.delete(&ann, &a.id, false).unwrap();
+    let a = prep.create(&scope(), None, csv(BUDGET)).unwrap();
+    let b = prep.create(&scope(), None, csv(BUDGET)).unwrap();
+    let elsewhere = prep.create(&Scope { project: "other".into(), ..scope() }, None, csv(BUDGET)).unwrap();
+    prep.delete(&scope(), &a.id, false).unwrap();
     assert!(!dir.0.join("default/shop").join(DIR).join(&a.id).exists());
-    assert!(matches!(prep.get(&ann, &a.id), Err(Error::NotFound(_))));
-    let a2 = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    let mut removed = prep.delete_owner("default", &Owner::of("ann").unwrap()).unwrap();
-    removed.sort();
-    let mut want = vec![a2.id, b.id];
-    want.sort();
-    assert_eq!(removed, want);
-    assert_eq!(prep.get(&scope("bob"), &c.id).unwrap().id, c.id, "another owner's stays");
-    assert_eq!(prep.delete_project("default", "shop").unwrap(), vec![c.id]);
+    assert!(matches!(prep.get(&scope(), &a.id), Err(Error::NotFound(_))));
+    assert_eq!(prep.delete_project("default", "shop").unwrap(), vec![b.id]);
     assert!(!dir.0.join("default/shop").join(DIR).exists());
+    assert!(prep.get(&Scope { project: "other".into(), ..scope() }, &elsewhere.id).is_ok(), "another project's stays");
 }
 
 fn steps(v: Value) -> Vec<Step> {
@@ -182,7 +170,7 @@ const SALES: &str = "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n";
 #[test]
 fn a_recipe_of_steps_makes_each_version() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let change = Change {
         key: vec![],
@@ -213,7 +201,7 @@ fn a_recipe_of_steps_makes_each_version() {
 #[test]
 fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     // Nothing reads `store`: its going is a note.
     let d = prep.replace(&ann, &d.id, csv("region,amount\nNY,1\n")).unwrap();
@@ -244,7 +232,7 @@ fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
 #[test]
 fn a_rename_upstream_is_fixed_by_pointing_the_steps_at_the_new_name() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let remap = |column: &str| serde_json::json!([{ "op": "remap", "column": column, "values": [{ "from": "NY", "to": "New York" }] }]);
     let d = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: steps(remap("region")) }).unwrap();
@@ -259,7 +247,7 @@ fn a_rename_upstream_is_fixed_by_pointing_the_steps_at_the_new_name() {
 #[test]
 fn a_removal_with_readers_is_refused_naming_them() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let with = |extra: serde_json::Value| {
         let mut v = vec![serde_json::json!({ "op": "formula", "column": "label", "formula": "region & store" })];
@@ -300,7 +288,7 @@ fn a_removal_with_readers_is_refused_naming_them() {
 #[test]
 fn a_preview_runs_a_step_over_a_sample_and_keeps_nothing() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let p = prep
         .preview(
@@ -346,7 +334,7 @@ fn rows_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Value> {
 #[test]
 fn a_dimension_edit_is_a_remap_and_holds_through_a_sync() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
     let (d, out) = prep
         .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
@@ -364,7 +352,7 @@ fn a_dimension_edit_is_a_remap_and_holds_through_a_sync() {
 #[test]
 fn a_measure_edit_overrides_one_row_and_is_flagged_when_upstream_moves() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
     let row = serde_json::json!({ "region": "NY", "month": "2026-01-01", "amount": 100 });
     let (d, out) =
@@ -389,7 +377,7 @@ fn a_measure_edit_overrides_one_row_and_is_flagged_when_upstream_moves() {
 #[test]
 fn an_edit_that_does_not_name_one_row_is_refused_unless_a_key_or_all_says() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv("region,store,amount\nNY,a,1\nNY,a,2\nCA,b,3\n")).unwrap();
     let row = serde_json::json!({ "region": "NY", "store": "a" });
     let e = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 9 }]))).err().unwrap();
@@ -412,7 +400,7 @@ fn an_edit_that_does_not_name_one_row_is_refused_unless_a_key_or_all_says() {
 #[test]
 fn a_dimension_edit_for_one_row_rows_added_and_deleted_and_undo() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
     let (d, out) = prep
         .edit(
@@ -451,7 +439,7 @@ fn a_dimension_edit_for_one_row_rows_added_and_deleted_and_undo() {
 #[test]
 fn edits_apply_where_they_were_made_and_an_edit_on_a_gone_column_holds() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
     let (d, _) = prep
         .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
@@ -511,7 +499,7 @@ fn arrived(regions: &[&str], revenue: &[i128]) -> Arrived {
 #[test]
 fn a_semantic_query_is_a_source_refreshed_by_request() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let query = Query { branch: "main".into(), spec: Some(serde_json::json!({ "fields": ["region", "revenue"] })), expr: None };
     let id = new_id("shop");
     let d = prep.create_from_query(&ann, &id, Some("revenue"), query.clone(), arrived(&["NY", "CA"], &[1050, 200])).unwrap();
@@ -549,7 +537,7 @@ fn change(against: u32, v: Value) -> Change {
 #[test]
 fn a_join_brings_another_datasets_columns_and_refuses_to_multiply_rows() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let sales = prep.create(&ann, None, csv("region,amount\nNY,10\nCA,5\nTX,1\n")).unwrap();
     let owners = prep.create(&ann, None, csv("area,manager\nNY,kim\nCA,lee\n")).unwrap();
     let join = serde_json::json!([{ "op": "join", "dataset": owners.id, "on": [{ "left": "region", "right": "area" }] }]);
@@ -569,20 +557,20 @@ fn a_join_brings_another_datasets_columns_and_refuses_to_multiply_rows() {
     let bad = serde_json::json!([{ "op": "join", "dataset": dup.id, "on": [{ "left": "region", "right": "area" }] }]);
     let e = prep.change(&ann, &sales.id, change(3, bad)).err().unwrap();
     assert!(e.to_string().contains("not unique on its keys") && e.to_string().contains("'NY'"), "{e}");
-    // Another owner's dataset is not there to be read.
-    let bobs = prep.create(&scope("bob"), None, csv("area,manager\nNY,x\n")).unwrap();
+    // A dataset of another project is not there to be read.
+    let theirs = prep.create(&Scope { project: "other".into(), ..scope() }, None, csv("area,manager\nNY,x\n")).unwrap();
     let e = prep.change(
         &ann,
         &sales.id,
-        change(3, serde_json::json!([{ "op": "join", "dataset": bobs.id, "on": [{ "left": "region", "right": "area" }] }])),
+        change(3, serde_json::json!([{ "op": "join", "dataset": theirs.id, "on": [{ "left": "region", "right": "area" }] }])),
     );
-    assert!(e.err().unwrap().to_string().contains("not one of this owner's datasets"));
+    assert!(e.err().unwrap().to_string().contains("not a dataset of this project"));
 }
 
 #[test]
 fn an_append_meets_columns_by_name() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let jan = prep.create(&ann, None, csv("region,amount\nNY,10\n")).unwrap();
     let feb = prep.create(&ann, None, csv("amount,region,note\n2.5,CA,late\n")).unwrap();
     let d = prep.change(&ann, &jan.id, change(1, serde_json::json!([{ "op": "append", "dataset": feb.id }]))).unwrap();
@@ -596,7 +584,7 @@ fn an_append_meets_columns_by_name() {
 #[test]
 fn datasets_that_read_datasets_are_a_dag_run_downstream_in_order() {
     let (_dir, prep) = prep();
-    let ann = scope("ann");
+    let ann = scope();
     let a = prep.create(&ann, None, csv("k,v\n1,10\n")).unwrap();
     let b = prep.create(&ann, None, csv("k\n1\n")).unwrap();
     let c = prep.create(&ann, None, csv("k\n1\n")).unwrap();
@@ -696,7 +684,7 @@ mod blends {
 
     fn fixture() -> Fixture {
         let (dir, prep) = prep();
-        let ann = scope("ann");
+        let ann = scope();
         let budget = prep.create(&ann, None, csv("region,month,amount\nNY,2026-01,100\nNY,2026-02,90\nCA,2026-01,50\n")).unwrap().id;
         let owners = prep.create(&ann, None, csv("region,manager\nNY,kim\nCA,lee\n")).unwrap().id;
         let targets = prep.create(&ann, None, csv("region\nNY\nNY\n")).unwrap().id;
@@ -842,9 +830,9 @@ mod blends {
             let e = f.prep.blend(&f.ann, &plan, &m, "q").err().unwrap();
             assert!(e.to_string().contains(says), "{says}: {e}");
         }
-        // Another owner's dataset is not there to attach.
+        // A dataset of another project is not there to attach.
         let plan = Blend { datasets: attach, joins: vec![join("model")], outputs };
-        assert!(matches!(f.prep.blend(&scope("bob"), &plan, &m, "q"), Err(Error::NotFound(_))));
+        assert!(matches!(f.prep.blend(&Scope { project: "other".into(), ..scope() }, &plan, &m, "q"), Err(Error::NotFound(_))));
     }
 }
 
@@ -861,7 +849,7 @@ fn every_dataset_is_copied_to_the_object_store_and_restored_from_it() {
         Prep::open(&data, s).unwrap().with_backup(Some(objects.clone()))
     };
     let prep = open();
-    let ann = scope("ann");
+    let ann = scope();
     let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
     assert_eq!(d.backup.as_ref().map(|b| b.failed.clone()), Some(None), "{:?}", d.backup);
     let (d, _) = prep

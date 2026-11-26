@@ -5,8 +5,7 @@
 /// answers it with the right status without reading the message.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The request is wrong: a bad option, a step that names nothing,
-    /// an owner reference that is missing.
+    /// The request is wrong: a bad option, a step that names nothing.
     #[error("{0}")]
     Invalid(String),
     /// The request is well formed and the data will not have it: a file
@@ -14,8 +13,7 @@ pub enum Error {
     /// rows that do not parse.
     #[error("{0}")]
     Unprocessable(String),
-    /// No such dataset for this owner, which is also what another
-    /// owner's dataset is.
+    /// No such dataset in the project.
     #[error("{0}")]
     NotFound(String),
     /// The change was made against a recipe that has moved on, or the

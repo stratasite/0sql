@@ -35,8 +35,6 @@ pub(crate) const ROWS: &str = "rows.arrow";
 pub struct Dataset {
     pub id: String,
     pub name: String,
-    /// The owner reference's hash; the reference itself is never kept.
-    pub owner: String,
     pub created: String,
     pub updated: String,
     /// The recipe's latest version.
@@ -154,7 +152,7 @@ impl Store {
         out
     }
 
-    /// Every dataset of a project, whoever owns it, by id.
+    /// Every dataset of a project, by id.
     pub fn all(&self, org: &str, project: &str) -> Vec<(PathBuf, Dataset)> {
         let Ok(entries) = std::fs::read_dir(self.root(org, project)) else { return Vec::new() };
         let mut out: Vec<(PathBuf, Dataset)> = entries
