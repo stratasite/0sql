@@ -18,7 +18,7 @@
 use crate::error::{Error, Result};
 use crate::lineage::Lineage;
 use crate::schema::Column;
-use crate::source::{Kind, Parse};
+use crate::source::{Kind, Parse, Query, SemanticRead};
 use arrow_array::RecordBatch;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -77,6 +77,9 @@ pub struct SourceState {
     pub snapshot: u32,
     /// Its columns: the types every later snapshot meets.
     pub columns: Vec<Column>,
+    /// What a semantic source runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<Query>,
 }
 
 /// A snapshot's manifest.
@@ -93,6 +96,8 @@ pub struct Snapshot {
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse: Option<Parse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticRead>,
     pub columns: Vec<Column>,
     pub rows: u64,
     /// How its columns met the source's: new, gone, widened, converted.

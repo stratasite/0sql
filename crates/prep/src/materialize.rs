@@ -50,6 +50,7 @@ pub(crate) fn load_sources(session: &Session, dir: &Path, dataset: &Dataset, sam
             file_name: snapshot.file_name,
             sha256: snapshot.sha256,
             parse: snapshot.parse,
+            semantic: snapshot.semantic,
         });
     }
     Ok(read)

@@ -90,7 +90,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "Invalid", message.into())
 }
 
-fn internal(e: zsql_exec::Error) -> ApiError {
+pub(crate) fn internal(e: zsql_exec::Error) -> ApiError {
     match e {
         zsql_exec::Error::Busy(_) => ApiError(StatusCode::SERVICE_UNAVAILABLE, "Busy", format!("{e}; try again shortly")),
         zsql_exec::Error::NotFound(why) => ApiError(StatusCode::NOT_FOUND, "NotFound", why),
@@ -259,9 +259,25 @@ pub(crate) async fn sql_exec(
     answer(&app, record, None, page, wants_arrow(&headers)).await
 }
 
+/// A spec run fresh, never answered from the cache: what a dataset's
+/// semantic source is refreshed by.
+pub(crate) fn submit_fresh(
+    app: &Shared,
+    (org, uid, branch): (&str, &str, &str),
+    spec: Option<Value>,
+    expr: Option<String>,
+    context: Option<SecurityContext>,
+    connection: Map<String, Value>,
+    wait: Option<f64>,
+) -> Result<(Record, Duration), ApiError> {
+    let req = RunRequest { spec, expr, context, connection, wait, fresh: true, ..RunRequest::default() };
+    let (record, _, wait) = submit(app, org, uid, branch, req)?;
+    Ok((record, wait))
+}
+
 /// The record once the run is over, or as it stands when `wait` is up.
 /// Asked again at a widening interval, on no thread of its own.
-async fn settled(app: &Shared, record: Record, wait: Duration) -> Result<Record, ApiError> {
+pub(crate) async fn settled(app: &Shared, record: Record, wait: Duration) -> Result<Record, ApiError> {
     let deadline = Instant::now() + wait;
     let mut record = record;
     let mut pause = Duration::from_millis(5);

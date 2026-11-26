@@ -539,6 +539,7 @@ mod tests {
             id: "s1".into(),
             kind: crate::source::Kind::Upload,
             snapshot: 1,
+            query: None,
             columns: vec![
                 c("region", ColumnType::Text, Role::Dimension),
                 c("store", ColumnType::Text, Role::Dimension),

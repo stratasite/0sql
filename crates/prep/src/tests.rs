@@ -474,3 +474,70 @@ fn edits_apply_where_they_were_made_and_an_edit_on_a_gone_column_holds() {
     let (log, _) = prep.edit_log(&ann, &d.id).unwrap();
     assert!(matches!(&log.last().unwrap().edits[0], Edit::Undo { undoes, .. } if undoes == "1.1"));
 }
+
+fn arrived(regions: &[&str], revenue: &[i128]) -> Arrived {
+    use arrow_array::{ArrayRef, Decimal128Array, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, true),
+        Field::new("year", DataType::Int32, true),
+        Field::new("revenue", DataType::Decimal128(10, 2), true),
+    ]));
+    let n = regions.len();
+    let arrays: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(StringArray::from(regions.to_vec())),
+        std::sync::Arc::new(Int32Array::from(vec![2026; n])),
+        std::sync::Arc::new(Decimal128Array::from(revenue.to_vec()).with_precision_and_scale(10, 2).unwrap()),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    Arrived {
+        rows: Batches { schema, batches: vec![batch] },
+        roles: [("region", Role::Dimension), ("year", Role::Dimension), ("revenue", Role::Measure)]
+            .into_iter()
+            .map(|(n, r)| (n.to_string(), r))
+            .collect(),
+        read: SemanticRead {
+            branch: "main".into(),
+            deployed_at: "2026-11-26T10:00Z".into(),
+            spec: Some(serde_json::json!({ "fields": ["region", "year", "revenue"] })),
+            expr: None,
+            sql_sha256: "ab".repeat(32),
+            context: "cd".repeat(32),
+            fields: [("revenue".to_string(), "orders.revenue".to_string())].into_iter().collect(),
+        },
+    }
+}
+
+#[test]
+fn a_semantic_query_is_a_source_refreshed_by_request() {
+    let (_dir, prep) = prep();
+    let ann = scope("ann");
+    let query = Query { branch: "main".into(), spec: Some(serde_json::json!({ "fields": ["region", "revenue"] })), expr: None };
+    let id = new_id("shop");
+    let d = prep.create_from_query(&ann, &id, Some("revenue"), query.clone(), arrived(&["NY", "CA"], &[1050, 200])).unwrap();
+    assert_eq!(d.id, id);
+    let kinds: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
+    assert_eq!(kinds, [("region", Text, Role::Dimension), ("year", Integer, Role::Dimension), ("revenue", Decimal(2), Role::Measure)]);
+    assert_eq!(prep.query(&ann, &id).unwrap(), query);
+    let lineage = prep.lineage(&ann, &id, None).unwrap();
+    let read = lineage.sources[0].semantic.as_ref().unwrap();
+    assert_eq!((read.branch.as_str(), read.fields["revenue"].as_str()), ("main", "orders.revenue"));
+    // A refresh is a new snapshot, and the recipe runs on it.
+    let d = prep
+        .change(
+            &ann,
+            &id,
+            Change {
+                key: vec![],
+                against: 1,
+                roles: Default::default(),
+                steps: steps(serde_json::json!([{ "op": "remove", "columns": ["year"] }])),
+            },
+        )
+        .unwrap();
+    let d = prep.refresh(&ann, &d.id, arrived(&["NY"], &[99])).unwrap();
+    assert_eq!((d.sources[0].snapshot, d.rows), (2, 1));
+    assert_eq!(rows_of(&prep, &ann, &id), [serde_json::json!(["NY", "0.99"])]);
+    assert!(prep.replace(&ann, &id, csv(BUDGET)).is_err(), "a query's dataset is not replaced by an upload");
+    assert!(prep.create_from_query(&ann, &id, None, query, arrived(&[], &[])).is_err(), "an id is made once");
+}

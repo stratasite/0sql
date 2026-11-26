@@ -247,6 +247,54 @@ async fn edits_through_their_routes() {
     assert!(a.error().contains("edit 1: there is no column 'nope'"), "{}", a.body);
 }
 
+/// A dataset made from a semantic query, run fresh against the
+/// warehouse, and refreshed by request.
+#[tokio::test]
+async fn a_semantic_query_as_a_source() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let file = sales("prep");
+    let connection = json!({ "file": file.to_str().unwrap() });
+    let base = format!("/projects/{CS}/datasets");
+    let a = s
+        .post_as_ann(
+            &format!("{base}/query"),
+            json!({ "name": "revenue", "branch": "main", "expr": "category asc, revenue", "connection": connection }),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let id = a.body["id"].as_str().unwrap().to_string();
+    assert_eq!(a.body["sources"][0]["kind"], "semantic");
+    let roles: Vec<(&str, &str)> =
+        a.body["columns"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap(), c["role"].as_str().unwrap())).collect();
+    assert_eq!(roles[1].1, "measure", "the model says revenue is a measure: {roles:?}");
+    assert_eq!(roles[0].1, "dimension");
+    let rows = s.as_ann(Method::GET, &format!("{base}/{id}/rows")).await;
+    assert_eq!(rows.body["rows"], json!([["books", "30.50"], ["games", "5.25"], ["toys", "1.00"]]), "{}", rows.body);
+    let lineage = s.as_ann(Method::GET, &format!("{base}/{id}/lineage")).await;
+    let read = &lineage.body["sources"][0]["semantic"];
+    assert_eq!((read["branch"].as_str(), read["sql_sha256"].as_str().map(str::len)), (Some("main"), Some(64)), "{}", lineage.body);
+    assert!(read["context"].is_string() && read["fields"].is_object(), "{read}");
+
+    let a = s.post_as_ann(&format!("{base}/{id}/refresh"), json!({ "connection": connection })).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!((a.body["sources"][0]["snapshot"].as_u64(), a.body["live"].as_u64()), (Some(2), Some(2)));
+    let lineage = s.as_ann(Method::GET, &format!("{base}/{id}/lineage")).await;
+    assert_eq!(lineage.body["sources"][0]["snapshot"], 2);
+
+    // A refresh is for a query's dataset; a bad query is refused as the planner refuses it.
+    let upload = s.upload(&base, Some("user-ann"), BUDGET).await.body["id"].as_str().unwrap().to_string();
+    let a = s.post_as_ann(&format!("{base}/{upload}/refresh"), json!({})).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    let a = s
+        .post_as_ann(&format!("{base}/query"), json!({ "branch": "main", "expr": "nothing_by_this_name", "connection": connection }))
+        .await;
+    assert!(a.status.is_client_error(), "{}", a.body);
+    let a = s.post_as_ann(&format!("{base}/query"), json!({ "branch": "nope", "expr": "revenue" })).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+}
+
 #[tokio::test]
 async fn datasets_can_be_turned_off() {
     let data_dir = std::env::temp_dir().join(format!("zsqld-tests-{}-{}", std::process::id(), nanos()));

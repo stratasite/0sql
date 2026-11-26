@@ -83,8 +83,14 @@ and the first few are shown; past a threshold (one row in a hundred, or
 Every choice is in the manifest. The file is parsed by data prep in
 Rust, not by the engine.
 
-**A semantic source** runs its spec under the context sent with the
-refresh, row policies compiled in. The snapshot shows what that context
+**A semantic source** (`POST .../datasets/query` with a branch and a
+`spec` or an `expr`; `POST .../{id}/refresh` again) runs its spec under
+the context sent with the refresh, row policies compiled in. The server
+plans and runs it as `/run` does, fresh, and hands data prep the rows;
+data prep never calls the planner. Column roles come from the model:
+a measure is a measure. A run that outlasts the request's wait is
+answered 202 with the dataset's id and the run's, waited on after, and
+the dataset says what it waits on, or that it failed. The snapshot shows what that context
 could see; that is the creator's to manage. A refresh always runs
 against the warehouse (`fresh`), never answered from the cache. The
 server keeps no context, so a refresh is a request from the
@@ -458,6 +464,8 @@ with no org the org is `default`. The owner reference is the
 ```
 GET    /projects/{uid}/datasets                         this owner's datasets
 POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file_name=&delimiter=&quote=&header=&max_bad_rows=
+POST   /projects/{uid}/datasets/query                   {"name", "branch", "spec" | "expr", "context", "connection", "wait"}
+POST   /projects/{uid}/datasets/{id}/refresh            {"context", "connection", "wait"}: its query again, fresh
 GET    /projects/{uid}/datasets/{id}
 DELETE /projects/{uid}/datasets/{id}
 PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV: a new snapshot, the recipe run over it
@@ -512,9 +520,11 @@ know about datasets.
 | `store` | `.datasets`, manifests, atomic writes, hard delete, the backup |
 | `blend` | attaching a dataset to a request; filter, enrich, their rules |
 
-- **Dependencies point one way.** `zsql-prep` uses the planner, the
-  dialects and `zsql-exec`'s run path; none of them uses it. That is
-  what keeps datasets out of automatic query generation.
+- **Dependencies point one way.** `zsql-prep` depends on no part of
+  the planner or the model: the server runs a semantic source's spec
+  through its ordinary run path and hands data prep the rows. Nothing
+  that plans a query depends on `zsql-prep`. That is what keeps datasets
+  out of automatic query generation.
 - **The server holds only routes,** in one module, and the attachment
   header on `/mcp`.
 
@@ -545,7 +555,7 @@ know about datasets.
   pages, previews, recipe versions.
 - [x] **3. Edits.** Investigate the open questions first; then remaps,
   measure overrides, the edit log, orphans and flags.
-- [ ] **4. A semantic query as a source,** refreshed fresh, by request.
+- [x] **4. A semantic query as a source,** refreshed fresh, by request.
 - [ ] **5. Combining datasets.** Joins and appends, the DAG and its
   cascade.
 - [ ] **6. Blends.** Attachment in the spec, the owner header on `/mcp`,

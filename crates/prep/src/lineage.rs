@@ -4,7 +4,7 @@
 //! followed back to the source columns it came from.
 
 use crate::schema::Role;
-use crate::source::{Kind, Parse};
+use crate::source::{Kind, Parse, SemanticRead};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -47,6 +47,8 @@ pub struct SourceRead {
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse: Option<Parse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticRead>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

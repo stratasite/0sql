@@ -52,7 +52,7 @@ pub use lineage::Lineage;
 pub use materialize::View;
 pub use recipe::{Change, Recipe, SortKey, Step};
 pub use schema::{Column, ColumnType, Role};
-pub use source::CsvOptions;
+pub use source::{CsvOptions, Query, SemanticRead};
 pub use store::{Dataset, Held, Materialization, Snapshot, Store, DIR};
 
 use sha2::Digest;
@@ -145,6 +145,14 @@ struct EditCx<'a> {
     log: &'a [Entry],
 }
 
+/// Rows a semantic query returned, with the model's roles for its
+/// columns and what made them.
+pub struct Arrived {
+    pub rows: Batches,
+    pub roles: std::collections::BTreeMap<String, Role>,
+    pub read: source::SemanticRead,
+}
+
 /// What a preview is asked for.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +188,22 @@ pub struct Prep {
     pub(crate) duckdb_version: String,
     /// The datasets a job is running on: one at a time each.
     busy: Mutex<HashSet<PathBuf>>,
+    /// Queries still running for a dataset, or that failed after their
+    /// request was answered, by the dataset's directory.
+    pending: Mutex<std::collections::HashMap<PathBuf, Pending>>,
+}
+
+/// A query a dataset waits on, run after its request was answered.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Pending {
+    #[serde(skip)]
+    owner: String,
+    /// The run, by its id under `/results`.
+    pub result: String,
+    pub since: String,
+    /// Set when it failed: the dataset was not made or not refreshed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
 }
 
 /// A dataset held for one job; let go when dropped.
@@ -198,7 +222,14 @@ impl Prep {
     pub fn open(data_dir: &Path, settings: Settings) -> Result<Prep> {
         let engine = Engine::new(settings.engine.clone());
         let duckdb_version = engine.version()?;
-        Ok(Prep { store: Store::new(data_dir), engine, settings, duckdb_version, busy: Mutex::new(HashSet::new()) })
+        Ok(Prep {
+            store: Store::new(data_dir),
+            engine,
+            settings,
+            duckdb_version,
+            busy: Mutex::new(HashSet::new()),
+            pending: Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     pub fn settings(&self) -> &Settings {
@@ -231,6 +262,33 @@ impl Prep {
         Ok((dir, dataset))
     }
 
+    /// Says a query runs on for a dataset, after its request was
+    /// answered; `failed` says it ended without a snapshot; `done` that
+    /// it made one.
+    pub fn waiting(&self, scope: &Scope, id: &str, result: &str) {
+        let dir = self.store.root(&scope.org, &scope.project).join(id);
+        let p = Pending { owner: scope.owner.hash().to_string(), result: result.to_string(), since: time::now(), failed: None };
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(dir, p);
+    }
+
+    pub fn failed(&self, scope: &Scope, id: &str, why: &str) {
+        let dir = self.store.root(&scope.org, &scope.project).join(id);
+        if let Some(p) = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&dir) {
+            p.failed = Some(why.to_string());
+        }
+    }
+
+    pub fn done(&self, scope: &Scope, id: &str) {
+        let dir = self.store.root(&scope.org, &scope.project).join(id);
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&dir);
+    }
+
+    /// The query a dataset of this owner waits on, if one does.
+    pub fn pending(&self, scope: &Scope, id: &str) -> Option<Pending> {
+        let dir = self.store.root(&scope.org, &scope.project).join(id);
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&dir).filter(|p| p.owner == scope.owner.hash()).cloned()
+    }
+
     /// This owner's datasets in the project.
     pub fn list(&self, scope: &Scope) -> Vec<Dataset> {
         self.store.all(&scope.org, &scope.project).into_iter().map(|(_, d)| d).filter(|d| d.owner == scope.owner.hash()).collect()
@@ -245,12 +303,45 @@ impl Prep {
     pub fn create(&self, scope: &Scope, name: Option<&str>, upload: Upload<'_>) -> Result<Dataset> {
         let name = dataset_name(name, upload.file_name.as_deref())?;
         self.check_bytes(upload.bytes.len())?;
-        let id = new_id(&scope.project);
+        self.create_with(scope, &new_id(&scope.project), name, None, |staging| self.take(staging, UPLOAD_SOURCE, 1, &upload, &[]))
+    }
+
+    /// A new dataset, from rows a semantic query returned, under the id
+    /// given (`new_id`), so a caller that answered before the query
+    /// finished can say which it will be.
+    pub fn create_from_query(
+        &self,
+        scope: &Scope,
+        id: &str,
+        name: Option<&str>,
+        query: source::Query,
+        arrived: Arrived,
+    ) -> Result<Dataset> {
+        if !is_id(id) {
+            return Err(Error::Invalid(format!("'{id}' is not a dataset id")));
+        }
+        let name = dataset_name(name, Some(&query.branch).map(|b| format!("query on {b}")).as_deref())?;
+        self.create_with(scope, id, name, Some(query), |staging| self.take_rows(staging, UPLOAD_SOURCE, 1, &arrived, &[]))
+    }
+
+    fn create_with(
+        &self,
+        scope: &Scope,
+        id: &str,
+        name: String,
+        query: Option<source::Query>,
+        take: impl FnOnce(&Path) -> Result<Vec<Column>>,
+    ) -> Result<Dataset> {
+        let id = id.to_string();
         let root = self.store.root(&scope.org, &scope.project);
+        if root.join(&id).exists() {
+            return Err(Error::Conflict(format!("dataset {id} is there already")));
+        }
         let staging = root.join(format!(".new-{id}"));
         let result: Result<Dataset> = (|| {
             let now = time::now();
-            let taken = self.take(&staging, UPLOAD_SOURCE, 1, &upload, &[])?;
+            let kind = if query.is_some() { source::Kind::Semantic } else { source::Kind::Upload };
+            let taken = take(&staging)?;
             let mut dataset = Dataset {
                 id: id.clone(),
                 name,
@@ -260,7 +351,7 @@ impl Prep {
                 recipe: 1,
                 live: None,
                 made: 0,
-                sources: vec![store::SourceState { id: UPLOAD_SOURCE.into(), kind: source::Kind::Upload, snapshot: 1, columns: taken }],
+                sources: vec![store::SourceState { id: UPLOAD_SOURCE.into(), kind, snapshot: 1, columns: taken, query }],
                 columns: Vec::new(),
                 rows: 0,
                 notes: Vec::new(),
@@ -292,20 +383,55 @@ impl Prep {
         Ok(dataset)
     }
 
+    /// What a dataset's semantic source runs, for the caller that runs
+    /// it.
+    pub fn query(&self, scope: &Scope, id: &str) -> Result<source::Query> {
+        let (_, dataset) = self.find(scope, id)?;
+        dataset
+            .sources
+            .iter()
+            .find_map(|s| s.query.clone())
+            .ok_or_else(|| Error::Invalid(format!("dataset {id} is not made from a semantic query; there is nothing to refresh")))
+    }
+
+    /// A new snapshot of a dataset's semantic source, from rows its query
+    /// returned, and the recipe run over it; as a replaced upload is.
+    pub fn refresh(&self, scope: &Scope, id: &str, arrived: Arrived) -> Result<Dataset> {
+        self.resnapshot(scope, id, source::Kind::Semantic, |prep, dir, source, n, established| {
+            prep.take_rows(dir, source, n, &arrived, established)
+        })
+    }
+
     /// A new snapshot of the dataset's upload, and the recipe run over
     /// it. The snapshot is kept even when the recipe then fails, and the
     /// last materialization stays live.
     pub fn replace(&self, scope: &Scope, id: &str, upload: Upload<'_>) -> Result<Dataset> {
         self.check_bytes(upload.bytes.len())?;
+        self.resnapshot(scope, id, source::Kind::Upload, |prep, dir, source, n, established| {
+            prep.take(dir, source, n, &upload, established)
+        })
+    }
+
+    fn resnapshot(
+        &self,
+        scope: &Scope,
+        id: &str,
+        kind: source::Kind,
+        take: impl FnOnce(&Prep, &Path, &str, u32, &[Column]) -> Result<Vec<Column>>,
+    ) -> Result<Dataset> {
         let (dir, _) = self.find(scope, id)?;
         let _job = self.job(&dir)?;
         let (_, mut dataset) = self.find(scope, id)?;
-        let Some(index) = dataset.sources.iter().position(|s| s.kind == source::Kind::Upload) else {
-            return Err(Error::Invalid(format!("dataset {id} is not fed by an upload")));
+        let Some(index) = dataset.sources.iter().position(|s| s.kind == kind) else {
+            let what = match kind {
+                source::Kind::Upload => "an upload",
+                source::Kind::Semantic => "a semantic query",
+            };
+            return Err(Error::Invalid(format!("dataset {id} is not fed by {what}")));
         };
         let source = dataset.sources[index].clone();
         let n = source.snapshot + 1;
-        let columns = self.take(&dir, &source.id, n, &upload, &source.columns)?;
+        let columns = take(self, &dir, &source.id, n, &source.columns)?;
         dataset.sources[index] = store::SourceState { snapshot: n, columns, ..source };
         dataset.updated = time::now();
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
@@ -745,22 +871,61 @@ impl Prep {
         Ok(())
     }
 
-    /// Takes snapshot `n` of a source into `dir`; its columns.
+    /// Takes snapshot `n` of an upload into `dir`; its columns.
     fn take(&self, dir: &Path, source: &str, n: u32, upload: &Upload<'_>, established: &[Column]) -> Result<Vec<Column>> {
         let session = self.engine.session()?;
         let taken = snapshot::from_csv(&session, upload.bytes, &upload.options, established, self.settings.max_rows)?;
+        let digest = sha2::Sha256::digest(upload.bytes);
+        let sha = digest.iter().map(|b| format!("{b:02x}")).collect();
+        self.keep_snapshot(dir, source, n, source::Kind::Upload, upload.file_name.clone(), Some(sha), None, taken)
+    }
+
+    /// Takes snapshot `n` of a semantic source into `dir`; its columns.
+    fn take_rows(&self, dir: &Path, source: &str, n: u32, arrived: &Arrived, established: &[Column]) -> Result<Vec<Column>> {
+        let session = self.engine.session()?;
+        let taken = snapshot::from_rows(&session, &arrived.rows, &arrived.roles, established, self.settings.max_rows)?;
+        self.keep_snapshot(dir, source, n, source::Kind::Semantic, None, None, Some(arrived.read.clone()), taken)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn keep_snapshot(
+        &self,
+        dir: &Path,
+        source: &str,
+        n: u32,
+        kind: source::Kind,
+        file_name: Option<String>,
+        sha256: Option<String>,
+        semantic: Option<source::SemanticRead>,
+        taken: snapshot::Taken,
+    ) -> Result<Vec<Column>> {
         let (rows_path, manifest_path) = store::snapshot_paths(dir, source, n);
         let bytes = store::write_rows(&rows_path, &taken.rows)?;
-        let digest = sha2::Sha256::digest(upload.bytes);
+        if bytes > self.settings.max_bytes {
+            let _ = std::fs::remove_file(&rows_path);
+            return Err(Error::Unprocessable(format!(
+                "the snapshot is {bytes} bytes, more than the {} a dataset holds",
+                self.settings.max_bytes
+            )));
+        }
+        // What arrived, by its hash: the file as uploaded, or the rows as kept.
+        let sha256 = match sha256 {
+            Some(s) => s,
+            None => {
+                let kept = std::fs::read(&rows_path).map_err(|e| Error::io(&rows_path, e))?;
+                sha2::Sha256::digest(&kept).iter().map(|b| format!("{b:02x}")).collect()
+            }
+        };
         let snapshot = Snapshot {
             source: source.to_string(),
             number: n,
-            kind: source::Kind::Upload,
+            kind,
             taken: time::now(),
-            file_name: upload.file_name.clone(),
-            sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            file_name,
+            sha256,
             bytes,
-            parse: Some(taken.parse),
+            parse: taken.parse,
+            semantic,
             columns: taken.columns.clone(),
             rows: taken.rows.num_rows() as u64,
             changes: taken.changes,
@@ -802,7 +967,7 @@ fn snapshot_notes(dir: &Path, dataset: &Dataset) -> Vec<String> {
 /// A dataset's id: `ds_` and sixteen hex digits, unguessable enough
 /// that one is never made twice, and checked before it names a
 /// directory.
-fn new_id(salt: &str) -> String {
+pub fn new_id(salt: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let digest = sha2::Sha256::digest(format!("{}\n{}\n{n}\n{salt}", time::nanos(), std::process::id()).as_bytes());

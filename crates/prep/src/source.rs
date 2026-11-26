@@ -18,6 +18,42 @@ use serde::{Deserialize, Serialize};
 pub enum Kind {
     /// A file the application uploaded.
     Upload,
+    /// A spec run on a branch of the model, fresh, under the context the
+    /// refresh was sent with.
+    Semantic,
+}
+
+/// What a semantic source runs: a spec, or the shorthand for one, on a
+/// branch.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Query {
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+}
+
+/// What a semantic snapshot was made by: where and when the spec ran,
+/// as what SQL, and for whom. The context itself is never kept, only a
+/// fingerprint of it; nor is the run's result id, which expires with the
+/// cache.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SemanticRead {
+    pub branch: String,
+    /// When the deployment that planned it was made.
+    pub deployed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+    pub sql_sha256: String,
+    /// The hash of the security context it ran under.
+    pub context: String,
+    /// Each column's field in the model, by uid, where it is one.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 /// What a request may say about how its CSV is laid out. Anything it

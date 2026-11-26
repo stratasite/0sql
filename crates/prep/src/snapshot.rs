@@ -14,7 +14,7 @@ use zsql_datasource::Batches;
 pub(crate) struct Taken {
     pub rows: Batches,
     pub columns: Vec<Column>,
-    pub parse: Parse,
+    pub parse: Option<Parse>,
     pub changes: Vec<String>,
 }
 
@@ -32,7 +32,73 @@ pub(crate) fn from_csv(session: &Session, bytes: &[u8], options: &CsvOptions, es
     session.load("raw", &raw, &[batch])?;
     let (exprs, columns, changes) = meet_established(session, "raw", &parsed.columns, established)?;
     let rows = session.query(&format!("SELECT {} FROM raw", exprs.join(", ")))?;
-    Ok(Taken { rows, columns, parse: parsed.parse, changes })
+    Ok(Taken { rows, columns, parse: Some(parsed.parse), changes })
+}
+
+/// Rows a run returned, as a snapshot. Each column is cast to the type
+/// a dataset holds it as, then met with the source's types as an
+/// upload's are; `roles` are the model's, for columns new to the source.
+pub(crate) fn from_rows(
+    session: &Session,
+    rows: &Batches,
+    roles: &std::collections::BTreeMap<String, Role>,
+    established: &[Column],
+    max_rows: usize,
+) -> Result<Taken> {
+    if rows.num_rows() > max_rows {
+        return Err(Error::Unprocessable(format!("the query returned {} rows, more than the {max_rows} a dataset holds", rows.num_rows())));
+    }
+    let mut incoming: Vec<(String, ColumnType)> = Vec::new();
+    for f in rows.schema.fields() {
+        if incoming.iter().any(|(n, _)| n.eq_ignore_ascii_case(f.name())) {
+            return Err(Error::Unprocessable(format!("the query returned two columns named '{}'", f.name())));
+        }
+        incoming.push((f.name().clone(), held_as(f.data_type())));
+    }
+    let fields: Vec<Field> = incoming.iter().map(|(n, t)| Field::new(n, t.arrow(), true)).collect();
+    let schema = Arc::new(Schema::new(fields));
+    let mut batches = Vec::new();
+    for b in &rows.batches {
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        for (i, (name, t)) in incoming.iter().enumerate() {
+            let cast = arrow_cast::cast(b.column(i), &t.arrow()).map_err(|e| {
+                Error::Unprocessable(format!("column '{name}' of type {} cannot be held as {t}: {e}", b.column(i).data_type()))
+            })?;
+            arrays.push(cast);
+        }
+        batches.push(RecordBatch::try_new(schema.clone(), arrays)?);
+    }
+    session.load("raw", &incoming, &batches)?;
+    let (exprs, mut columns, changes) = meet_established(session, "raw", &incoming, established)?;
+    for c in columns.iter_mut() {
+        if !established.iter().any(|e| e.name == c.name) {
+            if let Some(r) = roles.get(&c.name) {
+                c.role = *r;
+            }
+        }
+    }
+    let list = if exprs.is_empty() { "NULL AS \"_\"".to_string() } else { exprs.join(", ") };
+    let rows = session.query(&format!("SELECT {list} FROM raw"))?;
+    Ok(Taken { rows, columns, parse: None, changes })
+}
+
+/// The type a dataset holds a warehouse's column as: the nearest of its
+/// own, and text for anything it has no type for.
+fn held_as(t: &DataType) -> ColumnType {
+    match t {
+        DataType::Boolean => ColumnType::Boolean,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => ColumnType::Integer,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => ColumnType::Integer,
+        DataType::UInt64 => ColumnType::Decimal(0),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => ColumnType::Double,
+        DataType::Decimal128(_, s) | DataType::Decimal256(_, s) if *s >= 0 && *s as u8 <= crate::schema::DECIMAL_SCALE_MAX => {
+            ColumnType::Decimal(*s as u8)
+        }
+        DataType::Decimal128(..) | DataType::Decimal256(..) => ColumnType::Double,
+        DataType::Date32 | DataType::Date64 => ColumnType::Date,
+        DataType::Timestamp(..) => ColumnType::Timestamp,
+        _ => ColumnType::Text,
+    }
 }
 
 /// The select list that gives a table of text columns, whose values
