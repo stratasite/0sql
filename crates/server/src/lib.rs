@@ -14,7 +14,7 @@
 //! whole by a request that sends a secret of its own (see
 //! `credentials`). The server has no
 //! credential of its own to check: a deploy, a validate, a test run
-//! and a removal are as open as a read, and whoever may do any of them
+//! and a removal, of a branch or a whole project, are as open as a read, and whoever may do any of them
 //! is decided by the service in front.
 //!
 //! A project belongs to an org, and an org is a directory of the data
@@ -39,6 +39,7 @@
 //! POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables          {"connection": {...}}  ?q=&schema=&catalog=&limit=&offset=
 //! POST /projects/{uid}/branches/{branch}/datasources/{ds}/tables/{table}  {"connection": {...}}  ?schema=&catalog=
 //! DELETE /projects/{uid}/branches/{branch}
+//! DELETE /projects/{uid}                              the whole project: every branch of it
 //! GET  /projects                                       every deployed branch, ?q=text
 //! POST /projects/{uid}/branches/{branch}/run           {"spec": {...}} or {"expr": "..."}: planned, run, and the rows
 //! POST /projects/{uid}/branches/{branch}/sql-exec      {"datasource": "...", "sql": "..."}: one statement, run as written

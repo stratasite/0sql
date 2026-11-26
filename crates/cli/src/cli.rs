@@ -112,6 +112,15 @@ pub(crate) struct Target {
 impl Target {
     /// What the branch is called on the server: `project/branch`, with
     /// the org in front when it is not the default one.
+    /// What the project is called on the server: `project`, with the
+    /// org in front when it is not the default one.
+    pub(crate) fn project_name(&self) -> String {
+        match self.org.as_deref().filter(|o| *o != crate::remote::DEFAULT_ORG) {
+            Some(org) => format!("{org}/{}", self.uid),
+            None => self.uid.clone(),
+        }
+    }
+
     pub(crate) fn name(&self) -> String {
         match self.org.as_deref().filter(|o| *o != crate::remote::DEFAULT_ORG) {
             Some(org) => format!("{org}/{}/{}", self.uid, self.branch),
@@ -491,12 +500,15 @@ pub(crate) enum Command {
         #[command(flatten)]
         remote: Remote,
     },
-    /// Remove a deployed branch from the server.
+    /// Remove a deployed branch from the server, or with --all-branches the whole project.
     #[command(display_order = 35, alias = "remove")]
     Undeploy {
-        /// Confirm: this removes the branch from the server.
+        /// Confirm: this removes the branch, or the project, from the server.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Remove the whole project: every branch of it on the server.
+        #[arg(long, conflicts_with = "branch")]
+        all_branches: bool,
         #[command(flatten)]
         remote: Remote,
     },

@@ -367,6 +367,19 @@ fn a_bind_beyond_the_loopback_has_to_be_meant_and_then_anyone_who_reaches_it_dep
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(!get(&addr, "/projects").1.contains("\"staging\""));
 
+    // The whole project: every branch of it goes, and naming a branch
+    // beside --all-branches is refused before anything is sent.
+    let out = run(&["deploy", "--branch", "staging"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run(&["undeploy", "--all-branches", "--branch", "staging", "--yes"]);
+    assert!(!out.status.success(), "--all-branches and --branch together are refused");
+    assert!(get(&addr, "/projects").1.contains("\"staging\""));
+    let out = run(&["undeploy", "--all-branches", "--yes"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("\"main\"") && said.contains("\"staging\""), "{said}");
+    assert!(!get(&addr, "/projects").1.contains("\"grocery-store\""));
+
     let (status, said) = s.stop();
     assert!(status.success());
     assert!(!said.contains("token") && !said.contains("zdt_left-over"), "nothing about a token is said or kept:\n{said}");

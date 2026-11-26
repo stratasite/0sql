@@ -366,11 +366,69 @@ async fn each_branch_is_its_own_deployment() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.listing().await, ["billing/main", "customer-service/main"]);
     assert_eq!(s.fields(CS, "dev").await.unwrap_err().status, StatusCode::NOT_FOUND);
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/dev"), &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "gone is gone: {}", a.body);
+
+    // A branch on disk that never loaded can be removed by name too.
+    let stale = s.data_dir.join("default").join(CS).join("old");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("snapshot.json.gz"), b"not a snapshot").unwrap();
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}/branches/old"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert!(!stale.exists());
 
     // A restart finds what is on disk and nothing else.
     let again = app_over(&s.data_dir);
     let (n, skipped) = reload(&again).unwrap();
     assert_eq!((n, skipped.len()), (2, 0));
+}
+
+/// Removing a project takes every branch of it, loaded or not, and
+/// leaves other projects and the same project of another org alone.
+#[tokio::test]
+async fn removing_a_project_takes_every_branch_of_it() {
+    let s = server();
+    for (uid, branch, marker) in [(CS, "main", "cs-main"), (CS, "dev", "cs-dev"), ("billing", "main", "billing")] {
+        let a = s.deploy(uid, branch, archive(uid, marker)).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    }
+    let a = s
+        .send(Method::POST, &format!("/orgs/acme/projects/{CS}/branches/main/deploy"), &[], Some(("application/gzip", archive(CS, "acme"))))
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    // A branch on disk that never loaded is the project's too.
+    let stale = s.data_dir.join("default").join(CS).join("old");
+    std::fs::create_dir_all(&stale).unwrap();
+
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["removed"], CS);
+    assert_eq!(a.body["branches"], json!(["dev", "main", "old"]));
+    assert_eq!(s.listing().await, ["billing/main"]);
+    assert!(!s.data_dir.join("default").join(CS).exists());
+    assert_eq!(s.on_disk(), ["acme/customer-service/main", "default/billing/main"]);
+    assert_eq!(s.fields(CS, "main").await.unwrap_err().status, StatusCode::NOT_FOUND);
+
+    // Gone is gone: a second removal is told so, as is a project never deployed.
+    let a = s.send(Method::DELETE, &format!("/projects/{CS}"), &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    let a = s.send(Method::DELETE, "/projects/nothing-here", &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    // A name that could leave the data directory is refused before use.
+    let a = s.send(Method::DELETE, "/projects/..%2Fdefault", &[], None).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert_eq!(s.on_disk(), ["acme/customer-service/main", "default/billing/main"]);
+
+    // Under the org prefix it is that org's project.
+    let a = s.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}"), &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(a.body["removed"], format!("acme/{CS}"));
+    assert_eq!(s.on_disk(), ["default/billing/main"]);
+
+    // A restart finds what is left and nothing else.
+    let again = app_over(&s.data_dir);
+    let (n, skipped) = reload(&again).unwrap();
+    assert_eq!((n, skipped.len()), (1, 0));
 }
 
 /// A name that could step out of its project's directory, or out of

@@ -260,7 +260,20 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
             }
             Ok(())
         }
-        Command::Undeploy { yes, remote } => {
+        Command::Undeploy { yes, all_branches: true, remote } => {
+            // The branch is never sent; one is named so that a project
+            // with no committed branch can still be removed.
+            let mut w = Where::with(project, remote);
+            w.branch = Some(String::new());
+            let t = w.target(false)?;
+            let what = format!("project {} and every branch of it", t.project_name());
+            let sure = yes || tty::confirm(&format!("remove {what} from {}?", t.client.server), "--yes")?;
+            if !sure {
+                bail!("nothing removed");
+            }
+            show::print_json(&t.client.delete(&remote::project_path(t.org.as_deref(), &t.uid))?)
+        }
+        Command::Undeploy { yes, all_branches: false, remote } => {
             let t = Where::with(project, remote).target(false)?;
             let sure = yes || tty::confirm(&format!("remove {} from {}?", t.name(), t.client.server), "--yes")?;
             if !sure {

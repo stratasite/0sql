@@ -391,15 +391,69 @@ pub(crate) async fn remove(
         // would otherwise swap its directory in between the removal of
         // the model and of the files.
         let _writing = lock(&app.deploying);
-        let removed = write(&app.models).remove(&crate::key(&org, &uid, &branch)).is_some();
-        if !removed {
+        let loaded = write(&app.models).remove(&crate::key(&org, &uid, &branch)).is_some();
+        // A branch on disk that would not load at startup is removed
+        // too: it is not served, but it is still the branch's files.
+        let dir = app.dir(&org, &uid, &branch);
+        let on_disk = dir.is_dir();
+        if !loaded && !on_disk {
             return Err(not_found(&org, &uid, &branch));
         }
-        let _ = std::fs::remove_dir_all(app.dir(&org, &uid, &branch));
+        if on_disk {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not remove {uid}/{branch}: {e}")))?;
+        }
         tracing::info!("removed {org}/{uid}/{branch}");
         // Named as the log names it, with the org when it is not the default.
         let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
         Ok(Json(json!({ "removed": format!("{within}{uid}/{branch}") })))
+    })
+    .await
+}
+
+/// A whole project: every branch of it, loaded or not, and its
+/// directory. A branch that was on disk but would not load at startup
+/// goes too, since it is the project's all the same. What the object
+/// store keeps of past deploys stays, as it does for one branch: that
+/// is history, and its own store's to expire.
+pub(crate) async fn remove_project(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid,)): Params<(String,)>,
+) -> Result<Json<Value>, ApiError> {
+    check_uid(&uid)?;
+    blocking(move || {
+        // Under the deploy lock, as for a branch: a deploy in flight
+        // would otherwise swap a branch back in under the removal.
+        let _writing = lock(&app.deploying);
+        let prefix = crate::key(&org, &uid, "");
+        let mut branches: Vec<String> = {
+            let mut models = write(&app.models);
+            let keys: Vec<String> = models.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+            keys.iter().filter_map(|k| models.remove(k).map(|m| m.branch.clone())).collect()
+        };
+        let dir = app.data_dir.join(&org).join(&uid);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() && !name.starts_with('.') && !branches.contains(&name) {
+                    branches.push(name);
+                }
+            }
+        }
+        let existed = dir.exists();
+        if branches.is_empty() && !existed {
+            let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!(" in org {org}") };
+            return Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid}{within}")));
+        }
+        if existed {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not remove {uid}: {e}")))?;
+        }
+        branches.sort();
+        tracing::info!("removed {org}/{uid} and its branches {}", branches.join(", "));
+        let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
+        Ok(Json(json!({ "removed": format!("{within}{uid}"), "branches": branches })))
     })
     .await
 }
