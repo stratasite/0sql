@@ -340,6 +340,10 @@ mod parser_tests {
         assert!(!aggregates_every_reference("lower([Region]@d)", &aggs));
         assert!(!aggregates_every_reference("sum([Units]@d) over (order by [Date]@d)", &aggs));
         assert!(!aggregates_every_reference("upper('count(') || [Region]@d", &aggs));
+        // An aggregate's name inside a string literal is not a call.
+        assert!(!aggregates_every_reference("'count(' || [Region]@d", &aggs));
+        assert!(aggregates_every_reference("max('sum(' || [Region]@d)", &aggs));
+        assert!(aggregate_calls("'sum(' || [Region]@d || ')'", &aggs).is_empty());
     }
 
     #[test]

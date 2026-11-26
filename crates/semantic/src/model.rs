@@ -198,6 +198,11 @@ impl SemanticModel {
         SemanticModel { core: self.core.clone(), layer }
     }
 
+    /// Whether the field is one a layer added, not one of the model's own.
+    pub fn is_layer_field(&self, id: Id) -> bool {
+        self.layer.fields.iter().any(|f| f.id == id)
+    }
+
     pub fn snapshot(&self) -> &Snapshot {
         &self.core.snap
     }

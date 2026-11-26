@@ -15,8 +15,7 @@
 
 use crate::universe::Universes;
 use crate::{Error, Result};
-use serde_json::json;
-use zsql_semantic::{Expression, Field, FieldKind, Id, Path, SemanticModel};
+use zsql_semantic::{DataType, Expression, Field, FieldKind, Id, Path, SemanticModel};
 use zsql_spec::{Projection, ProjectionKind, Query};
 
 /// What every synthetic measure's name and uid start with. No spec can
@@ -34,16 +33,13 @@ pub struct Lifted {
 
 /// `None` when the query has nothing to lift.
 pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[String], query: &Query) -> Result<Option<Lifted>> {
-    let projected: Vec<&str> = query
-        .projections
-        .iter()
-        .filter(|p| p.kind == ProjectionKind::Field && p.field_kind == Some(FieldKind::Dimension))
-        .filter_map(|p| p.field_uid.as_deref())
-        .collect();
+    let projected = Projected::of(query);
+    let names: Vec<&str> = aggregates.iter().map(String::as_str).collect();
     for p in &query.projections {
-        refuse_measures_with_unprojected_dimensions(semantic, aggregates, query, p, &projected)?;
+        refuse_measures_with_unprojected_dimensions(semantic, &names, query, p, &projected)?;
     }
-    let wanted: Vec<usize> = query.projections.iter().enumerate().filter(|(_, p)| liftable(p, &projected)).map(|(i, _)| i).collect();
+    let wanted: Vec<usize> =
+        query.projections.iter().enumerate().filter(|(_, p)| liftable(p, &projected, &names)).map(|(i, _)| i).collect();
     if wanted.is_empty() {
         return Ok(None);
     }
@@ -55,9 +51,6 @@ pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[Strin
         next_id -= 1;
         next_id
     };
-    let invalid =
-        |alias: &str, e: serde_json::Error| Error::Resolution(format!("Calculation \"{alias}\" could not be planned as a measure: {e}"));
-
     let mut lifted = Lifted { fields: vec![], expressions: vec![], paths: vec![], query: query.clone() };
     // (name, formula, data type) of each field made so far.
     let mut made: Vec<(String, String, String)> = Vec::new();
@@ -65,8 +58,7 @@ pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[Strin
         let calc = lifted.query.projections[i].clone();
         let alias = calc.alias.clone().unwrap_or_default();
         let dims: Vec<&Field> = calc.dimension_refs.iter().filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension))).collect();
-        // The formula as a model expression writes it: references by name.
-        let sql = calc.sql.clone().unwrap_or_default().replace("]@d", "]").replace("]@D", "]");
+        let sql = calc.sql.clone().unwrap_or_default();
         let data_type = calc.calculation_data_type.clone().unwrap_or_else(|| "decimal".into());
 
         // Named for the alias, so a message that names the field reads as
@@ -97,47 +89,14 @@ pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[Strin
                 )));
             }
             let field_id = fresh();
-            let field: Field = serde_json::from_value(json!({
-                "id": field_id,
-                "uid": uid,
-                "name": name,
-                "type": "Semantic::Measure",
-                "data_type": data_type,
-            }))
-            .map_err(|e| invalid(&alias, e))?;
-            lifted.fields.push(field);
+            lifted.fields.push(Field::measure(field_id, uid.clone(), name.clone(), DataType::from_name(&data_type)));
             made.push((name.clone(), sql.clone(), data_type.clone()));
 
             let dim_ids: Vec<Id> = dims.iter().map(|d| d.id).collect();
             for table in tables {
-                let expression: Expression = serde_json::from_value(json!({
-                    "id": fresh(),
-                    "table_id": table.id,
-                    "field_id": field_id,
-                    "sql": sql,
-                    "dimension_ref_ids": dim_ids,
-                }))
-                .map_err(|e| invalid(&alias, e))?;
-                lifted.expressions.push(expression);
+                lifted.expressions.push(Expression::over_dimensions(fresh(), table.id, field_id, sql.clone(), dim_ids.clone()));
                 // As a measure declared on the table is reached: at the root.
-                let path: Path = serde_json::from_value(json!({
-                    "id": fresh(),
-                    "root_table_id": table.id,
-                    "target_table_id": table.id,
-                    "from_table_id": null,
-                    "field_id": field_id,
-                    "field_type": "Semantic::Measure",
-                    "step_number": 0,
-                    "cost": table.cost,
-                    "tier": 0,
-                    "joins": [],
-                    "table_nodes": [table.id],
-                    "datasource_id": table.datasource_id,
-                    "blending_field_id": null,
-                    "extended_blend_group": null,
-                }))
-                .map_err(|e| invalid(&alias, e))?;
-                lifted.paths.push(path);
+                lifted.paths.push(Path::at_root(fresh(), table, field_id, FieldKind::Measure));
             }
         }
 
@@ -148,21 +107,41 @@ pub fn lift(semantic: &SemanticModel, universes: &Universes, aggregates: &[Strin
         p.sql = None;
         p.calculation_field_type = None;
         p.dimension_refs = vec![];
-        // `aggregates_dimensions` stays set: the resolver reads it to
-        // aggregate the measure in one universe, since unlike a model
-        // measure it is mapped on many.
     }
     Ok(Some(lifted))
 }
 
-/// One that reads only projected dimensions is already at the query's
-/// grain wherever it is evaluated, so it stays a calculation; so does one
-/// that reads a projection by alias.
-fn liftable(p: &Projection, projected: &[&str]) -> bool {
+/// The dimensions the query projects, by uid: all of them, and those
+/// projected as they are. A truncated or extracted date is a different
+/// value from the date, so an aggregate over `[Date]@d` beside a month of
+/// it still reads a dimension the query's rows do not carry.
+struct Projected<'q> {
+    plain: Vec<&'q str>,
+    any: Vec<&'q str>,
+}
+
+impl<'q> Projected<'q> {
+    fn of(query: &'q Query) -> Self {
+        let dims = || query.projections.iter().filter(|p| p.kind == ProjectionKind::Field && p.field_kind == Some(FieldKind::Dimension));
+        Projected {
+            plain: dims().filter(|p| p.decorators.is_empty()).filter_map(|p| p.field_uid.as_deref()).collect(),
+            any: dims().filter_map(|p| p.field_uid.as_deref()).collect(),
+        }
+    }
+}
+
+/// A measure defined on dimensions: the calculation aggregates, reads no
+/// measure and no projection, and keeps every dimension inside an
+/// aggregate call, as `count(distinct [Customer ID]@d)` does. One that
+/// reads only dimensions projected as they are is already at the query's
+/// grain wherever it is evaluated, so it stays a calculation.
+fn liftable(p: &Projection, projected: &Projected, aggregates: &[&str]) -> bool {
     p.kind == ProjectionKind::Calculation
-        && p.aggregates_dimensions
+        && p.calculation_field_type.as_deref() == Some("measure")
+        && p.measure_refs.is_empty()
         && p.projection_refs.is_empty()
-        && p.dimension_refs.iter().any(|u| !projected.contains(&u.as_str()))
+        && p.dimension_refs.iter().any(|u| !projected.plain.contains(&u.as_str()))
+        && p.sql.as_deref().map(|sql| zsql_spec::expr::aggregates_every_reference(sql, aggregates)).unwrap_or(false)
 }
 
 /// A calculation that reads a measure may read a dimension only when the
@@ -173,19 +152,30 @@ fn liftable(p: &Projection, projected: &[&str]) -> bool {
 /// at the wrong grain. That is refused, with what to write instead.
 fn refuse_measures_with_unprojected_dimensions(
     semantic: &SemanticModel,
-    aggregates: &[String],
+    aggregates: &[&str],
     query: &Query,
     p: &Projection,
-    projected: &[&str],
+    projected: &Projected,
 ) -> Result<()> {
     if p.kind != ProjectionKind::Calculation || p.calculation_field_type.as_deref() != Some("measure") {
         return Ok(());
     }
+    // Not projected at all; or projected only truncated or extracted and
+    // read inside an aggregate, where it is the dimension itself that is
+    // aggregated. Outside one it is the projected column's value, as in a
+    // window's `order by [Date]@d`.
+    let sql = p.sql.as_deref().unwrap_or_default();
+    let calls = zsql_spec::expr::aggregate_calls(sql, aggregates);
     let unprojected: Vec<&Field> = p
         .dimension_refs
         .iter()
-        .filter(|u| !projected.contains(&u.as_str()))
-        .filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension)))
+        .filter_map(|u| semantic.field_by_uid(u, Some(FieldKind::Dimension)).map(|f| (u, f)))
+        .filter(|(u, f)| {
+            !projected.any.contains(&u.as_str())
+                || (!projected.plain.contains(&u.as_str())
+                    && calls.iter().any(|c| c.dimensions.iter().any(|d| f.name.eq_ignore_ascii_case(d))))
+        })
+        .map(|(_, f)| f)
         .collect();
     if unprojected.is_empty() {
         return Ok(());
@@ -216,9 +206,7 @@ fn refuse_measures_with_unprojected_dimensions(
 
     let alias = p.alias.clone().unwrap_or_default();
     let dims = unprojected.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ");
-    let names: Vec<&str> = aggregates.iter().map(String::as_str).collect();
-    let sql = p.sql.as_deref().unwrap_or_default();
-    let together = zsql_spec::expr::aggregate_calls(sql, &names).into_iter().any(|c| {
+    let together = calls.iter().any(|c| {
         (!c.measures.is_empty() || c.aliases.iter().any(|a| measure_aliases.contains(a)))
             && c.dimensions.iter().any(|d| unprojected.iter().any(|u| u.name.eq_ignore_ascii_case(d)))
     });

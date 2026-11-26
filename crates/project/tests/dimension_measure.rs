@@ -340,3 +340,50 @@ fn a_lifted_plan_leaves_the_model_as_it_was_and_plans_the_same_way_twice() {
     // And no spec can name a synthetic measure: lowering sees the model alone.
     assert!(plan(serde_json::json!({"projections": [{"field": "synmsr:customers"}]})).is_err());
 }
+
+#[test]
+fn a_dimension_projected_only_truncated_is_still_aggregated_as_a_measure() {
+    // The month of the date is projected, not the date: counting dates at
+    // the merge would count the month column, one per row.
+    let sql = plan(serde_json::json!({
+        "projections": [
+            {"field": "date", "decorators": [{"type": "truncate", "grain": "month"}]},
+            {"field": "store net paid"},
+            {"field": "catalog net paid"},
+            {"calculation": true, "alias": "Days", "sql": "count(distinct [Date]@d)", "data_type": "integer"}
+        ]
+    }))
+    .unwrap();
+    let hosts: Vec<&str> = parts(&sql).into_iter().filter(|p| p.contains("count(distinct T1.\"d_date\")")).collect();
+    assert_eq!(hosts.len(), 1, "one node counts the dates themselves:\n{sql}");
+    assert!(hosts[0].contains("GROUP BY\n\tDATE_TRUNC('month'"), "{sql}");
+    let merge = sql.rsplit("\n)\nSELECT").next().unwrap();
+    assert!(!merge.contains("count(distinct"), "{sql}");
+}
+
+#[test]
+fn a_measure_inside_an_aggregate_over_a_truncated_dimension_is_refused_but_a_window_order_is_not() {
+    let month = serde_json::json!({"field": "date", "decorators": [{"type": "truncate", "grain": "month"}]});
+    let err = plan(serde_json::json!({
+        "projections": [
+            month,
+            {"field": "store net paid"},
+            {"calculation": true, "alias": "Good days", "data_type": "integer",
+             "sql": "count(distinct case when [Store Net Paid]@m > 0 then [Date]@d end)"}
+        ]
+    }))
+    .unwrap_err();
+    assert!(err.contains("inside an aggregate over Date"), "{err}");
+
+    // Outside an aggregate the reference is the projected column's value.
+    let sql = plan(serde_json::json!({
+        "projections": [
+            month,
+            {"field": "store net paid"},
+            {"calculation": true, "alias": "Change",
+             "sql": "max([Store Net Paid]@m) - lag(max([Store Net Paid]@m), 1) over (order by [Date]@d)"}
+        ]
+    }))
+    .unwrap();
+    assert!(sql.contains("AS \"Change\""), "{sql}");
+}
