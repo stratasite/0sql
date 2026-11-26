@@ -108,6 +108,23 @@ impl Dialect {
         self.render("quote", &[("exp", ident)])
     }
 
+    /// An output column name this warehouse accepts. `name` itself unless
+    /// it holds one of `alias_forbidden_chars`; then its words, split on
+    /// those characters and whitespace, joined by `_`: BigQuery returns
+    /// `Month(Date)` as `Month_Date`.
+    pub fn clean_alias(&self, name: &str) -> String {
+        let forbidden = self.get("alias_forbidden_chars").and_then(Value::as_str).unwrap_or("");
+        if !name.chars().any(|c| forbidden.contains(c)) {
+            return name.to_string();
+        }
+        let words: Vec<&str> = name.split(|c: char| c.is_whitespace() || forbidden.contains(c)).filter(|w| !w.is_empty()).collect();
+        if words.is_empty() {
+            "col".to_string()
+        } else {
+            words.join("_")
+        }
+    }
+
     /// A string literal with the value's quotes doubled.
     pub fn string_lit(&self, value: &str) -> Result<String, Error> {
         let escaped = value.replace('\'', "''");
@@ -512,6 +529,21 @@ mod tests {
         let over = pg.with_overrides([("final_pass_measure_join_type", &serde_json::json!("inner"))]);
         assert_eq!(over.final_pass_measure_join_type(), "inner");
         assert_eq!(pg.final_pass_measure_join_type(), "full", "the catalog's copy is untouched");
+    }
+
+    /// BigQuery refuses parentheses and operators in a column name even
+    /// quoted, so a generated name is renamed there and nowhere else.
+    #[test]
+    fn bigquery_column_names_drop_what_it_refuses() {
+        let dialects = Dialects::builtin();
+        let bq = dialects.get("bigquery").unwrap();
+        assert_eq!(bq.clean_alias("Month(Date)"), "Month_Date");
+        assert_eq!(bq.clean_alias("Product Name (same Customer ID)"), "Product_Name_same_Customer_ID");
+        assert_eq!(bq.clean_alias("sum([Net Paid]@m) / 100"), "sum_Net_Paid_m_100");
+        assert_eq!(bq.clean_alias("Net Paid"), "Net Paid", "a space it takes, so a plain name is untouched");
+        assert_eq!(bq.clean_alias("()"), "col");
+        let pg = dialects.get("postgres").unwrap();
+        assert_eq!(pg.clean_alias("Month(Date)"), "Month(Date)");
     }
 
     #[test]

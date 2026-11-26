@@ -8,16 +8,20 @@ use crate::Result;
 pub const SKIP_ALIAS_PREFIX: &str = "__msr";
 
 pub fn run(graph: &mut Graph) -> Result<()> {
+    let dialect = graph.dialect.clone();
     for id in graph.post_order() {
         let root = graph.nodes[id].is_root();
         let node = &mut graph.nodes[id];
         let mut used: Vec<String> = Vec::new();
         for p in node.projections.iter_mut() {
             if root {
-                let mut a = p.alias.clone();
+                // The name a result column comes back under, so it must be
+                // one the warehouse accepts.
+                let base = dialect.clean_alias(&p.alias);
+                let mut a = base.clone();
                 let mut i = 0;
                 while used.contains(&a) {
-                    a = format!("{}_{}", p.alias, i);
+                    a = format!("{}_{}", base, i);
                     i += 1;
                 }
                 used.push(a.clone());

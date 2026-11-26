@@ -4,6 +4,10 @@
 # BigQuery uses backticks for identifier quoting.
 quote: "`@exp`"
 
+# Column names take letters, digits, spaces, `_`, `-` and a few symbols,
+# but none of these, so `Month(Date)` is returned as `Month_Date`.
+alias_forbidden_chars: "!\"$()*,./;?@[\\]^`{}~"
+
 # FORMAT_DATE uses strftime elements. base.yml's %W/%M mean
 # week-number/minute in BigQuery, so use the standard name codes.
 day_name_format: "%A"

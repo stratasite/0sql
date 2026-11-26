@@ -2,6 +2,9 @@
 # quotes and string lit
 quote: "\"@exp\""
 string_literal: "'@exp'"
+# Characters the warehouse refuses in an output column name, even quoted.
+# A projection whose name holds one is renamed to its words joined by `_`.
+alias_forbidden_chars: ""
 
 # Date Literal Formats
 date_format: "%Y-%m-%d"

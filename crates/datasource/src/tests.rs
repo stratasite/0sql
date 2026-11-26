@@ -920,6 +920,10 @@ struct Fake {
 }
 
 fn fake(reply: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> Fake {
+    // A fake answers REST and nothing else, so no driver is looked for on
+    // the thread that talks to it, whatever this machine has installed.
+    #[cfg(not(target_env = "musl"))]
+    crate::adbc::rest_only_for_tests();
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
