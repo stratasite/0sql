@@ -22,7 +22,7 @@ A dataset is **a recipe over sources**:
 
 ```
  sources ──► snapshots ──► recipe (steps 1..n) ──► materialization v<k> ──► query, blend, feed another dataset
- upload         immutable      replayed on every       Parquet, immutable,
+ upload         immutable      replayed on every       Arrow, immutable,
  semantic query                new snapshot            records its lineage
  dataset
  feed (later)
@@ -32,7 +32,8 @@ A dataset is **a recipe over sources**:
   **snapshot**.
 - The **recipe** is an ordered list of **steps** that shape them.
 - A **materialization** is the recipe run over the latest snapshots,
-  kept as Parquet: what the grid shows and what is queried.
+  kept as an Arrow IPC file, as results are: what the grid shows and
+  what is queried.
 
 Editing in the grid adds to the recipe; stored rows are never changed.
 A sync brings a new snapshot and runs the same recipe over it, which is
@@ -69,16 +70,18 @@ the cap fails, saying so.
 | dataset | another dataset's materialization | that dataset has a new one |
 | feed (later) | what an upstream system pushed or a connector pulled | each sync |
 
-Each ends in a snapshot as Parquet with a manifest, so the recipe never
-knows which kind fed it.
+Each ends in a snapshot, an Arrow IPC file with a manifest, so the
+recipe never knows which kind fed it.
 
 **A CSV upload** says, or has detected and recorded: encoding (UTF-8,
 with a BOM accepted), delimiter, quote, whether there is a header. Types
 are inferred, and a column that looks like an identifier (leading zeros,
 postcodes) stays text. Column names are made unique and case-distinct;
 an empty name becomes `column_<n>`. A row that does not parse is counted
-and the first few are shown; past a threshold the import fails rather
-than quietly dropping data. Every choice is in the manifest.
+and the first few are shown; past a threshold (one row in a hundred, or
+`max_bad_rows`) the import fails rather than quietly dropping data.
+Every choice is in the manifest. The file is parsed by data prep in
+Rust, not by the engine.
 
 **A semantic source** runs its spec under the context sent with the
 refresh, row policies compiled in. The snapshot shows what that context
@@ -127,9 +130,11 @@ written in a small expression language of data prep's own: column
 references, literals, operators, and an **allowlist** of functions
 (text, numbers, dates, conditionals), compiled to DuckDB's SQL by data
 prep's compiler. It does not reuse `calc(...)` from the query
-shorthand, which carries raw SQL. DuckDB is opened with external access
-off, so no formula and no step can read a file, a URL or another
-dataset's directory.
+shorthand, which carries raw SQL. DuckDB is opened in memory with
+external access off and its configuration locked, and it touches no
+file at all: data prep reads and writes every snapshot and
+materialization itself and hands the engine Arrow batches. No formula
+and no step can read a file, a URL or another dataset's directory.
 
 ### Columns are a dependency graph
 
@@ -377,10 +382,11 @@ The data directory keeps the layout it has ("What is on disk" in
   <org>/<project>/
     <branch>/              a deployed branch, as today
     .datasets/<id>/
+      dataset.json         the manifest, written last: the registry entry
       recipe/r<m>.json     every recipe version
       edits.log            the edit log
-      sources/<s>/         snapshots, Parquet + manifest
-      v<k>/                materializations, Parquet + manifest + lineage
+      sources/<s>/<n>.*    snapshots: rows.arrow + manifest
+      v<k>/                materializations: rows.arrow + manifest + lineage
   .cache/results/  .cache/records/
 ```
 
@@ -410,14 +416,40 @@ The data directory keeps the layout it has ("What is on disk" in
   is not backed up.
 
 Routes are under `/projects/{uid}/datasets`, and under `/orgs/{org}`;
-with no org the org is `default`.
+with no org the org is `default`. The owner reference is the
+`zsql-owner` header.
+
+```
+GET    /projects/{uid}/datasets                         this owner's datasets
+POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file_name=&delimiter=&quote=&header=&max_bad_rows=
+GET    /projects/{uid}/datasets/{id}
+DELETE /projects/{uid}/datasets/{id}
+PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV: a new snapshot, the recipe run over it
+GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=
+GET    /projects/{uid}/datasets/{id}/lineage            ?version=
+GET    /projects/{uid}/datasets/{id}/recipe             ?version=
+POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
+GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
+DELETE /datasets                                        every dataset of this owner in the org
+```
+
+A dataset can be made only in a project deployed on some branch of
+the org.
 
 ## Running it
 
-Every materialization, refresh, cascade and preview is a job, answered
-202 with an id, with a seat in an admission class of its own, a DuckDB
-memory limit and a spill directory. How jobs are recorded and recovered
-after a crash is left until the jobs exist.
+Every materialization, refresh, cascade and preview has a seat in an
+admission class of its own (`prep`, `ZSQL_ADMIT_PREP`), a DuckDB memory
+limit (`ZSQL_PREP_MEMORY`), a thread count (`ZSQL_PREP_THREADS`) and a
+spill directory under `.cache/prep`. One job runs on a dataset at a
+time; a second is told it is busy. The caps are `ZSQL_DATASET_MAX_ROWS`
+(a million) and `ZSQL_DATASET_MAX_BYTES` (256 MB).
+
+An upload and a recipe change run while the request waits: a dataset
+is small, and the deadline is ninety seconds. A refresh from the
+warehouse and a cascade become jobs answered 202 with an id when they
+arrive (phases 4 and 5); how jobs are recorded and recovered after a
+crash is left until then.
 
 ## How the code is laid out
 
@@ -426,7 +458,8 @@ know about datasets.
 
 | module | what it holds |
 |---|---|
-| `source` | source kinds, each producing a snapshot; CSV parsing |
+| `source` | source kinds; the CSV contract, parsed in Rust |
+| `snapshot` | rows that arrived, typed and met with their source's types |
 | `schema` | column roles, types and their evolution |
 | `recipe` | steps, recipe versions, the edit log, the column graph |
 | `formula` | the formula language: parser, allowlist, compiler to DuckDB SQL |
@@ -435,7 +468,7 @@ know about datasets.
 | `engine` | DuckDB, opened with external access off and its limits |
 | `materialize` | running a recipe, previews, pages, the DAG cascade |
 | `lineage` | what each materialization was made from; upstream, downstream, impact |
-| `store` | `zsql-datasets`, manifests, hard delete, the backup |
+| `store` | `.datasets`, manifests, atomic writes, hard delete, the backup |
 | `blend` | attaching a dataset to a request; filter, enrich, their rules |
 
 - **Dependencies point one way.** `zsql-prep` uses the planner, the
@@ -461,7 +494,7 @@ know about datasets.
 
 ## Phases
 
-- [ ] **1. The core, fed by an upload.** `.datasets` under each project
+- [x] **1. The core, fed by an upload.** `.datasets` under each project
   and the test that pins it; The crate, the owner reference,
   the CSV contract, roles and types, snapshots, recipes and
   materializations, the caps, lineage records, hard delete, the engine

@@ -42,6 +42,7 @@ fn server_over(data_dir: &std::path::Path) -> Shared {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,
+        prep: None,
     })
 }
 

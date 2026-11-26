@@ -72,6 +72,7 @@ impl ServeArgs {
             ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
             ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
             ("ZSQL_ADMIT_PROBE", &mut a.probe),
+            ("ZSQL_ADMIT_PREP", &mut a.prep),
         ] {
             if let Some(v) = var(name) {
                 *slot = number(&v, name)?;
@@ -124,6 +125,26 @@ impl ServeArgs {
         }
         if let Some(v) = var("ZSQL_CACHE_SWEEP_SECS") {
             cfg.runs.cache_sweep = Duration::from_secs(number(&v, "ZSQL_CACHE_SWEEP_SECS")?.max(1) as u64);
+        }
+        // Data prep: on unless turned off, and bounded.
+        match var("ZSQL_DATASETS").as_deref().map(str::trim) {
+            Some("off" | "0" | "false" | "no") => cfg.datasets = None,
+            Some("on" | "1" | "true" | "yes") | None => {}
+            Some(other) => bail!("ZSQL_DATASETS is on or off; it is {other}"),
+        }
+        if let Some(d) = cfg.datasets.as_mut() {
+            if let Some(v) = var("ZSQL_DATASET_MAX_ROWS") {
+                d.max_rows = number(&v, "ZSQL_DATASET_MAX_ROWS")?;
+            }
+            if let Some(v) = var("ZSQL_DATASET_MAX_BYTES") {
+                d.max_bytes = number(&v, "ZSQL_DATASET_MAX_BYTES")? as u64;
+            }
+            if let Some(v) = var("ZSQL_PREP_MEMORY") {
+                d.engine.memory = v;
+            }
+            if let Some(v) = var("ZSQL_PREP_THREADS") {
+                d.engine.threads = number(&v, "ZSQL_PREP_THREADS")?;
+            }
         }
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)

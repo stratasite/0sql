@@ -35,6 +35,7 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 |---|---|---|---|
 | heavy | deploy, validate, test | 2 | 5 s |
 | probe | a datasource's tables and one table's structure: `POST .../datasources/{ds}/tables` and `.../tables/{table}` | cores × 2 | 1 s |
+| prep | datasets: `/projects/{uid}/datasets/...` and `DELETE /datasets` | cores ÷ 2, at least 2 | 1 s |
 | explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
 | plan | everything else: sql, explain, tables, values, branch summary, projects, removal, `POST /mcp` | cores × 4 | 1 s |
 
@@ -57,7 +58,7 @@ dispatcher. See `docs/mcp.md`.
 
 ## Deadlines
 
-90 s for heavy and for a probe, 30 s for everything else. A deadline that passes
+90 s for heavy, a probe, a run and data prep, 30 s for everything else. A deadline that passes
 answers `503 Timeout` **without** `Retry-After`, because unlike `Busy`
 it happened after the handler started.
 
@@ -89,7 +90,7 @@ Each refusal is a `400 TooLarge` naming the limit.
 ## Configuration
 
 ```
-ZSQL_ADMIT_PLAN, ZSQL_ADMIT_EXPLORE, ZSQL_ADMIT_HEAVY, ZSQL_ADMIT_PROBE    concurrency permits
+ZSQL_ADMIT_PLAN, ZSQL_ADMIT_EXPLORE, ZSQL_ADMIT_HEAVY, ZSQL_ADMIT_PROBE, ZSQL_ADMIT_PREP    concurrency permits
 ```
 
 ## What clients see
