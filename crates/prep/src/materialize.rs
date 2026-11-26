@@ -137,7 +137,8 @@ pub(crate) fn run(
     k: u32,
 ) -> Result<Run> {
     let pinned_at = crate::time::now();
-    let edits = crate::edits::in_force(log, upto);
+    let steps_of = |m: u32| store::read_json::<Recipe>(&store::recipe_path(dir, m)).ok().map(|r| r.steps);
+    let edits = crate::edits::in_force(log, upto, &steps_of, &recipe.steps);
     let compiled = compile::compile(recipe, &edits, &dataset.sources, &inputs_map(inputs), &pinned_at)?;
     if !compiled.unresolved.is_empty() {
         return Ok(Run::Held(compiled.unresolved));

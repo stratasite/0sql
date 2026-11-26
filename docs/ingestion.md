@@ -218,10 +218,19 @@ What an edit means depends on the column's role.
 
 **Settled when edits were built** (they were the open questions):
 
-- **A dimension edit for one row only** is an override of that row
-  (`"one": true`), named by its identity like a measure edit, with the
-  edited value's original among its members. Without `one`, a
-  dimension edit is a remap.
+- **Which rows an edit is for is the user's to choose,** by `match`:
+  the columns whose values must be the edited row's.
+  - **None:** every row with the edited value, a remap of the column
+    (`NY` → `New York` everywhere). A dimension edit's default.
+  - **Some:** the rows that agree on them (`NY` → `New York` where
+    `country` is `US`), however many, through every sync; orphaned when
+    none do.
+  - **The row's whole identity:** that row alone. A measure edit's
+    default. A measure edit whose `match` names several rows is refused
+    unless it says `"all": true`.
+
+  A dimension's own original value is always among what an edit of it
+  matches on.
 - **A row's identity** is the recipe's `key` when the user marks one,
   else every dimension column. An edit that names more than one row is
   refused when it is made, saying so and offering both ways out: mark a
@@ -231,7 +240,9 @@ What an edit means depends on the column's role.
 - **Edits past a join or an append** need no rule of their own. An edit
   applies after the steps the recipe had when it was made, and names
   its row by what is there at that point. A step added later runs after
-  it and sees the edited value.
+  it and sees the edited value. When the recipe changes around an edit,
+  the edit follows the steps it was made after: steps put before it or
+  removed from before it do not move it off what it was made on.
 - **An edit is a reader.** An edit on a column gone upstream holds the
   dataset like a step does; confirming undoes it, as an entry of the
   log.

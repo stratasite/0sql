@@ -114,6 +114,13 @@ impl Edit {
 pub enum Asked {
     /// A cell changed. `row` is the row as the grid showed it; for a
     /// dimension edited as a remap, `from` may stand in for it.
+    ///
+    /// `match` says which rows it is for: the columns whose values must
+    /// be the row's. None at all is every row with the edited value: a
+    /// remap of the column. Some is the rows that agree on them: `NY` to
+    /// `New York` where `country` is `US`. The row's whole identity is
+    /// that one row. Left out, a dimension edit is a remap of the
+    /// column, and a measure edit is of the row.
     Cell {
         column: String,
         #[serde(default)]
@@ -121,10 +128,10 @@ pub enum Asked {
         #[serde(default)]
         from: Option<Value>,
         to: Value,
-        /// A dimension cell for this row only, not every row with the value.
-        #[serde(default)]
-        one: bool,
-        /// Every row with this identity, when it names more than one.
+        #[serde(default, rename = "match")]
+        matching: Option<Vec<String>>,
+        /// For a measure: every row `match` names, when it names more
+        /// than one. A dimension edit is for every row it names already.
         #[serde(default)]
         all: bool,
     },
@@ -180,8 +187,65 @@ pub(crate) fn append(dir: &Path, entry: &Entry) -> Result<()> {
 }
 
 /// The edits in force after the first `upto` entries: every edit not
-/// undone, each with the position it applies at, in the order made.
-pub(crate) fn in_force(log: &[Entry], upto: u64) -> Vec<(usize, Edit)> {
+/// undone, each with the position it applies at in `current`, in the
+/// order made.
+///
+/// An edit applies after the steps the recipe had when it was made. The
+/// recipe may have changed since, so that position is carried over to
+/// the current steps: it follows the last of the steps before it that
+/// the current recipe still has, wherever that now is. A step removed
+/// or added earlier in the recipe moves no edit off what it was made on.
+/// `steps_of` gives a recipe version's steps.
+pub(crate) fn in_force(
+    log: &[Entry],
+    upto: u64,
+    steps_of: &dyn Fn(u32) -> Option<Vec<crate::recipe::Step>>,
+    current: &[crate::recipe::Step],
+) -> Vec<(usize, Edit)> {
+    let mut placed: std::collections::HashMap<(u32, usize), usize> = std::collections::HashMap::new();
+    let log: Vec<Entry> = log
+        .iter()
+        .map(|e| {
+            let at = *placed.entry((e.recipe, e.after)).or_insert_with(|| relocate(e.after, steps_of(e.recipe).as_deref(), current));
+            Entry { after: at, ..e.clone() }
+        })
+        .collect();
+    in_force_placed(&log, upto)
+}
+
+/// Where a position after `after` steps of `old` is in `new`: after the
+/// last of those steps that `new` still has, by the longest run of steps
+/// the two share in order.
+pub(crate) fn relocate(after: usize, old: Option<&[crate::recipe::Step]>, new: &[crate::recipe::Step]) -> usize {
+    let Some(old) = old else { return after.min(new.len()) };
+    if old == new {
+        return after;
+    }
+    let after = after.min(old.len());
+    let (n, m) = (old.len(), new.len());
+    // lcs[i][j]: the longest common run of old[i..] and new[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old[i] == new[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
+        }
+    }
+    let (mut i, mut j, mut at) = (0, 0, 0);
+    while i < n && j < m && i < after {
+        if old[i] == new[j] {
+            at = j + 1;
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    at
+}
+
+fn in_force_placed(log: &[Entry], upto: u64) -> Vec<(usize, Edit)> {
     let entries: Vec<&Entry> = log.iter().filter(|e| e.seq <= upto).collect();
     let undone: std::collections::HashSet<&str> = entries
         .iter()

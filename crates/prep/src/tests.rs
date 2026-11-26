@@ -409,7 +409,7 @@ fn a_dimension_edit_for_one_row_rows_added_and_deleted_and_undo() {
             edits(
                 1,
                 serde_json::json!([
-                    { "op": "cell", "column": "region", "row": { "region": "NY", "month": "2026-02-01" }, "to": "NJ", "one": true },
+                    { "op": "cell", "column": "region", "row": { "region": "NY", "month": "2026-02-01" }, "to": "NJ", "match": ["month"] },
                     { "op": "delete", "row": { "region": "CA", "month": "2026-01-01" } },
                     { "op": "add", "values": { "region": "TX", "month": "2026-01-01", "amount": 5 } },
                 ]),
@@ -874,4 +874,99 @@ fn every_dataset_is_copied_to_the_object_store_and_restored_from_it() {
     // With no object store there is nothing to restore from.
     let (_d2, plain) = self::prep();
     assert!(matches!(plain.restore("default"), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn a_dimension_edit_is_for_the_column_for_rows_that_agree_on_others_or_for_one_row() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let three = "region,store,month,amount\nNY,a,2026-01-01,1\nNY,b,2026-01-01,2\nNY,a,2026-02-01,3\nCA,a,2026-01-01,4\n";
+    let regions = |prep: &Prep, id: &str| -> Vec<Value> { rows_of(prep, &ann, id).iter().map(|r| r[0].clone()).collect() };
+
+    // Every NY: the column.
+    let d = prep.create(&ann, None, csv(three)).unwrap();
+    prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }]))).unwrap();
+    assert_eq!(regions(&prep, &d.id), ["New York", "New York", "New York", "CA"]);
+
+    // NY where store is a: the rows that agree on store, however many.
+    let d = prep.create(&ann, None, csv(three)).unwrap();
+    let row = serde_json::json!({ "region": "NY", "store": "a", "month": "2026-01-01", "amount": 1 });
+    let (_, out) = prep
+        .edit(
+            &ann,
+            &d.id,
+            edits(1, serde_json::json!([{ "op": "cell", "column": "region", "row": row, "to": "Manhattan", "match": ["store"] }])),
+        )
+        .unwrap();
+    assert_eq!(out[0].state, State::Applied);
+    assert_eq!(regions(&prep, &d.id), ["Manhattan", "NY", "Manhattan", "CA"]);
+
+    // That row alone: its whole identity.
+    let d = prep.create(&ann, None, csv(three)).unwrap();
+    let (_, out) = prep
+        .edit(
+            &ann,
+            &d.id,
+            edits(1, serde_json::json!([{ "op": "cell", "column": "region", "row": row, "to": "Brooklyn", "match": ["store", "month"] }])),
+        )
+        .unwrap();
+    assert_eq!(out[0].state, State::Applied);
+    assert_eq!(regions(&prep, &d.id), ["Brooklyn", "NY", "NY", "CA"]);
+
+    // Its conditions hold through a new file: rows that agree are edited, others not.
+    let d = prep.replace(&ann, &d.id, csv("region,store,month,amount\nNY,a,2026-01-01,9\nNY,c,2026-01-01,1\n")).unwrap();
+    assert_eq!(regions(&prep, &d.id), ["Brooklyn", "NY"]);
+
+    // A measure's default is its row; a measure edit that names several rows needs all.
+    let d = prep.create(&ann, None, csv(three)).unwrap();
+    let e = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["store"] }])))
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("3 rows have these values"), "{e}");
+    prep.edit(
+        &ann,
+        &d.id,
+        edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["store"], "all": true }])),
+    )
+    .unwrap();
+    let amounts: Vec<Value> = rows_of(&prep, &ann, &d.id).iter().map(|r| r[3].clone()).collect();
+    assert_eq!(amounts, [0, 2, 0, 0]);
+    let e = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["nope"] }])))
+        .err();
+    assert!(e.unwrap().to_string().contains("no column 'nope'"));
+}
+
+#[test]
+fn an_edit_stays_after_the_steps_it_was_made_on_when_the_recipe_changes_around_it() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep.create(&ann, None, csv("region,store,amount\nny,a,1\nny,b,2\nca,a,3\n")).unwrap();
+    let label = serde_json::json!({ "op": "formula", "column": "label", "formula": "upper(region)" });
+    let d = prep.change(&ann, &d.id, change(1, serde_json::json!([label]))).unwrap();
+    // An edit of `label`, made after the step that makes it.
+    let (d, _) =
+        prep.edit(&ann, &d.id, edits(2, serde_json::json!([{ "op": "cell", "column": "label", "from": "NY", "to": "NEW YORK" }]))).unwrap();
+    // A step put before it, and a group after: the edit stays between.
+    let trim = serde_json::json!({ "op": "trim", "columns": ["store"] });
+    let group = serde_json::json!({ "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] });
+    let d = prep.change(&ann, &d.id, change(2, serde_json::json!([trim, label, group]))).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["CA", 3]), serde_json::json!(["NEW YORK", 3])]);
+    // The step before it removed: still after the formula, still before the group.
+    let d = prep.change(&ann, &d.id, change(3, serde_json::json!([label, group]))).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id)[1], serde_json::json!(["NEW YORK", 3]));
+}
+
+#[test]
+fn a_position_is_carried_to_the_steps_a_recipe_still_has() {
+    let s = |n: &str| -> Step { serde_json::from_value(serde_json::json!({ "op": "trim", "columns": [n] })).unwrap() };
+    let (a, b, c, x) = (s("a"), s("b"), s("c"), s("x"));
+    use crate::edits::relocate;
+    let old = [a.clone(), b.clone(), c.clone()];
+    assert_eq!(relocate(2, Some(&old), &old), 2);
+    assert_eq!(relocate(2, Some(&old), &[x.clone(), a.clone(), b.clone(), c.clone()]), 3, "a step put before moves it on");
+    assert_eq!(relocate(2, Some(&old), &[a.clone(), c.clone()]), 1, "the step it followed gone: after the one before");
+    assert_eq!(relocate(2, Some(&old), std::slice::from_ref(&c)), 0);
+    assert_eq!(relocate(3, None, &[a]), 1, "a version not found: as far as the recipe goes");
 }

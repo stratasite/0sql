@@ -592,7 +592,7 @@ impl Prep {
             &steps,
             &roles,
             &recipe.key,
-            &edits::in_force(&log, dataset.edits),
+            &edits::in_force(&log, dataset.edits, &steps_of(&dir), &steps),
             (&dataset.sources, &materialize::inputs_map(&inputs)),
             &pinned_at,
         )?;
@@ -629,8 +629,10 @@ impl Prep {
         let mut steps = recipe.steps.clone();
         steps.insert(k, Step::Remove { columns: vec![column.to_string()] });
         let log = edits::read_log(&dir)?;
-        let in_force: Vec<(usize, Edit)> =
-            edits::in_force(&log, dataset.edits).into_iter().map(|(a, e)| (if a >= k { a + 1 } else { a }, e)).collect();
+        let in_force: Vec<(usize, Edit)> = edits::in_force(&log, dataset.edits, &steps_of(&dir), &recipe.steps)
+            .into_iter()
+            .map(|(a, e)| (if a >= k { a + 1 } else { a }, e))
+            .collect();
         let inputs = materialize::inputs_map(&self.inputs(&dir, &recipe.inputs())?);
         let c = compile::compile_all(&steps, &recipe.roles, &recipe.key, &in_force, (&dataset.sources, &inputs), &pinned_at)?;
         // And the datasets that read it, by what they name of it.
@@ -760,7 +762,7 @@ impl Prep {
         }
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let log = edits::read_log(&dir)?;
-        let in_force = edits::in_force(&log, dataset.edits);
+        let in_force = edits::in_force(&log, dataset.edits, &steps_of(&dir), &recipe.steps);
         let k = dataset.live.ok_or_else(|| Error::Internal(format!("dataset {id} has no live version")))?;
         let manifest: Materialization = store::read_json(&store::version_dir(&dir, k).join("manifest.json"))?;
         let rows = store::read_rows(&store::version_dir(&dir, k).join(store::ROWS))?;
@@ -844,10 +846,23 @@ impl Prep {
             }
         };
         Ok(match asked {
-            Asked::Cell { column, row, from, to, one, all } => {
+            Asked::Cell { column, row, from, to, matching: matched, all } => {
                 let c = column_of(&column)?.clone();
                 compile::value_sql(&to, c.ty, &c.name)?;
-                if c.role == Role::Dimension && !one {
+                let dimension = c.role == Role::Dimension;
+                let others: Option<Vec<String>> = match matched {
+                    // A dimension's default is the column; a measure's, its row.
+                    None if dimension => None,
+                    None => Some(identity.to_vec()),
+                    Some(m) if m.iter().all(|x| x.eq_ignore_ascii_case(&c.name)) && dimension => None,
+                    Some(m) => Some(m),
+                };
+                if let Some(names) = &others {
+                    for n in names {
+                        column_of(n)?;
+                    }
+                }
+                if others.is_none() {
                     let from = from
                         .or_else(|| {
                             row.as_ref().and_then(|r| r.iter().find(|(n, _)| n.eq_ignore_ascii_case(&c.name)).map(|(_, v)| v.clone()))
@@ -856,9 +871,22 @@ impl Prep {
                     compile::value_sql(&from, c.ty, &c.name)?;
                     Edit::Remap { id, column: c.name, from, to }
                 } else {
-                    let row = row.ok_or_else(|| Error::Invalid(format!("an edit of '{}' for one row says which row: row", c.name)))?;
-                    let key = edits::key_of(&row, identity)?;
+                    let row = row.ok_or_else(|| Error::Invalid(format!("an edit of '{}' for some rows says which: row", c.name)))?;
+                    // The columns that name its rows; a dimension's own value is one of them.
+                    let mut names = others.unwrap_or_default();
+                    if dimension && !names.iter().any(|n| n.eq_ignore_ascii_case(&c.name)) {
+                        names.push(c.name.clone());
+                    }
+                    if names.is_empty() {
+                        return Err(Error::Invalid(format!(
+                            "an edit of measure '{}' names its rows: match the columns that pick them out",
+                            c.name
+                        )));
+                    }
+                    let key = edits::key_of(&row, &names)?;
                     let (n, current) = matching(&key, Some(&c))?;
+                    // A dimension edit with conditions is for every row they name.
+                    let all = all || (dimension && n > 1);
                     names_one(n, all)?;
                     // The value first replaced is what a sync is checked against.
                     let earlier = in_force.iter().rev().find_map(|(_, e)| match e {
@@ -1262,6 +1290,11 @@ impl Prep {
         let (dir, _) = self.find(scope, id)?;
         Ok(self.downstream_of(&dir, id).into_iter().map(|(_, d, _)| d).collect())
     }
+}
+
+/// A recipe version's steps, read from a dataset's directory.
+fn steps_of(dir: &Path) -> impl Fn(u32) -> Option<Vec<Step>> + '_ {
+    move |m| store::read_json::<Recipe>(&store::recipe_path(dir, m)).ok().map(|r| r.steps)
 }
 
 /// What the latest snapshots said of their columns: new, gone, widened.
