@@ -240,7 +240,8 @@ on each node. Without them a server keeps both on its own disk.
 
 **Reaching a warehouse.** Postgres, Redshift, MySQL and SQL Server
 over their wire protocols; Snowflake, BigQuery, Databricks, Trino,
-ClickHouse and Athena over HTTP; DuckDB and SQLite in the process.
+ClickHouse, Athena and Druid over HTTP; DuckDB and SQLite in the
+process: every dialect the planner writes, it can run.
 Snowflake and BigQuery go through their ADBC drivers when one is
 installed (`dbc install snowflake`; `zsql datasource drivers` says what
 is found). DuckDB and the drivers return each column as its type; the
