@@ -178,9 +178,75 @@ What to keep in mind whichever path is used:
   went live, and a slow store slows every deploy behind it. A store
   slow enough can outlast the request: a deploy is answered within 90
   seconds or told the deadline passed, and the deploy may still go
-  live after that. `zsql status` says which model the branch has. Nothing
+  live after that (a streamed deploy, below, is not cut off: it reports to
+  its end). `zsql status` says which model the branch has. Nothing
   clears these away: how long they are kept is the bucket's lifecycle
   rule to say.
+
+### Deploying from your own service
+
+`zsql deploy` is one HTTP request, and any program may send the same
+one. Send it with `Accept: application/x-ndjson`: that is the way to
+call the route. The server then answers with one JSON object a line,
+a line for each step as it is done, and the answer it would have
+given whole as the last line, so the caller can show progress and
+never waits blind on a large model or a slow object store. The CLI
+sends it this way.
+
+```sh
+tar czf project.tgz -C path/to/project .
+curl -N \
+  -H 'Content-Type: application/gzip' \
+  -H 'Accept: application/x-ndjson' \
+  --data-binary @project.tgz \
+  http://zsqld.internal:3699/orgs/acme/projects/shop/branches/main/deploy
+```
+
+```
+{"event":"unpacked","bytes":12841,"entries":49,"ms":3}
+{"event":"loaded","ms":38}
+{"event":"compiled","tables":33,"fields":380,"joins":58,"paths":1212,"policies":0,"values":0,"tests":2,"ms":45}
+{"event":"test","name":"store sales price by date","status":"passed","ms":50}
+{"event":"tested","passed":2,"failed":0,"ms":50}
+{"event":"kept","archive":"deploys/acme/shop/main/acme-shop-main-20261126T153012.123Z.zip","ms":71}
+{"event":"live","ms":93}
+{"event":"done","result":{"project":"shop","branch":"main","tables":33,"test_results":{...},"credentials":{...},...}}
+```
+
+- **The route.** `POST /projects/{uid}/branches/{branch}/deploy`, or
+  `/orgs/{org}/projects/...` for an org other than the default. The
+  body is a tar.gz of the project directory, with `project.yml` at its
+  root or in its one top folder. For the branch's credentials, put
+  `.zsql` in it: a deploy carries the secrets it holds, as "The
+  credential of a datasource" says. Add `?clear_secrets=true` to make
+  this deploy the whole truth about them. `.../validate` takes the
+  same body and streams the same steps, makes nothing live, and so has
+  no `kept` or `live`.
+- **The steps.** `unpacked`, `loaded`, `compiled`, a `test` for each
+  test and `tested`, then for a deploy `kept` (only with an object
+  store) and `live`. Each carries `ms`, the milliseconds since the
+  server began. A test that fails does not stop a deploy. Read the
+  `event` and pass over one you do not know: a later release may add
+  steps.
+- **The end.** The last line is `{"event":"done","result":{...}}`,
+  whose `result` is exactly the JSON a deploy without the header
+  answers, or `{"event":"error","status":400,"error":{"class":...,
+  "message":...}}`, the refusal it would have answered with that
+  status. A stream that stops before either was cut off somewhere
+  between: ask `GET .../branches/{branch}` what is live.
+- **The status.** Once the first line is sent the status is `200`,
+  so read the last line, not the status, to learn how it went. What is
+  refused before any work keeps its own status and its JSON body: an
+  empty body, a bad name, a server at its limit (`429` or `503` with
+  `Retry-After`, safe to send again), a body over the limit.
+- **A caller that goes away** does not stop the deploy. It runs to
+  its end as if somebody were listening.
+- **Through a proxy**, turn off response buffering for the route, or
+  the lines arrive all at once at the end. The server sends
+  `X-Accel-Buffering: no`, which nginx obeys.
+
+Without the header the route answers once, at the end, with the
+`result` object alone, as it did before the stream.
 
 ## Probing a datasource
 
