@@ -48,7 +48,25 @@ pub struct Plan {
 
 /// Whether drivers are looked for at all.
 pub(crate) fn enabled() -> bool {
+    #[cfg(test)]
+    if REST_ONLY.with(std::cell::Cell::get) {
+        return false;
+    }
     !matches!(std::env::var("ZSQL_ADBC").ok().as_deref().map(str::trim), Some("off" | "0" | "false" | "no"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static REST_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For a test of a REST transport against a fake server: no driver is
+/// looked for on this thread, whatever the machine has installed. A
+/// driver would speak its own protocol to a fake that only answers REST.
+/// Per thread, as `ZSQL_ADBC=off` cannot be, since tests run side by side.
+#[cfg(test)]
+pub(crate) fn rest_only_for_tests() {
+    REST_ONLY.with(|r| r.set(true));
 }
 
 /// The driver of this name, or `None` when none is installed. A driver
