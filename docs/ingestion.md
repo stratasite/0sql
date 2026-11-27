@@ -4,6 +4,11 @@ A plan, started 2026-11-26, revised after a review the same day. High
 level only; nothing here is built or scheduled. One node only; more than
 one is out of scope.
 
+**Next shape, planned 2026-11-27:** [Sources, datasets and pipelines](#sources-datasets-and-pipelines-planned)
+replaces a dataset's linear recipe with a graph the application sends
+and 0sql runs. What follows it describes what is built today; that
+section says what of it carries over.
+
 ## What it is for
 
 The model describes the warehouse as its developers built it. A
@@ -756,6 +761,263 @@ know about datasets.
 - **Quotas and retention.**
 - **More than one node:** a concern for `docs/clustering.md`.
 
+## Sources, datasets and pipelines (planned)
+
+Planned 2026-11-27, not built; revised the same day after a review and
+the user's answers. It replaces "a dataset has one source and one linear
+recipe", which makes a result of several inputs a chain of datasets:
+each intermediate one to share, version and delete, its lineage split,
+and a refresh a cascade between them.
+
+### Who does what
+
+A user who is not an engineer, helped by an AI, gets data from where it
+is (a file, the warehouse, a tool) and shapes it into what their
+analysis needs. The application in front of 0sql shows them **datasets**
+to browse; editing one shows its **pipeline** as a graph, with a preview
+of the output below and, on every node, what the last run did there.
+The inputs a pipeline reads are found in an explorer when building one,
+and are not where a user starts.
+
+The split is the contract:
+
+- **The application owns the pipeline:** it builds the graph, names its
+  nodes, keeps its versions, drafts and diffs, places a user's edits in
+  it, and decides when it runs: on a click, on a schedule, after a new
+  upload, after a stop. It decides who may read what, as today.
+- **0sql runs a graph it is given.** It checks it, runs it under the
+  context it is sent, keeps the output, and says what each node did. It
+  keeps no pipeline of its own, no schedule, and runs nothing it was
+  not asked to.
+
+### Three things
+
+- **A source** is where data comes from, and what came: its kind, how it
+  is read, and its **snapshots**, each a pull or an upload kept whole.
+  A source is not browsed as a dataset; it is what the "add an input"
+  explorer lists. It has a name and a description for the explorer.
+- **A dataset** is what a user sees, shares and blends: a name and its
+  **outputs**, versioned, each made by one run.
+- **A pipeline** is the graph a run is sent: nodes from its inputs to
+  one output. 0sql keeps a copy of it with each run, as the record of
+  what made that output, never as something to run again.
+
+**An upload used as it is creates a source and a dataset over it, and
+copies nothing.** The dataset's output version is a pointer to the
+source's snapshot, with the roles the dataset gives its columns. One
+thing is listed, under one id, to share and blend. A run of a graph
+with nodes in it makes the next output version real rows; the id, its
+shares and the blends that name it stay.
+
+```
+<org>/<project>/.datasets/
+  .sources/src_7f3a…/        a source
+    source.json                kind, name, read options, every version of them
+    snapshots/<n>/             rows.arrow + manifest (columns, types, parse report,
+                               the context's fingerprint for a query)
+  ds_91fc…/                  a dataset
+    dataset.json               name, roles, live output version
+    v<k>/                      an output: rows.arrow, or a pointer to a snapshot;
+                               manifest, lineage, run record, the graph it ran
+  .runs/<run id>.json        a run in flight, or answered, for a retry to find
+```
+
+### Sources
+
+| kind | a snapshot is | taken when |
+|---|---|---|
+| `upload` | the parsed file | each upload to it |
+| `query` | a spec run on a branch, under the run's context | a run pulls it |
+| `push` | rows an application or an agent posts, with where they came from | each post |
+| `tool` (later) | what an MCP tool or a connector returned, called by 0sql | a run pulls it |
+
+- **Reading is the source's:** the CSV contract, the parse report,
+  inferred types, and the type rule on each new snapshot ("Types
+  evolve"). A wrong inference is fixed on the source (`types`), as a new
+  version of its read options; a graph may read a source with types of
+  its own instead, for itself only.
+- **A new snapshot runs nothing.** A new upload or a pull adds a
+  snapshot; a dataset reading the source changes on its next run, when
+  the application sends one.
+- **A query source keeps its spec, never a context.** A run pulls it
+  under the context the run was sent, and the snapshot records that
+  context's fingerprint. B's pipeline reading A's query source reads it
+  as B. A run that reads the latest snapshot rather than pulling reads
+  it only if the fingerprint is the run's own; otherwise it pulls.
+- **`push` comes before `tool`:** an agent calls a tool on its side and
+  posts the rows, so 0sql calls out to nothing and holds no third
+  party's credential. `tool` waits for a reason to call out.
+- **What came is kept as it came:** a run reads a snapshot, never the
+  live source, so a run can be done again on the same data, and a tool
+  is not called again to repeat one.
+
+### A run
+
+A request is the graph, the output dataset it makes, the context, and a
+**run id** the application chooses. A run id sent again answers what the
+first one did, in flight or done, so a retry makes nothing twice. One run
+per output dataset at a time; another is `409 Busy`.
+
+The graph is nodes, each with the application's id, which 0sql never
+renames and keys everything it says by:
+
+| node | reads | makes |
+|---|---|---|
+| `source` | a source, by id | a snapshot, as the input says |
+| `dataset` | another dataset's output, by id | that output, as the input says |
+| `steps` | one node | the steps of today's recipe, in order |
+| `join` | two nodes | today's join, between nodes rather than datasets; the only way to join |
+| `append` | two or more nodes | today's append |
+| `sql` | one or more nodes, each under an alias the node names | a query, a black box as today's `sql` step |
+| `edits` | one node | the edits it carries, inline |
+| `output` | one node | the dataset's output |
+
+- **An input says what it reads:** `latest` (the newest snapshot or
+  version at run time; the default), a snapshot or version id, or for a
+  source `pull` (pull first) or `max_age` (pull when the newest is older
+  than this, else read it and say how old it is). The run record says
+  what each input read.
+- **First it is checked, whole,** before anything is pulled or written:
+  every query input plans under the context; every source and dataset
+  named exists; every node compiles, with the columns and types it
+  makes; the output contract holds on the schema. A run refused says,
+  by node id, every reason, typed, and where it can tell, a fix: a
+  column gone and one new with most of its values the same is
+  suggested by name, type and overlap. Which datasets a context may
+  read is the application's, so 0sql checks only that they exist.
+- **A dry run** is that check and nothing more, plus what a run would
+  pull and read: "pulls revenue (last pulled 3 hours ago, as another
+  user, so again), reads the budget file of Monday, runs 6 nodes".
+- **A preview** is the same request with a node to stop at, over a
+  sample or the whole input, keeping nothing. A join previewed over a
+  sample says its counts are of a sample, since rows unmatched there
+  may match in the whole.
+- **One run** compiles the graph to views in one engine session, as a
+  recipe is today, and keeps one output version, whole or not at all,
+  with one lineage: each snapshot and dataset version read.
+- **The rules carry over:** a column a node reads that is gone fails the
+  run, naming the node; the caps; the engine sandbox.
+
+### Edits are a node
+
+A user's cell edits go in an `edits` node the application places in the
+graph, carried inline in it:
+
+```
+input1, input2 → join → edits → filter → blend with a query
+```
+
+An edit names its rows by value, the key columns of the rows at its node
+("where `store_id` = 17, set `region` to West"), not by position, so it
+holds when what is upstream changes. An `edits` node names its key; a key
+that is not unique where the node is fails the run. The run record says
+of each edit whether it applied, found no row (orphaned), or found its
+value already changed upstream (flagged). Where to put the node, and
+moving it, is the application's.
+
+This replaces today's edit log, which 0sql keeps and places by step
+position.
+
+### An output contract
+
+The `output` node may declare its key (or grain) and checks: `unique`
+and `not_null` first, a row count within a share of the last run's
+later. Each check either holds the run, keeping the last output, or
+lets it through with a warning. The application, or an AI for it,
+writes them; every run checks them.
+
+### Every run says what it did
+
+A run keeps, with the output version, a record per node, which the
+application shows on the graph and an AI reads to explain a run:
+
+| node | recorded |
+|---|---|
+| `source`, `dataset` | which snapshot or version, pulled or reused and why, rows and columns, age |
+| `steps`, `sql` | rows in and out; columns added, removed, retyped; values changed per step ("trimmed 412 values", "filled 37 blanks"); time; warnings |
+| `join`, `append` | rows matched and unmatched each side; a side refused for repeating keys; columns met by name |
+| `edits` | each edit's state: applied, orphaned, flagged |
+| `output` | rows, bytes, the version made, each check's result |
+
+Each node also has a **one-line summary in words**, written from those
+numbers by the server, not by a model: "Joined revenue: 1,204 of 1,210
+rows matched; 6 stores have no revenue." It costs nothing, says the same
+every time, and is true. Beside it is a **profile** of what the node
+made: per column its nulls, distinct values, minimum and maximum. The
+summary is for a person; the profile is what an AI reasons from.
+
+Two runs' records, node by node, say why a number changed; the
+application diffs them, as it diffs its graphs.
+
+### Crashes and stops
+
+A run is a job like any other ("Crashes, stops and restarts"), with one
+change: **0sql resumes nothing.** A run a start finds is interrupted,
+cause `crash` or cause `stop`, and the application, which stopped the
+server or saw it crash, decides what to send again. This drops what is
+built today for a stop: suspended jobs resumed at start,
+`ZSQL_RESUME_JOBS`, `zsql server stop --resume`, and a query's context
+kept on disk while it runs. The ten seconds' grace, the statuses and the
+sweep stay.
+
+### The API, in outline
+
+```
+POST   …/sources?kind=upload           a file → a source (and with dataset=true, a dataset over it)
+POST   …/sources/{id}/snapshots        a new file, or pushed rows
+PATCH  …/sources/{id}                  name, description, read options (a new version of them)
+GET    …/sources                       the explorer: kind, name, columns, last snapshot
+POST   …/runs                          a graph, its output dataset, a context, a run id
+POST   …/runs?check=true               a dry run
+POST   …/preview                       a graph and a node to stop at
+GET    …/runs/{id}                     a run, in flight or done, node by node
+GET    …/datasets/{id}/v/{k}           an output version, with its run record and graph
+```
+
+Datasets keep their routes, rows, lineage, blends and deletion; a blend
+reads a dataset's output whatever made it. Every answer that reads
+inputs (a run, a preview, a dry run) carries `reads`: each source and
+dataset, by kind and id, so the application checks one list against who
+is asking.
+
+### Deleting, and retention
+
+- Deleting a dataset deletes its outputs and run records. Its sources
+  stay.
+- Which sources no pipeline reads is the application's to know, since it
+  keeps the pipelines; 0sql deletes a source when asked, and a dataset
+  that read it fails its next run, saying so.
+- Snapshots kept per source are capped; a snapshot a dataset's live
+  output points to, or read, is never the one let go.
+
+### From today's datasets
+
+Today's dataset is a pipeline already, of one shape: a `source` node, a
+`steps` node with its recipe, an `edits` node, and the output. Its
+source becomes a source; its recipe, a graph the application sends;
+its `join` and `append` steps, `dataset` inputs; its edit log, edits
+inline by key; its cascade goes, since nothing runs unasked. Nothing is
+in production, so this is a rewrite of the store's layout, not a
+migration.
+
+### Settled, and open
+
+Settled with the user: datasets are what is browsed; sources are
+first-class and found in an explorer; an upload used as it is is one
+dataset over one source, copying nothing; a pipeline has one output;
+the application owns the graph, its ids, its versions, its edits and
+when it runs, and sends the context a run is under; 0sql checks and
+runs it, stores no context, resumes nothing and runs nothing unasked.
+
+Open: whether a source keeps the original file beside the parsed rows,
+to read it again with other options; incremental pulls (append past a
+cursor, or upsert by a key), left out of the first version, where a
+pull replaces; a pipeline with more than one output.
+
+Later: linking a dataset's columns to the model's fields; suggestions
+drawn from a run's own data ("37 blanks in owner, fill down?"); row
+diffs between output versions; `tool` sources.
+
 ## Phases
 
 - [x] **1. The core, fed by an upload.** `.datasets` under each project
@@ -776,3 +1038,8 @@ know about datasets.
   every model key asked for, cross joins, the cache. MCP went to "Later".
 - [x] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.
+- [ ] **9. Sources, datasets and pipelines** (planned above): resume
+  dropped first; sources and their snapshots, `push`; a run of a graph
+  sent, its checks, dry run and preview; zero-copy outputs; edits inline
+  by key; the output contract; the per-node run record, summaries and
+  profiles; the API; today's datasets rewritten to it.
