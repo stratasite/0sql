@@ -62,10 +62,14 @@ sized for. A source or a node that would pass the cap fails, saying so.
   scoping datasets per user was built first, and dropped on 2026-11-26
   for this: it duplicated the application's access control and fitted
   no sharing model.)
-- **A query source is read as a context.** A run pulls it under the
-  context the run was sent with, and its snapshot records that
-  context's fingerprint; a later run reads a snapshot only if it was
-  taken as its own context, and otherwise pulls. A dataset made from
+- **A query source is read as the statement it plans to.** A run plans
+  its spec under the context the run was sent with, before anything
+  else, and pulls it; its snapshot is kept under the key of that
+  statement (the SQL, the context folded in, and the datasource), as
+  the query cache answers only the same SQL. A later run reads a
+  snapshot only if its own spec plans to the same statement now, and
+  otherwise pulls: another context whose SQL differs, or a deploy that
+  changed a policy, pulls again. A dataset made from
   one holds that context's view, whoever the application then lets read
   the dataset; the application should say so before such a dataset is
   shared. The server never keeps a context.
@@ -121,7 +125,7 @@ shares and the blends that name it stay.
   .sources/src_7f3a…/        a source
     source.json                kind, name, read options, every version of them
     snapshots/<n>/             rows.arrow + manifest (columns, types, parse report,
-                               the context's fingerprint for a query)
+                               the key of the statement pulled, for a query)
   ds_91fc…/                  a dataset
     dataset.json               name, roles, live output version
     v<k>/                      an output: rows.arrow, or a pointer to a snapshot;
@@ -149,11 +153,14 @@ live version, or the version it names.
 - **A new snapshot runs nothing.** A new upload or a pull adds a
   snapshot; a dataset reading the source changes on its next run, when
   the application sends one.
-- **A query source keeps its spec, never a context.** A run pulls it
-  under the context the run was sent, and the snapshot records that
-  context's fingerprint. B's pipeline reading A's query source reads it
-  as B. A run that reads the latest snapshot rather than pulling reads
-  it only if the fingerprint is the run's own; otherwise it pulls.
+- **A query source keeps its spec, never a context.** A run plans and
+  pulls it under the context the run was sent, and the snapshot records
+  the key of the statement run. B's pipeline reading A's query source
+  reads it as B. A run that reads the latest snapshot rather than
+  pulling reads it only if the statement its spec plans to now is the
+  one the snapshot was taken by; otherwise it pulls. Who may read a
+  source's snapshots, through its rows routes or a dataset over it, is
+  the application's to decide, as with every other route.
 - **`push` comes before `tool`:** an agent calls a tool on its side and
   posts the rows, so 0sql calls out to nothing and holds no third
   party's credential. `tool` waits for a reason to call out.
@@ -183,7 +190,7 @@ in the order first seen, its type inferred as a file's is.
 A request is the graph, the output dataset it makes, the context, and a
 **run id** the application chooses. A run id sent again answers what the
 first one did, in flight or done, so a retry makes nothing twice. One run
-per output dataset at a time; another is `409 Busy`.
+per output dataset at a time; another is 409, class `Conflict`.
 
 The graph is nodes, each with the application's id, which 0sql never
 renames and keys everything it says by:
@@ -205,7 +212,8 @@ renames and keys everything it says by:
   than this, else read it and say how old it is). The run record says
   what each input read.
 - **First it is checked, whole,** before anything is pulled or written:
-  every query input plans under the context; every source and dataset
+  every query input plans under the context (a spec that does not is
+  refused, code `plan`); every source and dataset
   named exists; every node compiles, with the columns and types it
   makes; the output contract holds on the schema. A run refused says,
   by node id, every reason, typed, and where it can tell, a fix: a
@@ -246,8 +254,10 @@ An edit names its rows by value, the key columns of the rows at its node
 ("where `store_id` = 17, set `region` to West"), not by position, so it
 holds when what is upstream changes. An `edits` node names its key; a key
 that is not unique where the node is fails the run. The run record says
-of each edit whether it applied, found no row (orphaned), or found its
-value already changed upstream (flagged). Where to put the node, and
+of each edit whether it applied, found no row (orphaned), found several
+rows (ambiguous), found its value already changed upstream (flagged), or
+met another edit of the same cell (conflict). A remap names values, not
+rows, so it is always recorded applied. Where to put the node, and
 moving it, is the application's.
 
 Edits apply in the order the node lists them: a row deleted and then
@@ -497,15 +507,16 @@ POST   /projects/{uid}/branches/{branch}/blend
 
 - **A run** answers its record: 200 when it is over, whatever it came
   to; 202 while it pulls or runs, past its `wait` (30 seconds unless it
-  says, at most 300), and `GET /runs/{id}` reads it after. A graph
+  says, at most 80, inside the prep deadline), and `GET /runs/{id}` reads it after. A graph
   refused before it runs is 422, class `Refused`, with `problems`, each
   of its node; nothing is recorded, since nothing ran. A run id sent
   with another graph, dataset or context is 409; a dataset a run is
   making answers another 409.
 - **A preview** answers its node's columns and rows, the record of each
   node it ran, its problems, `reads` and `inputs`. A query source it
-  reads with no snapshot of its context is pulled first, joining a run
-  of that query already going or kept; past its `wait` (10 seconds) it
+  reads with no snapshot of the statement it plans to is pulled first,
+  joining a run of that query already going or kept, and read while the
+  preview runs; it keeps nothing. Past its `wait` (10 seconds) it
   answers 202, and the same request again is answered when the
   warehouse is done.
 
@@ -520,7 +531,7 @@ Every output records what made it:
   push said of its origin;
 - for each dataset read, by node: its id and output version;
 - for each query snapshot: the branch, the deploy, the spec, the planned
-  SQL's hash, a fingerprint of the context, and the model field of each
+  SQL's hash, the key of the statement, and the model field of each
   column (not the run's result id, which expires with the cache);
 - the column roles;
 - the versions of the server, the compiler and DuckDB;
@@ -715,7 +726,9 @@ The data directory keeps the layout it has ("What is on disk" in
   `datasets/<org>/<project>/sources/<id>/`: a backup, read back only by
   a restore (`POST /datasets/restore`, for the org, bringing back every
   source and dataset the store has whole and this node does not, the
-  sources first). What is immutable is sent once; the manifest every
+  sources first). A file is sent once, and again only if its size or
+  modified time changed (a version's manifest does, when the source it
+  pointed at is deleted and its rows copied in); the manifest every
   time, and last, so one in the store is whole once it is there. A
   failed copy is retried, does not fail the job, and the manifest's
   `backup` says it is not backed up. A delete removes the copy.
@@ -729,7 +742,8 @@ spill directory of its own under `.cache/prep`, removed when it closes:
 DuckDB names its spill files alike in every instance, so sessions
 sharing one would read and delete each other's. One run makes a
 dataset at a time, and one job takes a snapshot of a source at a time; a
-second is told it is busy. The caps are
+second upload is told it is busy, and a second run's pull waits its turn
+(two minutes at most) rather than lose what it pulled. The caps are
 `ZSQL_DATASET_MAX_ROWS` (a million) and `ZSQL_DATASET_MAX_BYTES`
 (256 MB).
 
@@ -775,8 +789,9 @@ or a stop does to the jobs running is said on what they worked on.
   the server, so it was not run again. Send it again."). A run's record
   says `interrupted`, and so does its dataset's `last_run`. The next job
   on it ends it.
-- **A stop gives running jobs ten seconds,** then stops the rest and
-  keeps them as *suspended*; the next start marks each `interrupted`,
+- **A stop gives running jobs ten seconds,** in which a run already
+  started may still keep what it pulls and finish, or fail and be
+  recorded failed; then it stops the rest and keeps them as *suspended*; the next start marks each `interrupted`,
   with `"cause": "stop"`. **Nothing is resumed:** the application stopped
   the server, and it decides what to send again. A run sent again under
   its id answers its interrupted record; a new id runs it.

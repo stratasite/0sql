@@ -44,11 +44,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zsql_exec::{Record, Status};
-use zsql_prep::{Arrived, CsvOptions, Graph, Named, Prep, Pull, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
+use zsql_prep::{Arrived, CsvOptions, Graph, Keys, Named, Prep, Pull, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
 use zsql_spec::SecurityContext;
 
 impl From<zsql_prep::Error> for ApiError {
@@ -464,7 +463,9 @@ pub(crate) async fn version(
 /// How long a run's request waits before it is answered 202, unless it
 /// says: and the most it may say.
 const WAIT: Duration = Duration::from_secs(30);
-const WAIT_MAX: Duration = Duration::from_secs(300);
+/// Under the prep class's 90s deadline, so the answer is always this
+/// route's own 202 and never the guard's 503.
+const WAIT_MAX: Duration = Duration::from_secs(80);
 
 /// How long a pull is waited on, after its request was answered.
 const PULL_LIMIT: Duration = Duration::from_secs(3600);
@@ -492,10 +493,23 @@ pub(crate) struct RunQuery {
     check: bool,
 }
 
-/// The fingerprint of the context a run is sent with: what its query
-/// sources' snapshots are kept under, and read only as.
-fn fingerprint(context: &Option<SecurityContext>) -> String {
-    zsql_exec::sha256(&serde_json::to_string(context).unwrap_or_default())
+/// What each query source of a graph plans to under the context sent:
+/// the key its snapshots are kept under and read only by, as the query
+/// cache answers only the same SQL, or why it does not plan. Planned
+/// before the graph is checked, so a spec that does not plan is
+/// refused before anything is pulled.
+async fn keys(app: &Shared, prep: &Arc<Prep>, scope: &Scope, graph: &Graph, context: &Option<SecurityContext>) -> Result<Keys, ApiError> {
+    let (app, prep, scope, graph, context) = (app.clone(), prep.clone(), scope.clone(), graph.clone(), context.clone());
+    blocking(move || {
+        let mut keys = Keys::new(zsql_exec::sha256(&serde_json::to_string(&context).unwrap_or_default()));
+        for (source, q) in prep.query_sources(&scope, &graph) {
+            let planned = crate::names::check_branch(&q.branch)
+                .and_then(|()| crate::exec::plan_spec(&app, (&scope.org, &scope.project, &q.branch), (q.spec, q.expr), context.clone()));
+            keys = keys.with(source, planned.map(|(ds, sql)| zsql_prep::query_key(&ds, &sql)).map_err(|e| e.2));
+        }
+        Ok(keys)
+    })
+    .await
 }
 
 fn wait_of(wait: Option<f64>) -> Result<Duration, ApiError> {
@@ -520,19 +534,19 @@ pub(crate) async fn run(
     Input(body): Input<RunBody>,
 ) -> Result<Response, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
-    let print = fingerprint(&body.context);
+    let keys = keys(&app, &prep, &scope, &body.graph, &body.context).await?;
     if q.check {
         let graph = body.graph;
-        return blocking(move || Ok(Json(shown(&prep.check(&scope, &graph, &print)?)).into_response())).await;
+        return blocking(move || Ok(Json(shown(&prep.check(&scope, &graph, &keys)?)).into_response())).await;
     }
     let (Some(id), Some(dataset)) = (body.id.clone(), body.dataset.clone()) else {
         return Err(invalid("a run says its id, which a retry sends again, and the dataset it makes"));
     };
     let wait = wait_of(body.wait)?;
     let begun = {
-        let (prep, scope, print) = (prep.clone(), scope.clone(), print.clone());
+        let (prep, scope) = (prep.clone(), scope.clone());
         let request = zsql_prep::RunRequest { id: id.clone(), dataset, graph: body.graph };
-        blocking(move || Ok(prep.begin(&scope, request, &print))).await?
+        blocking(move || Ok(prep.begin(&scope, request, &keys))).await?
     };
     let ticket = match begun {
         Ok(zsql_prep::Begun::Answered(r)) => return Ok(answered(&r)),
@@ -616,7 +630,6 @@ async fn pull(
     fresh: bool,
 ) -> Result<Arrived, ApiError> {
     crate::names::check_branch(&p.query.branch)?;
-    let fingerprint = fingerprint(&context);
     let (record, _, _) = {
         let (app, org, uid, q) = (app.clone(), scope.org.clone(), scope.project.clone(), p.query.clone());
         blocking(move || crate::exec::submit_spec(&app, (&org, &uid, &q.branch), (q.spec, q.expr), context, connection, Some(0.0), fresh))
@@ -630,12 +643,12 @@ async fn pull(
             format!("{} is still running in the warehouse (result {}); send the same request again", p.name, record.id),
         ));
     }
-    arrived(app, scope, &p.query, record, fingerprint).await
+    arrived(app, scope, &p.query, record).await
 }
 
 /// A finished run's rows, with the model's role and field for each
 /// column that is one.
-async fn arrived(app: &Shared, scope: &Scope, query: &Query, record: Record, fingerprint: String) -> Result<Arrived, ApiError> {
+async fn arrived(app: &Shared, scope: &Scope, query: &Query, record: Record) -> Result<Arrived, ApiError> {
     if record.status != Status::Succeeded {
         let why = record.error.clone().unwrap_or_else(|| format!("{:?}", record.status).to_lowercase());
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable", format!("the query did not succeed: {why}")));
@@ -666,7 +679,9 @@ async fn arrived(app: &Shared, scope: &Scope, query: &Query, record: Record, fin
             spec: record.spec.clone(),
             expr: record.expr.clone(),
             sql_sha256: zsql_exec::sha256(&record.sql),
-            context: fingerprint,
+            // Kept under the key of the statement run, which a later
+            // run's spec must plan to again to read it.
+            context: zsql_prep::query_key(&record.datasource_uid, &record.sql),
             fields,
         };
         Ok(Arrived { rows, roles, read })
@@ -711,19 +726,20 @@ pub(crate) async fn preview(
     Input(body): Input<PreviewBody>,
 ) -> Result<Response, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
-    let print = fingerprint(&body.context);
+    let keys = keys(&app, &prep, &scope, &body.graph, &body.context).await?;
     let wait = body.wait.map(|w| wait_of(Some(w))).transpose()?.unwrap_or(PREVIEW_WAIT);
     let request = zsql_prep::PreviewRequest { graph: body.graph, node: body.node, whole: body.whole, limit: body.limit };
     let pulls = {
-        let (prep, scope, print, request) = (prep.clone(), scope.clone(), print.clone(), request.clone());
-        match blocking(move || Ok(prep.preview_pulls(&scope, &request, &print))).await? {
+        let (prep, scope, keys, request) = (prep.clone(), scope.clone(), keys.clone(), request.clone());
+        match blocking(move || Ok(prep.preview_pulls(&scope, &request, &keys))).await? {
             Ok(p) => p,
             Err(e) => return Ok(refusal(e)),
         }
     };
-    // A query source not taken as this context is pulled first, as a
-    // run would; the snapshot is kept, and the preview reads it.
-    let mut pulled = HashMap::new();
+    // A query source with no snapshot of the statement it plans to is
+    // pulled first, as a run would; the preview reads the rows, and
+    // keeps nothing.
+    let mut pulled = Vec::new();
     for p in &pulls {
         let arrived = match pull(&app, &scope, p, body.context.clone(), body.connection.clone(), wait, false).await {
             Ok(a) => a,
@@ -732,12 +748,10 @@ pub(crate) async fn preview(
             }
             Err(e) => return Err(e),
         };
-        let (prep, scope, source) = (prep.clone(), scope.clone(), p.source.clone());
-        let (_, snap) = blocking(move || Ok(prep.pulled(&scope, &source, arrived)?)).await?;
-        pulled.insert(p.source.clone(), snap.number);
+        pulled.push((p.source.clone(), arrived));
     }
     blocking(move || {
-        let p = match prep.preview(&scope, &request, &print, &pulled) {
+        let p = match prep.preview(&scope, &request, &keys, pulled) {
             Ok(p) => p,
             Err(e) => return Ok(refusal(e)),
         };

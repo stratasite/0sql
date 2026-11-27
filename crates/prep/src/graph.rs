@@ -193,8 +193,11 @@ pub enum Code {
     MissingColumn,
     /// What an input reads does not fit it.
     Read,
-    /// A snapshot named was taken as another context.
+    /// A snapshot named was taken by another statement than its spec
+    /// plans to now: another context, or another deploy.
     Context,
+    /// A query source's spec does not plan.
+    Plan,
     /// The data will not have it: a value that does not convert, a key
     /// that repeats.
     Data,

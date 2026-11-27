@@ -138,7 +138,7 @@ fn bench() {
     for k in 0..2 {
         let t = Instant::now();
         let request = RunRequest { id: format!("bench-{k}"), dataset: d.id.clone(), graph: g.clone() };
-        let r = match prep.begin(&scope, request, "ctx").unwrap() {
+        let r = match prep.begin(&scope, request, &Keys::new("ctx")).unwrap() {
             Begun::Started(t) => prep.execute(*t),
             Begun::Answered(r) => *r,
         };
@@ -160,7 +160,7 @@ fn bench() {
     for (node, whole) in [(None, false), (Some("clean"), false), (Some("j"), false), (Some("fix"), true)] {
         let t = Instant::now();
         let request = PreviewRequest { graph: g.clone(), node: node.map(str::to_string), whole, limit: None };
-        let p = prep.preview(&scope, &request, "ctx", &HashMap::new()).unwrap();
+        let p = prep.preview(&scope, &request, &Keys::new("ctx"), Vec::new()).unwrap();
         assert!(p.problems.is_empty(), "{:?}", p.problems);
         timed(&format!("preview {} {}", node.unwrap_or("output"), if whole { "(whole)" } else { "(sample)" }), t);
         let mut v = json!({ "node": p.node, "nodes": p.nodes, "rows": zsql_exec::json::rows(&p.rows).unwrap() });
@@ -176,12 +176,12 @@ fn bench() {
     timed("upload (second snapshot)", t);
     let t = Instant::now();
     let request = PreviewRequest { graph: g.clone(), node: Some("clean".into()), whole: false, limit: None };
-    let p = prep.preview(&scope, &request, "ctx", &HashMap::new()).unwrap();
+    let p = prep.preview(&scope, &request, &Keys::new("ctx"), Vec::new()).unwrap();
     timed("preview refused (overlaps)", t);
     assert!(!p.problems.is_empty());
     out.push(serde_json::to_value(&p.problems).unwrap());
     let t = Instant::now();
-    let c = prep.check(&scope, &g, "ctx").unwrap();
+    let c = prep.check(&scope, &g, &Keys::new("ctx")).unwrap();
     timed("check refused (overlaps)", t);
     let mut v = serde_json::to_value(&c).unwrap();
     timeless(&mut v);

@@ -160,18 +160,18 @@ impl Prep {
     /// A new snapshot of an upload source, from a new file.
     pub fn add_upload(&self, scope: &Scope, id: &str, upload: Upload<'_>) -> Result<(Source, Snapshot)> {
         self.check_bytes(upload.bytes.len())?;
-        self.add_snapshot(scope, id, Kind::Upload, recovery::JobKind::Upload, |prep, dir, s| prep.take_upload(dir, s, &upload))
+        self.add_snapshot(scope, id, Kind::Upload, (recovery::JobKind::Upload, false), |prep, dir, s| prep.take_upload(dir, s, &upload))
     }
 
     /// A new snapshot of a push source, from rows posted.
     pub fn add_push(&self, scope: &Scope, id: &str, pushed: Pushed) -> Result<(Source, Snapshot)> {
-        self.add_snapshot(scope, id, Kind::Push, recovery::JobKind::Push, |prep, dir, s| prep.take_push(dir, s, &pushed))
+        self.add_snapshot(scope, id, Kind::Push, (recovery::JobKind::Push, false), |prep, dir, s| prep.take_push(dir, s, &pushed))
     }
 
-    /// A new snapshot of a query source, from the rows a pull returned,
-    /// with the fingerprint of the context it ran under.
-    pub fn pulled(&self, scope: &Scope, id: &str, arrived: Arrived) -> Result<(Source, Snapshot)> {
-        self.add_snapshot(scope, id, Kind::Query, recovery::JobKind::Pull, |prep, dir, s| prep.take_rows(dir, s, &arrived))
+    /// A new snapshot of a query source, from the rows a run's pull
+    /// returned, kept under the key of the statement it ran.
+    pub(crate) fn pulled(&self, scope: &Scope, id: &str, arrived: Arrived) -> Result<(Source, Snapshot)> {
+        self.add_snapshot(scope, id, Kind::Query, (recovery::JobKind::Pull, true), |prep, dir, s| prep.take_rows(dir, s, &arrived))
     }
 
     fn add_snapshot(
@@ -179,11 +179,11 @@ impl Prep {
         scope: &Scope,
         id: &str,
         kind: Kind,
-        job: recovery::JobKind,
+        (job, for_run): (recovery::JobKind, bool),
         take: impl FnOnce(&Prep, &Path, &mut Source) -> Result<Snapshot>,
     ) -> Result<(Source, Snapshot)> {
         let (dir, _) = self.find_source(scope, id)?;
-        let held = self.job(&dir, job)?;
+        let held = if for_run { self.run_job(&dir, job)? } else { self.job(&dir, job)? };
         let (_, mut s) = self.find_source(scope, id)?;
         if s.kind != kind {
             let how = match s.kind {

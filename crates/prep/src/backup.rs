@@ -2,8 +2,10 @@
 //! under `datasets/<org>/<project>/<id>/` there, and each source's under
 //! `datasets/<org>/<project>/sources/<id>/`, read back only by a restore.
 //!
-//! What either has is immutable but for its manifest, so a copy sends
-//! what it has not sent before and the manifest last: one in the store
+//! A copy sends what is new or changed since it last sent it (a file
+//! is known by its size and modified time; most never change, and a
+//! version's manifest does when a source it pointed at is deleted and
+//! its rows copied in), and the manifest last: one in the store
 //! is whole once its manifest is there, and a restore takes only those.
 //! A copy that fails is tried again, and then the dataset or source
 //! says it is not backed up; the job it followed has still succeeded. A
@@ -12,15 +14,15 @@
 use crate::error::{Error, Result};
 use crate::store;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zsql_exec::Objects;
 
 /// Where datasets go in the store.
 pub const PREFIX: &str = "datasets";
 
-/// The files sent already, kept beside them, so a copy sends only what
-/// is new.
+/// The files sent already, each with its size and modified time, kept
+/// beside them, so a copy sends only what is new or changed.
 const SENT: &str = ".backed-up.json";
 
 /// The files that change: sent every time.
@@ -103,6 +105,13 @@ fn files(dir: &Path) -> Vec<String> {
     out
 }
 
+/// A file as a copy knows it: its size and when it was last written.
+fn stamp(file: &Path) -> String {
+    let Ok(m) = std::fs::metadata(file) else { return String::new() };
+    let at = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}:{at}", m.len())
+}
+
 fn key(org: &str, project: &str, below: &[String], rel: &str) -> Vec<String> {
     let mut k = vec![PREFIX.to_string(), org.to_string(), project.to_string()];
     k.extend(below.iter().cloned());
@@ -122,14 +131,17 @@ pub(crate) fn copy(objects: &Objects, dir: &Path) -> Result<()> {
     let (org, project, below, manifest) =
         names_of(dir).ok_or_else(|| Error::Internal(format!("{} is not a dataset's or a source's directory", dir.display())))?;
     let sent_path = dir.join(SENT);
-    let mut sent: BTreeSet<String> = store::read_json(&sent_path).unwrap_or_default();
-    for rel in files(dir) {
-        if rel == manifest || (sent.contains(&rel) && !CHANGING.contains(&rel.as_str())) {
+    let mut sent: BTreeMap<String, String> = store::read_json(&sent_path).unwrap_or_default();
+    let here = files(dir);
+    sent.retain(|rel, _| here.contains(rel));
+    for rel in here {
+        let stamp = stamp(&dir.join(&rel));
+        if rel == manifest || (sent.get(&rel) == Some(&stamp) && !CHANGING.contains(&rel.as_str())) {
             continue;
         }
         put(objects, &key(&org, &project, &below, &rel), &dir.join(&rel))?;
         if !CHANGING.contains(&rel.as_str()) {
-            sent.insert(rel);
+            sent.insert(rel, stamp);
         }
     }
     store::write_json(&sent_path, &sent)?;
@@ -187,7 +199,15 @@ pub(crate) fn restore(objects: &Objects, data_dir: &Path, org: &str) -> Result<V
                 store::write_file(&staging.join(rel.join("/")), &bytes)?;
             }
             // What was sent is what is here: a later copy sends nothing again.
-            let sent: BTreeSet<String> = rels.iter().map(|r| r.join("/")).filter(|r| !CHANGING.contains(&r.as_str())).collect();
+            let sent: BTreeMap<String, String> = rels
+                .iter()
+                .map(|r| r.join("/"))
+                .filter(|r| !CHANGING.contains(&r.as_str()))
+                .map(|r| {
+                    let at = stamp(&staging.join(&r));
+                    (r, at)
+                })
+                .collect();
             store::write_json(&staging.join(SENT), &sent)?;
             std::fs::rename(&staging, &target).map_err(|e| Error::io(&target, e))
         })();

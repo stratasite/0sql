@@ -70,7 +70,9 @@ pub(crate) fn classify(path: &str) -> Class {
         // itself is the model's, and cheap.
         ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
         ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] | ["cache", "invalidate"] => Class::Run,
-        ["projects", _, "datasets", ..] | ["projects", _, "branches", _, "blend"] | ["datasets", ..] => Class::Prep,
+        ["projects", _, "datasets" | "sources" | "runs" | "preview", ..] | ["projects", _, "branches", _, "blend"] | ["datasets", ..] => {
+            Class::Prep
+        }
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route
@@ -209,6 +211,11 @@ mod tests {
             ("/datasets", Prep),
             ("/datasets/restore", Prep),
             ("/projects/a/branches/main/blend", Prep),
+            ("/projects/a/sources", Prep),
+            ("/projects/a/sources/src_1/snapshots", Prep),
+            ("/projects/a/runs", Prep),
+            ("/projects/a/runs/r-1", Prep),
+            ("/projects/a/preview", Prep),
         ] {
             assert_eq!(classify(p), want, "{p}");
             // Under an org a route costs what it costs without one.

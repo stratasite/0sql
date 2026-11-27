@@ -266,13 +266,20 @@ async fn a_query_source_is_pulled_by_a_run() {
     assert_eq!(a.body["inputs"][0]["will"], "read", "{}", a.body);
     let a = s.post_json(&format!("/projects/{CS}/preview"), json!({ "graph": graph, "connection": connection })).await;
     assert_eq!(a.body["rows"].as_array().unwrap().len(), 3, "{}", a.body);
-    // A query the planner refuses fails the run, saying so.
+    // A query the planner refuses is refused before anything is pulled,
+    // by node, and nothing is recorded.
     let a = s.post_json(&format!("/projects/{CS}/sources?kind=query"), json!({ "branch": "main", "expr": "nothing_by_this_name" })).await;
     let bad = a.body["source"]["id"].as_str().unwrap().to_string();
     let g = json!({ "nodes": [{ "id": "x", "kind": "source", "source": bad }, { "id": "out", "kind": "output", "input": "x" }] });
     let a = s.post_json(&format!("/projects/{CS}/runs"), json!({ "id": "q-3", "dataset": id, "graph": g, "connection": connection })).await;
-    assert_eq!(a.body["state"], "failed", "{}", a.body);
-    assert!(a.body["error"].as_str().unwrap().starts_with("pulling query on main"), "{}", a.body);
+    assert_eq!((a.status, a.class()), (StatusCode::UNPROCESSABLE_ENTITY, "Refused"), "{}", a.body);
+    assert_eq!((a.body["problems"][0]["node"].as_str(), a.body["problems"][0]["code"].as_str()), (Some("x"), Some("plan")), "{}", a.body);
+    assert_eq!(s.call(Method::GET, &format!("/projects/{CS}/runs/q-3")).await.status, StatusCode::NOT_FOUND);
+    let a = s.post_json(&format!("/projects/{CS}/runs?check=true"), json!({ "graph": g })).await;
+    assert_eq!(a.body["ok"], false, "{}", a.body);
+    // The preview kept nothing: the one snapshot is the run's.
+    let a = s.call(Method::GET, &format!("/projects/{CS}/sources/{src}/snapshots")).await;
+    assert_eq!(a.body["snapshots"].as_array().unwrap().len(), 1, "{}", a.body);
     let a = s.post_json(&format!("/projects/{CS}/sources?kind=query"), json!({ "branch": "../x", "expr": "revenue" })).await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
 }

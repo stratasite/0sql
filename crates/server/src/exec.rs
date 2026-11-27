@@ -120,11 +120,23 @@ pub(crate) fn page_of(offset: Option<u64>, limit: Option<u64>) -> Result<(u64, u
 
 /// Plans the request and hands its statement to the runs. What comes
 /// back is the record, how the request was met, and how long to wait.
-fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> Result<(Record, How, Duration), ApiError> {
+/// A request planned: its statement, where it runs, and its limit.
+struct Planned {
+    model: std::sync::Arc<zsql_core::Model>,
+    spec: Option<Value>,
+    sql: String,
+    datasource: String,
+    row_limit: Option<u64>,
+}
+
+fn plan(app: &Shared, (org, uid, branch): (&str, &str, &str), req: &RunRequest) -> Result<Planned, ApiError> {
     let model = app.model(org, uid, branch)?;
     check_expr(req.expr.as_deref())?;
-    let planned =
-        model.plan_request(SqlRequest { spec: req.spec.clone(), expr: req.expr.clone(), context: req.context }, false, &shape_check)?;
+    let planned = model.plan_request(
+        SqlRequest { spec: req.spec.clone(), expr: req.expr.clone(), context: req.context.clone() },
+        false,
+        &shape_check,
+    )?;
     let dialect = app.dialects.get(&planned.plan.adapter).map_err(zsql_core::Error::from)?;
     // The caller's limit, or the server's default when it was given one.
     // With neither, the statement has no limit and returns every row:
@@ -132,6 +144,25 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
     let row_limit = planned.limit.or(app.default_sql_limit);
     let sql = planned.plan.sql_with_limit(row_limit, &dialect).map_err(zsql_core::Error::from)?;
     let datasource = planned.plan.datasource_uid.clone();
+    Ok(Planned { model, spec: planned.spec, sql, datasource, row_limit })
+}
+
+/// A spec planned under a context, and not run: the statement it would
+/// run and the datasource it would run on. What a data prep run keys a
+/// query source's snapshots by.
+pub(crate) fn plan_spec(
+    app: &Shared,
+    (org, uid, branch): (&str, &str, &str),
+    (spec, expr): (Option<Value>, Option<String>),
+    context: Option<SecurityContext>,
+) -> Result<(String, String), ApiError> {
+    let req = RunRequest { spec, expr, context, ..RunRequest::default() };
+    let p = plan(app, (org, uid, branch), &req)?;
+    Ok((p.datasource, p.sql))
+}
+
+fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> Result<(Record, How, Duration), ApiError> {
+    let Planned { model, spec, sql, datasource, row_limit } = plan(app, (org, uid, branch), &req)?;
 
     let (mut conn, secrets) = connection_of(app, (org, uid, branch), &datasource, None, &req.connection, None)?;
     // What a statement may do is the database's to say, through the
@@ -152,7 +183,7 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
             datasource_uid: datasource.clone(),
             tables: model.tables_read(&datasource, &sql),
             sql,
-            spec: planned.spec.or(req.spec),
+            spec: spec.or(req.spec),
             expr: req.expr,
             row_limit,
             cache_key,

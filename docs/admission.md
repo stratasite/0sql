@@ -35,7 +35,7 @@ Acquired with a short timeout; past it the answer is `503 Busy` with
 |---|---|---|---|
 | heavy | deploy, validate, test | 2 | 5 s |
 | probe | a datasource's tables and one table's structure: `POST .../datasources/{ds}/tables` and `.../tables/{table}` | cores × 2 | 1 s |
-| prep | datasets: `/projects/{uid}/datasets/...` and `DELETE /datasets` | cores ÷ 2, at least 2 | 1 s |
+| prep | data prep: `/projects/{uid}/datasets/...`, `/sources/...`, `/runs/...`, `/preview`, `/branches/{b}/blend`, `/datasets/restore` | cores ÷ 2, at least 2 | 1 s |
 | explore | explore, fields, and the `fields` and `explore` MCP tools | cores | 1 s |
 | plan | everything else: sql, explain, tables, values, branch summary, projects, removal, `POST /mcp` | cores × 4 | 1 s |
 

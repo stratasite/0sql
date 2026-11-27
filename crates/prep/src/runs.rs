@@ -41,6 +41,42 @@ pub struct Pull {
     pub nodes: Vec<String>,
 }
 
+/// What each query source of a graph is read and pulled as.
+///
+/// A query snapshot is kept under the key of the statement its spec
+/// planned to: the SQL, the context folded into it, and the datasource
+/// it runs on. A run reads a snapshot only if it was taken by the same
+/// statement its own spec plans to now, as the query cache answers only
+/// the same SQL; a new deploy or another context that changes the SQL
+/// pulls again. The server plans each query source before a run is
+/// checked, so a spec that does not plan is refused before anything is
+/// pulled.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Keys {
+    /// The hash of the context a run was sent with, for its record.
+    pub context: String,
+    /// Each query source, to the key of what it plans to, or why it does
+    /// not plan.
+    pub sources: BTreeMap<String, std::result::Result<String, String>>,
+}
+
+impl Keys {
+    pub fn new(context: impl Into<String>) -> Keys {
+        Keys { context: context.into(), sources: BTreeMap::new() }
+    }
+
+    /// A source's key, as planned.
+    pub fn with(mut self, source: impl Into<String>, key: std::result::Result<String, String>) -> Keys {
+        self.sources.insert(source.into(), key);
+        self
+    }
+}
+
+/// The key a query snapshot is kept under: of the statement and where it runs.
+pub fn query_key(datasource: &str, sql: &str) -> String {
+    sha256(format!("{datasource}\n{sql}").as_bytes())
+}
+
 /// A run under way: what it pulls, then what it runs. Handed to the
 /// server, which pulls, and back to [`Prep::execute`].
 pub struct Ticket {
@@ -48,13 +84,32 @@ pub struct Ticket {
     pub id: String,
     dir: PathBuf,
     graph: Graph,
-    fingerprint: String,
+    keys: Keys,
     started: String,
     request: String,
     /// The pulls it waits on.
     pub pulls: Vec<Pull>,
-    /// What each pull made: source to snapshot.
-    pulled: HashMap<String, u32>,
+    /// What each pull made, by source.
+    pulled: HashMap<String, Took>,
+}
+
+/// What a pull made, for the run or preview that reads it: a snapshot
+/// kept, or for a preview one held only while it runs.
+#[derive(Clone)]
+pub(crate) struct Took {
+    snap: Snapshot,
+    rows: PathBuf,
+    kept: bool,
+}
+
+/// A directory a preview's pulls are held in while it runs, removed
+/// when it is done.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// What asking for a run came to.
@@ -146,17 +201,9 @@ fn reads_of(graph: &Graph) -> Vec<ReadRef> {
 
 impl Prep {
     /// What each input node of `order` reads, as `read` says, for a run
-    /// under the context `fingerprint` names. `pulled` is what a run's
+    /// with the query keys `keys` holds. `pulled` is what a run's
     /// pulls made, source to snapshot.
-    fn resolve(
-        &self,
-        scope: &Scope,
-        graph: &Graph,
-        order: &[usize],
-        fingerprint: &str,
-        mode: Mode,
-        pulled: &HashMap<String, u32>,
-    ) -> Resolved {
+    fn resolve(&self, scope: &Scope, graph: &Graph, order: &[usize], keys: &Keys, mode: Mode, pulled: &HashMap<String, Took>) -> Resolved {
         let mut r = Resolved {
             loaded: HashMap::new(),
             inputs: Vec::new(),
@@ -169,7 +216,7 @@ impl Prep {
         for &k in order {
             match &graph.nodes[k] {
                 Node::Source { id, source, read, types, .. } => {
-                    self.resolve_source(scope, &mut r, k, (id, source, *read, types), (fingerprint, mode), pulled)
+                    self.resolve_source(scope, &mut r, k, (id, source, *read, types), (keys, mode), pulled)
                 }
                 Node::Dataset { id, dataset, read, .. } => self.resolve_dataset(scope, &mut r, k, (id, dataset, *read)),
                 _ => {}
@@ -256,8 +303,8 @@ impl Prep {
         r: &mut Resolved,
         k: usize,
         (id, source, read, types): (&str, &str, Read, &BTreeMap<String, ColumnType>),
-        (fingerprint, mode): (&str, Mode),
-        pulled: &HashMap<String, u32>,
+        (keys, mode): (&Keys, Mode),
+        pulled: &HashMap<String, Took>,
     ) {
         let bad = |code: Code, m: String| Problem::new(Some(id), code, m);
         let (dir, s) = match self.find_source(scope, source) {
@@ -268,12 +315,27 @@ impl Prep {
             }
         };
         let manifest = |n: u32| store::read_json::<Snapshot>(&store::snapshot_dir(&dir, n).join("manifest.json")).ok();
-        let mine = |snap: &Snapshot| snap.semantic.as_ref().is_some_and(|x| x.context == fingerprint);
+        // A query source's snapshot is its own only when taken by the
+        // statement its spec plans to now.
+        let key = match (s.kind, keys.sources.get(source)) {
+            (Kind::Query, Some(Ok(key))) => Some(key.as_str()),
+            (Kind::Query, Some(Err(why))) => {
+                r.problems.push(bad(Code::Plan, format!("source {} does not plan: {why}", s.name)));
+                return;
+            }
+            (Kind::Query, None) => {
+                r.problems.push(bad(Code::Plan, format!("source {} was not planned before the run", s.name)));
+                return;
+            }
+            _ => None,
+        };
+        let mine = |snap: &Snapshot| snap.semantic.as_ref().is_some_and(|x| Some(x.context.as_str()) == key);
         let newest_mine = || (1..=s.snapshot).rev().filter_map(manifest).find(mine);
         // What it reads, or none when it is pulled first; and why.
-        let pulled_here = pulled.get(source).copied().filter(|_| !matches!(read, Read::Snapshot(_)));
-        let (chosen, will, why): (Option<Snapshot>, Will, String) = if let Some(n) = pulled_here {
-            (manifest(n), Will::Pull, "pulled for this run, as this context".into())
+        let pulled_here = pulled.get(source).filter(|_| !matches!(read, Read::Snapshot(_)));
+        let (chosen, will, why): (Option<Snapshot>, Will, String) = if let Some(t) = pulled_here {
+            let why = if t.kept { "pulled for this run" } else { "pulled for this preview, and kept nowhere" };
+            (Some(t.snap.clone()), Will::Pull, why.into())
         } else {
             match (s.kind, read) {
                 (_, Read::Version(_)) => {
@@ -284,7 +346,10 @@ impl Prep {
                     Some(snap) if s.kind == Kind::Query && !mine(&snap) => {
                         r.problems.push(bad(
                             Code::Context,
-                            format!("snapshot {n} of {} was taken as another context, and a run reads only its own", s.name),
+                            format!(
+                                "snapshot {n} of {} was taken by another statement than its spec plans to now (another context or deploy); a run reads only its own",
+                                s.name
+                            ),
                         ));
                         return;
                     }
@@ -302,19 +367,23 @@ impl Prep {
                             (
                                 None,
                                 Will::Pull,
-                                format!("its newest snapshot as this context is {} old, more than {}", record::age(a), record::age(max)),
+                                format!("its newest snapshot of this statement is {} old, more than {}", record::age(a), record::age(max)),
                             )
                         } else {
                             let n = snap.number;
-                            (Some(snap), Will::Read, format!("snapshot {n}, taken as this context {} ago", record::age(a)))
+                            (Some(snap), Will::Read, format!("snapshot {n}, taken by this statement {} ago", record::age(a)))
                         }
                     }
                     (_, Some(snap), _) => {
                         let n = snap.number;
-                        (Some(snap), Will::Read, format!("snapshot {n}, the newest taken as this context"))
+                        (Some(snap), Will::Read, format!("snapshot {n}, the newest taken by this statement"))
                     }
                     (_, None, _) if s.snapshot == 0 => (None, Will::Pull, "it has never been pulled".into()),
-                    (_, None, _) => (None, Will::Pull, "its snapshots were taken as other contexts".into()),
+                    (_, None, _) => {
+                        let last = manifest(s.snapshot).and_then(|m| time::age_secs(&m.taken));
+                        let ago = last.map(|a| format!(", last pulled {} ago", record::age(a))).unwrap_or_default();
+                        (None, Will::Pull, format!("its snapshots were taken by other statements (another context or deploy){ago}"))
+                    }
                 },
                 (_, Read::Pull) => {
                     let how = if s.kind == Kind::Upload { "send it a new file" } else { "post it new rows" };
@@ -380,18 +449,13 @@ impl Prep {
             Some(f) => format!("{f} (source {}, snapshot {}{age})", s.name, snap.number),
             None => format!("source {} (snapshot {}{age})", s.name, snap.number),
         };
-        r.loaded.insert(
-            k,
-            pipeline::Loaded {
-                rows: store::snapshot_dir(&dir, snap.number).join(store::ROWS),
-                columns: snap.columns.clone(),
-                origin: s.id.clone(),
-                types: all_types,
-                said,
-                previous,
-            },
-        );
-        if !provisional {
+        let rows = match pulled_here {
+            Some(t) => t.rows.clone(),
+            None => store::snapshot_dir(&dir, snap.number).join(store::ROWS),
+        };
+        r.loaded
+            .insert(k, pipeline::Loaded { rows, columns: snap.columns.clone(), origin: s.id.clone(), types: all_types, said, previous });
+        if !provisional && pulled_here.is_none_or(|t| t.kept) {
             r.sources.insert(k, (s, snap));
         }
     }
@@ -413,15 +477,35 @@ impl Prep {
         }
     }
 
+    /// Every query source a graph's nodes read, with its query: what the
+    /// server plans, under the run's context, into [`Keys`] before the
+    /// graph is checked. A source not found is left for the check to say.
+    pub fn query_sources(&self, scope: &Scope, graph: &Graph) -> Vec<(String, Query)> {
+        let mut out: Vec<(String, Query)> = Vec::new();
+        for n in &graph.nodes {
+            if let Node::Source { source, .. } = n {
+                if out.iter().any(|(s, _)| s == source) {
+                    continue;
+                }
+                if let Ok((_, s)) = self.find_source(scope, source) {
+                    if let (Kind::Query, Some(q)) = (s.kind, s.query) {
+                        out.push((s.id, q));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// A dry run: what a run of `graph` would read and pull under the
-    /// context `fingerprint` names, each node's columns, and every
+    /// query keys `keys` holds, each node's columns, and every
     /// problem, with no pull and nothing written.
-    pub fn check(&self, scope: &Scope, graph: &Graph, fingerprint: &str) -> Result<Checked> {
+    pub fn check(&self, scope: &Scope, graph: &Graph, keys: &Keys) -> Result<Checked> {
         let order = match graph.order(None) {
             Ok(o) => o,
             Err(problems) => return Ok(checked_with(graph, Vec::new(), Vec::new(), Vec::new(), problems)),
         };
-        let r = self.resolve(scope, graph, &order, fingerprint, Mode::Run, &HashMap::new());
+        let r = self.resolve(scope, graph, &order, keys, Mode::Run, &HashMap::new());
         let mut problems = r.problems;
         let nodes = match self.compile(graph, &order, &r.loaded, &time::now())? {
             Ok(planned) => planned
@@ -440,21 +524,46 @@ impl Prep {
         Ok(checked_with(graph, r.inputs, r.pulls, nodes, problems))
     }
 
-    /// The pulls a preview waits on, under the context `fingerprint`
-    /// names: its query sources with no snapshot taken as that context.
-    pub fn preview_pulls(&self, scope: &Scope, request: &PreviewRequest, fingerprint: &str) -> Result<Vec<Pull>> {
+    /// The pulls a preview waits on: its query sources with no snapshot
+    /// taken by the statement `keys` holds for each.
+    pub fn preview_pulls(&self, scope: &Scope, request: &PreviewRequest, keys: &Keys) -> Result<Vec<Pull>> {
         let order = request.graph.order(request.node.as_deref()).map_err(Error::Problems)?;
-        Ok(self.resolve(scope, &request.graph, &order, fingerprint, Mode::Preview, &HashMap::new()).pulls)
+        Ok(self.resolve(scope, &request.graph, &order, keys, Mode::Preview, &HashMap::new()).pulls)
     }
 
     /// A graph run up to a node, over a sample of each input unless
     /// asked for all, kept nowhere: what the application shows while a
-    /// pipeline is being built. `pulled` is what the pulls it waited on
-    /// made.
-    pub fn preview(&self, scope: &Scope, request: &PreviewRequest, fingerprint: &str, pulled: &HashMap<String, u32>) -> Result<Previewed> {
+    /// pipeline is being built. `pulled` is the rows the pulls it waited
+    /// on returned, by source: read while it runs, and kept nowhere.
+    pub fn preview(&self, scope: &Scope, request: &PreviewRequest, keys: &Keys, pulled: Vec<(String, Arrived)>) -> Result<Previewed> {
         let graph = &request.graph;
         let order = graph.order(request.node.as_deref()).map_err(Error::Problems)?;
-        let r = self.resolve(scope, graph, &order, fingerprint, Mode::Preview, pulled);
+        let scratch = Scratch(self.store.data_dir().join(".previews").join(format!("{}", time::nanos())));
+        let mut took = HashMap::new();
+        for (source, arrived) in pulled {
+            let (_, s) = self.find_source(scope, &source)?;
+            let session = self.engine.session()?;
+            let taken = crate::snapshot::from_rows(&session, &arrived.rows, &arrived.roles, &s.columns, self.settings.max_rows)?;
+            let rows = scratch.0.join(format!("{source}.arrow"));
+            let bytes = store::write_rows(&rows, &taken.rows)?;
+            let snap = Snapshot {
+                source: s.id.clone(),
+                number: s.snapshot + 1,
+                kind: s.kind,
+                taken: time::now(),
+                file_name: None,
+                sha256: String::new(),
+                bytes,
+                parse: taken.parse,
+                semantic: Some(arrived.read),
+                origin: None,
+                columns: taken.columns,
+                rows: taken.rows.num_rows() as u64,
+                changes: taken.changes,
+            };
+            took.insert(source, Took { snap, rows, kept: false });
+        }
+        let r = self.resolve(scope, graph, &order, keys, Mode::Preview, &took);
         let reads = reads_of(graph);
         let node = request.node.clone().or_else(|| graph.output().map(|n| n.id().to_string())).unwrap_or_default();
         let empty = |problems: Vec<Problem>, nodes: Vec<NodeRecord>| Previewed {
@@ -471,7 +580,7 @@ impl Prep {
             return Ok(empty(r.problems, Vec::new()));
         }
         if let Some(p) = r.pulls.first() {
-            let m = format!("{} is to be pulled first, as this context", p.name);
+            let m = format!("{} is to be pulled first", p.name);
             return Ok(empty(vec![Problem::new(Some(&p.nodes[0]), Code::Read, m)], Vec::new()));
         }
         let planned = match self.compile(graph, &order, &r.loaded, &time::now())? {
@@ -496,12 +605,12 @@ impl Prep {
     /// request under that id is refused. One run per dataset at a time.
     /// What it must pull first is on the ticket, for the server to pull
     /// and hand back to [`Prep::execute`].
-    pub fn begin(&self, scope: &Scope, request: RunRequest, fingerprint: &str) -> Result<Begun> {
+    pub fn begin(&self, scope: &Scope, request: RunRequest, keys: &Keys) -> Result<Begun> {
         if !crate::is_run_id(&request.id) {
             return Err(Error::Invalid(format!("'{}' is not a run id: 1 to 128 letters, digits, '_', '-', '.' or ':'", request.id)));
         }
         let root = self.root(scope);
-        let asked = sha256(&serde_json::to_vec(&(&request.dataset, &request.graph, fingerprint))?);
+        let asked = sha256(&serde_json::to_vec(&(&request.dataset, &request.graph, keys))?);
         let path = store::run_path(&root, &request.id);
         if let Ok(r) = store::read_json::<RunRecord>(&path) {
             if r.request != asked {
@@ -517,7 +626,7 @@ impl Prep {
         }
         let (dir, _) = self.find(scope, &request.dataset)?;
         let order = request.graph.order(None).map_err(Error::Problems)?;
-        let r = self.resolve(scope, &request.graph, &order, fingerprint, Mode::Run, &HashMap::new());
+        let r = self.resolve(scope, &request.graph, &order, keys, Mode::Run, &HashMap::new());
         if !r.problems.is_empty() {
             return Err(Error::Problems(r.problems));
         }
@@ -546,7 +655,7 @@ impl Prep {
             started: started.clone(),
             ended: None,
             request: asked.clone(),
-            context: fingerprint.to_string(),
+            context: keys.context.clone(),
             reads: reads_of(&request.graph),
             inputs: r.inputs,
             version: None,
@@ -566,7 +675,7 @@ impl Prep {
             id: request.id,
             dir,
             graph: request.graph,
-            fingerprint: fingerprint.to_string(),
+            keys: keys.clone(),
             started,
             request: asked,
             pulls: r.pulls,
@@ -578,7 +687,9 @@ impl Prep {
     /// source, for the run to read.
     pub fn pulled_for(&self, ticket: &mut Ticket, source: &str, arrived: Arrived) -> Result<()> {
         let (_, snap) = self.pulled(&ticket.scope, source, arrived)?;
-        ticket.pulled.insert(source.to_string(), snap.number);
+        let (dir, _) = self.find_source(&ticket.scope, source)?;
+        let rows = store::snapshot_dir(&dir, snap.number).join(store::ROWS);
+        ticket.pulled.insert(source.to_string(), Took { snap, rows, kept: true });
         Ok(())
     }
 
@@ -586,14 +697,26 @@ impl Prep {
     /// not succeed.
     pub fn fail(&self, ticket: Ticket, why: &str) -> RunRecord {
         let mut r = self.record_of(&ticket);
-        if self.is_stopping() {
-            lock(&self.running).remove(&ticket.dir);
-            return r;
+        // Past a stop's grace the record says suspended, and the next
+        // start says it was interrupted by the stop.
+        if self.is_stopped() {
+            return self.suspend(&ticket, r);
         }
         r.state = RunState::Failed;
         r.error = Some(why.to_string());
         r.summary = format!("Failed: {why}");
         self.finish(&ticket, r)
+    }
+
+    /// A run a stop cut short: recorded suspended, which the next start
+    /// says was interrupted by the stop, and its dataset let go.
+    fn suspend(&self, ticket: &Ticket, mut r: RunRecord) -> RunRecord {
+        if r.state == RunState::Running {
+            r.state = RunState::Suspended;
+            let _ = store::write_json(&store::run_path(&self.root(&ticket.scope), &ticket.id), &r);
+        }
+        lock(&self.running).remove(&ticket.dir);
+        r
     }
 
     fn record_of(&self, ticket: &Ticket) -> RunRecord {
@@ -605,7 +728,7 @@ impl Prep {
             started: ticket.started.clone(),
             ended: None,
             request: ticket.request.clone(),
-            context: ticket.fingerprint.clone(),
+            context: ticket.keys.context.clone(),
             reads: reads_of(&ticket.graph),
             inputs: Vec::new(),
             version: None,
@@ -639,10 +762,7 @@ impl Prep {
         let mut r = self.record_of(&ticket);
         match self.run_ticket(&ticket, &mut r) {
             Ok(()) => {}
-            Err(_) if self.is_stopping() => {
-                lock(&self.running).remove(&ticket.dir);
-                return self.record_of(&ticket);
-            }
+            Err(_) if self.is_stopped() => return self.suspend(&ticket, self.record_of(&ticket)),
             Err(Error::Problems(p)) => {
                 r.state = RunState::Failed;
                 r.summary = format!("Failed: {}", p.iter().map(Problem::said).collect::<Vec<_>>().join("; "));
@@ -660,7 +780,7 @@ impl Prep {
     fn run_ticket(&self, ticket: &Ticket, r: &mut RunRecord) -> Result<()> {
         let graph = &ticket.graph;
         let order = graph.order(None).map_err(Error::Problems)?;
-        let res = self.resolve(&ticket.scope, graph, &order, &ticket.fingerprint, Mode::Run, &ticket.pulled);
+        let res = self.resolve(&ticket.scope, graph, &order, &ticket.keys, Mode::Run, &ticket.pulled);
         r.inputs = res.inputs.clone();
         if !res.problems.is_empty() {
             return Err(Error::Problems(res.problems));

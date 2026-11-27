@@ -81,7 +81,7 @@ fn run_id() -> String {
 /// starts, the words of the refusal.
 fn run(prep: &Prep, scope: &Scope, ds: &str, g: Graph) -> std::result::Result<RunRecord, String> {
     let request = RunRequest { id: run_id(), dataset: ds.into(), graph: g };
-    match prep.begin(scope, request, ANN).map_err(|e| e.to_string())? {
+    match prep.begin(scope, request, &Keys::new(ANN)).map_err(|e| e.to_string())? {
         Begun::Started(t) => {
             assert!(t.pulls.is_empty(), "a run here pulls nothing: {:?}", t.pulls);
             Ok(prep.execute(*t))
@@ -117,7 +117,12 @@ fn columns_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Column> {
 /// What a preview of steps over a source says is wrong, in words.
 fn refused(prep: &Prep, scope: &Scope, src: &str, steps: Value) -> String {
     let p = prep
-        .preview(scope, &PreviewRequest { graph: steps_graph(src, steps), node: None, whole: false, limit: None }, ANN, &HashMap::new())
+        .preview(
+            scope,
+            &PreviewRequest { graph: steps_graph(src, steps), node: None, whole: false, limit: None },
+            &Keys::new(ANN),
+            Vec::new(),
+        )
         .unwrap();
     p.problems.iter().map(Problem::said).collect::<Vec<_>>().join("; ")
 }
@@ -529,7 +534,7 @@ fn a_sql_step_is_a_black_box_over_input_alone() {
     // A column it reads, gone upstream, refuses the run, naming it and what follows.
     prep.add_upload(&ann, &src, csv("region,store,amount\nNY,a,1\n")).unwrap();
     let request = RunRequest { id: run_id(), dataset: d.id.clone(), graph: steps_graph(&src, steps) };
-    let Err(Error::Problems(problems)) = prep.begin(&ann, request, ANN) else { panic!("refused") };
+    let Err(Error::Problems(problems)) = prep.begin(&ann, request, &Keys::new(ANN)) else { panic!("refused") };
     let said: Vec<String> = problems.iter().map(Problem::said).collect();
     assert_eq!(
         said,
@@ -554,7 +559,7 @@ fn a_sql_step_is_a_black_box_over_input_alone() {
     }
     // Names are DuckDB's: a repeat is numbered, an expression is its text.
     let g = steps_graph(&src, json!([{ "op": "sql", "query": "SELECT region, region, upper(region) FROM input" }]));
-    let p = prep.preview(&ann, &PreviewRequest { graph: g, node: None, whole: false, limit: None }, ANN, &HashMap::new()).unwrap();
+    let p = prep.preview(&ann, &PreviewRequest { graph: g, node: None, whole: false, limit: None }, &Keys::new(ANN), Vec::new()).unwrap();
     assert_eq!(p.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "region_1", "upper(region)"]);
 }
 
@@ -673,7 +678,7 @@ fn a_column_gone_upstream_fails_the_run_naming_it_with_what_it_likely_became() {
     // `region` is gone; `Area` is new and has its values.
     prep.add_upload(&ann, &src, csv("Area,amount,regoin\nNY,1,x\nCA,2,y\n")).unwrap();
     let request = RunRequest { id: run_id(), dataset: d.id.clone(), graph: steps_graph(&src, steps.clone()) };
-    let Err(Error::Problems(problems)) = prep.begin(&ann, request, ANN) else { panic!("refused") };
+    let Err(Error::Problems(problems)) = prep.begin(&ann, request, &Keys::new(ANN)) else { panic!("refused") };
     let p = &problems[0];
     assert_eq!((p.node.as_deref(), p.code, p.column.as_deref()), (Some("shape"), graph::Code::MissingColumn, Some("region")));
     let s: Vec<&str> = p.suggestions.iter().map(|s| s.column.as_str()).collect();
@@ -683,7 +688,7 @@ fn a_column_gone_upstream_fails_the_run_naming_it_with_what_it_likely_became() {
     // The application points the step at the new name, and it runs.
     ran(&prep, &ann, &d.id, steps_graph(&src, json!([{ "op": "add_column", "column": "label", "formula": "upper(Area)" }])));
     // A dry run says the same as the run, before it.
-    let c = prep.check(&ann, &steps_graph(&src, steps), ANN).unwrap();
+    let c = prep.check(&ann, &steps_graph(&src, steps), &Keys::new(ANN)).unwrap();
     assert!(!c.ok && c.said.starts_with("It would not run: node shape: step 1 (add_column) reads column 'region'"), "{}", c.said);
 }
 
@@ -698,14 +703,19 @@ fn a_preview_stops_at_a_node_over_a_sample_and_keeps_nothing() {
         { "id": "never", "kind": "steps", "input": "big", "steps": [{ "op": "trim_val", "columns": ["gone"] }] },
     ]));
     let p = prep
-        .preview(&ann, &PreviewRequest { graph: g.clone(), node: Some("big".into()), whole: false, limit: None }, ANN, &HashMap::new())
+        .preview(
+            &ann,
+            &PreviewRequest { graph: g.clone(), node: Some("big".into()), whole: false, limit: None },
+            &Keys::new(ANN),
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!((p.rows.num_rows(), p.node.as_str(), p.sample), (2, "big", Some(1000)));
     assert!(p.problems.is_empty(), "what is past the node is not compiled: {:?}", p.problems);
     assert_eq!(p.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["in", "big"]);
     assert_eq!(p.reads[0].id, s.id);
     let p = prep
-        .preview(&ann, &PreviewRequest { graph: g, node: Some("never".into()), whole: true, limit: None }, ANN, &HashMap::new())
+        .preview(&ann, &PreviewRequest { graph: g, node: Some("never".into()), whole: true, limit: None }, &Keys::new(ANN), Vec::new())
         .unwrap();
     assert_eq!((p.problems.len(), p.sample), (1, None), "a preview shows what will not resolve rather than refusing");
     assert_eq!(prep.get(&ann, &d.id).unwrap().made, 1, "nothing was made");
@@ -978,11 +988,19 @@ fn arrived(regions: &[&str], revenue: &[i128], context: &str) -> Arrived {
     }
 }
 
+/// The keys the server would plan for `g`: here each query source's
+/// statement is named by the context alone, as if its SQL changed with
+/// nothing else.
+fn planned(prep: &Prep, scope: &Scope, g: &Graph, context: &str) -> Keys {
+    prep.query_sources(scope, g).into_iter().fold(Keys::new(context), |k, (s, _)| k.with(s, Ok(context.to_string())))
+}
+
 /// A run whose pulls the test answers, as the server would, with rows
 /// taken as `context`.
 fn run_pulling(prep: &Prep, scope: &Scope, ds: &str, g: Graph, context: &str, rows: &[&str]) -> (Vec<String>, RunRecord) {
+    let keys = planned(prep, scope, &g, context);
     let request = RunRequest { id: run_id(), dataset: ds.into(), graph: g };
-    let Begun::Started(mut t) = prep.begin(scope, request, context).unwrap() else { panic!("a new run id") };
+    let Begun::Started(mut t) = prep.begin(scope, request, &keys).unwrap() else { panic!("a new run id") };
     let pulled: Vec<String> = t.pulls.iter().map(|p| p.source.clone()).collect();
     for p in pulled.clone() {
         prep.pulled_for(&mut t, &p, arrived(rows, &vec![100; rows.len()], context)).unwrap();
@@ -1002,7 +1020,7 @@ fn a_query_source_is_pulled_by_a_run_as_its_context_and_read_only_as_it() {
         graph(json!([{ "id": "rev", "kind": "source", "source": s.id, "read": read }, { "id": "out", "kind": "output", "input": "rev" }]))
     };
     // Never pulled: the dry run says so, and a run pulls it.
-    let c = prep.check(&ann, &g(json!("latest")), "ann").unwrap();
+    let c = prep.check(&ann, &g(json!("latest")), &planned(&prep, &ann, &g(json!("latest")), "ann")).unwrap();
     assert!(c.ok && c.said.starts_with("Pulls revenue (it has never been pulled)"), "{}", c.said);
     let (pulled, r) = run_pulling(&prep, &ann, &d.id, g(json!("latest")), "ann", &["NY", "CA"]);
     assert_eq!((pulled, r.state), (vec![s.id.clone()], RunState::Succeeded), "{}", r.summary);
@@ -1029,10 +1047,96 @@ fn a_query_source_is_pulled_by_a_run_as_its_context_and_read_only_as_it() {
     assert_eq!(run_pulling(&prep, &ann, &d.id, g(json!("pull")), "ann", &["NY"]).0.len(), 1);
     assert!(run_pulling(&prep, &ann, &d.id, g(json!({ "max_age": 3600 })), "ann", &[]).0.is_empty());
     // A snapshot named that another context took is refused.
-    let e = prep.begin(&ann, RunRequest { id: run_id(), dataset: d.id.clone(), graph: g(json!({ "snapshot": 2 })) }, "ann").err().unwrap();
-    assert!(e.to_string().contains("snapshot 2 of revenue was taken as another context"), "{e}");
+    let e = prep
+        .begin(
+            &ann,
+            RunRequest { id: run_id(), dataset: d.id.clone(), graph: g(json!({ "snapshot": 2 })) },
+            &planned(&prep, &ann, &g(json!("latest")), "ann"),
+        )
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("snapshot 2 of revenue was taken by another statement"), "{e}");
+    // A spec that does not plan is refused before anything is pulled.
+    let unplanned = Keys::new("ann").with(s.id.clone(), Err("no field revenue".into()));
+    let e = prep.check(&ann, &g(json!("latest")), &unplanned).unwrap();
+    assert!(!e.ok && e.said.contains("does not plan: no field revenue"), "{}", e.said);
+    let e = prep.begin(&ann, RunRequest { id: run_id(), dataset: d.id.clone(), graph: g(json!("latest")) }, &unplanned).err().unwrap();
+    assert!(matches!(&e, Error::Problems(p) if p[0].code == crate::graph::Code::Plan), "{e}");
     // A query source takes no file.
     assert!(prep.add_upload(&ann, &s.id, csv(BUDGET)).err().unwrap().to_string().contains("pulled by a run"));
+}
+
+#[test]
+fn a_preview_reads_what_it_pulls_and_keeps_nothing() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let query = Query { branch: "main".into(), spec: Some(json!({ "fields": ["region", "revenue"] })), expr: None };
+    let s = prep.create_query(&ann, Named::default(), query).unwrap();
+    let g = graph(json!([{ "id": "rev", "kind": "source", "source": s.id }, { "id": "out", "kind": "output", "input": "rev" }]));
+    let keys = planned(&prep, &ann, &g, "ann");
+    let request = PreviewRequest { graph: g, node: None, whole: false, limit: None };
+    let pulls = prep.preview_pulls(&ann, &request, &keys).unwrap();
+    assert_eq!(pulls.len(), 1);
+    let p = prep.preview(&ann, &request, &keys, vec![(s.id.clone(), arrived(&["NY", "CA"], &[100, 100], "ann"))]).unwrap();
+    assert!(p.problems.is_empty(), "{:?}", p.problems);
+    assert_eq!(p.rows.num_rows(), 2);
+    assert!(p.inputs[0].why.contains("kept nowhere"), "{}", p.inputs[0].why);
+    assert_eq!(prep.source(&ann, &s.id).unwrap().snapshot, 0, "no snapshot kept");
+    assert!(prep.snapshots(&ann, &s.id).unwrap().is_empty());
+}
+
+#[test]
+fn two_runs_pulling_one_source_at_once_both_keep_what_they_pulled() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let query = Query { branch: "main".into(), spec: Some(json!({ "fields": ["region", "revenue"] })), expr: None };
+    let s = prep.create_query(&ann, Named::default(), query).unwrap();
+    let g = graph(
+        json!([{ "id": "rev", "kind": "source", "source": s.id, "read": "pull" }, { "id": "out", "kind": "output", "input": "rev" }]),
+    );
+    let keys = planned(&prep, &ann, &g, "ann");
+    let tickets: Vec<Ticket> = (0..2)
+        .map(|_| {
+            let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+            let Begun::Started(t) = prep.begin(&ann, RunRequest { id: run_id(), dataset: d.id, graph: g.clone() }, &keys).unwrap() else {
+                panic!()
+            };
+            *t
+        })
+        .collect();
+    let gate = std::sync::Barrier::new(2);
+    let done: Vec<RunRecord> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = tickets
+            .into_iter()
+            .map(|mut t| {
+                let (prep, gate, src) = (&prep, &gate, s.id.clone());
+                scope.spawn(move || {
+                    let rows: Vec<&str> = (0..20_000).map(|_| "NY").collect();
+                    let a = arrived(&rows, &vec![1; rows.len()], "ann");
+                    gate.wait();
+                    prep.pulled_for(&mut t, &src, a).unwrap();
+                    prep.execute(t)
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+    assert!(done.iter().all(|r| r.state == RunState::Succeeded), "{:?}", done.iter().map(|r| &r.summary).collect::<Vec<_>>());
+    assert_eq!(prep.source(&ann, &s.id).unwrap().snapshot, 2);
+}
+
+#[test]
+fn a_dataset_deleted_takes_its_run_records_with_it() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, SALES);
+    let r = ran(&prep, &ann, &d.id, steps_graph(&s.id, json!([])));
+    assert!(prep.run(&ann, &r.id).is_ok());
+    let (_, other) = upload(&prep, &ann, SALES);
+    let kept = ran(&prep, &ann, &other.id, steps_graph(&s.id, json!([])));
+    prep.delete(&ann, &d.id).unwrap();
+    assert!(matches!(prep.run(&ann, &r.id), Err(Error::NotFound(_))));
+    assert!(prep.run(&ann, &kept.id).is_ok(), "another dataset's runs stay");
 }
 
 #[test]
@@ -1041,7 +1145,7 @@ fn a_run_id_answers_its_first_request_and_a_dataset_takes_one_run_at_a_time() {
     let ann = scope();
     let (s, d) = upload(&prep, &ann, SALES);
     let g = steps_graph(&s.id, json!([]));
-    let ask = |id: &str, g: Graph| prep.begin(&ann, RunRequest { id: id.into(), dataset: d.id.clone(), graph: g }, ANN);
+    let ask = |id: &str, g: Graph| prep.begin(&ann, RunRequest { id: id.into(), dataset: d.id.clone(), graph: g }, &Keys::new(ANN));
     let Begun::Started(t) = ask("r1", g.clone()).unwrap() else { panic!() };
     assert!(matches!(ask("r2", g.clone()), Err(Error::Conflict(m)) if m.contains("being made by run r1")));
     let Begun::Answered(running) = ask("r1", g.clone()).unwrap() else { panic!("a retry") };
@@ -1061,12 +1165,12 @@ fn a_dry_run_says_what_a_run_would_read_and_each_nodes_columns() {
     let (_dir, prep) = prep();
     let ann = scope();
     let src = source(&prep, &ann, SALES);
-    let c = prep.check(&ann, &steps_graph(&src, json!([{ "op": "remove_columns", "columns": ["store"] }])), ANN).unwrap();
+    let c = prep.check(&ann, &steps_graph(&src, json!([{ "op": "remove_columns", "columns": ["store"] }])), &Keys::new(ANN)).unwrap();
     assert!(c.ok);
     assert_eq!(c.said, "Reads budget (snapshot 1, its newest), runs 3 nodes.");
     let shape = c.nodes.iter().find(|n| n.id == "shape").unwrap();
     assert_eq!(shape.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "amount"]);
-    let c = prep.check(&ann, &graph(json!([{ "id": "a", "kind": "source", "source": src }])), ANN).unwrap();
+    let c = prep.check(&ann, &graph(json!([{ "id": "a", "kind": "source", "source": src }])), &Keys::new(ANN)).unwrap();
     assert!(!c.ok && c.problems[0].message.contains("has none"), "{:?}", c.problems);
     assert!(prep.list(&ann).is_empty(), "a dry run makes nothing");
 }
@@ -1376,7 +1480,26 @@ fn every_source_and_dataset_is_copied_to_the_object_store_and_restored_from_it()
     assert!(matches!(plain.restore("default"), Err(Error::Invalid(_))));
 }
 
-// -------------------------------------------------------------- recovery
+#[test]
+fn a_dataset_whose_source_was_deleted_is_restored_whole() {
+    let (dir, _) = prep();
+    let store_dir = dir.0.join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let objects = std::sync::Arc::new(zsql_exec::Objects::open(&format!("file://{}", store_dir.display()), &[]).unwrap());
+    let data = dir.0.join("data");
+    let open = || reopen(&data).with_backup(Some(objects.clone()));
+    let prep = open();
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, BUDGET);
+    // Its output was the snapshot; the rows are copied in, and sent again.
+    assert_eq!(prep.delete_source(&ann, &s.id).unwrap(), std::slice::from_ref(&d.id));
+    std::fs::remove_dir_all(data.join("default")).unwrap();
+    let prep = open();
+    assert_eq!(prep.restore("default").unwrap(), [format!("shop/{}", d.id)]);
+    assert_eq!(rows_of(&prep, &ann, &d.id)[0][0], "EMEA");
+}
+
+// -------------------------------------------------------------- recovery// -------------------------------------------------------------- recovery
 
 mod recovery_tests {
     use super::*;
@@ -1388,7 +1511,7 @@ mod recovery_tests {
         let ann = scope();
         let (s, d) = upload(&prep, &ann, BUDGET);
         let Begun::Started(_t) = prep
-            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN)
+            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, &Keys::new(ANN))
             .unwrap()
         else {
             panic!()
@@ -1413,7 +1536,7 @@ mod recovery_tests {
         assert!(prep.get(&ann, &d.id).unwrap().interrupted.is_none());
         // So does the same id: it answers what it came to.
         let Begun::Answered(again) = prep
-            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN)
+            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, &Keys::new(ANN))
             .unwrap()
         else {
             panic!()
@@ -1427,8 +1550,9 @@ mod recovery_tests {
         let ann = scope();
         let (s, d) = upload(&prep, &ann, BUDGET);
         let slow = json!([{ "op": "sql", "query": "SELECT region, month, amount FROM input, range(100000000000) a, range(1000) b" }]);
-        let Begun::Started(t) =
-            prep.begin(&ann, RunRequest { id: "slow".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, slow) }, ANN).unwrap()
+        let Begun::Started(t) = prep
+            .begin(&ann, RunRequest { id: "slow".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, slow) }, &Keys::new(ANN))
+            .unwrap()
         else {
             panic!()
         };
@@ -1440,7 +1564,11 @@ mod recovery_tests {
             assert_eq!(job.join().unwrap().state, RunState::Suspended);
         });
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
-        let e = prep.begin(&ann, RunRequest { id: "late".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN);
+        let e = prep.begin(
+            &ann,
+            RunRequest { id: "late".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) },
+            &Keys::new(ANN),
+        );
         assert!(matches!(e, Err(Error::Stopping(_))), "nothing new starts");
         assert!(matches!(prep.add_upload(&ann, &s.id, csv(BUDGET)), Err(Error::Stopping(_))));
         drop(prep);
@@ -1448,6 +1576,54 @@ mod recovery_tests {
         let i = prep.run(&ann, "slow").unwrap().interrupted.unwrap();
         assert_eq!((i.job, i.cause), (JobKind::Run, Cause::Stop));
         assert!(i.reason.contains("stopped while this run ran, and nothing is resumed"), "{}", i.reason);
+    }
+
+    #[test]
+    fn a_run_whose_pull_lands_in_a_stops_grace_finishes() {
+        let (_dir, prep) = prep();
+        let ann = scope();
+        let query = Query { branch: "main".into(), spec: Some(json!({ "fields": ["region", "revenue"] })), expr: None };
+        let s = prep.create_query(&ann, Named::default(), query).unwrap();
+        let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+        let g = graph(json!([{ "id": "rev", "kind": "source", "source": s.id }, { "id": "out", "kind": "output", "input": "rev" }]));
+        let keys = planned(&prep, &ann, &g, "ann");
+        let Begun::Started(mut t) = prep.begin(&ann, RunRequest { id: "graced".into(), dataset: d.id.clone(), graph: g }, &keys).unwrap()
+        else {
+            panic!()
+        };
+        std::thread::scope(|scope| {
+            let stop = scope.spawn(|| prep.stop(std::time::Duration::from_secs(10)));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // The pull was in flight when the stop began; it lands now.
+            prep.pulled_for(&mut t, &s.id, arrived(&["NY"], &[100], "ann")).unwrap();
+            assert_eq!(prep.execute(*t).state, RunState::Succeeded);
+            stop.join().unwrap();
+        });
+        assert_eq!(prep.run(&ann, "graced").unwrap().state, RunState::Succeeded);
+    }
+
+    #[test]
+    fn a_run_that_fails_in_a_stops_grace_is_recorded_failed_not_crashed() {
+        let (dir, prep) = prep();
+        let ann = scope();
+        let query = Query { branch: "main".into(), spec: Some(json!({ "fields": ["region", "revenue"] })), expr: None };
+        let s = prep.create_query(&ann, Named::default(), query).unwrap();
+        let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+        let g = graph(json!([{ "id": "rev", "kind": "source", "source": s.id }, { "id": "out", "kind": "output", "input": "rev" }]));
+        let keys = planned(&prep, &ann, &g, "ann");
+        let Begun::Started(t) = prep.begin(&ann, RunRequest { id: "bad".into(), dataset: d.id.clone(), graph: g }, &keys).unwrap() else {
+            panic!()
+        };
+        std::thread::scope(|scope| {
+            let stop = scope.spawn(|| prep.stop(std::time::Duration::from_secs(10)));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(prep.fail(*t, "pulling revenue: the warehouse said no").state, RunState::Failed);
+            stop.join().unwrap();
+        });
+        drop(prep);
+        let prep = reopen(&dir.0);
+        let r = prep.run(&ann, "bad").unwrap();
+        assert_eq!((r.state, r.interrupted), (RunState::Failed, None));
     }
 
     #[test]

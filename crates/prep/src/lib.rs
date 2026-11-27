@@ -65,7 +65,7 @@ pub use graph::{Graph, Node, Problem};
 pub use lineage::Lineage;
 pub use materialize::View;
 pub use record::{InputPlan, NodeRecord, RunRecord, RunState};
-pub use runs::{Begun, Checked, NodeColumns, PreviewRequest, Previewed, Pull, RunRequest, Ticket};
+pub use runs::{query_key, Begun, Checked, Keys, NodeColumns, PreviewRequest, Previewed, Pull, RunRequest, Ticket};
 pub use schema::{Column, ColumnType, Role};
 pub use source::{CsvOptions, Kind, Query, SemanticRead};
 pub use sources::{Named, Pushed, SourceChange};
@@ -198,11 +198,17 @@ pub struct Prep {
     backup: Option<std::sync::Arc<zsql_exec::Objects>>,
     /// Set when the server stops: no job starts.
     stopping: std::sync::atomic::AtomicBool,
+    /// Set when a stop's grace is over: a run started before it may no
+    /// longer keep what it pulled.
+    stopped: std::sync::atomic::AtomicBool,
     /// The directories whose jobs a stop suspended: their markers stay.
     suspended: Mutex<HashSet<PathBuf>>,
     /// What the start found, until the server takes it.
     recovered: Mutex<recovery::Recovered>,
 }
+
+/// How long a run waits for another job on a source it pulled to end.
+const RUN_JOB_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A source or dataset held for one job; let go when dropped. Its
 /// marker goes with it, unless a stop suspended it.
@@ -244,6 +250,7 @@ impl Prep {
             running: Mutex::new(HashMap::new()),
             backup: None,
             stopping: std::sync::atomic::AtomicBool::new(false),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             suspended: Mutex::new(HashSet::new()),
             recovered: Mutex::new(recovery::Recovered::default()),
         };
@@ -325,6 +332,7 @@ impl Prep {
         while !idle() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
         let busy: Vec<PathBuf> = lock(&self.busy).iter().cloned().collect();
         for dir in &busy {
             let path = dir.join(recovery::MARKER);
@@ -355,6 +363,11 @@ impl Prep {
 
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a stop's grace is over: what still runs is suspended.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The same, copying each dataset and source to the object store as
@@ -424,6 +437,31 @@ impl Prep {
         if !lock(&self.busy).insert(dir.to_path_buf()) {
             return Err(Error::Conflict("this is busy with another job; try again when it is done".into()));
         }
+        self.marked(dir, kind)
+    }
+
+    /// The same, for a run already started: it may keep what it pulled
+    /// through a stop's grace, and waits its turn behind another job on
+    /// the same source (another run's pull, say) rather than failing
+    /// after a pull that may have taken minutes.
+    pub(crate) fn run_job(&self, dir: &Path, kind: recovery::JobKind) -> Result<Job<'_>> {
+        let until = std::time::Instant::now() + RUN_JOB_PATIENCE;
+        loop {
+            if self.is_stopped() {
+                return Err(Error::Stopping("the server is stopping; try again in a moment".into()));
+            }
+            if lock(&self.busy).insert(dir.to_path_buf()) {
+                return self.marked(dir, kind);
+            }
+            if std::time::Instant::now() >= until {
+                return Err(Error::Conflict("this is busy with another job; try again when it is done".into()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A job taken: its marker left.
+    fn marked(&self, dir: &Path, kind: recovery::JobKind) -> Result<Job<'_>> {
         let job = Job { prep: self, dir: dir.to_path_buf() };
         let marker = recovery::Marker { job: kind, started: time::now(), state: recovery::State::Running };
         store::write_json(&dir.join(recovery::MARKER), &marker)?;
@@ -574,6 +612,12 @@ impl Prep {
         }
         let _job = self.job(&dir, recovery::JobKind::Delete)?;
         store::remove(&dir)?;
+        // Its runs go with it: a record holds what the rows looked like.
+        for path in recovery::entries(&self.root(scope).join(store::RUNS)) {
+            if store::read_json::<RunRecord>(&path).is_ok_and(|r| r.dataset == id) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
         self.forget_blends(&scope.org, &scope.project, id);
         self.forget_backup(&scope.org, &scope.project, &[id]);
         tracing::info!("dataset {id} removed from {}/{}", scope.org, scope.project);
