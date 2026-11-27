@@ -66,6 +66,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zsql_datasource::Batches;
 
+/// How many blends a project keeps; past it, the least recently made go.
+const BLENDS_KEPT: usize = 64;
+
+/// Keeps the `keep` newest entries of a directory of kept answers.
+fn evict(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut all: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()))
+        .collect();
+    if all.len() <= keep {
+        return;
+    }
+    all.sort();
+    for (_, path) in &all[..all.len() - keep] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 /// What a server's data prep is allowed.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -82,7 +102,12 @@ impl Settings {
         Settings {
             max_rows: 1_000_000,
             max_bytes: 256 << 20,
-            engine: EngineLimits { memory: "1GB".into(), threads: 2, spill: data_dir.join(".cache").join("prep") },
+            engine: EngineLimits {
+                memory: "1GB".into(),
+                threads: 2,
+                spill: data_dir.join(".cache").join("prep"),
+                job: engine::JOB_LIMIT,
+            },
         }
     }
 }
@@ -212,7 +237,10 @@ impl Drop for Job<'_> {
 
 impl Prep {
     pub fn open(data_dir: &Path, settings: Settings) -> Result<Prep> {
-        let engine = Engine::new(settings.engine.clone());
+        // An answer handed back may be twice what a dataset holds: a step
+        // between may make more than the recipe keeps.
+        let bound = engine::Bound { rows: settings.max_rows.saturating_mul(2).max(1), bytes: settings.max_bytes.saturating_mul(2).max(1) };
+        let engine = Engine::new(settings.engine.clone(), bound);
         let duckdb_version = engine.version()?;
         Ok(Prep {
             store: Store::new(data_dir),
@@ -459,7 +487,7 @@ impl Prep {
         dataset.sources[index] = store::SourceState { snapshot: n, columns, ..source };
         dataset.updated = time::now();
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
-        let log = edits::read_log(&dir)?;
+        let log = edits::read_log(&dir, dataset.edits)?;
         let made = self.materialize(&dir, &mut dataset, &recipe, &log);
         match &made {
             Ok(None) => dataset.held = None,
@@ -547,7 +575,7 @@ impl Prep {
     /// keeps both.
     fn commit(&self, dir: &Path, dataset: Dataset, recipe: Recipe, entry: Option<Entry>, readers_go_stale: bool) -> Result<Dataset> {
         let mut next = dataset;
-        let mut log = edits::read_log(dir)?;
+        let mut log = edits::read_log(dir, next.edits)?;
         if let Some(e) = &entry {
             log.push(e.clone());
             next.edits = e.seq;
@@ -586,7 +614,7 @@ impl Prep {
         }
         let roles = preview.roles.unwrap_or(recipe.roles);
         let pinned_at = time::now();
-        let log = edits::read_log(&dir)?;
+        let log = edits::read_log(&dir, dataset.edits)?;
         let input_ids: Vec<String> = steps.iter().filter_map(Step::dataset).map(str::to_string).collect();
         let inputs = self.inputs(&dir, &input_ids)?;
         let compiled = compile::compile_all(
@@ -631,7 +659,7 @@ impl Prep {
         };
         let mut steps = recipe.steps.clone();
         steps.insert(k, Step::RemoveColumns { columns: vec![column.to_string()] });
-        let log = edits::read_log(&dir)?;
+        let log = edits::read_log(&dir, dataset.edits)?;
         let in_force: Vec<(usize, Edit)> = edits::in_force(&log, dataset.edits, &steps_of(&dir), &recipe.steps)
             .into_iter()
             .map(|(a, e)| (if a >= k { a + 1 } else { a }, e))
@@ -764,7 +792,7 @@ impl Prep {
             return Err(Error::Invalid(format!("an entry holds 1 to {} edits", edits::ENTRY_LIMIT)));
         }
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
-        let log = edits::read_log(&dir)?;
+        let log = edits::read_log(&dir, dataset.edits)?;
         let in_force = edits::in_force(&log, dataset.edits, &steps_of(&dir), &recipe.steps);
         let k = dataset.live.ok_or_else(|| Error::Internal(format!("dataset {id} has no live version")))?;
         let manifest: Materialization = store::read_json(&store::version_dir(&dir, k).join("manifest.json"))?;
@@ -888,8 +916,9 @@ impl Prep {
                     }
                     let key = edits::key_of(&row, &names)?;
                     let (n, current) = matching(&key, Some(&c))?;
-                    // A dimension edit with conditions is for every row they name.
-                    let all = all || (dimension && n > 1);
+                    // A dimension edit with conditions is for every row they
+                    // name, however many, now and after every sync.
+                    let all = all || dimension;
                     names_one(n, all)?;
                     // The value first replaced is what a sync is checked against.
                     let earlier = in_force.iter().rev().find_map(|(_, e)| match e {
@@ -897,7 +926,7 @@ impl Prep {
                         _ => None,
                     });
                     let was = earlier.unwrap_or(if n == 1 { current } else { serde_json::Value::Null });
-                    Edit::Set { id, column: c.name, key, was, to, all: all && n > 1 }
+                    Edit::Set { id, column: c.name, key, was, to, all }
                 }
             }
             Asked::Delete { row, all } => {
@@ -934,7 +963,7 @@ impl Prep {
     /// The edit log, and how each edit fared in the live version.
     pub fn edit_log(&self, scope: &Scope, id: &str) -> Result<(Vec<Entry>, Vec<Outcome>)> {
         let (dir, dataset) = self.find(scope, id)?;
-        let log: Vec<Entry> = edits::read_log(&dir)?.into_iter().filter(|e| e.seq <= dataset.edits).collect();
+        let log: Vec<Entry> = edits::read_log(&dir, dataset.edits)?;
         Ok((log, dataset.live.map(|k| edits::read_outcomes(&dir, k)).unwrap_or_default()))
     }
 
@@ -1165,7 +1194,14 @@ impl Prep {
         let mut notes = Vec::new();
         let mut stopped: Vec<String> = Vec::new();
         for (d_dir, _, _) in self.downstream_of(dir, id) {
-            // Read again: an earlier step of this cascade may have moved it.
+            // Its job first, then what it is: read before, it could be a
+            // version another job has since moved past.
+            let name = d_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let Ok(_job) = self.job(&d_dir) else {
+                notes.push(format!("dataset {name} was not run again: it was busy"));
+                stopped.push(name);
+                continue;
+            };
             let Ok(mut d) = store::read_json::<Dataset>(&d_dir.join(store::MANIFEST)) else { continue };
             let Ok(recipe) = store::read_json::<Recipe>(&store::recipe_path(&d_dir, d.recipe)) else { continue };
             if let Some(i) = recipe.inputs().iter().find(|i| stopped.contains(i)) {
@@ -1173,12 +1209,7 @@ impl Prep {
                 stopped.push(d.id);
                 continue;
             }
-            let Ok(_job) = self.job(&d_dir) else {
-                notes.push(format!("dataset {} was not run again: it was busy", d.id));
-                stopped.push(d.id);
-                continue;
-            };
-            let log = edits::read_log(&d_dir).unwrap_or_default();
+            let log = edits::read_log(&d_dir, d.edits).unwrap_or_default();
             match self.materialize(&d_dir, &mut d, &recipe, &log) {
                 Ok(None) => {
                     d.held = None;
@@ -1222,9 +1253,12 @@ impl Prep {
     /// A blend: the model's part, run, and the attached datasets joined
     /// to it as the request says. Each dataset is found in the project
     /// before anything is looked up, and the answer is kept by the
-    /// model's SQL, each dataset's id and version, and the joins, so a
-    /// match is the same question over the same data.
-    pub fn blend(&self, scope: &Scope, plan: &blend::Blend, model: &blend::ModelPart, model_sql: &str) -> Result<Blended> {
+    /// model's run, each dataset's id and version, and the joins, so a
+    /// match is the same question over the same data. `model_run` names
+    /// the run of the model's part: the run's own cache decides when it
+    /// is run again (`fresh`, the datasource's TTL, an invalidation, the
+    /// credential), and a new run is a new question here.
+    pub fn blend(&self, scope: &Scope, plan: &blend::Blend, model: &blend::ModelPart, model_run: &str) -> Result<Blended> {
         let mut found = Vec::new();
         for a in &plan.datasets {
             blend::check_alias(&a.alias)?;
@@ -1239,7 +1273,7 @@ impl Prep {
         let datasets: Vec<lineage::DatasetRead> =
             found.iter().map(|f| lineage::DatasetRead { id: f.id.clone(), version: f.version }).collect();
         let question = serde_json::json!({
-            "sql": model_sql,
+            "model": model_run,
             "datasets": found.iter().map(|f| (f.alias.clone(), f.id.clone(), f.version)).collect::<Vec<_>>(),
             "joins": plan.joins,
             "outputs": plan.outputs.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>(),
@@ -1247,7 +1281,8 @@ impl Prep {
             "project": scope.project,
         });
         let key: String = sha2::Sha256::digest(question.to_string().as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-        let kept = self.store.blends().join(&key);
+        let blends = self.store.blends(&scope.org, &scope.project);
+        let kept = blends.join(&key);
         if let Ok(rows) = store::read_rows(&kept.join(store::ROWS)) {
             return Ok(Blended { rows, datasets, hit: true });
         }
@@ -1260,7 +1295,7 @@ impl Prep {
         }
         let rows = blend::run(&session, plan, model, &found)?;
         // Kept whole or not at all; a failure to keep is not a failure to answer.
-        let staging = self.store.blends().join(format!(".{key}.{}", time::nanos()));
+        let staging = blends.join(format!(".{key}.{}", time::nanos()));
         let keep = (|| -> Result<()> {
             store::write_rows(&staging.join(store::ROWS), &rows)?;
             store::write_json(
@@ -1273,15 +1308,16 @@ impl Prep {
             let _ = std::fs::remove_dir_all(&staging);
             tracing::warn!("a blend's answer was not kept: {e}");
         }
+        evict(&blends, BLENDS_KEPT);
         Ok(Blended { rows, datasets, hit: false })
     }
 
     /// Removes the kept blends that read a dataset: they answer no more.
     fn forget_blends(&self, org: &str, project: &str, id: &str) {
-        let Ok(entries) = std::fs::read_dir(self.store.blends()) else { return };
+        let Ok(entries) = std::fs::read_dir(self.store.blends(org, project)) else { return };
         for e in entries.flatten() {
             let Ok(k) = store::read_json::<BlendKept>(&e.path().join("blend.json")) else { continue };
-            if k.org == org && k.project == project && k.datasets.iter().any(|d| d.id == id) {
+            if k.datasets.iter().any(|d| d.id == id) {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }

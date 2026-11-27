@@ -33,6 +33,9 @@ async function fakeZsqld() {
     if (req.method === "POST" && path === "/orgs/acme/projects/shop/datasets") return reply.code(201).send(DATASET);
     if (path === "/orgs/acme/projects/shop/datasets") return { datasets: [DATASET, { ...DATASET, id: "ds_ffffffffffffffff", name: "someone else's" }] };
     if (path.endsWith("/rows")) return { version: 1, columns: [], total: 0, offset: 0, rows: [] };
+    if (req.method === "POST" && path.endsWith("/edits")) {
+      return reply.code(503).header("retry-after", "0").send({ error: { class: "Timeout", message: "this request passed its 90s deadline" } });
+    }
     return DATASET;
   });
   await z.listen({ port: 0, host: "127.0.0.1" });
@@ -173,4 +176,63 @@ test("zsqld out of reach is a 502, not a crash", async () => {
   assert.equal((await app.inject({ method: "GET", url: "/api/datasets", headers: { cookie } })).statusCode, 502);
   await app.close();
   rmSync(cfg.dataDir, { recursive: true, force: true });
+});
+
+test("a step that reads another dataset needs the user to be allowed to read it", async () => {
+  const { app, ann, seen, done } = await setUp();
+  await importAsAnn(app, ann);
+  // A dataset of the project ann's records do not let her read.
+  const theirs = "ds_eeeeeeeeeeeeeeee";
+  const calls = seen.length;
+  for (const [url, payload] of [
+    [`/api/datasets/${ID}/preview`, { steps: [{ op: "append", dataset: theirs }] }],
+    [`/api/datasets/${ID}/recipe`, { against: 1, steps: [{ op: "join", dataset: theirs, on: [] }] }],
+  ] as const) {
+    const res = await app.inject({ method: "POST", url, headers: { cookie: ann }, payload });
+    assert.equal(res.statusCode, 404, url);
+  }
+  assert.equal(seen.length, calls, "no step reading a dataset ann may not read reached zsqld");
+  await done();
+});
+
+test("a blend is sent with what a user may choose, and never their context or connection", async () => {
+  const { app, ann, seen, done } = await setUp();
+  await importAsAnn(app, ann);
+  const payload = {
+    spec: { projections: [{ field: "region" }] },
+    datasets: [{ id: ID, as: "b" }],
+    blend: [],
+    context: { user_id: "admin" },
+    connection: { host: "10.0.0.5" },
+    fresh: true,
+  };
+  const res = await app.inject({ method: "POST", url: "/api/blend", headers: { cookie: ann }, payload });
+  assert.equal(res.statusCode, 200, res.body);
+  const sent = JSON.parse(seen.at(-1)!.body) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(sent).sort(), ["blend", "datasets", "spec"]);
+  await done();
+});
+
+test("a write that passed zsqld's deadline is not sent again", async () => {
+  const { app, ann, seen, done } = await setUp();
+  await importAsAnn(app, ann);
+  const calls = seen.length;
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/datasets/${ID}/edits`,
+    headers: { cookie: ann },
+    payload: { against: 1, edits: [{ op: "cell", column: "region", from: "EMEA", to: "Europe" }] },
+  });
+  assert.equal(res.statusCode, 503);
+  assert.equal(seen.length, calls + 1, "sent once: it may have landed");
+  await done();
+});
+
+test("an id that names an object's own property is no dataset", async () => {
+  const { app, ann, done } = await setUp();
+  for (const id of ["__proto__", "constructor", "toString"]) {
+    const res = await app.inject({ method: "GET", url: `/api/datasets/${id}`, headers: { cookie: ann } });
+    assert.equal(res.statusCode, 404, id);
+  }
+  await done();
 });

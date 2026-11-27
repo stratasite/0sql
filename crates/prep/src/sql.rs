@@ -104,27 +104,30 @@ fn vet(session: &Session, query: &str) -> Result<std::result::Result<(), String>
     if tree["statements"].as_array().map_or(0, Vec::len) != 1 {
         return Ok(Err("a sql step is one query, a SELECT".into()));
     }
-    let mut ctes = Vec::new();
-    collect_ctes(&tree, &mut ctes);
-    Ok(walk(&tree, &ctes))
+    Ok(walk(&tree, &[]))
 }
 
-fn collect_ctes(v: &serde_json::Value, out: &mut Vec<String>) {
-    match v {
-        serde_json::Value::Object(o) => {
-            if let Some(map) = o.get("cte_map").and_then(|m| m["map"].as_array()) {
-                out.extend(map.iter().filter_map(|e| e["key"].as_str()).map(str::to_lowercase));
-            }
-            o.values().for_each(|x| collect_ctes(x, out));
-        }
-        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_ctes(x, out)),
-        _ => {}
-    }
+/// The names a node's own `WITH` makes. They are seen in that node and
+/// below it, its subqueries and the `WITH` tables' own bodies, and
+/// nowhere else: a name made inside a subquery is not a table outside it.
+fn ctes_of(o: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    o.get("cte_map")
+        .and_then(|m| m["map"].as_array())
+        .map(|map| map.iter().filter_map(|e| e["key"].as_str()).map(str::to_lowercase).collect())
+        .unwrap_or_default()
 }
 
-fn walk(v: &serde_json::Value, ctes: &[String]) -> std::result::Result<(), String> {
+fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), String> {
     match v {
         serde_json::Value::Object(o) => {
+            let own = ctes_of(o);
+            let scope: Vec<String>;
+            let ctes = if own.is_empty() {
+                outer
+            } else {
+                scope = outer.iter().cloned().chain(own).collect();
+                &scope
+            };
             let text = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
             match (text("type").as_str(), text("class").as_str()) {
                 ("base_table", _) => {
@@ -142,13 +145,7 @@ fn walk(v: &serde_json::Value, ctes: &[String]) -> std::result::Result<(), Strin
                         ));
                     }
                 }
-                (_, "function") => {
-                    let f = text("function_name");
-                    if !text("schema").is_empty() || !text("catalog").is_empty() {
-                        return Err(format!("{f}() is named with a schema; a sql step calls DuckDB's functions by their names"));
-                    }
-                    closed(&f)?;
-                }
+                ("show_ref", _) => return Err("a sql step is one query, a SELECT".into()),
                 // `current_date` and its kind are written without parentheses.
                 (_, "column_ref") => {
                     if let Some([only]) = o.get("column_names").and_then(|c| c.as_array()).map(Vec::as_slice) {
@@ -160,9 +157,17 @@ fn walk(v: &serde_json::Value, ctes: &[String]) -> std::result::Result<(), Strin
                 }
                 _ => {}
             }
+            // Every node that calls something by name is checked, of
+            // whatever class: a function, an aggregate, a window.
+            if let Some(f) = o.get("function_name").and_then(|f| f.as_str()) {
+                if !text("schema").is_empty() || !text("catalog").is_empty() {
+                    return Err(format!("{}() is named with a schema; a sql step calls DuckDB's functions by their names", f.to_lowercase()));
+                }
+                closed(&f.to_lowercase())?;
+            }
             o.values().try_for_each(|x| walk(x, ctes))
         }
-        serde_json::Value::Array(a) => a.iter().try_for_each(|x| walk(x, ctes)),
+        serde_json::Value::Array(a) => a.iter().try_for_each(|x| walk(x, outer)),
         _ => Ok(()),
     }
 }
@@ -209,13 +214,18 @@ pub fn describe(
         Ok(rows) => rows,
         Err(e) => return Ok(Err(plain(&e))),
     };
+    // The engine's own names for the types, which tell a sum's HUGEINT
+    // from a DECIMAL(38,0) that Arrow holds alike.
+    let named = session
+        .texts(&format!("SELECT column_type FROM (DESCRIBE SELECT * FROM {})", wrapped(query)))
+        .unwrap_or_default();
     let mut out: Vec<(String, ColumnType)> = Vec::new();
-    for f in rows.schema.fields() {
+    for (i, f) in rows.schema.fields().iter().enumerate() {
         let name = f.name().clone();
         if out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             return Ok(Err(format!("it makes two columns named '{name}'; give each its own name with AS")));
         }
-        match type_of(f.data_type()) {
+        match type_of(f.data_type(), named.get(i).map(String::as_str).unwrap_or("")) {
             Some(t) => out.push((name, t)),
             None => {
                 return Ok(Err(format!(
@@ -231,11 +241,15 @@ pub fn describe(
     Ok(Ok(out))
 }
 
-/// A column the engine answers with, as a dataset's type.
-fn type_of(t: &DataType) -> Option<ColumnType> {
+/// A column the engine answers with, as a dataset's type, given the
+/// engine's name for it.
+fn type_of(t: &DataType, named: &str) -> Option<ColumnType> {
     match t {
-        // A sum is a HUGEINT, which comes back as a decimal of no places.
-        DataType::Decimal128(_, 0) | DataType::Decimal256(_, 0) | DataType::UInt64 => Some(ColumnType::Integer),
+        // A sum of integers is a HUGEINT, which comes back as a decimal
+        // of no places; it is a whole number. A DECIMAL(38,0) of the
+        // data's own, 20-digit numbers, stays one, as does a UBIGINT.
+        DataType::Decimal128(_, 0) | DataType::Decimal256(_, 0) if named.eq_ignore_ascii_case("hugeint") => Some(ColumnType::Integer),
+        DataType::Decimal128(_, 0) | DataType::Decimal256(_, 0) | DataType::UInt64 => Some(ColumnType::Decimal(0)),
         DataType::Timestamp(_, _) => Some(ColumnType::Timestamp),
         DataType::Null => Some(ColumnType::Text),
         other => ColumnType::from_arrow(other).ok(),
@@ -253,7 +267,8 @@ pub fn missing_column(message: &str) -> Option<String> {
 /// `input`, the query run there, and what it makes loaded back as `name`.
 pub fn run(engine: &Engine, session: &Session, name: &str, stage: &SqlStage) -> Result<()> {
     let rows = session.query(&format!("SELECT * FROM {}", stage.input))?;
-    let own = engine.session()?;
+    // No more time than the job has left.
+    let own = engine.session_until(session.deadline())?;
     own.load("input", &stage.input_columns, &rows.batches)?;
     let list: Vec<String> = stage.columns.iter().map(|(c, t)| format!("CAST(\"__q\".{x} AS {}) AS {x}", t.sql(), x = ident(c))).collect();
     let made = own
@@ -282,6 +297,8 @@ mod tests {
             "SELECT *, i FROM input, range(3) r(i)",
             "SELECT 'now() random() pg_catalog' AS \"today\" FROM input -- now()\n",
             "SELECT unnest([1, 2]) AS x",
+            "SELECT * FROM (WITH a AS (SELECT * FROM input) SELECT * FROM a, (SELECT * FROM a) b) t",
+            "SELECT *, row_number() OVER () AS n FROM input",
         ] {
             assert_eq!(vetted(q), Ok(()), "{q}");
         }
@@ -306,6 +323,11 @@ mod tests {
             ("SELECT * FROM read_csv('/etc/passwd')", "read_csv() is not a table"),
             ("SELECT (SELECT count(*) FROM duckdb_tables()) AS n FROM input", "duckdb_tables() is not a table"),
             ("SELECT pg_catalog.now() AS t", "named with a schema"),
+            // A WITH name is a table only where its WITH is seen.
+            ("SELECT name, setting FROM (WITH pg_settings AS (SELECT 1) SELECT 1) t, pg_settings", "it reads pg_settings"),
+            ("SELECT * FROM (WITH duckdb_tables AS (SELECT 1) SELECT 1) t, duckdb_tables", "it reads duckdb_tables"),
+            ("SELECT current_setting('temp_directory') OVER () AS t FROM input", "current_setting() reads the engine"),
+            ("SHOW TABLES", "one query"),
         ] {
             let got = vetted(q);
             assert!(got.as_ref().err().is_some_and(|e| e.contains(says)), "{q}: {got:?}");

@@ -73,7 +73,12 @@ impl ColumnType {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => ColumnType::Integer,
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => ColumnType::Integer,
             DataType::Float16 | DataType::Float32 | DataType::Float64 => ColumnType::Double,
-            DataType::Decimal128(_, s) | DataType::Decimal256(_, s) if *s >= 0 => ColumnType::Decimal(*s as u8),
+            DataType::Decimal128(_, s) | DataType::Decimal256(_, s) if *s >= 0 && *s as u8 <= DECIMAL_SCALE_MAX => {
+                ColumnType::Decimal(*s as u8)
+            }
+            // More places than a decimal is given: a float, as a file's
+            // value with that many is.
+            DataType::Decimal128(..) | DataType::Decimal256(..) => ColumnType::Double,
             DataType::Date32 | DataType::Date64 => ColumnType::Date,
             DataType::Timestamp(_, None) => ColumnType::Timestamp,
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => ColumnType::Text,

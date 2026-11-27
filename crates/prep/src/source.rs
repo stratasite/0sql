@@ -156,10 +156,27 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
             bad.push(BadRow { line, reason });
         }
     };
+    let mut cells = 0usize;
     for record in reader.byte_records() {
         match record {
             Ok(r) => {
                 let line = r.position().map(|p| p.line()).unwrap_or(0);
+                if r.len() > COLUMN_LIMIT {
+                    return Err(Error::Unprocessable(format!(
+                        "line {line} has {} fields, more than the {COLUMN_LIMIT} columns a dataset has",
+                        r.len()
+                    )));
+                }
+                if let Some(long) = r.iter().find(|f| f.len() > FIELD_LIMIT) {
+                    return Err(Error::Unprocessable(format!(
+                        "line {line} has a field of {} bytes, more than the {FIELD_LIMIT} a value is",
+                        long.len()
+                    )));
+                }
+                cells += r.len();
+                if cells > CELL_LIMIT {
+                    return Err(Error::Unprocessable(format!("this file has more than {CELL_LIMIT} values, the most a dataset takes")));
+                }
                 // A blank line between rows is nothing, not a row of one
                 // empty field.
                 if r.len() == 1 && r[0].iter().all(|b| b.is_ascii_whitespace()) {
@@ -218,9 +235,10 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
 
     let (names, renamed) = column_names(names_row.as_deref(), width);
     let mut values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); width];
-    for (_, fields) in &rows {
-        for (c, field) in fields.iter().enumerate() {
-            values[c].push(if field.trim().is_empty() { None } else { Some(field.clone()) });
+    let row_count = rows.len();
+    for (_, fields) in rows {
+        for (c, field) in fields.into_iter().enumerate() {
+            values[c].push(if field.trim().is_empty() { None } else { Some(field) });
         }
     }
     let columns: Vec<(String, ColumnType)> = names
@@ -251,13 +269,24 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
             quote,
             header,
             header_detected,
-            rows: rows.len(),
+            rows: row_count,
             bad_rows,
             bad_examples: bad,
             renamed,
         },
     })
 }
+
+/// The most columns a file may have.
+pub const COLUMN_LIMIT: usize = 4096;
+
+/// The longest field, in bytes.
+pub const FIELD_LIMIT: usize = 1 << 20;
+
+/// The most values a file may have, all its rows' fields together. Each
+/// is held a few times over while it is read, so this, not the bytes,
+/// is what bounds a file of empty fields.
+pub const CELL_LIMIT: usize = 32 << 20;
 
 fn too_many(max_rows: usize) -> Error {
     Error::Unprocessable(format!("this file has more than {max_rows} rows, the most a dataset holds"))

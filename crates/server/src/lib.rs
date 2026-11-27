@@ -236,8 +236,21 @@ fn hostname() -> String {
 /// Runs work that would hold a runtime thread for seconds on a blocking
 /// thread instead, so a deploy never stalls the planning the rest of
 /// the server is doing.
+///
+/// The work holds the request's admission seat until it ends. A request
+/// that passes its deadline is answered, but its work goes on, and the
+/// seat must stay taken while it does, or work past its deadline would
+/// pile up past the cap.
 pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
-    match tokio::task::spawn_blocking(work).await {
+    let seat = guard::seat();
+    match tokio::task::spawn_blocking(move || {
+        let held = seat;
+        let result = work();
+        drop(held);
+        result
+    })
+    .await
+    {
         Ok(result) => result,
         Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("this request did not finish: {e}"))),
     }

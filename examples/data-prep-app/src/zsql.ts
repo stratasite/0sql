@@ -220,9 +220,14 @@ export class ZsqlError extends Error {
     this.name = "ZsqlError";
   }
 
-  /** Busy (503) and a dataset busy with another job (409 Conflict) are worth one more try. */
+  /**
+   * Busy (503: nothing was done) and a dataset busy with another job
+   * (409 Conflict) are worth one more try. A 503 Timeout is not: the work
+   * goes on after the answer and may well land, and an edit sent again
+   * would be made twice. Read the dataset again instead.
+   */
   get retryable(): boolean {
-    return this.status === 503 || (this.status === 409 && /busy/.test(this.message));
+    return (this.status === 503 && this.kind === "Busy") || (this.status === 409 && /busy/.test(this.message));
   }
 }
 

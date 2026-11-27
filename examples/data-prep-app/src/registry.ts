@@ -25,32 +25,34 @@ export interface Entry {
 }
 
 export class Registry {
-  #entries: Record<string, Entry>;
+  // A Map, not an object: an id is the user's to send, and `__proto__` is
+  // no dataset.
+  #entries: Map<string, Entry>;
 
   constructor(private readonly path: string) {
     try {
-      this.#entries = JSON.parse(readFileSync(path, "utf8")) as Record<string, Entry>;
+      this.#entries = new Map(Object.entries(JSON.parse(readFileSync(path, "utf8")) as Record<string, Entry>));
     } catch {
-      this.#entries = {};
+      this.#entries = new Map();
     }
   }
 
   /** What `user` may do with dataset `id`; `undefined` is nothing at all. */
   access(user: string, id: string): Access | undefined {
-    const e = this.#entries[id];
+    const e = this.#entries.get(id);
     if (!e) return undefined;
     if (e.owner === user) return "owner";
     return e.sharedWith.includes(user) ? "reader" : undefined;
   }
 
   entry(id: string): Entry | undefined {
-    return this.#entries[id];
+    return this.#entries.get(id);
   }
 
   /** The datasets `user` may see, with what they may do. */
   visible(user: string): Map<string, Access> {
     const out = new Map<string, Access>();
-    for (const id of Object.keys(this.#entries)) {
+    for (const id of this.#entries.keys()) {
       const a = this.access(user, id);
       if (a) out.set(id, a);
     }
@@ -58,12 +60,12 @@ export class Registry {
   }
 
   add(id: string, owner: string): void {
-    this.#entries[id] = { owner, sharedWith: [], created: new Date().toISOString() };
+    this.#entries.set(id, { owner, sharedWith: [], created: new Date().toISOString() });
     this.#save();
   }
 
   share(id: string, user: string): void {
-    const e = this.#entries[id];
+    const e = this.#entries.get(id);
     if (e && user !== e.owner && !e.sharedWith.includes(user)) {
       e.sharedWith.push(user);
       this.#save();
@@ -71,7 +73,7 @@ export class Registry {
   }
 
   unshare(id: string, user: string): void {
-    const e = this.#entries[id];
+    const e = this.#entries.get(id);
     if (e) {
       e.sharedWith = e.sharedWith.filter((u) => u !== user);
       this.#save();
@@ -79,14 +81,14 @@ export class Registry {
   }
 
   remove(id: string): void {
-    delete this.#entries[id];
+    this.#entries.delete(id);
     this.#save();
   }
 
   #save(): void {
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(this.#entries, null, 2));
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.#entries), null, 2));
     renameSync(tmp, this.path);
   }
 }

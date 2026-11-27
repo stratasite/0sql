@@ -126,7 +126,8 @@ impl Tok {
     }
 }
 
-const OPS: [&str; 17] = ["<=", ">=", "!=", "<>", "=", "<", ">", "+", "-", "*", "/", "%", "&", "(", ")", ",", "=="];
+// Two-character operators first: the lexer takes the first that matches.
+const OPS: [&str; 17] = ["<=", ">=", "!=", "<>", "==", "=", "<", ">", "+", "-", "*", "/", "%", "&", "(", ")", ","];
 
 fn lex(text: &str) -> Result<Vec<Tok>> {
     let chars: Vec<char> = text.chars().collect();
@@ -818,6 +819,24 @@ const FUNCTIONS: [&str; 52] = [
     "log10",
 ];
 
+/// The longest value a `replace()` that lengthens may make. Nested, each
+/// one multiplies the length, and the engine's memory limit does not
+/// hold back a value that size: it is refused before it is made.
+pub const REPLACE_LIMIT: usize = 64 * 1024;
+
+/// `replace(x, a, b)`, refused with words where it could make a value
+/// past [`REPLACE_LIMIT`]: at most `length(x) * (1 + length(b))` long
+/// when `b` is longer than `a`. Each argument is written once, bound in
+/// a lambda, so nesting does not double the SQL.
+fn replace_within(x: &str, a: &str, b: &str) -> String {
+    format!(
+        "list_transform([{{'x': {x}, 'a': {a}, 'b': {b}}}], lambda r: CASE \
+         WHEN coalesce(length(r.b), 0) <= coalesce(length(r.a), 0) \
+         OR coalesce(length(r.x), 0) * (1 + coalesce(length(r.b), 0)) <= {REPLACE_LIMIT} THEN replace(r.x, r.a, r.b) \
+         ELSE error('replace() would make a value longer than {REPLACE_LIMIT} characters') END)[1]"
+    )
+}
+
 fn arity(name: &str, n: usize, min: usize, max: usize) -> Result<()> {
     if n < min || n > max {
         let want = if min == max {
@@ -878,7 +897,7 @@ fn call(name: &str, a: &[String], t: &[Option<ColumnType>], args: &[Expr], scope
             for x in t {
                 want_text(*x, "replace()")?;
             }
-            (format!("replace({})", a.join(", ")), Some(Text))
+            (replace_within(&a[0], &a[1], &a[2]), Some(Text))
         }
         "concat" => {
             arity(name, n, 1, usize::MAX)?;

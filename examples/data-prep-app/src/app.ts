@@ -23,6 +23,8 @@ export interface User {
 }
 
 const SESSION = "session";
+/** How long a sign-in lasts. */
+const SESSION_SECONDS = 8 * 60 * 60;
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 
 /**
@@ -87,10 +89,27 @@ export async function buildApp(config: Config, options: { fetch?: typeof fetch; 
     return { user: u, access };
   }
 
+  /**
+   * The datasets a recipe's steps read (a join's, an append's), each one
+   * the user must be allowed to read: a step reads another dataset whole,
+   * so a preview would show it and a recipe would copy it. A recipe
+   * saved keeps reading what it named when zsqld runs it again on a new
+   * file upstream; take a dataset out of the recipes that read it when
+   * you take away someone's access to it.
+   */
+  function readsAllowed(req: FastifyRequest, steps: Step[] | undefined): void {
+    for (const step of steps ?? []) {
+      const read = (step as { dataset?: unknown }).dataset;
+      if (typeof read === "string") allowed(req, read, "reader");
+    }
+  }
+
+  // A DEMO SIGN-IN: anyone may sign in as any name, with no password.
+  // Replace this route with your own sign-in; nothing below it changes.
   app.post<{ Body: { name?: string } }>("/api/session", async (req, reply) => {
     const name = (req.body?.name ?? "").trim().toLowerCase();
     if (!NAME.test(name)) throw new Refused(400, "Invalid", "a name is lower-case letters, digits, - and _");
-    reply.setCookie(SESSION, name, { signed: true, httpOnly: true, sameSite: "lax", path: "/" });
+    reply.setCookie(SESSION, name, { signed: true, httpOnly: true, sameSite: "lax", secure: "auto", maxAge: SESSION_SECONDS, path: "/" });
     return { name };
   });
 
@@ -208,11 +227,13 @@ export async function buildApp(config: Config, options: { fetch?: typeof fetch; 
 
   app.post<{ Params: { id: string }; Body: RecipeChange }>("/api/datasets/:id/recipe", async (req) => {
     allowed(req, req.params.id, "owner");
+    readsAllowed(req, req.body?.steps);
     return shown(await withRetry(() => zsql.changeRecipe(req.params.id, req.body)), "owner");
   });
 
   app.post<{ Params: { id: string }; Body: { steps?: Step[]; limit?: number } }>("/api/datasets/:id/preview", async (req) => {
     allowed(req, req.params.id, "owner");
+    readsAllowed(req, req.body?.steps);
     return withRetry(() => zsql.preview(req.params.id, req.body ?? {}));
   });
 
@@ -250,10 +271,17 @@ export async function buildApp(config: Config, options: { fetch?: typeof fetch; 
   });
 
   // A blend reads every dataset it attaches: each must be one the user may read.
+  // The request to zsqld is built here, from what a user may choose: the
+  // spec, the datasets and the joins, and a page. Never pass on a
+  // browser's `context` (it would choose its own security context) or
+  // `connection` (it would point zsqld at a host of its choosing); set
+  // `context` from your session, for the user signed in.
   app.post<{ Body: BlendRequest }>("/api/blend", async (req) => {
     signedIn(req);
-    for (const d of req.body?.datasets ?? []) allowed(req, d.id, "reader");
-    return withRetry(() => zsql.blend(config.branch, req.body));
+    const b = req.body ?? ({} as BlendRequest);
+    for (const d of b.datasets ?? []) allowed(req, d.id, "reader");
+    const asked: BlendRequest = { spec: b.spec, datasets: b.datasets, blend: b.blend, offset: b.offset, limit: b.limit };
+    return withRetry(() => zsql.blend(config.branch, asked));
   });
 
   return app;

@@ -129,9 +129,9 @@ impl Store {
         self.data_dir.clone()
     }
 
-    /// Where blends' answers are kept.
-    pub fn blends(&self) -> PathBuf {
-        self.data_dir.join(".cache").join("blends")
+    /// Where a project's kept blends are.
+    pub fn blends(&self, org: &str, project: &str) -> PathBuf {
+        self.data_dir.join(".cache").join("blends").join(org).join(project)
     }
 
     /// Where one project's datasets are.

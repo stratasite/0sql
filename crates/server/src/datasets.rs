@@ -730,7 +730,8 @@ pub(crate) async fn blend(
         let path = app.runs.rows(&record).map_err(crate::exec::internal)?;
         let rows = zsql_exec::page(&path, 0, u64::MAX).map_err(crate::exec::internal)?;
         let part = zsql_prep::blend::ModelPart { rows, keys: split.keys };
-        let b = prep.blend(&scope, &plan, &part, &record.sql)?;
+        // Kept by the model's run, whose cache says when it is run again.
+        let b = prep.blend(&scope, &plan, &part, &record.id)?;
         let (offset, limit) = page;
         let total = b.rows.num_rows() as u64;
         let mut skip = offset as usize;

@@ -156,7 +156,14 @@ pub struct Request {
     pub edits: Vec<Asked>,
 }
 
-pub(crate) fn read_log(dir: &Path) -> Result<Vec<Entry>> {
+/// The log's entries the dataset acknowledged: the first `upto`. An
+/// entry past them was written by a job that failed before its manifest
+/// was, and was never an edit.
+pub(crate) fn read_log(dir: &Path, upto: u64) -> Result<Vec<Entry>> {
+    Ok(read_all(dir)?.into_iter().filter(|e| e.seq <= upto).collect())
+}
+
+fn read_all(dir: &Path) -> Result<Vec<Entry>> {
     let path = dir.join(LOG);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -176,9 +183,24 @@ pub(crate) fn read_log(dir: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// Appends an entry and makes it durable before it is acknowledged.
+/// Appends an entry and makes it durable before it is acknowledged. An
+/// entry of its number or later, never acknowledged, goes first, so no
+/// two entries share a number.
 pub(crate) fn append(dir: &Path, entry: &Entry) -> Result<()> {
     let path = dir.join(LOG);
+    let all = read_all(dir)?;
+    if all.iter().any(|e| e.seq >= entry.seq) {
+        let mut text = Vec::new();
+        for e in all.iter().filter(|e| e.seq < entry.seq) {
+            text.extend(serde_json::to_vec(e)?);
+            text.push(b'\n');
+        }
+        let staging = dir.join(format!(".{LOG}.{}", crate::time::nanos()));
+        let mut f = std::fs::File::create(&staging).map_err(|e| Error::io(&staging, e))?;
+        f.write_all(&text).map_err(|e| Error::io(&staging, e))?;
+        f.sync_data().map_err(|e| Error::io(&staging, e))?;
+        std::fs::rename(&staging, &path).map_err(|e| Error::io(&path, e))?;
+    }
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| Error::io(&path, e))?;
@@ -374,13 +396,69 @@ fn key_match(columns: &[Column], key: &[String]) -> String {
 
 /// Applies edits to `input`, as the view `output`; how each fared.
 /// Every edit here reads only columns `columns` has.
+///
+/// They apply in the order they were made: a delete and then a remap of
+/// the value it named deletes the row, and a remap of a remapped value
+/// chains. Edits in a row of one kind that cannot change each other's
+/// rows are applied together, in one view.
 pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Column], edits: &[Edit]) -> Result<Vec<Outcome>> {
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut rel = input.to_string();
     let mut n = 0usize;
+    for (tag, run) in runs(columns, edits).iter().enumerate() {
+        apply_run(session, (output, tag), columns, run, (&mut rel, &mut n), &mut outcomes)?;
+    }
+    let list = columns.iter().map(|c| ident(&c.name)).collect::<Vec<_>>().join(", ");
+    session.execute(&format!("CREATE VIEW {} AS SELECT {list} FROM {rel}", ident(output)))?;
+    Ok(outcomes)
+}
+
+/// The edits cut where one could change what the next one finds: at a
+/// change of kind; for overrides, of the rows' columns or the target; for
+/// remaps, where one maps the value another made.
+fn runs(columns: &[Column], edits: &[Edit]) -> Vec<Vec<Edit>> {
+    let column_of = |c: &str| type_of(columns, c).map(|c| c.name.clone()).unwrap_or_else(|| c.to_string());
+    let group = |e: &Edit| -> Option<(u8, Vec<String>, String)> {
+        Some(match e {
+            Edit::Remap { .. } => (0, vec![], String::new()),
+            Edit::Set { column, key, .. } => (1, key.keys().cloned().collect(), column_of(column)),
+            Edit::Delete { .. } => (2, vec![], String::new()),
+            Edit::Add { .. } => (3, vec![], String::new()),
+            _ => return None,
+        })
+    };
+    let mut out: Vec<Vec<Edit>> = Vec::new();
+    for e in edits {
+        let Some(g) = group(e) else { continue };
+        let joins = out.last().is_some_and(|run| {
+            group(&run[0]).as_ref() == Some(&g)
+                && match e {
+                    Edit::Remap { column, from, .. } => !run.iter().any(
+                        |r| matches!(r, Edit::Remap { column: c, to, .. } if column_of(c) == column_of(column) && text_of(to) == text_of(from)),
+                    ),
+                    _ => true,
+                }
+        });
+        match out.last_mut() {
+            Some(run) if joins => run.push(e.clone()),
+            _ => out.push(vec![e.clone()]),
+        }
+    }
+    out
+}
+
+/// One run of edits over `rel`, which it moves to the view it makes.
+fn apply_run(
+    session: &Session,
+    (output, tag): (&str, usize),
+    columns: &[Column],
+    edits: &[Edit],
+    (rel, n): (&mut String, &mut usize),
+    outcomes: &mut Vec<Outcome>,
+) -> Result<()> {
     let list = |prefix: &str| columns.iter().map(|c| format!("{prefix}{}", ident(&c.name))).collect::<Vec<_>>().join(", ");
     let mut next = |sql: String, rel: &mut String| -> Result<()> {
-        n += 1;
+        *n += 1;
         let name = format!("{output}_{n}");
         session.execute(&format!("CREATE VIEW {} AS {sql}", ident(&name)))?;
         *rel = ident(&name);
@@ -412,7 +490,7 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
                 None => select.push(ident(&c.name)),
             }
         }
-        next(format!("SELECT {} FROM {rel}", select.join(", ")), &mut rel)?;
+        next(format!("SELECT {} FROM {rel}", select.join(", ")), rel)?;
     }
 
     // Overrides of one cell, by key columns and target column.
@@ -457,7 +535,7 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
                 _ => None,
             })
             .collect();
-        let m = format!("__set{gi}");
+        let m = format!("__set{tag}_{gi}");
         load_texts(session, &m, &names, &rows)?;
         let x = ident(&target.name);
         let counted = session.query(&format!(
@@ -512,7 +590,7 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
                 ids = ids.join(", "),
                 on = key_match(columns, &key),
             ),
-            &mut rel,
+            rel,
         )?;
     }
 
@@ -542,7 +620,7 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
                 _ => None,
             })
             .collect();
-        let m = format!("__delete{gi}");
+        let m = format!("__delete{tag}_{gi}");
         load_texts(session, &m, &names, &rows)?;
         let counted = session.query(&format!(
             "SELECT m.\"__id\", CAST(count(r.\"__one\") AS BIGINT), FALSE FROM {m} m \
@@ -581,7 +659,7 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
                 ids = apply_ids.join(", "),
                 on = key_match(columns, &key),
             ),
-            &mut rel,
+            rel,
         )?;
     }
 
@@ -620,15 +698,14 @@ pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Col
             outcomes.push(Outcome { id: id.clone(), state: State::Applied, detail: None });
         }
         if !rows.is_empty() {
-            load_texts(session, "__add", &names, &rows)?;
+            let add = ident(&format!("__add{tag}"));
+            load_texts(session, &format!("__add{tag}"), &names, &rows)?;
             let casts: Vec<String> =
                 columns.iter().map(|c| format!("TRY_CAST({} AS {}) AS {}", ident(&c.name), c.ty.sql(), ident(&c.name))).collect();
-            next(format!("SELECT {} FROM {rel} UNION ALL SELECT {} FROM \"__add\"", list(""), casts.join(", ")), &mut rel)?;
+            next(format!("SELECT {} FROM {rel} UNION ALL SELECT {} FROM {add}", list(""), casts.join(", ")), rel)?;
         }
     }
-
-    session.execute(&format!("CREATE VIEW {} AS SELECT {} FROM {rel}", ident(output), list("")))?;
-    Ok(outcomes)
+    Ok(())
 }
 
 /// `(id, count, changed)` from a query that answers those three.

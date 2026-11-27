@@ -205,7 +205,9 @@ region ORDER BY month) AS running FROM input"}`. It is a black box:
   query, which is of the query as it was wrapped.
 - **Its columns are DuckDB's answer,** learned by running it with no
   rows, each cast to a type a dataset has: a sum's HUGEINT is an
-  integer; a list, a struct or an interval is refused, saying to cast
+  integer; a `DECIMAL(38,0)`, such as the data's own 20-digit numbers,
+  stays a decimal of no places; a decimal of more places than 18 is a
+  double; a list, a struct or an interval is refused, saying to cast
   it. Names are DuckDB's too: an expression with no `AS` is named by its
   text, a repeat is numbered. A column it keeps by name keeps its role
   while it is still a number, or still not one; the rest are inferred.
@@ -214,8 +216,13 @@ region ORDER BY month) AS running FROM input"}`. It is a black box:
   step and the column. Its lineage is coarse: each column it makes is
   from everything it was given.
 - **It is bounded** by the session's memory and threads, and stopped
-  after 60 seconds. The session has external access off and its
+  after 60 seconds, or sooner when the job it is part of runs out of
+  time. What it hands back is counted as it comes, and refused past
+  twice a dataset's caps. The session has external access off and its
   configuration locked, as every session does: no file, no URL.
+- **Its WITH tables are scoped as SQL scopes them:** a name made inside
+  a subquery is not a table outside it, so it cannot stand in for a
+  name of the engine's own (`pg_settings`) elsewhere in the query.
 
 **Formulas have their own language.** A computed column or a filter is
 written in a small expression language of data prep's own: column
@@ -319,12 +326,19 @@ What an edit means depends on the column's role.
 
   A dimension's own original value is always among what an edit of it
   matches on.
+- **Edits apply in the order they were made,** at each place in the
+  recipe: a row deleted and then its value remapped stays deleted; a
+  remap of a remapped value chains (`NY` → `New York` → `NYC`); a row
+  added and then deleted is gone.
 - **A row's identity** is the recipe's `key` when the user marks one,
   else every dimension column. An edit that names more than one row is
   refused when it is made, saying so and offering both ways out: mark a
   key, or send `"all": true` to edit every row with those values. At a
   later sync an edit made for one row that now names several is listed
-  as *ambiguous* and not applied; nothing guesses.
+  as *ambiguous* and not applied; nothing guesses. An edit for the rows
+  that agree, a dimension edit with a `match` or any edit with
+  `"all": true`, is for every such row, however many matched when it
+  was made.
 - **Edits past a join or an append** need no rule of their own. An edit
   applies after the steps the recipe had when it was made, and names
   its row by what is there at that point. A step added later runs after
@@ -502,10 +516,14 @@ limit of its own, and datasets are bounded by their caps. A top-N with a
 `filter` blend is therefore the top N of the model, filtered, and can
 return fewer than N rows. This is deliberate, to protect the server.
 
-**The cache is reused.** A blend's result is cached by the model's SQL,
-each attached dataset's id and materialization version, and the joins.
-Each dataset is found before the lookup, and a new materialization is
-a new key, so a match is the same question over the same data.
+**The cache is reused.** A blend's result is kept by the run of the
+model's part, each attached dataset's id and materialization version,
+and the joins. The run is the run cache's: `fresh`, the datasource's
+`cache_ttl`, an invalidation and the credential decide when the model's
+part runs again, and a new run is a new key. Each dataset is found
+before the lookup, and a new materialization is a new key, so a match
+is the same question over the same data. A project keeps its 64 most
+recent blends.
 
 ## Only when asked
 
@@ -623,9 +641,32 @@ the org.
 Every materialization, refresh, cascade and preview has a seat in an
 admission class of its own (`prep`, `ZSQL_ADMIT_PREP`), a DuckDB memory
 limit (`ZSQL_PREP_MEMORY`), a thread count (`ZSQL_PREP_THREADS`) and a
-spill directory under `.cache/prep`. One job runs on a dataset at a
-time; a second is told it is busy. The caps are `ZSQL_DATASET_MAX_ROWS`
-(a million) and `ZSQL_DATASET_MAX_BYTES` (256 MB).
+spill directory of its own under `.cache/prep`, removed when it closes:
+DuckDB names its spill files alike in every instance, so sessions
+sharing one would read and delete each other's. One job runs on a
+dataset at a time; a second is told it is busy. The caps are
+`ZSQL_DATASET_MAX_ROWS` (a million) and `ZSQL_DATASET_MAX_BYTES`
+(256 MB).
+
+What bounds a job, beyond the caps:
+
+- **Five minutes,** all its queries together, after which what is
+  running is interrupted and nothing more runs. A request answered at
+  its deadline keeps its admission seat until its work has stopped, so
+  work past its deadline never piles up past the cap.
+- **What the engine hands back is counted as it comes,** rows and Arrow
+  bytes, and refused past twice the caps: DuckDB's memory limit does not
+  count what has left it.
+- **A file** has at most 4,096 columns, fields of at most 1 MB, and 32
+  million values in all.
+- **A formula's `replace()`** that lengthens is refused when it could
+  make a value past 64 KB: nested, each one multiplies the length, and
+  DuckDB's memory limit does not hold back a value that size.
+
+A `sql` step's query can still make large values inside the engine
+(`repeat()`, `lpad()`); the memory limit does not count those, and what
+would bound them is a process of its own with an OS limit. That is left
+for when a job runs out of process.
 
 An upload and a recipe change run while the request waits: a dataset
 is small, and the deadline is ninety seconds. A refresh from the

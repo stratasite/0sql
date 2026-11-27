@@ -512,9 +512,10 @@ fn cross(session: &Session, parent: &Rel, child: &Rel, alias: &str) -> Result<()
 fn unique(session: &Session, rel: &Rel, k: &[(String, String, ColumnType)], alias: &str) -> Result<()> {
     let cols: Vec<String> = k.iter().map(|(_, r, _)| ident(r)).collect();
     let n = session.count(&format!(
-        "SELECT count(*) FROM (SELECT {c} FROM {} GROUP BY {c} HAVING count(*) > 1)",
+        "SELECT count(*) FROM (SELECT {c} FROM {} WHERE {nn} GROUP BY {c} HAVING count(*) > 1)",
         rel.sql,
-        c = cols.join(", ")
+        c = cols.join(", "),
+        nn = cols.iter().map(|c| format!("{c} IS NOT NULL")).collect::<Vec<_>>().join(" AND ")
     ))?;
     if n > 0 {
         return Err(Error::Unprocessable(format!(

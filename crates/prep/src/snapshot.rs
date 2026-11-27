@@ -24,9 +24,10 @@ const EXAMPLES: usize = 3;
 /// A CSV upload, as a snapshot of a source whose columns are
 /// `established` (none for a new source).
 pub(crate) fn from_csv(session: &Session, bytes: &[u8], options: &CsvOptions, established: &[Column], max_rows: usize) -> Result<Taken> {
-    let parsed = parse_csv(bytes, options, max_rows)?;
+    let mut parsed = parse_csv(bytes, options, max_rows)?;
     let fields: Vec<Field> = parsed.columns.iter().map(|(n, _)| Field::new(n, DataType::Utf8, true)).collect();
-    let arrays: Vec<ArrayRef> = parsed.values.iter().map(|v| Arc::new(StringArray::from(v.clone())) as ArrayRef).collect();
+    let arrays: Vec<ArrayRef> =
+        std::mem::take(&mut parsed.values).into_iter().map(|v| Arc::new(StringArray::from(v)) as ArrayRef).collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
     let raw: Vec<(String, ColumnType)> = parsed.columns.iter().map(|(n, _)| (n.clone(), ColumnType::Text)).collect();
     session.load("raw", &raw, &[batch])?;

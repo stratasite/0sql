@@ -46,6 +46,12 @@ pub(crate) fn release_seat() {
     let _ = SEAT.try_with(Held::release);
 }
 
+/// The seat the request in hand was admitted on, for work that outlives
+/// its answer to hold.
+pub(crate) fn seat() -> Option<Held> {
+    SEAT.try_with(Held::clone).ok()
+}
+
 pub(crate) async fn guard(State(app): State<Shared>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let class = admission::classify(req.uri().path());
     if class == Class::Exempt {

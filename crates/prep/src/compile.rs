@@ -581,7 +581,8 @@ fn one(
                 let i = found(cols, c)?;
                 let x = ident(&cols.columns[i].name);
                 // Blank text is empty too: a step before may have made it.
-                let value = if cols.columns[i].ty == ColumnType::Text { format!("NULLIF(trim({x}), '')") } else { x.clone() };
+                // A value that is there is kept as it is, spaces and all.
+                let value = if cols.columns[i].ty == ColumnType::Text { format!("CASE WHEN trim({x}) <> '' THEN {x} END") } else { x.clone() };
                 list[i] = format!(
                     "COALESCE({value}, last_value({value} IGNORE NULLS) OVER (ORDER BY \"__position\" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS {x}"
                 );
@@ -643,7 +644,12 @@ fn join(
     let keys: Vec<String> = right_keys.iter().map(|k| ident(k)).collect();
     checks.push(Check {
         step: n,
-        relation: format!("(SELECT {k} FROM {table} GROUP BY {k} HAVING count(*) > 1)", k = keys.join(", ")),
+        // A null key joins nothing, so two of them are no repeat.
+        relation: format!(
+            "(SELECT {k} FROM {table} WHERE {nn} GROUP BY {k} HAVING count(*) > 1)",
+            k = keys.join(", "),
+            nn = keys.iter().map(|k| format!("{k} IS NOT NULL")).collect::<Vec<_>>().join(" AND ")
+        ),
         column: right_keys[0].clone(),
         failing: "TRUE".into(),
         says: format!("step {n} (join): dataset {id} is not unique on its keys, and {{n}} key value(s) repeat; it would multiply rows"),

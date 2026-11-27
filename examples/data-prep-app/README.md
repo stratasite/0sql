@@ -16,6 +16,9 @@ What datasets are, and every rule behind these calls, is in
 browser ──(this app's session)──► this app's backend ──(only what it allows)──► zsqld
 ```
 
+The sign-in is a stub: anyone may sign in as any name. Replace
+`POST /api/session` with your own; nothing behind it changes.
+
 **zsqld keeps no user.** A dataset is its project's, addressed by its
 id, and zsqld answers whoever reaches it, as it does for deploys and
 runs. Access control is this app's, and it is all in one place:
@@ -27,6 +30,12 @@ runs. Access control is this app's, and it is all in one place:
   anything reaches zsqld. A dataset a user may not see answers 404; a
   change by someone it is only shared with answers 403. Tests hold
   that neither reaches zsqld.
+- A step can read another dataset: a `join` or an `append` names one.
+  A preview would show it and a recipe would copy it, so the app checks
+  that the user may read every dataset a recipe's steps name, as it
+  checks a blend's. A saved recipe keeps reading what it named when
+  zsqld runs it again, so take a dataset out of the recipes that read it
+  when you take away someone's access to it.
 - zsqld lists every dataset of the project; the app shows each user the
   ones its record lets them.
 - zsqld must not be reachable from a browser, or from anyone but this
@@ -74,7 +83,7 @@ npm start          # http://127.0.0.1:3700
 | `ZSQL_ORG` | `default` | the org the datasets are in |
 | `ZSQL_PROJECT` | `grocery-store` | the project they belong to |
 | `ZSQL_BRANCH` | `main` | the branch a blend plans the model's part on; blends only. `zsql serve` deploys the branch checked out |
-| `SESSION_SECRET` | a demo value | signs the session cookie |
+| `SESSION_SECRET` | random, per process | signs the session cookie; unset, sign-ins end when the app stops |
 | `DATA_DIR` | `data` | where the app keeps its own records (`registry.json`) |
 | `MAX_UPLOAD_BYTES` | 64 MB | the largest file accepted; zsqld has its own cap, `ZSQL_DATASET_MAX_BYTES` |
 | `PORT` | `3700` | this app's port |
@@ -142,8 +151,12 @@ read it again. `preview` runs steps over a sample without keeping
 anything, which is what to show while a step is being made.
 
 **Blends** run the model's part in the warehouse, so the branch's
-datasource must be reachable, with its credential deployed or sent in
-`connection`. The request states every join; nothing is joined for it.
+datasource must be reachable, with its credential deployed. The app
+builds the request to zsqld from what a user may choose (the spec, the
+datasets, the joins and a page) and nothing else from the browser: a
+browser's `context` would pick its own security context, and its
+`connection` would point zsqld at a host of its choosing. Set `context`
+from your session. The request states every join; nothing is joined for it.
 Every model key a join names must be projected too: the dataset is at
 that grain, so the answer is. A join with no keys (`"on": []`) is a
 cross join, each row of the dataset beside every row of the model, for
@@ -157,7 +170,10 @@ zsqld refuses in one shape, `{"error": {"class", "message"}}`, and its
 messages are written to be shown to a user. The app passes them through
 with their status. `withRetry` tries once more, after the `retry-after`
 zsqld gives, on `503 Busy` and on `409` for a dataset busy with another
-job. A streamed upload is not retried: its body cannot be sent twice.
+job: nothing was done. A `503 Timeout` is not tried again: the work goes
+on after the answer and may well land, so an edit sent twice would be
+made twice; read the dataset again instead. A streamed upload is not
+retried: its body cannot be sent twice.
 
 Uploads and recipe changes finish within the request, so give the
 client a timeout above zsqld's 90 seconds for data prep; `src/zsql.ts`
