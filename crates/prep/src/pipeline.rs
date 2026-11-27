@@ -441,19 +441,13 @@ pub(crate) fn execute(
     Ok(done)
 }
 
-fn first_rows(batches: Vec<RecordBatch>, n: Option<usize>) -> Vec<RecordBatch> {
-    let Some(n) = n else { return batches };
-    let mut out = Vec::new();
-    let mut left = n;
-    for b in batches {
-        if left == 0 {
-            break;
-        }
-        let take = left.min(b.num_rows());
-        out.push(b.slice(0, take));
-        left -= take;
-    }
-    out
+/// The rows of a rows file, or its first `n`: a sample reads no batch
+/// past them.
+fn first_rows(path: &std::path::Path, n: Option<usize>) -> Result<Vec<RecordBatch>> {
+    Ok(match n {
+        Some(n) => crate::store::read_rows_range(path, 0, n)?.batches,
+        None => crate::store::read_rows(path)?.batches,
+    })
 }
 
 fn run_node(
@@ -467,9 +461,8 @@ fn run_node(
     match &p.plan {
         Plan::Load { table, chain } => {
             let l = loaded.ok_or_else(|| Error::Internal("an input was not resolved".into()))?;
-            let rows = crate::store::read_rows(&l.rows)?;
             let typed: Vec<(String, ColumnType)> = l.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
-            session.load(table, &typed, &first_rows(rows.batches, options.sample))?;
+            session.load(table, &typed, &first_rows(&l.rows, options.sample)?)?;
             if let Some(chain) = chain {
                 run_chain(engine, session, chain, None)?;
             }
@@ -820,19 +813,18 @@ pub(crate) fn overlaps(engine: &Engine, problems: &mut [Problem], loaded: &HashM
         }
         let (a, b) = (format!("prev{k}"), format!("cur{k}"));
         let load = |table: &str, path: &PathBuf, cols: &[Column]| -> Result<()> {
-            let rows = crate::store::read_rows(path)?;
             let typed: Vec<(String, ColumnType)> = cols.iter().map(|c| (c.name.clone(), c.ty)).collect();
-            session.load(table, &typed, &first_rows(rows.batches, Some(100_000)))
+            session.load(table, &typed, &first_rows(path, Some(100_000))?)
         };
         load(&a, prev_rows, prev_cols)?;
         load(&b, &l.rows, &l.columns)?;
         for g in gone {
             let mut best: Option<(f64, String)> = None;
+            let had = session.count(&format!("SELECT count(DISTINCT CAST({} AS VARCHAR)) FROM {}", ident(&g.name), ident(&a)))?;
+            if had == 0 {
+                continue;
+            }
             for c in &new {
-                let had = session.count(&format!("SELECT count(DISTINCT CAST({} AS VARCHAR)) FROM {}", ident(&g.name), ident(&a)))?;
-                if had == 0 {
-                    continue;
-                }
                 let shared = session.count(&format!(
                     "SELECT count(*) FROM (SELECT DISTINCT CAST({} AS VARCHAR) AS v FROM {}) x WHERE v IN (SELECT CAST({} AS VARCHAR) FROM {})",
                     ident(&g.name),
