@@ -1,4 +1,4 @@
-//! What data prep refuses, and why, in the five ways the API tells
+//! What data prep refuses, and why, in the six ways the API tells
 //! them apart.
 
 /// A refusal or a failure. Each says which kind it is, so the server
@@ -23,6 +23,10 @@ pub enum Error {
     /// Something on this side broke.
     #[error("{0}")]
     Internal(String),
+    /// The server is stopping: nothing new starts, and what runs is
+    /// suspended. Worth asking again in a moment.
+    #[error("{0}")]
+    Stopping(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -86,7 +86,7 @@ mod run;
 
 pub use admission::AdmissionCounts;
 pub use mcp::Settings as McpSettings;
-pub use run::{run, run_blocking, serve, Config, RunLimits};
+pub use run::{run, run_blocking, serve, Config, RunLimits, STOP_INTENT};
 pub use zsql_prep::Settings as PrepSettings;
 
 use crate::admission::Admission;

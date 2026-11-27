@@ -60,6 +60,10 @@ pub struct Dataset {
     /// Where its copy in the object store stands, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<crate::backup::Backup>,
+    /// The job a restart found in flight and did not run again, until
+    /// the dataset's next job. Kept beside the manifest, not in it.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<crate::recovery::Interrupted>,
 }
 
 /// Why a dataset's latest snapshots have not been made into a version.
@@ -160,7 +164,8 @@ impl Store {
             .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| {
                 let dir = e.path();
-                let d: Dataset = read_json(&dir.join(MANIFEST)).ok()?;
+                let mut d: Dataset = read_json(&dir.join(MANIFEST)).ok()?;
+                d.interrupted = read_json(&dir.join(crate::recovery::INTERRUPTED)).ok();
                 Some((dir, d))
             })
             .collect();
@@ -199,8 +204,24 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| Error::io(&tmp, e))?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
+        f.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
+        f.sync_data().map_err(|e| Error::io(&tmp, e))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    sync_dir(path.parent())
+}
+
+/// Makes a directory's entries durable: a rename into it survives a
+/// power cut once this returns. A file is synced before it is renamed,
+/// so a manifest never names what is not on disk.
+pub(crate) fn sync_dir(dir: Option<&Path>) -> Result<()> {
+    if let Some(dir) = dir {
+        std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| Error::io(dir, e))?;
+    }
+    Ok(())
 }
 
 /// Rows as an Arrow IPC file, LZ4-compressed as results are; the
@@ -219,8 +240,10 @@ pub(crate) fn write_rows(path: &Path, rows: &Batches) -> Result<u64> {
         }
         writer.finish()?;
     }
+    std::fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(|e| Error::io(&tmp, e))?;
     let bytes = std::fs::metadata(&tmp).map_err(|e| Error::io(&tmp, e))?.len();
     std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    sync_dir(path.parent())?;
     Ok(bytes)
 }
 

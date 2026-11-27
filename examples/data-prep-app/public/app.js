@@ -75,7 +75,7 @@ async function refreshList() {
   ul.replaceChildren(
     ...body.datasets.map((d) =>
       el("li", { class: d.id === state.current?.id ? "on" : "", onclick: guarded(() => open(d.id)) },
-        d.name, el("small", {}, `${d.rows} rows · v${d.live ?? "-"}${d.held ? " · held" : ""}${d.access === "reader" ? ` · shared by ${d.owner}` : ""}`)),
+        d.name, el("small", {}, `${d.rows} rows · v${d.live ?? "-"}${d.held ? " · held" : ""}${d.interrupted ? " · interrupted" : ""}${d.access === "reader" ? ` · shared by ${d.owner}` : ""}`)),
     ),
   );
   if (!body.datasets.length) ul.append(el("li", { class: "muted" }, "none yet: import a CSV"));
@@ -120,7 +120,9 @@ function show(d) {
   sharing(d);
   $("#d-name").textContent = d.name;
   $("#d-meta").textContent = `${d.rows} rows · version ${d.live} · recipe ${d.recipe} · ${d.edits} edit entr${d.edits === 1 ? "y" : "ies"}`;
-  $("#notes").replaceChildren(...(d.notes ?? []).map((n) => el("li", {}, n)));
+  // A job a restart found in flight: its reason, first.
+  const said = d.interrupted ? [el("li", {}, el("strong", {}, "Interrupted: "), d.interrupted.reason)] : [];
+  $("#notes").replaceChildren(...said, ...(d.notes ?? []).map((n) => el("li", {}, n)));
   const held = $("#held");
   held.hidden = !d.held;
   if (d.held) {

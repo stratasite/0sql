@@ -62,7 +62,18 @@ export interface Dataset {
   edits: number;
   backup?: { at: string; failed?: string };
   /** A semantic query still running for it, or one that failed. */
-  pending?: { result: string; since: string; failed?: string };
+  pending?: { result: string; since: string; failed?: string; interrupted?: Interrupted };
+  /** A job a restart found in flight and did not run again; show `reason`. Ends with the dataset's next job. */
+  interrupted?: Interrupted;
+}
+
+/** Why a job did not finish: the process died with it (`crash`), or a stop did not resume it (`stop`). */
+export interface Interrupted {
+  job: "replace" | "refresh" | "create" | "change" | "confirm" | "edit" | "delete" | "update" | "cascade";
+  started: string;
+  found: string;
+  cause: "crash" | "stop";
+  reason: string;
 }
 
 export interface Page {

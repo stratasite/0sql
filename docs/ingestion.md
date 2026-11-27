@@ -670,9 +670,48 @@ for when a job runs out of process.
 
 An upload and a recipe change run while the request waits: a dataset
 is small, and the deadline is ninety seconds. A refresh from the
-warehouse and a cascade become jobs answered 202 with an id when they
-arrive (phases 4 and 5); how jobs are recorded and recovered after a
-crash is left until then.
+warehouse that outlasts its request is answered 202 and waited on
+after.
+
+### Crashes, stops and restarts
+
+A dataset is never half made: its manifest is written last, synced to
+disk with the files it names before it is renamed into place. What a
+crash or a stop does to the jobs running is said on the dataset.
+
+- **Every job leaves a marker** (`job.json` in the dataset's directory)
+  while it runs; a query a dataset waits on is kept in the project's
+  `.datasets/.jobs/`, with the security context it runs under, and never
+  a `connection`, which may hold a credential.
+- **A job a start finds running died with the process.** It may be
+  what killed it, so it is not run again. The dataset keeps the version
+  it had and says so in `interrupted`: the job, when it started, when
+  the start found it, `"cause": "crash"`, and a reason in words ("the
+  server restarted and found this recipe change in flight. It may be
+  what stopped the server, so it was not run again. Send it again.").
+  The dataset's next job ends it. A cascade passes over an interrupted
+  dataset, with a note, rather than run what may be what crashed.
+- **A stop gives running jobs ten seconds,** then interrupts the rest
+  and keeps them as *suspended*. A start resumes what the server runs
+  on its own: a query a dataset waits on, submitted again under its
+  context, and the datasets a cut-short cascade left behind. A request
+  that was answered already, an upload, a recipe change, an edit, is not
+  run unasked, which could make it twice: it is `interrupted`, with
+  `"cause": "stop"`, for its client to send again. So is a query sent
+  with a `connection` of its own.
+- **Whether a start resumes** is `ZSQL_RESUME_JOBS`: `suspended`, the
+  default, or `none`, which interrupts them instead. `zsql server stop
+  --resume` or `--no-resume` says otherwise for one stop.
+- **A dataset made from a query that never finished** has no manifest
+  to carry the word: its id answers as a pending one that failed, with
+  `interrupted` beside, for a week.
+- **What is behind what it reads is run again** after a start, in the
+  background and in order, unless it, or a dataset it reads, is
+  interrupted.
+- **What jobs left half made is swept** before anything is served:
+  spill directories, staging directories, files written beside their
+  targets, half-kept blends. One server owns a data directory (it holds
+  its lock), so nothing swept is anyone's.
 
 ## How the code is laid out
 

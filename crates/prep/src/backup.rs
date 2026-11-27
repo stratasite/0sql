@@ -75,7 +75,10 @@ fn files(dir: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.contains(".tmp-") {
+            // A job's marker and an interruption are this node's, of
+            // what ran here; a restored dataset starts without them.
+            let here = d == dir && (name == crate::recovery::MARKER || name == crate::recovery::INTERRUPTED);
+            if name.starts_with('.') || name.contains(".tmp-") || here {
                 continue;
             }
             let p = e.path();

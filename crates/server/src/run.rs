@@ -330,10 +330,47 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
 
     let router = router(app.clone());
 
+    // What the last stop suspended is submitted again; what a cascade cut
+    // short left behind is run again, in the background.
+    if let Some(prep) = app.prep.clone() {
+        let recovered = prep.take_recovered();
+        if !recovered.resume.is_empty() {
+            tokio::spawn(crate::datasets::resume(app.clone(), prep.clone(), recovered.resume));
+        }
+        tokio::task::spawn_blocking(move || {
+            for note in prep.repair() {
+                tracing::info!("data prep, after the restart: {note}");
+            }
+        });
+    }
+
     // The handlers are installed before the address is announced, so a
     // signal sent the moment the listening line is read is a graceful
     // stop and not the default disposition's instant death.
-    let shutdown = shutdown_signal();
+    //
+    // On the signal, data prep stops beside the requests: its jobs get a
+    // grace, and those still running are suspended, which the server
+    // waits for before it returns.
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = {
+        let signal = shutdown_signal();
+        let (prep, data_dir) = (app.prep.clone(), app.data_dir.clone());
+        async move {
+            signal.await;
+            match prep {
+                Some(prep) => {
+                    let resume = stop_intent(&data_dir).unwrap_or(prep.settings().resume);
+                    tokio::task::spawn_blocking(move || {
+                        prep.stop(PREP_GRACE, resume);
+                        let _ = stopped_tx.send(());
+                    });
+                }
+                None => {
+                    let _ = stopped_tx.send(());
+                }
+            }
+        }
+    };
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     // The address actually bound, so a port of 0 is answered with the
     // port it got.
@@ -349,8 +386,30 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     }
     listening(addr);
     axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
+    let _ = stopped_rx.await;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// How long data prep's jobs are given to finish when the server stops,
+/// before what still runs is suspended. Inside the twenty seconds
+/// `zsql server stop` waits before it kills.
+const PREP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where `zsql server stop --resume` or `--no-resume` says, for one stop,
+/// whether the next start resumes what it suspends.
+pub const STOP_INTENT: &str = ".stop-intent";
+
+/// The intent a stop was given, read once.
+fn stop_intent(data_dir: &std::path::Path) -> Option<bool> {
+    let path = data_dir.join(STOP_INTENT);
+    let said = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    match said.trim() {
+        "resume" => Some(true),
+        "no-resume" => Some(false),
+        _ => None,
+    }
 }
 
 /// [`serve`] on a runtime of its own, for a caller that is not async.

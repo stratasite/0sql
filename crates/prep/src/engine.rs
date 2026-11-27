@@ -49,7 +49,14 @@ pub struct Bound {
 pub struct Engine {
     limits: EngineLimits,
     bound: Bound,
+    /// Set when the server stops: every session's watch interrupts what
+    /// it runs, and nothing more runs in it.
+    stopping: Arc<AtomicBool>,
 }
+
+/// Why a session's watch stopped it.
+const BY_DEADLINE: u8 = 1;
+const BY_STOP: u8 = 2;
 
 /// One job's engine. The connection closes before its spill directory
 /// goes: fields drop in the order they are declared.
@@ -65,7 +72,8 @@ pub struct Session {
 /// interrupts what is running, and marks the session so nothing after
 /// runs either.
 struct Watch {
-    expired: Arc<AtomicBool>,
+    /// 0 while it runs; else [`BY_DEADLINE`] or [`BY_STOP`].
+    expired: Arc<std::sync::atomic::AtomicU8>,
     limit: Duration,
     done: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -93,7 +101,13 @@ impl Drop for Spill {
 
 impl Engine {
     pub fn new(limits: EngineLimits, bound: Bound) -> Engine {
-        Engine { limits, bound }
+        Engine { limits, bound, stopping: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// Stops every session, now and from now on: what runs is
+    /// interrupted, and a query after fails, saying the server stops.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
     }
 
     pub fn session(&self) -> Result<Session> {
@@ -119,16 +133,25 @@ impl Engine {
         // which it would refuse after; then nothing run from here on can
         // turn any of it back.
         conn.execute_batch("SET enable_external_access = false; SET lock_configuration = true")?;
-        let expired = Arc::new(AtomicBool::new(false));
+        let expired = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let (done, waiting) = std::sync::mpsc::channel::<()>();
-        let (handle, flag) = (conn.interrupt_handle(), expired.clone());
-        let left = deadline.saturating_duration_since(Instant::now());
-        let thread = std::thread::spawn(move || {
-            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = waiting.recv_timeout(left) {
-                flag.store(true, Ordering::SeqCst);
-                handle.interrupt();
-            }
+        let (handle, flag, stopping) = (conn.interrupt_handle(), expired.clone(), self.stopping.clone());
+        // It wakes every tenth of a second to see whether the server stops.
+        let thread = std::thread::spawn(move || loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let why = match waiting.recv_timeout(left.min(Duration::from_millis(100))) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stopping.load(Ordering::SeqCst) => BY_STOP,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if left <= Duration::from_millis(100) => BY_DEADLINE,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                _ => return,
+            };
+            flag.store(why, Ordering::SeqCst);
+            handle.interrupt();
+            return;
         });
+        if self.stopping.load(Ordering::SeqCst) {
+            expired.store(BY_STOP, Ordering::SeqCst);
+        }
         let watch = Watch { expired, limit: self.limits.job, done: Some(done), thread: Some(thread) };
         Ok(Session { watch, conn, bound: self.bound, deadline, _spill: spill })
     }
@@ -147,11 +170,14 @@ impl Session {
     }
 
     fn expired(&self) -> bool {
-        self.watch.expired.load(Ordering::SeqCst)
+        self.watch.expired.load(Ordering::SeqCst) != 0
     }
 
     fn stopped(&self) -> Error {
-        Error::Unprocessable(format!("this job ran for more than {} seconds and was stopped", self.watch.limit.as_secs()))
+        match self.watch.expired.load(Ordering::SeqCst) {
+            BY_STOP => Error::Stopping("the server is stopping, and this job was stopped with it; try again in a moment".into()),
+            _ => Error::Unprocessable(format!("this job ran for more than {} seconds and was stopped", self.watch.limit.as_secs())),
+        }
     }
 
     /// An engine result, as this crate's: an error after the deadline is
@@ -272,6 +298,23 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("was stopped"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(s.execute("SELECT 1").err().unwrap().to_string().contains("was stopped"));
+    }
+
+    #[test]
+    fn a_stop_interrupts_every_session_and_any_opened_after() {
+        let e = engine();
+        let s = e.session().unwrap();
+        let started = Instant::now();
+        std::thread::scope(|t| {
+            t.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                e.stop();
+            });
+            let err = s.count("SELECT count(*) FROM range(100000000000) a, range(1000) b").err().unwrap();
+            assert!(matches!(err, Error::Stopping(_)), "{err}");
+        });
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(e.session().unwrap().execute("SELECT 1"), Err(Error::Stopping(_))));
     }
 
     #[test]
