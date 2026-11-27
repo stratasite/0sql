@@ -270,6 +270,13 @@ pub(crate) fn run_path(root: &Path, id: &str) -> PathBuf {
 
 /// An output's manifest and rows: its own, or the snapshot it points to.
 pub(crate) fn version_rows(dir: &Path, k: u32) -> Result<(Materialization, Batches)> {
+    let (m, path) = version_rows_path(dir, k)?;
+    let rows = read_rows(&path)?;
+    Ok((m, rows))
+}
+
+/// An output's manifest, and where its rows are.
+pub(crate) fn version_rows_path(dir: &Path, k: u32) -> Result<(Materialization, PathBuf)> {
     let v = version_dir(dir, k);
     let m: Materialization = read_json(&v.join("manifest.json"))?;
     let path = match &m.pointer {
@@ -279,8 +286,7 @@ pub(crate) fn version_rows(dir: &Path, k: u32) -> Result<(Materialization, Batch
         }
         None => v.join(ROWS),
     };
-    let rows = read_rows(&path)?;
-    Ok((m, rows))
+    Ok((m, path))
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -348,6 +354,31 @@ pub(crate) fn read_rows(path: &Path) -> Result<Batches> {
     let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None)?;
     let schema = reader.schema();
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
+    Ok(Batches { schema, batches })
+}
+
+/// The rows of a rows file from `offset`, at most `limit` of them,
+/// reading no batch past them.
+pub(crate) fn read_rows_range(path: &Path, offset: usize, limit: usize) -> Result<Batches> {
+    let file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None)?;
+    let schema = reader.schema();
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let (mut skip, mut left) = (offset, limit);
+    for b in reader {
+        if left == 0 {
+            break;
+        }
+        let b = b?;
+        if skip >= b.num_rows() {
+            skip -= b.num_rows();
+            continue;
+        }
+        let take = left.min(b.num_rows() - skip);
+        batches.push(if skip == 0 && take == b.num_rows() { b } else { b.slice(skip, take) });
+        skip = 0;
+        left -= take;
+    }
     Ok(Batches { schema, batches })
 }
 

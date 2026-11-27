@@ -617,8 +617,8 @@ impl Prep {
     pub fn page(&self, scope: &Scope, id: &str, version: Option<u32>, offset: u64, limit: u64, view: &View<'_>) -> Result<Page> {
         let (dir, dataset) = self.find(scope, id)?;
         let k = self.version_of(&dir, &dataset, version)?;
-        let (m, rows) = store::version_rows(&dir, k)?;
-        let (total, rows) = materialize::page(&self.engine, &m.columns, &rows, offset, limit, view)?;
+        let (m, path) = store::version_rows_path(&dir, k)?;
+        let (total, rows) = materialize::page_of(&self.engine, &m.columns, (&path, m.rows), offset, limit, view)?;
         Ok(Page { version: k, columns: m.columns, total, offset, rows })
     }
 

@@ -360,8 +360,8 @@ impl Prep {
     pub fn source_rows(&self, scope: &Scope, id: &str, n: Option<u32>, offset: u64, limit: u64, view: &View<'_>) -> Result<Page> {
         let (dir, _) = self.find_source(scope, id)?;
         let snap = self.snapshot(scope, id, n)?;
-        let rows = store::read_rows(&store::snapshot_dir(&dir, snap.number).join(store::ROWS))?;
-        let (total, rows) = crate::materialize::page(&self.engine, &snap.columns, &rows, offset, limit, view)?;
+        let path = store::snapshot_dir(&dir, snap.number).join(store::ROWS);
+        let (total, rows) = crate::materialize::page_of(&self.engine, &snap.columns, (&path, snap.rows), offset, limit, view)?;
         Ok(Page { version: snap.number, columns: snap.columns, total, offset, rows })
     }
 
