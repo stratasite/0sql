@@ -216,6 +216,53 @@ fn type_of<'a>(columns: &'a [Column], name: &str) -> Option<&'a Column> {
     columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
 }
 
+/// How many edits of one kind and key are applied as conditions written
+/// into the select, which keeps the rows in their order as it reads
+/// them; past it, by a join, sorted back into that order.
+const INLINED: usize = 64;
+
+/// A text as the engine casts from, or a null.
+fn text_sql(t: Option<String>) -> String {
+    t.map_or_else(|| "NULL".to_string(), |t| crate::schema::literal(&t))
+}
+
+/// The key column and its type, as `key_match` casts to it.
+fn key_column(columns: &[Column], k: &str) -> (String, ColumnType) {
+    type_of(columns, k).map(|c| (c.name.clone(), c.ty)).unwrap_or((k.to_string(), ColumnType::Text))
+}
+
+/// What `key_match` is for one edit's key values: the row `r` has them.
+fn key_is(columns: &[Column], key: &[String], values: &BTreeMap<String, Value>) -> String {
+    key.iter()
+        .map(|k| {
+            let (name, ty) = key_column(columns, k);
+            format!("r.{} IS NOT DISTINCT FROM TRY_CAST({} AS {})", ident(&name), text_sql(values.get(k).and_then(text_of)), ty.sql())
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Whether no two of the edits in `m` whose ids are `ids` name the same
+/// row: their keys, cast to the key columns' types, are all different.
+/// Only then is each row matched by one edit at most, and a set can be
+/// written as a condition, not a join that would repeat the row.
+fn keys_differ(session: &Session, m: &str, ids: &[String], columns: &[Column], key: &[String]) -> Result<bool> {
+    let types: Vec<(String, ColumnType)> = key.iter().map(|k| key_column(columns, k)).collect();
+    // A float key is joined, as it always was: its values that compare
+    // equal need not group as one.
+    if types.iter().any(|(_, t)| *t == ColumnType::Double) {
+        return Ok(false);
+    }
+    let cast: Vec<String> = types.iter().enumerate().map(|(i, (_, t))| format!("TRY_CAST(\"__k{i}\" AS {})", t.sql())).collect();
+    let repeats = session.count(&format!(
+        "SELECT count(*) FROM (SELECT 1 FROM {} WHERE \"__id\" IN ({}) GROUP BY {} HAVING count(*) > 1)",
+        ident(m),
+        ids.join(", "),
+        cast.join(", ")
+    ))?;
+    Ok(repeats == 0)
+}
+
 /// The join condition between a relation's row `r` and an edit's key
 /// columns in `m`, each text cast to its column's type.
 fn key_match(columns: &[Column], key: &[String]) -> String {
@@ -237,11 +284,22 @@ fn key_match(columns: &[Column], key: &[String]) -> String {
 /// chains. Edits in a row of one kind that cannot change each other's
 /// rows are applied together, in one view.
 pub(crate) fn apply(session: &Session, input: &str, output: &str, columns: &[Column], edits: &[Edit]) -> Result<Vec<Outcome>> {
+    apply_inlining(session, (input, output), columns, edits, INLINED)
+}
+
+/// The same, writing at most `inlined` edits of a kind into a select.
+fn apply_inlining(
+    session: &Session,
+    (input, output): (&str, &str),
+    columns: &[Column],
+    edits: &[Edit],
+    inlined: usize,
+) -> Result<Vec<Outcome>> {
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut rel = input.to_string();
     let mut n = 0usize;
     for (tag, run) in runs(columns, edits).iter().enumerate() {
-        apply_run(session, (output, tag), columns, run, (&mut rel, &mut n), &mut outcomes)?;
+        apply_run(session, (output, tag, inlined), columns, run, (&mut rel, &mut n), &mut outcomes)?;
     }
     let list = columns.iter().map(|c| ident(&c.name)).collect::<Vec<_>>().join(", ");
     session.execute(&format!("CREATE VIEW {} AS SELECT {list} FROM {rel}", ident(output)))?;
@@ -283,7 +341,7 @@ fn runs(columns: &[Column], edits: &[Edit]) -> Vec<Vec<Edit>> {
 /// One run of edits over `rel`, which it moves to the view it makes.
 fn apply_run(
     session: &Session,
-    (output, tag): (&str, usize),
+    (output, tag, inlined): (&str, usize, usize),
     columns: &[Column],
     edits: &[Edit],
     (rel, n): (&mut String, &mut usize),
@@ -405,6 +463,29 @@ fn apply_run(
             continue;
         }
         let ids: Vec<String> = apply_ids.iter().map(|i| crate::schema::literal(i)).collect();
+        if ids.len() <= inlined && keys_differ(session, &m, &ids, columns, &key)? {
+            let whens: Vec<String> = last
+                .iter()
+                .filter_map(|e| match e {
+                    Edit::Set { id, key: k, to, .. } if apply_ids.contains(id) => {
+                        Some(format!("WHEN {} THEN TRY_CAST({} AS {})", key_is(columns, &key, k), text_sql(text_of(to)), target.ty.sql()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let select: Vec<String> = columns
+                .iter()
+                .map(|c| {
+                    if c.name == target.name {
+                        format!("CASE {} ELSE r.{x} END AS {x}", whens.join(" "), x = ident(&c.name))
+                    } else {
+                        format!("r.{}", ident(&c.name))
+                    }
+                })
+                .collect();
+            next(format!("SELECT {} FROM {rel} r", select.join(", ")), rel)?;
+            continue;
+        }
         let select: Vec<String> = columns
             .iter()
             .map(|c| {
@@ -484,6 +565,19 @@ fn apply_run(
         if apply_ids.is_empty() {
             continue;
         }
+        if apply_ids.len() <= inlined {
+            let named: Vec<String> = dels
+                .iter()
+                .filter_map(|e| match e {
+                    Edit::Delete { id, key: k, .. } if apply_ids.contains(&crate::schema::literal(id)) => {
+                        Some(format!("({})", key_is(columns, &key, k)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            next(format!("SELECT {} FROM {rel} r WHERE NOT ({})", list("r."), named.join(" OR ")), rel)?;
+            continue;
+        }
         next(
             format!(
                 "SELECT {cols} FROM (SELECT *, row_number() OVER () AS \"__pos\" FROM {rel}) r \
@@ -557,4 +651,86 @@ fn triples(rows: &zsql_datasource::Batches) -> Vec<(String, i64, bool)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn columns(of: &[(&str, ColumnType)]) -> Vec<Column> {
+        of.iter().map(|(n, t)| Column { name: n.to_string(), ty: *t, role: crate::schema::Role::inferred(n, *t) }).collect()
+    }
+
+    /// The rows and outcomes of edits applied as conditions where they
+    /// can be, and of the same edits applied by joins only.
+    fn both_ways(table: &str, cols: &[Column], edits: serde_json::Value, joined: bool) {
+        let edits: Vec<Edit> = serde_json::from_value(edits).unwrap();
+        let engine = crate::engine::tests::engine();
+        let list = cols.iter().map(|c| ident(&c.name)).collect::<Vec<_>>().join(", ");
+        let mut seen = Vec::new();
+        for (out, inlined) in [("inline", INLINED), ("joined", 0)] {
+            let s = engine.session().unwrap();
+            s.execute(table).unwrap();
+            let outcomes = apply_inlining(&s, ("t", out), cols, &edits, inlined).unwrap();
+            let sorted = s
+                .count(&format!("SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '{out}_%' AND sql LIKE '%row_number%'"))
+                .unwrap();
+            assert_eq!(sorted > 0, out == "joined" || joined, "{out}");
+            let rows = zsql_exec::json::rows(&s.query(&format!("SELECT {list} FROM {out}")).unwrap()).unwrap();
+            seen.push((outcomes, rows));
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[test]
+    fn edits_written_as_conditions_do_what_joins_do() {
+        let cols = columns(&[("id", ColumnType::Integer), ("code", ColumnType::Text), ("amount", ColumnType::Decimal(2))]);
+        let table = "CREATE TABLE t AS SELECT * FROM (VALUES (3, 'c', 1.50), (1, 'a', 2.00), (NULL, 'n', 3.00), (2, 'b', NULL), \
+                     (5, 'e', 4.25), (4, 'd', 0.10)) v(id, code, amount)";
+        both_ways(
+            table,
+            &cols,
+            json!([
+                { "id": "r", "kind": "remap", "column": "code", "from": "a", "to": "A" },
+                { "id": "s1", "kind": "set", "column": "amount", "key": { "id": 1 }, "to": 9.5, "was": 2 },
+                { "id": "s2", "kind": "set", "column": "amount", "key": { "id": null }, "to": "7" },
+                { "id": "s3", "kind": "set", "column": "amount", "key": { "id": 42 }, "to": 1 },
+                { "id": "s4", "kind": "set", "column": "amount", "key": { "id": 2 }, "to": null },
+                { "id": "s5", "kind": "set", "column": "amount", "key": { "id": 4 }, "to": "not a number" },
+                { "id": "s6", "kind": "set", "column": "amount", "key": { "id": 3 }, "to": 1 },
+                { "id": "s7", "kind": "set", "column": "amount", "key": { "id": 3 }, "to": 2 },
+                { "id": "d1", "kind": "delete", "key": { "id": 5 } },
+                { "id": "d2", "kind": "delete", "key": { "id": 77 } },
+                { "id": "d3", "kind": "delete", "key": { "id": null } },
+                { "id": "a1", "kind": "add", "key": { "id": 8 }, "values": { "code": "h" } },
+            ]),
+            false,
+        );
+        // Two sets whose keys differ as written and not as the key's
+        // type: joined, and the row they both name comes out twice.
+        both_ways(
+            table,
+            &cols,
+            json!([
+                { "id": "s1", "kind": "set", "column": "amount", "key": { "id": 1 }, "to": 5 },
+                { "id": "s2", "kind": "set", "column": "amount", "key": { "id": "1" }, "to": 6 },
+                { "id": "s3", "kind": "set", "column": "amount", "key": { "id": "x" }, "to": 6 },
+            ]),
+            true,
+        );
+        // A text key, and a set of every row with it.
+        let cols = columns(&[("code", ColumnType::Text), ("n", ColumnType::Integer)]);
+        both_ways(
+            "CREATE TABLE t AS SELECT * FROM (VALUES ('a', 1), ('b', 2), ('a', 3), ('it''s', 4)) v(code, n)",
+            &cols,
+            json!([
+                { "id": "s1", "kind": "set", "column": "n", "key": { "code": "a" }, "to": 10, "all": true },
+                { "id": "s2", "kind": "set", "column": "n", "key": { "code": "it's" }, "to": 11 },
+                { "id": "d1", "kind": "delete", "key": { "code": "b" } },
+                { "id": "d2", "kind": "delete", "key": { "code": "a" }, "all": true },
+            ]),
+            false,
+        );
+    }
 }
