@@ -387,6 +387,9 @@ pub(crate) fn execute(
 ) -> Result<Executed> {
     let mut done = Executed { records: Vec::new(), problems: Vec::new(), held: false, warnings: Vec::new(), last: None };
     let mut rows_of: HashMap<String, u64> = HashMap::new();
+    // Each table's profile, by its name: a table, once made, is never
+    // changed.
+    let mut profiled: HashMap<String, Vec<ColumnProfile>> = HashMap::new();
     for p in planned {
         let node = &graph.nodes[p.node];
         let id = node.id();
@@ -430,7 +433,13 @@ pub(crate) fn execute(
             }
         }
         if options.profile {
-            rec.profile = profile(session, &p.out)?;
+            // A node that makes no table of its own, as an output, has
+            // the profile of the table it reads, with its own roles.
+            rec.profile = match profiled.get(&p.out.name) {
+                Some(kept) => kept.iter().zip(&p.out.columns).map(|(k, c)| ColumnProfile { role: c.role, ..k.clone() }).collect(),
+                None => profile(session, &p.out)?,
+            };
+            profiled.insert(p.out.name.clone(), rec.profile.clone());
         }
         rec.summary = summary(node, &rec, loaded.get(&p.node), options.sample.is_some());
         rec.ms = t0.elapsed().as_millis() as u64;
@@ -667,8 +676,10 @@ fn contract(session: &Session, rel: &Rel, c: &Contract) -> Result<CheckResult> {
     Ok(CheckResult { check: c.check, columns: c.columns.clone(), on_fail: c.on_fail, passed: failing == 0, failing })
 }
 
-/// Per column of a relation: its empty values, distinct values, least
-/// and greatest, in one pass over it.
+/// Per column of a relation: its empty values, least and greatest, in
+/// one pass over it; then its distinct values, a query each. The engine
+/// counts many distinct aggregates in one query several times slower
+/// than it counts each alone.
 pub(crate) fn profile(session: &Session, rel: &Rel) -> Result<Vec<ColumnProfile>> {
     let cols: Vec<&Column> = rel.columns.iter().take(PROFILED).collect();
     if cols.is_empty() {
@@ -678,26 +689,30 @@ pub(crate) fn profile(session: &Session, rel: &Rel) -> Result<Vec<ColumnProfile>
         .iter()
         .map(|c| {
             let x = ident(&c.name);
-            format!(
-                "struct_pack(n := count(*) - count({x}), d := count(DISTINCT {x}), lo := left(CAST(min({x}) AS VARCHAR), 80), hi := left(CAST(max({x}) AS VARCHAR), 80))"
-            )
+            format!("struct_pack(n := count(*) - count({x}), lo := left(CAST(min({x}) AS VARCHAR), 80), hi := left(CAST(max({x}) AS VARCHAR), 80))")
         })
         .collect();
     let json = session.texts(&format!("SELECT CAST(to_json([{}]) AS VARCHAR) FROM {}", parts.join(", "), rel.name))?;
     let values: Vec<serde_json::Value> = json.first().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
-    Ok(cols
-        .iter()
-        .zip(values)
-        .map(|(c, v)| ColumnProfile {
+    let mut out = Vec::with_capacity(cols.len());
+    for (c, v) in cols.iter().zip(values) {
+        let x = ident(&c.name);
+        out.push(ColumnProfile {
             column: c.name.clone(),
             ty: c.ty,
             role: c.role,
             nulls: v["n"].as_u64().unwrap_or(0),
-            distinct: v["d"].as_u64().unwrap_or(0),
+            distinct: distinct(session, &x, &rel.name)?,
             min: v["lo"].as_str().map(str::to_string),
             max: v["hi"].as_str().map(str::to_string),
-        })
-        .collect())
+        });
+    }
+    Ok(out)
+}
+
+/// The distinct values of a column, nulls aside: what `count(DISTINCT x)` counts.
+fn distinct(session: &Session, x: &str, relation: &str) -> Result<u64> {
+    session.count(&format!("SELECT count({x}) FROM (SELECT DISTINCT {x} FROM {relation})"))
 }
 
 /// A node's record in one line.
@@ -851,4 +866,28 @@ pub(crate) fn overlaps(engine: &Engine, problems: &mut [Problem], loaded: &HashM
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinct_values_are_counted_as_count_distinct_counts_them() {
+        let s = crate::engine::tests::engine().session().unwrap();
+        s.execute(
+            "CREATE TABLE t AS SELECT * FROM (VALUES \
+             (0.0::DOUBLE, 'a', 1.50::DECIMAL(38,2), TIMESTAMP '2026-01-01 00:00:00', NULL::BIGINT), \
+             (-0.0::DOUBLE, 'A', 1.5::DECIMAL(38,2), TIMESTAMP '2026-01-01 00:00:00.000001', NULL), \
+             ('nan'::DOUBLE, 'a ', NULL, NULL, NULL), \
+             ('nan'::DOUBLE, '', 2.00, TIMESTAMP '2026-01-01 00:00:00', NULL), \
+             (NULL, NULL, 2.0, NULL, NULL), \
+             ('inf'::DOUBLE, 'é', -0.00, NULL, NULL)) v(f, t, d, ts, none)",
+        )
+        .unwrap();
+        for x in ["f", "t", "d", "ts", "none"] {
+            let x = ident(x);
+            assert_eq!(distinct(&s, &x, "t").unwrap(), s.count(&format!("SELECT count(DISTINCT {x}) FROM t")).unwrap(), "{x}");
+        }
+    }
 }
