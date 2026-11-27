@@ -582,7 +582,8 @@ fn one(
                 let x = ident(&cols.columns[i].name);
                 // Blank text is empty too: a step before may have made it.
                 // A value that is there is kept as it is, spaces and all.
-                let value = if cols.columns[i].ty == ColumnType::Text { format!("CASE WHEN trim({x}) <> '' THEN {x} END") } else { x.clone() };
+                let value =
+                    if cols.columns[i].ty == ColumnType::Text { format!("CASE WHEN trim({x}) <> '' THEN {x} END") } else { x.clone() };
                 list[i] = format!(
                     "COALESCE({value}, last_value({value} IGNORE NULLS) OVER (ORDER BY \"__position\" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS {x}"
                 );

@@ -77,7 +77,7 @@ pub struct SqlStage {
 }
 
 /// The query as it is run: with any trailing `;` gone, and not too long.
-/// What it says is checked by [`vet`], which needs the engine.
+/// What it says is checked by `vet`, which needs the engine.
 pub fn checked(query: &str) -> Result<String> {
     let mut q = query.trim();
     while let Some(rest) = q.strip_suffix(';') {
@@ -161,7 +161,10 @@ fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), Stri
             // whatever class: a function, an aggregate, a window.
             if let Some(f) = o.get("function_name").and_then(|f| f.as_str()) {
                 if !text("schema").is_empty() || !text("catalog").is_empty() {
-                    return Err(format!("{}() is named with a schema; a sql step calls DuckDB's functions by their names", f.to_lowercase()));
+                    return Err(format!(
+                        "{}() is named with a schema; a sql step calls DuckDB's functions by their names",
+                        f.to_lowercase()
+                    ));
                 }
                 closed(&f.to_lowercase())?;
             }
@@ -216,9 +219,7 @@ pub fn describe(
     };
     // The engine's own names for the types, which tell a sum's HUGEINT
     // from a DECIMAL(38,0) that Arrow holds alike.
-    let named = session
-        .texts(&format!("SELECT column_type FROM (DESCRIBE SELECT * FROM {})", wrapped(query)))
-        .unwrap_or_default();
+    let named = session.texts(&format!("SELECT column_type FROM (DESCRIBE SELECT * FROM {})", wrapped(query))).unwrap_or_default();
     let mut out: Vec<(String, ColumnType)> = Vec::new();
     for (i, f) in rows.schema.fields().iter().enumerate() {
         let name = f.name().clone();

@@ -21,7 +21,7 @@
 //!   is applied after, on the keys both sides now share.
 //! - **A join on no keys is a cross join,** an `enrich` only: each row of
 //!   the dataset beside each row it joins to, as it is (a rate, a
-//!   target, a few scenarios), bounded by [`CROSS_MAX`] rows.
+//!   target, a few scenarios), bounded by `CROSS_MAX` rows.
 //! - **Every model key a join names is asked for.** A dataset is at its
 //!   keys' grain, so the answer is too: nothing is planned finer than the
 //!   answer to be added up after.

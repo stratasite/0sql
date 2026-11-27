@@ -102,12 +102,7 @@ impl Settings {
         Settings {
             max_rows: 1_000_000,
             max_bytes: 256 << 20,
-            engine: EngineLimits {
-                memory: "1GB".into(),
-                threads: 2,
-                spill: data_dir.join(".cache").join("prep"),
-                job: engine::JOB_LIMIT,
-            },
+            engine: EngineLimits { memory: "1GB".into(), threads: 2, spill: data_dir.join(".cache").join("prep"), job: engine::JOB_LIMIT },
         }
     }
 }

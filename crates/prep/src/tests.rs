@@ -529,19 +529,20 @@ fn a_formula_that_would_make_a_huge_value_is_refused_and_double_equals_compares(
     let ann = scope();
     let d = prep.create(&ann, None, csv("region,amount\nNY,1\nCA,2\n")).unwrap();
     let nested = (0..6).fold("region".to_string(), |x, _| format!("replace({x}, 'N', 'NNNNNNNNNNNNNNNN')"));
-    let e = prep
-        .change(&ann, &d.id, change(1, serde_json::json!([{ "op": "add_column", "column": "big", "formula": nested }])))
-        .err()
-        .unwrap();
+    let e =
+        prep.change(&ann, &d.id, change(1, serde_json::json!([{ "op": "add_column", "column": "big", "formula": nested }]))).err().unwrap();
     assert!(e.to_string().contains("replace() would make a value longer than"), "{e}");
     let d = prep
         .change(
             &ann,
             &d.id,
-            change(1, serde_json::json!([
-                { "op": "add_column", "column": "ny", "formula": "region == 'NY'" },
-                { "op": "add_column", "column": "r", "formula": "replace(replace(region, 'N', 'n'), 'Y', 'y')" },
-            ])),
+            change(
+                1,
+                serde_json::json!([
+                    { "op": "add_column", "column": "ny", "formula": "region == 'NY'" },
+                    { "op": "add_column", "column": "r", "formula": "replace(replace(region, 'N', 'n'), 'Y', 'y')" },
+                ]),
+            ),
         )
         .unwrap();
     assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["NY", 1, true, "ny"]), serde_json::json!(["CA", 2, false, "CA"])]);
@@ -890,8 +891,9 @@ fn edits_apply_in_the_order_they_were_made() {
         .unwrap();
     assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
     // Its own entry, after the add: one place in the recipe, two entries.
-    let (d, out) =
-        prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "delete", "row": { "region": "TX", "month": "2026-01-01" } }]))).unwrap();
+    let (d, out) = prep
+        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "delete", "row": { "region": "TX", "month": "2026-01-01" } }])))
+        .unwrap();
     assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
     assert_eq!(
         rows_of(&prep, &ann, &d.id),

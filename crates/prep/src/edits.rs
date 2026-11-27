@@ -431,13 +431,12 @@ fn runs(columns: &[Column], edits: &[Edit]) -> Vec<Vec<Edit>> {
     for e in edits {
         let Some(g) = group(e) else { continue };
         let joins = out.last().is_some_and(|run| {
-            group(&run[0]).as_ref() == Some(&g)
-                && match e {
-                    Edit::Remap { column, from, .. } => !run.iter().any(
-                        |r| matches!(r, Edit::Remap { column: c, to, .. } if column_of(c) == column_of(column) && text_of(to) == text_of(from)),
-                    ),
-                    _ => true,
-                }
+            group(&run[0]).as_ref() == Some(&g) && match e {
+                Edit::Remap { column, from, .. } => !run.iter().any(
+                    |r| matches!(r, Edit::Remap { column: c, to, .. } if column_of(c) == column_of(column) && text_of(to) == text_of(from)),
+                ),
+                _ => true,
+            }
         });
         match out.last_mut() {
             Some(run) if joins => run.push(e.clone()),
