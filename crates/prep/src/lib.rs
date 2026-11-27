@@ -821,3 +821,6 @@ pub(crate) fn description_of(d: Option<&str>) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bench;
