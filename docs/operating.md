@@ -510,7 +510,6 @@ same thing. The ones an operator sets:
 | `ZSQL_DATASETS` | `off` turns datasets (data prep, `docs/ingestion.md`) off; on by default |
 | `ZSQL_DATASET_MAX_ROWS`, `ZSQL_DATASET_MAX_BYTES` | the most rows and bytes a dataset holds, at import and after its recipe; a million and 256 MB |
 | `ZSQL_PREP_MEMORY`, `ZSQL_PREP_THREADS` | the memory limit and threads of each data prep engine; `1GB` and 2 |
-| `ZSQL_RESUME_JOBS` | whether a start resumes the data prep jobs the last stop suspended: `suspended` (the default) or `none`; `zsql server stop --resume` or `--no-resume` overrides it for one stop. A job a crash cut short is never resumed: its dataset says it was interrupted (`docs/ingestion.md`) |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 
 `ops/zsqld.service` is a systemd unit to start from: a dedicated user, a

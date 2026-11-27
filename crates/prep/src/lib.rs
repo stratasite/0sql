@@ -95,10 +95,6 @@ pub struct Settings {
     /// The most bytes an upload, a snapshot or a materialization is.
     pub max_bytes: u64,
     pub engine: EngineLimits,
-    /// Whether a start resumes the jobs a stop suspended
-    /// (`ZSQL_RESUME_JOBS`); `zsql server stop --resume` or
-    /// `--no-resume` says otherwise for one stop.
-    pub resume: bool,
 }
 
 impl Settings {
@@ -108,7 +104,6 @@ impl Settings {
             max_rows: 1_000_000,
             max_bytes: 256 << 20,
             engine: EngineLimits { memory: "1GB".into(), threads: 2, spill: data_dir.join(".cache").join("prep"), job: engine::JOB_LIMIT },
-            resume: true,
         }
     }
 }
@@ -273,47 +268,42 @@ impl Prep {
             recovered: Mutex::new(recovery::Recovered::default()),
         };
         let recovered = prep.recover();
-        if recovered.swept > 0 || !recovered.interrupted.is_empty() || !recovered.resume.is_empty() {
+        if recovered.swept > 0 || !recovered.interrupted.is_empty() {
             tracing::info!(
-                "data prep: {} half-made thing(s) swept; {} job(s) interrupted: {}; {} query(ies) to resume",
+                "data prep: {} half-made thing(s) swept; {} job(s) interrupted: {}",
                 recovered.swept,
                 recovered.interrupted.len(),
-                recovered.interrupted.join(", "),
-                recovered.resume.len()
+                recovered.interrupted.join(", ")
             );
         }
         *lock(&prep.recovered) = recovered;
         Ok(prep)
     }
 
-    /// What the start found: the queries a stop suspended, for the
-    /// server to submit again, are handed over once.
+    /// What the start found, handed over once.
     pub fn take_recovered(&self) -> recovery::Recovered {
         std::mem::take(&mut *lock(&self.recovered))
     }
 
     /// Sweeps what jobs left half made, and turns each marker left
-    /// behind into an interruption or a job to resume.
+    /// behind into an interruption: cause `crash` for a job that was
+    /// running, `stop` for one a stop suspended. Nothing is run again.
     fn recover(&self) -> recovery::Recovered {
-        use recovery::{Cause, Interrupted, JobKind, Marker, QueryJob, State};
+        use recovery::{Cause, Interrupted, Marker, QueryJob, State};
         let mut out = recovery::Recovered { swept: recovery::sweep(&self.store.data_dir()), ..Default::default() };
         for (org, project, root) in recovery::roots(&self.store.data_dir()) {
             for (dir, d) in self.store.all(&org, &project) {
                 let path = dir.join(recovery::MARKER);
                 let Ok(m) = store::read_json::<Marker>(&path) else { continue };
-                let cause = match (m.state, m.job) {
-                    // Its readers are found stale by `repair`, and run.
-                    (State::Suspended, JobKind::Cascade | JobKind::Update) if m.resume => None,
-                    (State::Running, _) => Some(Cause::Crash),
-                    (State::Suspended, _) => Some(Cause::Stop),
+                let cause = match m.state {
+                    State::Running => Cause::Crash,
+                    State::Suspended => Cause::Stop,
                 };
-                if let Some(cause) = cause {
-                    let i = Interrupted::new(m.job, &m.started, cause, None);
-                    if let Err(e) = store::write_json(&dir.join(recovery::INTERRUPTED), &i) {
-                        tracing::warn!("dataset {} was interrupted and that could not be written: {e}", d.id);
-                    }
-                    out.interrupted.push(format!("{org}/{project}/{}", d.id));
+                let i = Interrupted::new(m.job, &m.started, cause, None);
+                if let Err(e) = store::write_json(&dir.join(recovery::INTERRUPTED), &i) {
+                    tracing::warn!("dataset {} was interrupted and that could not be written: {e}", d.id);
                 }
+                out.interrupted.push(format!("{org}/{project}/{}", d.id));
                 let _ = std::fs::remove_file(&path);
             }
             let jobs = root.join(recovery::QUERIES);
@@ -321,7 +311,6 @@ impl Prep {
             for e in entries.flatten() {
                 let path = e.path();
                 let Ok(mut q) = store::read_json::<QueryJob>(&path) else { continue };
-                let scope = Scope { org: org.clone(), project: project.clone() };
                 let dir = root.join(&q.id);
                 if q.interrupted.is_some() {
                     // The record of a dataset never made, until it is old.
@@ -334,17 +323,10 @@ impl Prep {
                 }
                 let kind = recovery::query_kind(&q);
                 let cause = match q.state {
-                    State::Suspended if q.resume && !q.connection => {
-                        let _ = std::fs::remove_file(&path);
-                        out.resume.push((scope, q));
-                        continue;
-                    }
                     State::Running => Cause::Crash,
                     State::Suspended => Cause::Stop,
                 };
-                let extra = (cause == Cause::Stop && q.connection && q.resume)
-                    .then_some("It was sent with a connection of its own, which is never kept, so it could not be resumed.");
-                let i = Interrupted::new(kind, &q.since, cause, extra);
+                let i = Interrupted::new(kind, &q.since, cause, None);
                 out.interrupted.push(format!("{org}/{project}/{}", q.id));
                 if dir.join(store::MANIFEST).exists() {
                     let _ = store::write_json(&dir.join(recovery::INTERRUPTED), &i);
@@ -359,23 +341,6 @@ impl Prep {
         out
     }
 
-    /// A query a stop suspended that the start could not submit again:
-    /// interrupted, saying why.
-    pub fn not_resumed(&self, scope: &Scope, q: &recovery::QueryJob, why: &str) {
-        let root = self.store.root(&scope.org, &scope.project);
-        let dir = root.join(&q.id);
-        let extra = format!("It could not be submitted again: {why}.");
-        let i = recovery::Interrupted::new(recovery::query_kind(q), &q.since, recovery::Cause::Stop, Some(&extra));
-        if dir.join(store::MANIFEST).exists() {
-            let _ = store::write_json(&dir.join(recovery::INTERRUPTED), &i);
-        } else {
-            let mut q = q.clone();
-            q.interrupted = Some(i);
-            let _ = store::write_json(&root.join(recovery::QUERIES).join(format!("{}.json", q.id)), &q);
-            self.remember(&dir, &q);
-        }
-    }
-
     /// An interrupted query of a dataset never made, as a failed pending
     /// one: what its id answers with.
     fn remember(&self, dir: &Path, q: &recovery::QueryJob) {
@@ -386,9 +351,9 @@ impl Prep {
 
     /// Stops data prep for a server that is stopping. No job starts from
     /// now; the jobs running are given `grace` to finish, and the rest
-    /// are interrupted and kept as suspended, with whether the next
-    /// start resumes them. A query waited on is suspended the same way.
-    pub fn stop(&self, grace: std::time::Duration, resume: bool) {
+    /// are stopped and kept as suspended, which the next start marks
+    /// interrupted. A query waited on is suspended the same way.
+    pub fn stop(&self, grace: std::time::Duration) {
         use recovery::{Marker, QueryJob, State};
         self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let until = std::time::Instant::now() + grace;
@@ -400,7 +365,6 @@ impl Prep {
             let path = dir.join(recovery::MARKER);
             if let Ok(mut m) = store::read_json::<Marker>(&path) {
                 m.state = State::Suspended;
-                m.resume = resume;
                 lock(&self.suspended).insert(dir.clone());
                 let _ = store::write_json(&path, &m);
             }
@@ -413,7 +377,6 @@ impl Prep {
                 let Ok(mut q) = store::read_json::<QueryJob>(&e.path()) else { continue };
                 if q.interrupted.is_none() && q.state == State::Running {
                     q.state = State::Suspended;
-                    q.resume = resume;
                     let _ = store::write_json(&e.path(), &q);
                 }
             }
@@ -423,77 +386,7 @@ impl Prep {
         while !lock(&self.busy).is_empty() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        tracing::info!("data prep stopped: {} job(s) suspended, to be {}", running.len(), if resume { "resumed" } else { "interrupted" });
-    }
-
-    /// The datasets behind what they read, after a restart: a cascade
-    /// cut short, or a stop that suspended one. Each is run again, in
-    /// order, except one interrupted, or one reading one, whose job may
-    /// be what stopped the server. What happened, as notes.
-    pub fn repair(&self) -> Vec<String> {
-        let mut notes = Vec::new();
-        for (_, _, root) in recovery::roots(&self.store.data_dir()) {
-            // Each round runs what is behind and reads nothing behind;
-            // what reads it is behind after, and runs in the next.
-            let mut ran: HashSet<String> = HashSet::new();
-            loop {
-                let all = self.siblings(&root.join("_"));
-                let live: std::collections::HashMap<&str, Option<u32>> = all.iter().map(|(_, d, _)| (d.id.as_str(), d.live)).collect();
-                let interrupted: HashSet<&str> =
-                    all.iter().filter(|(dir, _, _)| dir.join(recovery::INTERRUPTED).exists()).map(|(_, d, _)| d.id.as_str()).collect();
-                let behind = |dir: &Path, d: &Dataset| -> bool {
-                    let Some(k) = d.live else { return false };
-                    let Ok(l) = store::read_lineage(dir, k) else { return false };
-                    l.datasets.iter().any(|r| live.get(r.id.as_str()).is_some_and(|v| *v != Some(r.version)))
-                };
-                let stale: Vec<(PathBuf, String, Vec<String>)> = all
-                    .iter()
-                    .filter(|(dir, d, _)| d.held.is_none() && !ran.contains(&d.id) && behind(dir, d))
-                    .map(|(dir, d, r)| (dir.clone(), d.id.clone(), r.inputs()))
-                    .collect();
-                let ids: HashSet<&str> = stale.iter().map(|(_, id, _)| id.as_str()).collect();
-                let mut any = false;
-                for (dir, id, inputs) in &stale {
-                    if inputs.iter().any(|i| ids.contains(i.as_str())) {
-                        continue;
-                    }
-                    ran.insert(id.clone());
-                    if interrupted.contains(id.as_str()) || self.reads_interrupted(&all, id, &interrupted) {
-                        notes.push(format!(
-                            "dataset {id} is behind what it reads and was not run again: it, or what it reads, was interrupted"
-                        ));
-                        continue;
-                    }
-                    any = true;
-                    let mut stopped = Vec::new();
-                    if let Some(note) = self.update(dir, &mut stopped) {
-                        notes.push(note);
-                    }
-                }
-                if !any {
-                    break;
-                }
-            }
-        }
-        notes
-    }
-
-    /// Whether a dataset reads, at any depth, one interrupted.
-    fn reads_interrupted(&self, all: &[(PathBuf, Dataset, Recipe)], id: &str, interrupted: &HashSet<&str>) -> bool {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut todo = vec![id.to_string()];
-        while let Some(x) = todo.pop() {
-            let Some((_, _, r)) = all.iter().find(|(_, d, _)| d.id == x) else { continue };
-            for i in r.inputs() {
-                if interrupted.contains(i.as_str()) {
-                    return true;
-                }
-                if seen.insert(i.clone()) {
-                    todo.push(i);
-                }
-            }
-        }
-        false
+        tracing::info!("data prep stopped: {} job(s) interrupted", running.len());
     }
 
     /// The same, copying each dataset to the object store as it changes.
@@ -551,7 +444,7 @@ impl Prep {
             return Err(Error::Conflict("this dataset is busy with another job; try again when it is done".into()));
         }
         let job = Job { prep: self, dir: dir.to_path_buf() };
-        let marker = recovery::Marker { job: kind, started: time::now(), state: recovery::State::Running, resume: false };
+        let marker = recovery::Marker { job: kind, started: time::now(), state: recovery::State::Running };
         store::write_json(&dir.join(recovery::MARKER), &marker)?;
         if kind != recovery::JobKind::Update {
             let _ = std::fs::remove_file(dir.join(recovery::INTERRUPTED));
@@ -588,8 +481,8 @@ impl Prep {
     /// answered; `failed` says it ended without a snapshot; `done` that
     /// it made one.
     ///
-    /// The query is kept on disk while it runs, with the context it runs
-    /// under, so a start after a stop can submit it again.
+    /// The query is kept on disk while it runs, never with its context,
+    /// so a start can say it was interrupted.
     pub fn waiting(&self, scope: &Scope, job: recovery::QueryJob) {
         let root = self.store.root(&scope.org, &scope.project);
         let dir = root.join(&job.id);

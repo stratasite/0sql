@@ -686,8 +686,8 @@ crash or a stop does to the jobs running is said on the dataset.
 
 - **Every job leaves a marker** (`job.json` in the dataset's directory)
   while it runs; a query a dataset waits on is kept in the project's
-  `.datasets/.jobs/`, with the security context it runs under, and never
-  a `connection`, which may hold a credential.
+  `.datasets/.jobs/`, never with its security context or a
+  `connection`, which are the request's.
 - **A job a start finds running died with the process.** It may be
   what killed it, so it is not run again. The dataset keeps the version
   it had and says so in `interrupted`: the job, when it started, when
@@ -696,23 +696,13 @@ crash or a stop does to the jobs running is said on the dataset.
   what stopped the server, so it was not run again. Send it again.").
   The dataset's next job ends it. A cascade passes over an interrupted
   dataset, with a note, rather than run what may be what crashed.
-- **A stop gives running jobs ten seconds,** then interrupts the rest
-  and keeps them as *suspended*. A start resumes what the server runs
-  on its own: a query a dataset waits on, submitted again under its
-  context, and the datasets a cut-short cascade left behind. A request
-  that was answered already, an upload, a recipe change, an edit, is not
-  run unasked, which could make it twice: it is `interrupted`, with
-  `"cause": "stop"`, for its client to send again. So is a query sent
-  with a `connection` of its own.
-- **Whether a start resumes** is `ZSQL_RESUME_JOBS`: `suspended`, the
-  default, or `none`, which interrupts them instead. `zsql server stop
-  --resume` or `--no-resume` says otherwise for one stop.
+- **A stop gives running jobs ten seconds,** then stops the rest and
+  keeps them as *suspended*; the next start marks each `interrupted`,
+  with `"cause": "stop"`. **Nothing is resumed:** the application stopped
+  the server, and it decides what to send again.
 - **A dataset made from a query that never finished** has no manifest
   to carry the word: its id answers as a pending one that failed, with
   `interrupted` beside, for a week.
-- **What is behind what it reads is run again** after a start, in the
-  background and in order, unless it, or a dataset it reads, is
-  interrupted.
 - **What jobs left half made is swept** before anything is served:
   spill directories, staging directories, files written beside their
   targets, half-kept blends. One server owns a data directory (it holds
@@ -954,11 +944,9 @@ application diffs them, as it diffs its graphs.
 A run is a job like any other ("Crashes, stops and restarts"), with one
 change: **0sql resumes nothing.** A run a start finds is interrupted,
 cause `crash` or cause `stop`, and the application, which stopped the
-server or saw it crash, decides what to send again. This drops what is
-built today for a stop: suspended jobs resumed at start,
-`ZSQL_RESUME_JOBS`, `zsql server stop --resume`, and a query's context
-kept on disk while it runs. The ten seconds' grace, the statuses and the
-sweep stay.
+server or saw it crash, decides what to send again. (Resuming at start,
+`ZSQL_RESUME_JOBS` and a query's context kept on disk while it ran are
+gone already.)
 
 ### The API, in outline
 
@@ -1039,7 +1027,7 @@ diffs between output versions; `tool` sources.
 - [x] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.
 - [ ] **9. Sources, datasets and pipelines** (planned above): resume
-  dropped first; sources and their snapshots, `push`; a run of a graph
+  dropped (done); sources and their snapshots, `push`; a run of a graph
   sent, its checks, dry run and preview; zero-copy outputs; edits inline
   by key; the output contract; the per-node run record, summaries and
   profiles; the API; today's datasets rewritten to it.

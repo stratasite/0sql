@@ -145,11 +145,6 @@ impl ServeArgs {
             if let Some(v) = var("ZSQL_PREP_THREADS") {
                 d.engine.threads = number(&v, "ZSQL_PREP_THREADS")?;
             }
-            match var("ZSQL_RESUME_JOBS").as_deref().map(str::trim) {
-                Some("suspended") | None => d.resume = true,
-                Some("none") => d.resume = false,
-                Some(other) => bail!("ZSQL_RESUME_JOBS is suspended or none; it is {other}"),
-            }
         }
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
@@ -186,17 +181,10 @@ pub enum ServerCommand {
         args: ServeArgs,
     },
     /// Stop the background server (SIGTERM, then wait for it to finish).
-    /// Data prep jobs still running after a grace period are suspended;
-    /// the next start resumes those it can, as ZSQL_RESUME_JOBS says,
-    /// unless this says otherwise.
-    Stop {
-        /// Resume the suspended jobs at the next start.
-        #[arg(long, conflicts_with = "no_resume")]
-        resume: bool,
-        /// Do not: the next start marks them interrupted.
-        #[arg(long)]
-        no_resume: bool,
-    },
+    /// Data prep jobs still running after a grace period are marked
+    /// interrupted by the stop; nothing is resumed, the application
+    /// sends again what it wants run.
+    Stop,
     /// Whether the background server is running, and whether it answers;
     /// also whether a foreground `zsql serve` holds the data directory.
     Status {
@@ -444,7 +432,7 @@ fn signal(_pid: u32, _sig: i32) {}
 pub fn server(command: ServerCommand, at: Where) -> Result<()> {
     match command {
         ServerCommand::Start { args } => start(args, at),
-        ServerCommand::Stop { resume, no_resume } => stop(resume.then_some(true).or(no_resume.then_some(false))),
+        ServerCommand::Stop => stop(),
         ServerCommand::Health { server } => {
             let project = at.project_dir().ok();
             let client = crate::remote::Client::new(&config::server(server.as_deref(), project.as_ref()));
@@ -533,22 +521,16 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
     Ok(())
 }
 
-/// SIGTERM, which finishes what is in flight and suspends the data prep
-/// jobs still running after their grace; then, if the server has not
-/// gone in twenty seconds, SIGKILL, since a request that long is not
-/// worth a server that cannot be stopped. `resume` overrides, for this
-/// stop, whether the next start resumes what was suspended.
-fn stop(resume: Option<bool>) -> Result<()> {
+/// SIGTERM, which finishes what is in flight and interrupts the data
+/// prep jobs still running after their grace; then, if the server has
+/// not gone in twenty seconds, SIGKILL, since a request that long is
+/// not worth a server that cannot be stopped.
+fn stop() -> Result<()> {
     let Some(s) = running()? else {
         println!("no server is running");
         let _ = std::fs::remove_file(pid_file()?);
         return Ok(());
     };
-    if let Some(r) = resume {
-        let intent = s.data_dir.join(zsql_server::STOP_INTENT);
-        std::fs::write(&intent, if r { "resume" } else { "no-resume" })
-            .with_context(|| format!("could not say how to stop in {}", intent.display()))?;
-    }
     #[cfg(unix)]
     signal(s.pid, libc::SIGTERM);
     let t0 = Instant::now();

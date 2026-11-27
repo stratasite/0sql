@@ -67,7 +67,7 @@ export interface Dataset {
   interrupted?: Interrupted;
 }
 
-/** Why a job did not finish: the process died with it (`crash`), or a stop did not resume it (`stop`). */
+/** Why a job did not finish: the process died with it (`crash`), or the server was stopped while it ran (`stop`); nothing is resumed. */
 export interface Interrupted {
   job: "replace" | "refresh" | "create" | "change" | "confirm" | "edit" | "delete" | "update" | "cascade";
   started: string;

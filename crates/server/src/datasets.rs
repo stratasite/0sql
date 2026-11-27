@@ -235,9 +235,6 @@ async fn run_into(
 ) -> Result<Response, ApiError> {
     crate::names::check_branch(&query.branch)?;
     let fingerprint = zsql_exec::sha256(&serde_json::to_string(&context).unwrap_or_default());
-    // What a start after a stop needs to submit it again; never the
-    // connection, which may hold a credential.
-    let kept = (context.as_ref().and_then(|c| serde_json::to_value(c).ok()), !connection.is_empty());
     let (record, wait) = {
         let (app, org, uid, q) = (app.clone(), scope.org.clone(), scope.project.clone(), query.clone());
         blocking(move || crate::exec::submit_fresh(&app, (&org, &uid, &q.branch), q.spec, q.expr, context, connection, wait)).await?
@@ -259,10 +256,7 @@ async fn run_into(
                 Then::Refresh => zsql_prep::recovery::Then::Refresh,
             },
             query: query.clone(),
-            context: kept.0,
-            connection: kept.1,
             state: zsql_prep::recovery::State::Running,
-            resume: false,
             interrupted: None,
         },
     );
@@ -286,31 +280,6 @@ async fn run_into(
         }
     });
     Ok((StatusCode::ACCEPTED, Json(json!({ "id": id, "pending": { "result": result } }))).into_response())
-}
-
-/// Submits again the queries a stop suspended, as the start found them:
-/// each as its request did, answered at once, and waited on after.
-pub(crate) async fn resume(app: Shared, prep: Arc<Prep>, jobs: Vec<(Scope, zsql_prep::recovery::QueryJob)>) {
-    for (scope, q) in jobs {
-        let context: Option<SecurityContext> = q.context.clone().and_then(|c| serde_json::from_value(c).ok());
-        let then = match &q.then {
-            zsql_prep::recovery::Then::Create { name } => Then::Create { name: name.clone() },
-            zsql_prep::recovery::Then::Refresh => Then::Refresh,
-        };
-        let (id, query) = (q.id.clone(), q.query.clone());
-        match run_into(app.clone(), prep.clone(), scope.clone(), id.clone(), query, (context, Map::new(), Some(0.0)), then).await {
-            Ok(_) => tracing::info!("dataset {id} in {}/{}: its query, suspended by a stop, was submitted again", scope.org, scope.project),
-            Err(e) => {
-                tracing::warn!(
-                    "dataset {id} in {}/{}: its query, suspended by a stop, could not be submitted again: {}",
-                    scope.org,
-                    scope.project,
-                    e.2
-                );
-                prep.not_resumed(&scope, &q, &e.2);
-            }
-        }
-    }
 }
 
 /// A finished run's rows, made a snapshot: of a new dataset, or the next

@@ -1587,7 +1587,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn a_stop_suspends_what_runs_past_its_grace_and_a_request_is_interrupted_after() {
+    fn a_stop_suspends_what_runs_past_its_grace_and_the_next_start_says_so() {
         let (dir, prep) = prep();
         let ann = scope();
         let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
@@ -1597,7 +1597,7 @@ mod recovery_tests {
         std::thread::scope(|t| {
             let job = t.spawn(|| prep.change(&ann, &d.id, change(1, slow)));
             std::thread::sleep(std::time::Duration::from_millis(800));
-            prep.stop(std::time::Duration::from_millis(200), true);
+            prep.stop(std::time::Duration::from_millis(200));
             let e = job.join().unwrap().err().unwrap();
             assert!(e.to_string().contains("stopping"), "{e}");
         });
@@ -1605,9 +1605,9 @@ mod recovery_tests {
         assert!(matches!(prep.change(&ann, &d.id, change(1, serde_json::json!([]))), Err(Error::Stopping(_))), "nothing new starts");
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dataset_dir(&prep, &d.id).join(recovery::MARKER)).unwrap()).unwrap();
-        assert_eq!((m["state"].as_str(), m["resume"].as_bool()), (Some("suspended"), Some(true)));
+        assert_eq!(m["state"].as_str(), Some("suspended"));
         drop(prep);
-        // A recipe change was a request, answered already: not resumed.
+        // Nothing is resumed: the start says the stop interrupted it.
         let prep = reopen(&dir);
         let i = prep.get(&ann, &d.id).unwrap().interrupted.unwrap();
         assert_eq!((i.job, i.cause), (JobKind::Change, Cause::Stop));
@@ -1615,37 +1615,33 @@ mod recovery_tests {
         drop(dir);
     }
 
-    fn query_job(id: &str, then: Then, state: State, resume: bool, connection: bool) -> QueryJob {
+    fn query_job(id: &str, then: Then, state: State) -> QueryJob {
         QueryJob {
             id: id.into(),
             result: "r_1".into(),
             since: time::now(),
             then,
             query: Query { branch: "main".into(), spec: Some(serde_json::json!({ "projections": [] })), expr: None },
-            context: Some(serde_json::json!({ "user_id": 7 })),
-            connection,
             state,
-            resume,
             interrupted: None,
         }
     }
 
     #[test]
-    fn a_query_waited_on_is_kept_and_a_start_resumes_or_interrupts_it_as_it_was_left() {
+    fn a_query_waited_on_is_kept_and_a_start_interrupts_it_as_it_was_left() {
         let (dir, prep) = prep();
         let ann = scope();
         let refreshed = prep.create(&ann, None, csv(BUDGET)).unwrap();
-        let (crashed, resumed, own) = (new_id("shop"), new_id("shop"), new_id("shop"));
-        prep.waiting(&ann, query_job(&crashed, Then::Create { name: Some("q".into()) }, State::Running, false, false));
-        prep.waiting(&ann, query_job(&resumed, Then::Create { name: None }, State::Running, false, false));
-        prep.waiting(&ann, query_job(&own, Then::Create { name: None }, State::Running, false, true));
-        prep.waiting(&ann, query_job(&refreshed.id, Then::Refresh, State::Running, false, false));
+        let (crashed, stopped) = (new_id("shop"), new_id("shop"));
+        prep.waiting(&ann, query_job(&crashed, Then::Create { name: Some("q".into()) }, State::Running));
+        prep.waiting(&ann, query_job(&stopped, Then::Create { name: None }, State::Running));
+        prep.waiting(&ann, query_job(&refreshed.id, Then::Refresh, State::Running));
         // A query that ends is forgotten.
         let done = new_id("shop");
-        prep.waiting(&ann, query_job(&done, Then::Refresh, State::Running, false, false));
+        prep.waiting(&ann, query_job(&done, Then::Refresh, State::Running));
         prep.done(&ann, &done);
-        // The stop suspends them all; then pretend the first was a crash.
-        prep.stop(std::time::Duration::from_millis(10), true);
+        // The stop suspends them all; then pretend two were a crash.
+        prep.stop(std::time::Duration::from_millis(10));
         let jobs = dataset_dir(&prep, "x").parent().unwrap().join(recovery::QUERIES);
         let path = jobs.join(format!("{crashed}.json"));
         let mut q: QueryJob = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1658,16 +1654,13 @@ mod recovery_tests {
         drop(prep);
 
         let prep = reopen(&dir);
-        let r = prep.take_recovered();
-        let ids: Vec<&str> = r.resume.iter().map(|(_, q)| q.id.as_str()).collect();
-        assert_eq!(ids, [resumed.as_str()], "only the suspended one with no connection of its own is resumed");
-        assert_eq!(r.resume[0].1.context, Some(serde_json::json!({ "user_id": 7 })));
+        assert!(!std::fs::read_to_string(jobs.join(format!("{stopped}.json"))).unwrap().contains("context"), "no context is kept");
         let p = prep.pending(&ann, &crashed).expect("its id still answers");
         let i = p.interrupted.unwrap();
         assert_eq!((i.job, i.cause), (JobKind::Create, Cause::Crash));
         assert!(p.failed.unwrap().contains("Make it again"));
-        let i = prep.pending(&ann, &own).unwrap().interrupted.unwrap();
-        assert!(i.reason.contains("connection of its own"), "{}", i.reason);
+        let i = prep.pending(&ann, &stopped).unwrap().interrupted.unwrap();
+        assert_eq!((i.job, i.cause), (JobKind::Create, Cause::Stop), "a stop resumes nothing");
         let i = prep.get(&ann, &refreshed.id).unwrap().interrupted.unwrap();
         assert_eq!((i.job, i.cause), (JobKind::Refresh, Cause::Crash));
         assert!(prep.pending(&ann, &done).is_none());
@@ -1675,39 +1668,6 @@ mod recovery_tests {
         drop(prep);
         let prep = reopen(&dir);
         assert!(prep.pending(&ann, &crashed).unwrap().interrupted.is_some());
-        drop(dir);
-    }
-
-    #[test]
-    fn a_start_runs_again_what_is_behind_what_it_reads_except_past_an_interruption() {
-        let (dir, prep) = prep();
-        let ann = scope();
-        let sales = prep.create(&ann, None, csv("region,amount\nNY,10\nCA,5\n")).unwrap();
-        let owners = prep.create(&ann, None, csv("area,manager\nNY,kim\nCA,lee\n")).unwrap();
-        let join = serde_json::json!([{ "op": "join", "dataset": owners.id, "on": [{ "left": "region", "right": "area" }] }]);
-        let joined = prep.change(&ann, &sales.id, change(1, join)).unwrap();
-        // A cascade cut short: the sales dataset says it read an older owners.
-        let sdir = dataset_dir(&prep, &sales.id);
-        let lineage = sdir.join(format!("v{}", joined.live.unwrap())).join("lineage.json");
-        let mut l: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&lineage).unwrap()).unwrap();
-        l["datasets"][0]["version"] = serde_json::json!(0);
-        std::fs::write(&lineage, l.to_string()).unwrap();
-        // An interrupted reader is left alone, with words.
-        std::fs::write(
-            sdir.join(recovery::INTERRUPTED),
-            serde_json::to_string(&recovery::Interrupted::new(JobKind::Update, "x", Cause::Crash, None)).unwrap(),
-        )
-        .unwrap();
-        drop(prep);
-        let prep = reopen(&dir);
-        let notes = prep.repair();
-        assert!(notes.iter().any(|n| n.contains(&sales.id) && n.contains("was interrupted")), "{notes:?}");
-        assert_eq!(prep.get(&ann, &sales.id).unwrap().live, joined.live);
-        std::fs::remove_file(sdir.join(recovery::INTERRUPTED)).unwrap();
-        let notes = prep.repair();
-        assert!(notes.iter().any(|n| n.contains(&sales.id) && n.contains("is at version")), "{notes:?}");
-        assert_ne!(prep.get(&ann, &sales.id).unwrap().live, joined.live);
-        assert!(prep.repair().is_empty(), "nothing is behind now");
         drop(dir);
     }
 }

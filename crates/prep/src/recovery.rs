@@ -10,12 +10,9 @@
 //!   again: the dataset is marked *interrupted*, saying so, and keeps the
 //!   version it had.
 //! - **A stop suspends what is still running** after a grace period, and
-//!   says in each marker whether the next start resumes it. The jobs the
-//!   server runs on its own, a query a dataset waits on and the update of
-//!   the datasets that read one, are resumed; a request whose client was
-//!   already answered (an upload, a recipe change, an edit) is marked
-//!   interrupted for the client to send again, since running it unasked
-//!   could make it twice.
+//!   the next start marks it interrupted, cause `stop`. Nothing is
+//!   resumed: the application stopped the server, and it decides what to
+//!   send again.
 //! - **What a job leaves half made is swept** before anything is served:
 //!   spill directories, staging directories, files written beside their
 //!   targets.
@@ -97,9 +94,6 @@ pub(crate) struct Marker {
     pub job: JobKind,
     pub started: String,
     pub state: State,
-    /// Set by a stop: whether the next start resumes it.
-    #[serde(default)]
-    pub resume: bool,
 }
 
 /// What stopped a job.
@@ -108,7 +102,7 @@ pub(crate) struct Marker {
 pub enum Cause {
     /// The process died with it running.
     Crash,
-    /// The server was stopped, and it was not resumed.
+    /// The server was stopped while it ran.
     Stop,
 }
 
@@ -131,7 +125,7 @@ impl Interrupted {
                 "the server restarted and found this {} in flight. It may be what stopped the server, so it was not run again.",
                 job.what()
             ),
-            Cause::Stop => format!("the server was stopped while this {} ran, and it was not resumed.", job.what()),
+            Cause::Stop => format!("the server was stopped while this {} ran, and nothing is resumed.", job.what()),
         };
         let extra = extra.map(|e| format!(" {e}")).unwrap_or_default();
         Interrupted { job, started: started.to_string(), found: crate::time::now(), cause, reason: format!("{why}{extra} {}", job.then()) }
@@ -154,18 +148,10 @@ pub struct QueryJob {
     pub result: String,
     pub since: String,
     pub then: Then,
+    /// What it runs; never its context or a connection, which are the
+    /// request's.
     pub query: Query,
-    /// The security context it runs under, kept so a stop can resume
-    /// it: the dataset holds what that context sees in any case.
-    #[serde(default)]
-    pub context: Option<serde_json::Value>,
-    /// Whether the request sent a connection of its own. That is never
-    /// kept, it may hold a credential, so such a query is not resumed.
-    #[serde(default)]
-    pub connection: bool,
     pub state: State,
-    #[serde(default)]
-    pub resume: bool,
     /// Set when a start found it in flight and did not run it again: the
     /// record of a dataset that was never made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,8 +174,6 @@ pub struct Recovered {
     pub swept: usize,
     /// The datasets marked interrupted, as `org/project/id`.
     pub interrupted: Vec<String>,
-    /// Queries a stop suspended, for the server to submit again.
-    pub resume: Vec<(crate::Scope, QueryJob)>,
 }
 
 /// Every project directory of datasets under `data_dir`, with its org
