@@ -76,7 +76,7 @@ fn upload(t: &str) -> Upload<'_> {
 fn timeless(v: &mut Value) {
     match v {
         Value::Object(m) => {
-            for k in ["ms", "started", "ended", "taken", "made", "at", "age_secs", "id"] {
+            for k in ["ms", "started", "ended", "taken", "made", "at", "age_secs", "request", "id"] {
                 if k == "id" {
                     if m.get("id").and_then(Value::as_str).is_some_and(|s| s.starts_with("bench-")) {
                         m.remove("id");
@@ -189,7 +189,43 @@ fn bench() {
 
     eprintln!("total {} ms", times.iter().map(|(_, ms)| ms).sum::<u128>());
     if let Ok(path) = std::env::var("ZSQL_PREP_BENCH_OUT") {
-        std::fs::write(path, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+        // Ids are new each time.
+        let mut text = serde_json::to_string_pretty(&out).unwrap();
+        for (id, said) in [(&sales.id, "SALES"), (&stores.id, "STORES"), (&d.id, "DATASET")] {
+            text = text.replace(id.as_str(), said);
+        }
+        std::fs::write(path, text).unwrap();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Parsing alone, and taking it as a snapshot: the best of three each.
+#[test]
+#[ignore]
+fn bench_csv() {
+    let rows: usize = std::env::var("ZSQL_PREP_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let text = sales_csv(rows, "region");
+    let best = |f: &dyn Fn()| {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed().as_millis()
+            })
+            .min()
+            .unwrap_or(0)
+    };
+    let parse = best(&|| {
+        source::parse_csv(text.as_bytes(), &CsvOptions::default(), rows).unwrap();
+    });
+    eprintln!("parse_csv                          {parse:>7} ms");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/prep-bench/csv");
+    let settings = Settings::defaults(&dir);
+    let e = Engine::new(settings.engine.clone(), engine::Bound { rows: 2 * rows, bytes: 1 << 30 });
+    let taken = best(&|| {
+        let s = e.session().unwrap();
+        snapshot::from_csv(&s, text.as_bytes(), &CsvOptions::default(), &[], rows).unwrap();
+    });
+    eprintln!("from_csv (parse, load, cast)       {taken:>7} ms");
     let _ = std::fs::remove_dir_all(&dir);
 }

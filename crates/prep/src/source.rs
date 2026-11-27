@@ -256,7 +256,10 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
     for (c, (_, ty)) in columns.iter().enumerate() {
         if *ty != ColumnType::Text {
             for v in values[c].iter_mut().flatten() {
-                *v = v.trim().to_string();
+                let t = v.trim();
+                if t.len() != v.len() {
+                    *v = t.to_string();
+                }
             }
         }
     }
@@ -381,7 +384,7 @@ pub fn infer<'a>(values: impl Iterator<Item = &'a str>) -> ColumnType {
             continue;
         }
         any = true;
-        let c = could(v);
+        let c = could(v, &all);
         if c.identifier {
             return ColumnType::Text;
         }
@@ -417,8 +420,10 @@ pub fn infer<'a>(values: impl Iterator<Item = &'a str>) -> ColumnType {
     }
 }
 
-fn could(v: &str) -> Could {
-    let mut c = Could { boolean: v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"), ..Could::default() };
+/// What `v` could be, of what `want` still allows: a type already ruled
+/// out for the column is not tried again.
+fn could(v: &str, want: &Could) -> Could {
+    let mut c = Could { boolean: want.boolean && (v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false")), ..Could::default() };
     let unsigned = v.strip_prefix(['-', '+']).unwrap_or(v);
     let (whole, fraction) = match unsigned.split_once('.') {
         Some((w, f)) => (w, Some(f)),
@@ -429,27 +434,32 @@ fn could(v: &str) -> Could {
         c.identifier = true;
         return c;
     }
-    match fraction {
-        None if digits(whole) => {
-            c.integer = v.parse::<i64>().is_ok();
-            c.decimal = (whole.len() <= (DECIMAL_PRECISION - DECIMAL_SCALE_MAX) as usize).then_some(0);
-            c.double = true;
-        }
-        Some(f) if digits(whole) && digits(f) => {
-            let fits = f.len() <= DECIMAL_SCALE_MAX as usize && whole.len() <= (DECIMAL_PRECISION - DECIMAL_SCALE_MAX) as usize;
-            c.decimal = fits.then_some(f.len() as u8);
-            c.double = true;
-        }
-        _ => {
-            // Scientific notation and the like; never `inf` or `nan`,
-            // which are words.
-            c.double = v.bytes().any(|b| b.is_ascii_digit())
-                && v.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'-' | b'+'))
-                && v.parse::<f64>().is_ok_and(f64::is_finite);
+    if want.integer || want.decimal.is_some() || want.double {
+        match fraction {
+            None if digits(whole) => {
+                c.integer = want.integer && v.parse::<i64>().is_ok();
+                c.decimal = (whole.len() <= (DECIMAL_PRECISION - DECIMAL_SCALE_MAX) as usize).then_some(0);
+                c.double = true;
+            }
+            Some(f) if digits(whole) && digits(f) => {
+                let fits = f.len() <= DECIMAL_SCALE_MAX as usize && whole.len() <= (DECIMAL_PRECISION - DECIMAL_SCALE_MAX) as usize;
+                c.decimal = fits.then_some(f.len() as u8);
+                c.double = true;
+            }
+            _ => {
+                // Scientific notation and the like; never `inf` or `nan`,
+                // which are words.
+                c.double = want.double
+                    && v.bytes().any(|b| b.is_ascii_digit())
+                    && v.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'-' | b'+'))
+                    && v.parse::<f64>().is_ok_and(f64::is_finite);
+            }
         }
     }
-    c.date = is_date(v);
-    c.timestamp = !c.date && is_timestamp(v);
+    if want.date || want.timestamp {
+        c.date = is_date(v);
+        c.timestamp = want.timestamp && !c.date && is_timestamp(v);
+    }
     c
 }
 
