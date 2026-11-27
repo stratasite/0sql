@@ -1,8 +1,9 @@
 # Data prep demo app
 
 A reference for applications that put 0sql's datasets in front of
-their users. A user signs in, imports a CSV, shapes it in a grid, edits
-cells, uploads a new version of the file, and blends it with the model.
+their users. A user signs in, imports a CSV, shapes it in a pipeline,
+edits cells, joins another dataset, uploads a new version of the file,
+and blends it with the model.
 TypeScript and Fastify on the backend; plain HTML and JavaScript in the
 browser, so the backend, which is the part to copy, stays the thing to
 read.
@@ -30,12 +31,14 @@ runs. Access control is this app's, and it is all in one place:
   anything reaches zsqld. A dataset a user may not see answers 404; a
   change by someone it is only shared with answers 403. Tests hold
   that neither reaches zsqld.
-- A step can read another dataset: a `join` or an `append` names one.
-  A preview would show it and a recipe would copy it, so the app checks
-  that the user may read every dataset a recipe's steps name, as it
-  checks a blend's. A saved recipe keeps reading what it named when
-  zsqld runs it again, so take a dataset out of the recipes that read it
-  when you take away someone's access to it.
+- A pipeline reads its inputs: sources and other datasets, each a node
+  of its graph. A preview would show them and a run would copy them, so
+  the app checks that the user may read every one a graph names, as it
+  checks a blend's, before zsqld is asked. zsqld says the same back:
+  every run, dry run and preview answers `reads`, each source and
+  dataset by kind and id. A user may build on a dataset shared with
+  them, and on their own sources; sharing a dataset shares its rows,
+  not the sources it was made from.
 - zsqld lists every dataset of the project; the app shows each user the
   ones its record lets them.
 - zsqld must not be reachable from a browser, or from anyone but this
@@ -46,8 +49,15 @@ dataset with a user by name. A real app might let a dataset be read by
 anyone who may see a chart built on it: the chart's sharing rule
 decides, and zsqld is not asked.
 
-**One thing to say before sharing:** a dataset made from a semantic
-query holds what its creator's security context could see. Whoever it
+**zsqld keeps no pipeline either.** It runs the graph it is sent. The
+app keeps each dataset's graph and every version of it
+(`src/pipelines.ts`), places a user's grid edits in it, and decides when
+it runs: when a user saves a change, edits a cell, or uploads a new
+file. A new file runs nothing in zsqld; the app runs the pipeline after
+it.
+
+**One thing to say before sharing:** a dataset made from a query source
+holds what the context of the run that pulled it could see. Whoever it
 is shared with sees those rows, whatever their own context.
 
 ## Files
@@ -55,10 +65,11 @@ is shared with sees those rows, whatever their own context.
 | file | what it holds |
 |---|---|
 | `src/zsql.ts` | **the client to copy**: every data prep call, typed, with `ZsqlError` and a retry helper; no dependency beyond Node's `fetch` |
-| `src/registry.ts` | who owns and may read which dataset: this app's records, in a JSON file for the demo |
+| `src/registry.ts` | who owns and may read which dataset and source: this app's records, in a JSON file for the demo |
+| `src/pipelines.ts` | each dataset's pipeline: the graph and every version of it, in a JSON file for the demo |
 | `src/app.ts` | the backend: a demo sign-in, the access check, and one route per call, forwarding to zsqld |
 | `src/config.ts` | what the app reads from the environment |
-| `public/` | the browser side: list, import, grid with cell edits, sharing, recipe, edit log, lineage, blend |
+| `public/` | the browser side: list, import, grid with cell edits, sharing, the pipeline with what each node did, lineage, blend |
 | `test/app.test.ts` | the app against a stand-in zsqld: what it forwards, and what its access check keeps from zsqld |
 
 ## Run it
@@ -84,7 +95,7 @@ npm start          # http://127.0.0.1:3700
 | `ZSQL_PROJECT` | `grocery-store` | the project they belong to |
 | `ZSQL_BRANCH` | `main` | the branch a blend plans the model's part on; blends only. `zsql serve` deploys the branch checked out |
 | `SESSION_SECRET` | random, per process | signs the session cookie; unset, sign-ins end when the app stops |
-| `DATA_DIR` | `data` | where the app keeps its own records (`registry.json`) |
+| `DATA_DIR` | `data` | where the app keeps its own records (`registry.json`, `pipelines.json`) |
 | `MAX_UPLOAD_BYTES` | 64 MB | the largest file accepted; zsqld has its own cap, `ZSQL_DATASET_MAX_BYTES` |
 | `PORT` | `3700` | this app's port |
 
@@ -93,62 +104,71 @@ npm start          # http://127.0.0.1:3700
 ## The calls, as the app makes them
 
 **Import.** The browser posts a multipart form to the app. The app
-streams the file to zsqld as the raw body, never holding it whole:
+streams the file to zsqld as the raw body, never holding it whole, as a
+source and a dataset over it as it is, which copies nothing:
 
 ```ts
 const file = await req.file();
-const dataset = await zsql.create(file.file, { name, fileName: file.filename });
-registry.add(dataset.id, user.name);
+const made = await zsql.createUpload(file.file, { name, fileName: file.filename, dataset: true });
+registry.add(made.source.id, user.name, { kind: "source" });
+registry.add(made.dataset!.id, user.name, { kind: "dataset", source: made.source.id });
+pipelines.save(made.dataset!.id, asItIs(made.source.id), user.name);
 ```
 
 ```http
-POST /orgs/{org}/projects/{project}/datasets?name=Q1%20budget&file_name=budget.csv
+POST /orgs/{org}/projects/{project}/sources?kind=upload&dataset=true&name=Q1%20budget&file_name=budget.csv
 content-type: text/csv
 
 <the file's bytes>
 ```
 
-The answer is the dataset: its `id`, which the app records against the
-user who imported it, its columns with their types and roles, and
-`notes`.
+The answer is the source, its first snapshot (how the file was parsed)
+and the dataset, whose ids the app records against the user.
 
-**A new version of the file** (`replace`) runs the same recipe and the
-same edits over it. Show the user what comes back:
+**The pipeline** is a graph the app keeps: nodes from the inputs to one
+output, each with an id of the app's choosing.
 
-- `notes`: "column 'budget' widened from integer to decimal(2)",
-  "column 'owner' is new", "1 edit(s) flagged".
-- `held`: columns the recipe reads are gone, so the previous version
-  stays live. Show `held.unresolved`, and offer to fix the recipe or to
-  `confirm`, which drops the steps that held it.
+```json
+{ "nodes": [
+  { "id": "source", "kind": "source", "source": "src_…" },
+  { "id": "steps", "kind": "steps", "input": "source", "steps": [{ "op": "trim_val", "columns": ["region"] }] },
+  { "id": "output", "kind": "output", "input": "steps" }
+] }
+```
+
+Saving a change runs it: `POST /runs` with the graph, the dataset and a
+run id the app makes. The same id sent again is answered with what the
+first did, so a retry never runs it twice. The answer is the run's
+record: what each input read, and for each node its rows, columns
+added and removed, each step's values changed ("trimmed 412 values"),
+a join's matches, each edit's state, the output's checks, a profile of
+each column, and a one-line summary written from those numbers. The
+Pipeline tab shows it on every node. A graph zsqld refuses before it
+runs comes back 422 with `problems`, each of its node, with the column
+it reads that is not there and the ones it may have meant; the app
+keeps no version of it.
+
+**A dry run** (`check`) says what a run would read and do, and every
+problem, running nothing. **A preview** runs the graph up to a node over
+a sample, keeping nothing: what to show while a step is being made.
 
 **The grid** reads pages with `rows`. Sorting and filtering there are
-for viewing and change nothing. Clicking a cell opens an edit, sent as
-the grid showed the row, with the user's choice of which rows it is for
-(`match`, the columns whose values must be this row's):
+for viewing and change nothing. An edit made there goes in an `edits`
+node the app places before the output, carried in the graph, naming its
+row by value:
 
-- every row with the value: `{op: "cell", column, row, to, match: []}`,
-  a remap of the column; a dimension edit's default;
-- the rows that agree on some other columns:
-  `match: ["store"]`, so `GROCERY` → `Grocery North` where `store` is
-  `north`, for every such row, now and in every later file;
-- this row only: `match` naming its dimensions; a measure edit's default.
+- every row with the value: `{kind: "remap", column, from, to}`;
+- this row: `{kind: "set", column, key: {…}, to, was}`, the row named by
+  its dimensions, which are the node's key. With `was`, a later file
+  that changes the value it replaced is flagged.
 
-An edit that names no row, or several where it was meant for one, is
-refused with words to show. Each edit's state afterwards (`applied`,
-`orphaned`, `ambiguous`, `flagged`) is in the edit log.
+Each edit's state after the run (`applied`, `orphaned`, `flagged`) is in
+the run's record. Undo takes the edit out of the graph and runs it.
 
-**The recipe and the edits are one list** in the Recipe tab: the steps
-in order, and each batch of edits where it applies, which is after the
-steps the recipe had when it was made. zsqld keeps them apart, steps as
-recipe versions and edits as a log, because they behave differently: a
-step is a rule over every row; an edit names its rows, and may find
-them gone or changed in the next file. When steps are added or removed
-before an edit, zsqld keeps the edit after the steps it was made on.
-
-**Recipe changes** send the whole new recipe with `against`, the
-version the user was looking at; a 409 means someone changed it since:
-read it again. `preview` runs steps over a sample without keeping
-anything, which is what to show while a step is being made.
+**A new version of the file** is a new snapshot of its source, which
+runs nothing; the app then runs the dataset's pipeline over it, and the
+record says what changed: a column gone that a step reads refuses the
+run, naming it, and the last output stays.
 
 **Blends** run the model's part in the warehouse, so the branch's
 datasource must be reachable, with its credential deployed. The app
@@ -156,25 +176,25 @@ builds the request to zsqld from what a user may choose (the spec, the
 datasets, the joins and a page) and nothing else from the browser: a
 browser's `context` would pick its own security context, and its
 `connection` would point zsqld at a host of its choosing. Set `context`
-from your session. The request states every join; nothing is joined for it.
-Every model key a join names must be projected too: the dataset is at
-that grain, so the answer is. A join with no keys (`"on": []`) is a
-cross join, each row of the dataset beside every row of the model, for
-a target or a rate. The Blend tab writes a request that runs as it is,
-from `GET /api/fields`: the dataset's dimensions the model has by the
-same name are the keys, or a cross join when there are none.
+from your session, as `contextOf()` in `src/app.ts` is for runs. The
+request states every join; nothing is joined for it. Every model key a
+join names must be projected too: the dataset is at that grain, so the
+answer is. A join with no keys (`"on": []`) is a cross join, each row of
+the dataset beside every row of the model, for a target or a rate. The
+Blend tab writes a request that runs as it is, from `GET /api/fields`:
+the dataset's dimensions the model has by the same name are the keys, or
+a cross join when there are none.
 
 ## Errors and retries
 
-zsqld refuses in one shape, `{"error": {"class", "message"}}`, and its
-messages are written to be shown to a user. The app passes them through
-with their status. `withRetry` tries once more, after the `retry-after`
-zsqld gives, on `503 Busy` and on `409` for a dataset busy with another
-job: nothing was done. A `503 Timeout` is not tried again: the work goes
-on after the answer and may well land, so an edit sent twice would be
-made twice; read the dataset again instead. A streamed upload is not
-retried: its body cannot be sent twice.
+zsqld refuses in one shape, `{"error": {"class", "message"}}`, with
+`problems` beside it for a graph refused, and its messages are written
+to be shown to a user. The app passes them through with their status.
+`withRetry` tries once more, after the `retry-after` zsqld gives, on
+`503 Busy`: nothing was done. A run is safe to send again in any case,
+under its id. A streamed upload is not retried: its body cannot be sent
+twice.
 
-Uploads and recipe changes finish within the request, so give the
-client a timeout above zsqld's 90 seconds for data prep; `src/zsql.ts`
-uses 100.
+A run answers when it is over, or 202 past its `wait`, and goes on; read
+it again by its id. Give the client a timeout above that wait;
+`src/zsql.ts` uses 100 seconds.

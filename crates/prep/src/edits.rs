@@ -1,58 +1,36 @@
-//! Edits: what a user changes in the grid, as an append-only log
-//! folded into the recipe where each edit was made.
+//! Edits: what a user changes in the grid, carried inline in an
+//! `edits` node of the graph the application sends. The application
+//! keeps them and places the node; 0sql applies them where the node is,
+//! every run, and says how each fared.
 //!
-//! What an edit means depends on the column's role:
+//! An edit names its rows by value, never by position, so it holds when
+//! what is upstream changes:
 //!
-//! - **A dimension cell is a remap**: the rule (column, value) to new
-//!   value, for every row with that value. It needs no row identity.
-//! - **A measure cell is an override of one row**, and so is a
-//!   dimension cell edited for one row only (`one`). The row is named
-//!   by its identity: the recipe's key when one is marked, else every
-//!   dimension column, at the point the edit applies. Applied when
-//!   exactly one row has those values; orphaned when none does;
-//!   ambiguous when more than one does, unless the edit was made for
-//!   all of them. The value it replaced is kept, so a sync that changes
-//!   it upstream is flagged: the user's value wins, and the dataset
-//!   says where upstream disagreed.
-//! - **A row deleted or added** is named the same way.
+//! - **A remap** is the rule (column, value) to new value, for every row
+//!   with that value. It needs no key.
+//! - **A set** changes one column of the row whose key is `key`: the
+//!   node's key columns and their values. Applied when one row has
+//!   them; orphaned when none does; ambiguous when more than one does,
+//!   unless it was made for all of them. With `was`, the value it
+//!   replaced, a run where upstream changed that value is flagged: the
+//!   user's value wins, and the run says where upstream disagreed.
+//! - **A delete or an add** names its row the same way.
 //!
-//! An edit applies after the steps the recipe had when it was made, so
-//! an edit on a result past a join or an append names its row by what
-//! is there at that point, and needs no rule of its own.
-//!
-//! The log is `edits.log`, a JSON line an entry; pasting five thousand
-//! cells is one entry. Undo is an entry too.
+//! The node's key must be unique where the node is, or the run fails:
+//! an edit made for one row would find several.
 
 use crate::error::{Error, Result};
-use crate::schema::{Column, Role};
-use crate::store;
+use crate::schema::Column;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::Path;
 
-pub(crate) const LOG: &str = "edits.log";
+/// The most edits one node holds.
+pub const EDITS_LIMIT: usize = 10_000;
 
-/// The most edits one entry holds.
-pub const ENTRY_LIMIT: usize = 10_000;
-
-/// One append to the log.
+/// One edit, as the graph carries it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Entry {
-    /// From 1, one more than the entry before.
-    pub seq: u64,
-    pub at: String,
-    /// The recipe version it was made against.
-    pub recipe: u32,
-    /// How many of the recipe's steps it applies after.
-    pub after: usize,
-    pub edits: Vec<Edit>,
-}
-
-/// One edit, as it is kept.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Edit {
     Remap {
         id: String,
@@ -60,14 +38,15 @@ pub enum Edit {
         from: Value,
         to: Value,
     },
-    /// One cell, of the row whose identity is `key`.
+    /// One cell, of the row whose key is `key`.
     Set {
         id: String,
         column: String,
         key: BTreeMap<String, Value>,
-        /// The value it replaced, which a later sync is checked against.
-        was: Value,
         to: Value,
+        /// The value it replaced, which a later run is checked against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        was: Option<Value>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all: bool,
     },
@@ -80,18 +59,15 @@ pub enum Edit {
     Add {
         id: String,
         key: BTreeMap<String, Value>,
+        #[serde(default)]
         values: BTreeMap<String, Value>,
-    },
-    Undo {
-        id: String,
-        undoes: String,
     },
 }
 
 impl Edit {
     pub fn id(&self) -> &str {
         match self {
-            Edit::Remap { id, .. } | Edit::Set { id, .. } | Edit::Delete { id, .. } | Edit::Add { id, .. } | Edit::Undo { id, .. } => id,
+            Edit::Remap { id, .. } | Edit::Set { id, .. } | Edit::Delete { id, .. } | Edit::Add { id, .. } => id,
         }
     }
 
@@ -102,197 +78,85 @@ impl Edit {
             Edit::Set { column, key, .. } => std::iter::once(column.clone()).chain(key.keys().cloned()).collect(),
             Edit::Delete { key, .. } => key.keys().cloned().collect(),
             Edit::Add { key, values, .. } => key.keys().chain(values.keys()).cloned().collect(),
-            Edit::Undo { .. } => Vec::new(),
+        }
+    }
+
+    fn key(&self) -> Option<&BTreeMap<String, Value>> {
+        match self {
+            Edit::Set { key, .. } | Edit::Delete { key, .. } | Edit::Add { key, .. } => Some(key),
+            Edit::Remap { .. } => None,
         }
     }
 }
 
-/// An edit as a request asks for it, in terms of the grid it was made
-/// in: the live version's columns and rows.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Asked {
-    /// A cell changed. `row` is the row as the grid showed it; for a
-    /// dimension edited as a remap, `from` may stand in for it.
-    ///
-    /// `match` says which rows it is for: the columns whose values must
-    /// be the row's. None at all is every row with the edited value: a
-    /// remap of the column. Some is the rows that agree on them: `NY` to
-    /// `New York` where `country` is `US`. The row's whole identity is
-    /// that one row. Left out, a dimension edit is a remap of the
-    /// column, and a measure edit is of the row.
-    Cell {
-        column: String,
-        #[serde(default)]
-        row: Option<BTreeMap<String, Value>>,
-        #[serde(default)]
-        from: Option<Value>,
-        to: Value,
-        #[serde(default, rename = "match")]
-        matching: Option<Vec<String>>,
-        /// For a measure: every row `match` names, when it names more
-        /// than one. A dimension edit is for every row it names already.
-        #[serde(default)]
-        all: bool,
-    },
-    Delete {
-        row: BTreeMap<String, Value>,
-        #[serde(default)]
-        all: bool,
-    },
-    Add {
-        values: BTreeMap<String, Value>,
-    },
-    Undo {
-        edit: String,
-    },
-}
-
-/// The request: edits made against a recipe version.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub against: u32,
-    pub edits: Vec<Asked>,
-}
-
-/// The log's entries the dataset acknowledged: the first `upto`. An
-/// entry past them was written by a job that failed before its manifest
-/// was, and was never an edit.
-pub(crate) fn read_log(dir: &Path, upto: u64) -> Result<Vec<Entry>> {
-    Ok(read_all(dir)?.into_iter().filter(|e| e.seq <= upto).collect())
-}
-
-fn read_all(dir: &Path) -> Result<Vec<Entry>> {
-    let path = dir.join(LOG);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::io(&path, e)),
-    };
-    // A last line a crash cut short was never acknowledged, and is not
-    // an edit.
-    let mut out = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<Entry>(line) {
-            Ok(e) => out.push(e),
-            Err(_) if !text.ends_with('\n') && text.trim_end().ends_with(line) => break,
-            Err(e) => return Err(e.into()),
+/// Refused unless a node's edits are sound where it is: ids unique and
+/// at most 64 characters; each value of its column's type; every key
+/// naming exactly the node's key columns. What an edit reads that the
+/// node's input does not have is said by the caller, as a column gone.
+pub fn check(edits: &[Edit], key: &[String], columns: &[Column]) -> Result<()> {
+    if edits.len() > EDITS_LIMIT {
+        return Err(Error::Invalid(format!("an edits node holds at most {EDITS_LIMIT} edits")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for e in edits {
+        let id = e.id();
+        if id.is_empty() || id.len() > 64 || id.chars().any(char::is_control) {
+            return Err(Error::Invalid(format!("'{id}' is not an edit's id: 1 to 64 characters, none of them control characters")));
+        }
+        if !seen.insert(id.to_string()) {
+            return Err(Error::Invalid(format!("two edits have the id '{id}'")));
+        }
+        let at = |m: String| Error::Invalid(format!("edit {id}: {m}"));
+        if let Some(k) = e.key() {
+            if key.is_empty() {
+                return Err(at("the node has no key, so no edit can name a row; give it key columns".into()));
+            }
+            let named: Vec<String> = k.keys().map(|n| n.to_lowercase()).collect();
+            let mut wanted: Vec<String> = key.iter().map(|n| n.to_lowercase()).collect();
+            let mut named_sorted = named.clone();
+            named_sorted.sort();
+            wanted.sort();
+            if named_sorted != wanted {
+                return Err(at(format!(
+                    "its key names {}; the node's key is {}",
+                    k.keys().cloned().collect::<Vec<_>>().join(", "),
+                    key.join(", ")
+                )));
+            }
+        }
+        let typed = |name: &str, v: &Value| -> Result<()> {
+            match columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                Some(c) => crate::compile::value_sql(v, c.ty, &c.name).map(|_| ()).map_err(|e| at(e.to_string())),
+                None => Ok(()),
+            }
+        };
+        match e {
+            Edit::Remap { column, from, to, .. } => {
+                typed(column, from)?;
+                typed(column, to)?;
+            }
+            Edit::Set { column, key, to, was, .. } => {
+                typed(column, to)?;
+                if let Some(w) = was {
+                    typed(column, w)?;
+                }
+                for (c, v) in key {
+                    typed(c, v)?;
+                }
+            }
+            Edit::Delete { key, .. } => {
+                for (c, v) in key {
+                    typed(c, v)?;
+                }
+            }
+            Edit::Add { key, values, .. } => {
+                for (c, v) in key.iter().chain(values) {
+                    typed(c, v)?;
+                }
+            }
         }
     }
-    Ok(out)
-}
-
-/// Appends an entry and makes it durable before it is acknowledged. An
-/// entry of its number or later, never acknowledged, goes first, so no
-/// two entries share a number.
-pub(crate) fn append(dir: &Path, entry: &Entry) -> Result<()> {
-    let path = dir.join(LOG);
-    let all = read_all(dir)?;
-    if all.iter().any(|e| e.seq >= entry.seq) {
-        let mut text = Vec::new();
-        for e in all.iter().filter(|e| e.seq < entry.seq) {
-            text.extend(serde_json::to_vec(e)?);
-            text.push(b'\n');
-        }
-        let staging = dir.join(format!(".{LOG}.{}", crate::time::nanos()));
-        let mut f = std::fs::File::create(&staging).map_err(|e| Error::io(&staging, e))?;
-        f.write_all(&text).map_err(|e| Error::io(&staging, e))?;
-        f.sync_data().map_err(|e| Error::io(&staging, e))?;
-        std::fs::rename(&staging, &path).map_err(|e| Error::io(&path, e))?;
-    }
-    let mut line = serde_json::to_vec(entry)?;
-    line.push(b'\n');
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| Error::io(&path, e))?;
-    f.write_all(&line).map_err(|e| Error::io(&path, e))?;
-    f.sync_data().map_err(|e| Error::io(&path, e))
-}
-
-/// The edits in force after the first `upto` entries: every edit not
-/// undone, each with the position it applies at in `current`, in the
-/// order made.
-///
-/// An edit applies after the steps the recipe had when it was made. The
-/// recipe may have changed since, so that position is carried over to
-/// the current steps: it follows the last of the steps before it that
-/// the current recipe still has, wherever that now is. A step removed
-/// or added earlier in the recipe moves no edit off what it was made on.
-/// `steps_of` gives a recipe version's steps.
-pub(crate) fn in_force(
-    log: &[Entry],
-    upto: u64,
-    steps_of: &dyn Fn(u32) -> Option<Vec<crate::recipe::Step>>,
-    current: &[crate::recipe::Step],
-) -> Vec<(usize, Edit)> {
-    let mut placed: std::collections::HashMap<(u32, usize), usize> = std::collections::HashMap::new();
-    let log: Vec<Entry> = log
-        .iter()
-        .map(|e| {
-            let at = *placed.entry((e.recipe, e.after)).or_insert_with(|| relocate(e.after, steps_of(e.recipe).as_deref(), current));
-            Entry { after: at, ..e.clone() }
-        })
-        .collect();
-    in_force_placed(&log, upto)
-}
-
-/// Where a position after `after` steps of `old` is in `new`: after the
-/// last of those steps that `new` still has, by the longest run of steps
-/// the two share in order.
-pub(crate) fn relocate(after: usize, old: Option<&[crate::recipe::Step]>, new: &[crate::recipe::Step]) -> usize {
-    let Some(old) = old else { return after.min(new.len()) };
-    if old == new {
-        return after;
-    }
-    let after = after.min(old.len());
-    let (n, m) = (old.len(), new.len());
-    // lcs[i][j]: the longest common run of old[i..] and new[j..].
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if old[i] == new[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
-        }
-    }
-    let (mut i, mut j, mut at) = (0, 0, 0);
-    while i < n && j < m && i < after {
-        if old[i] == new[j] {
-            at = j + 1;
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    at
-}
-
-fn in_force_placed(log: &[Entry], upto: u64) -> Vec<(usize, Edit)> {
-    let entries: Vec<&Entry> = log.iter().filter(|e| e.seq <= upto).collect();
-    let undone: std::collections::HashSet<&str> = entries
-        .iter()
-        .flat_map(|e| e.edits.iter())
-        .filter_map(|e| match e {
-            Edit::Undo { undoes, .. } => Some(undoes.as_str()),
-            _ => None,
-        })
-        .collect();
-    entries
-        .iter()
-        .flat_map(|e| e.edits.iter().map(move |x| (e.after, x)))
-        .filter(|(_, x)| !matches!(x, Edit::Undo { .. }) && !undone.contains(x.id()))
-        .map(|(a, x)| (a, x.clone()))
-        .collect()
-}
-
-/// The columns that name a row: the key when one is marked, else every
-/// dimension.
-pub(crate) fn identity(columns: &[Column], key: &[String]) -> Vec<String> {
-    if key.is_empty() {
-        columns.iter().filter(|c| c.role == Role::Dimension).map(|c| c.name.clone()).collect()
-    } else {
-        key.to_vec()
-    }
+    Ok(())
 }
 
 /// How an edit fared in a run.
@@ -300,13 +164,13 @@ pub(crate) fn identity(columns: &[Column], key: &[String]) -> Vec<String> {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Applied,
-    /// No row has its identity: kept, listed, not applied.
+    /// No row has its key: kept, listed, not applied.
     Orphaned,
     /// More than one row has it, and it was made for one.
     Ambiguous,
     /// Applied, and upstream changed the value it replaced.
     Flagged,
-    /// An added row whose identity a row already has.
+    /// An added row whose key a row already has.
     Conflict,
 }
 
@@ -316,35 +180,6 @@ pub struct Outcome {
     pub state: State,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-}
-
-/// The values of a row's identity, taken from the row as the grid
-/// showed it, refused when it lacks one.
-pub(crate) fn key_of(row: &BTreeMap<String, Value>, identity: &[String]) -> Result<BTreeMap<String, Value>> {
-    if identity.is_empty() {
-        return Err(Error::Invalid(
-            "the dataset has no dimension to name a row by; mark a key in the recipe, or make a column a dimension".into(),
-        ));
-    }
-    let mut key = BTreeMap::new();
-    for c in identity {
-        let v = row
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(c))
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| Error::Invalid(format!("the row does not say its '{c}', which is part of what names a row")))?;
-        key.insert(c.clone(), v);
-    }
-    Ok(key)
-}
-
-/// The id of the `i`th edit of entry `seq`.
-pub(crate) fn id_of(seq: u64, i: usize) -> String {
-    format!("{seq}.{}", i + 1)
-}
-
-pub(crate) fn read_outcomes(dir: &Path, k: u32) -> Vec<Outcome> {
-    store::read_json(&store::version_dir(dir, k).join("edits.json")).unwrap_or_default()
 }
 
 // ------------------------------------------------------------- applying
@@ -424,7 +259,6 @@ fn runs(columns: &[Column], edits: &[Edit]) -> Vec<Vec<Edit>> {
             Edit::Set { column, key, .. } => (1, key.keys().cloned().collect(), column_of(column)),
             Edit::Delete { .. } => (2, vec![], String::new()),
             Edit::Add { .. } => (3, vec![], String::new()),
-            _ => return None,
         })
     };
     let mut out: Vec<Vec<Edit>> = Vec::new();
@@ -465,7 +299,7 @@ fn apply_run(
     };
 
     // Remaps, the last for each value of each column.
-    let mut remaps: Vec<(String, Vec<crate::recipe::Mapping>)> = Vec::new();
+    let mut remaps: Vec<(String, Vec<crate::steps::Mapping>)> = Vec::new();
     for e in edits {
         if let Edit::Remap { id, column, from, to } = e {
             let c = type_of(columns, column).map(|c| c.name.clone()).unwrap_or_else(|| column.clone());
@@ -477,7 +311,7 @@ fn apply_run(
                 }
             };
             entry.1.retain(|m| m.from != *from);
-            entry.1.push(crate::recipe::Mapping { from: from.clone(), to: to.clone() });
+            entry.1.push(crate::steps::Mapping { from: from.clone(), to: to.clone() });
             outcomes.push(Outcome { id: id.clone(), state: State::Applied, detail: None });
         }
     }
@@ -521,13 +355,14 @@ fn apply_run(
                 last.push(e);
             }
         }
-        let mut names = vec!["__id".to_string(), "__to".to_string(), "__was".to_string()];
+        let mut names = vec!["__id".to_string(), "__to".to_string(), "__was".to_string(), "__known".to_string()];
         names.extend((0..key.len()).map(|i| format!("__k{i}")));
         let rows: Vec<Vec<Option<String>>> = last
             .iter()
             .filter_map(|e| match e {
                 Edit::Set { id, key: k, was, to, .. } => {
-                    let mut r = vec![Some(id.clone()), text_of(to), text_of(was)];
+                    let known = Some(if was.is_some() { "y" } else { "n" }.to_string());
+                    let mut r = vec![Some(id.clone()), text_of(to), was.as_ref().and_then(text_of), known];
                     r.extend(key.iter().map(|c| k.get(c).and_then(text_of)));
                     Some(r)
                 }
@@ -539,7 +374,7 @@ fn apply_run(
         let x = ident(&target.name);
         let counted = session.query(&format!(
             "SELECT m.\"__id\", CAST(count(r.\"__one\") AS BIGINT), \
-             CAST(bool_or(r.{x} IS DISTINCT FROM TRY_CAST(m.\"__was\" AS {t})) AS BOOLEAN) \
+             CAST(bool_or(m.\"__known\" = 'y' AND r.{x} IS DISTINCT FROM TRY_CAST(m.\"__was\" AS {t})) AS BOOLEAN) \
              FROM {m} m LEFT JOIN (SELECT 1 AS \"__one\", * FROM {rel}) r ON {on} GROUP BY m.\"__id\"",
             m = ident(&m),
             t = target.ty.sql(),
@@ -556,8 +391,8 @@ fn apply_run(
                 _ => State::Ambiguous,
             };
             let detail = match state {
-                State::Orphaned => Some("no row has its identity".to_string()),
-                State::Ambiguous => Some(format!("{count} rows have its identity")),
+                State::Orphaned => Some("no row has its key".to_string()),
+                State::Ambiguous => Some(format!("{count} rows have its key")),
                 State::Flagged => Some(format!("upstream changed the value of '{}' it replaced", target.name)),
                 _ => None,
             };
@@ -640,8 +475,8 @@ fn apply_run(
                 apply_ids.push(crate::schema::literal(&id));
             }
             let detail = match state {
-                State::Orphaned => Some("no row has its identity".to_string()),
-                State::Ambiguous => Some(format!("{count} rows have its identity")),
+                State::Orphaned => Some("no row has its key".to_string()),
+                State::Ambiguous => Some(format!("{count} rows have its key")),
                 _ => None,
             };
             outcomes.push(Outcome { id, state, detail });
@@ -684,7 +519,7 @@ fn apply_run(
                 session.count(&format!("SELECT count(*) FROM {rel} WHERE {}", filters.join(" AND ")))?
             };
             if taken > 0 {
-                outcomes.push(Outcome { id: id.clone(), state: State::Conflict, detail: Some("a row with its identity is there".into()) });
+                outcomes.push(Outcome { id: id.clone(), state: State::Conflict, detail: Some("a row with its key is there".into()) });
                 continue;
             }
             let mut r = vec![Some(id.clone())];

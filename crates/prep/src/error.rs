@@ -1,4 +1,4 @@
-//! What data prep refuses, and why, in the six ways the API tells
+//! What data prep refuses, and why, in the seven ways the API tells
 //! them apart.
 
 /// A refusal or a failure. Each says which kind it is, so the server
@@ -13,13 +13,17 @@ pub enum Error {
     /// rows that do not parse.
     #[error("{0}")]
     Unprocessable(String),
-    /// No such dataset in the project.
+    /// No such dataset, source or run in the project.
     #[error("{0}")]
     NotFound(String),
-    /// The change was made against a recipe that has moved on, or the
-    /// dataset is busy with another job.
+    /// What it works on is busy with another job, or a run id was sent
+    /// with another request.
     #[error("{0}")]
     Conflict(String),
+    /// A graph refused before anything ran: each problem said of its
+    /// node, for a client to act on.
+    #[error("{}", said(.0))]
+    Problems(Vec<crate::graph::Problem>),
     /// Something on this side broke.
     #[error("{0}")]
     Internal(String),
@@ -30,6 +34,10 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn said(problems: &[crate::graph::Problem]) -> String {
+    problems.iter().map(crate::graph::Problem::said).collect::<Vec<_>>().join("; ")
+}
 
 impl Error {
     pub(crate) fn io(what: &std::path::Path, e: std::io::Error) -> Error {

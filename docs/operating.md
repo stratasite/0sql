@@ -474,7 +474,7 @@ Everything the server keeps lives in one data directory: `--data-dir`,
 | `lock` | held by the running server; its pid, address and public URL, which `zsql server status` reads |
 | `.cache/results/` | the rows of each run the server made, an Arrow file each |
 | `.cache/records/` | the record of each run, when the records are not in a database |
-| `<org>/<project>/.datasets/` | the project's datasets: snapshots, recipe versions and materializations (`docs/ingestion.md`). Never taken for a branch; removed with the project |
+| `<org>/<project>/.datasets/` | the project's sources and their snapshots, datasets and their output versions, and the records of runs (`docs/ingestion.md`). Never taken for a branch; removed with the project |
 | `.cache/prep/` | where a data prep engine spills what does not fit in its memory |
 | `.cache/blends/` | the answers of blends, kept by the model's SQL, each dataset's id and version, and the joins; a dataset's delete removes the ones that read it |
 
@@ -498,7 +498,7 @@ same thing. The ones an operator sets:
 | `ZSQL_PUBLIC_URL` | where the server is reached from outside, for `zsql server status` to report |
 | `ZSQL_ADMIT_PLAN`, `ZSQL_ADMIT_EXPLORE`, `ZSQL_ADMIT_HEAVY`, `ZSQL_ADMIT_PROBE`, `ZSQL_ADMIT_PREP` | how much of each kind of work runs at once; `docs/admission.md` |
 | `ZSQL_DB`, `ZSQL_DB_USER`, `ZSQL_DB_PASSWORD` | a Postgres to keep the records of runs in, as `host:port/database` with `?sslmode=` when it says; unset, they are kept on this node's disk. The table is `zsql_results`, made from `ops/zsql_results.sql` by whoever runs the database: the server checks for it at startup and never creates it |
-| `ZSQL_OBJECT_STORE` | where results are kept for every node to read: `s3://bucket/prefix`, `gs://`, `az://`, or `file:///dir`. A result goes under `cache/` there, each deploy, without its secrets, under `deploys/`, and each dataset, as a backup, under `datasets/`. Unset, a result is only on the disk of the node that made it |
+| `ZSQL_OBJECT_STORE` | where results are kept for every node to read: `s3://bucket/prefix`, `gs://`, `az://`, or `file:///dir`. A result goes under `cache/` there, each deploy, without its secrets, under `deploys/`, and each dataset and source, as a backup, under `datasets/`. Unset, a result is only on the disk of the node that made it |
 | `ZSQL_OBJECT_STORE_<OPTION>` | the store's options, by the store's own names: `ZSQL_OBJECT_STORE_AWS_ACCESS_KEY_ID`, `ZSQL_OBJECT_STORE_AWS_SECRET_ACCESS_KEY`, `ZSQL_OBJECT_STORE_AWS_REGION`, `ZSQL_OBJECT_STORE_AWS_ENDPOINT` and so on. An option the store does not have stops the server at startup. `AWS_*` and `GOOGLE_APPLICATION_CREDENTIALS` are never read for the store: the Athena and BigQuery adapters fall back to them, and a storage credential there would become a warehouse login |
 | `ZSQL_LOCAL_CACHE_MAX_PERCENT` | the share of the disk this node's results may take; 60. Past it, with an object store, the least recently read local copies are removed; without one, a run fails saying the disk is full |
 | `ZSQL_CACHE_SWEEP_SECS` | how often results that no longer answer, expired or invalidated, are deleted from the store and the disk; 300 |
@@ -508,7 +508,7 @@ same thing. The ones an operator sets:
 | `ZSQL_QUEUE_MAX` | how many runs may wait for a seat before the next is refused as busy; 5,000 |
 | `ZSQL_DEFAULT_SQL_LIMIT` | the row limit a run is given when its request has none; unset, which is no limit |
 | `ZSQL_DATASETS` | `off` turns datasets (data prep, `docs/ingestion.md`) off; on by default |
-| `ZSQL_DATASET_MAX_ROWS`, `ZSQL_DATASET_MAX_BYTES` | the most rows and bytes a dataset holds, at import and after its recipe; a million and 256 MB |
+| `ZSQL_DATASET_MAX_ROWS`, `ZSQL_DATASET_MAX_BYTES` | the most rows and bytes a snapshot or a dataset's output holds; a million and 256 MB |
 | `ZSQL_PREP_MEMORY`, `ZSQL_PREP_THREADS` | the memory limit and threads of each data prep engine; `1GB` and 2 |
 | `ZSQL_MCP_TOOLS`, `ZSQL_MCP_PROMPTS`, `ZSQL_MCP_SPEC_SCHEMA` | the MCP tools exposed, and files to read the instruction texts from in place of the compiled-in ones |
 

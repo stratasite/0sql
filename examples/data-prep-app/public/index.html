@@ -44,13 +44,13 @@
 
       <nav class="tabs">
         <button data-tab="grid" class="on">Grid</button>
-        <button data-tab="recipe">Recipe</button>
+        <button data-tab="pipeline">Pipeline</button>
         <button data-tab="lineage">Lineage</button>
         <button data-tab="blend">Blend</button>
       </nav>
 
       <div data-pane="grid">
-        <p class="muted owner-only">Click a cell to edit it, and choose which rows the edit is for.</p>
+        <p class="muted owner-only">Click a cell to edit it. An edit names its row by value, so it holds when a new file comes.</p>
         <div class="toolbar">
           <input id="filter" placeholder="filter, e.g. amount > 50 and region = 'EMEA'">
           <span class="spacer"></span>
@@ -62,9 +62,7 @@
           <fieldset>
             <legend>Apply to</legend>
             <label id="ce-every-label"><input type="radio" name="scope" value="every"> <span id="ce-every"></span></label>
-            <label><input type="radio" name="scope" value="where"> rows where it also matches:</label>
-            <div id="ce-dims" class="dims"></div>
-            <label><input type="radio" name="scope" value="row"> this row only</label>
+            <label><input type="radio" name="scope" value="row"> this row only, named by <span id="ce-key"></span></label>
           </fieldset>
           <div class="toolbar"><span class="spacer"></span><button type="button" id="ce-cancel">Cancel</button><button class="primary">Apply</button></div>
         </form>
@@ -72,9 +70,11 @@
         <div id="outcomes"></div>
       </div>
 
-      <div data-pane="recipe" hidden>
-        <p class="muted">What is done to the imported file, in order: the steps, and the edits made in the grid where
-          they were made. All of it runs again on every new version of the file.</p>
+      <div data-pane="pipeline" hidden>
+        <p class="muted">How this dataset is made: a graph from its inputs to the output, kept by this app and run by
+          zsqld. Each node says what its last run did there. Nothing runs on its own: saving a change, an edit in the
+          grid, or a new file runs it.</p>
+        <div id="run" class="banner" hidden></div>
         <ol id="pipeline" class="pipeline"></ol>
         <details class="owner-only">
           <summary>Add a step</summary>
@@ -91,13 +91,23 @@
             <button id="add-sql">sql</button>
           </div>
           <textarea id="new-step" spellcheck="false" placeholder='{"op": "filter", "formula": "amount > 0"}'></textarea>
-          <div class="toolbar"><span class="spacer"></span><button id="preview">Preview</button><button id="add-step" class="primary">Add</button></div>
+          <div class="toolbar"><span class="spacer"></span><button id="preview">Preview</button><button id="add-step" class="primary">Add and run</button></div>
           <div class="scroll"><table id="preview-grid"></table></div>
         </details>
         <details class="owner-only">
-          <summary>Edit every step as JSON</summary>
-          <textarea id="recipe" spellcheck="false"></textarea>
-          <div class="toolbar"><span class="spacer"></span><button id="save-recipe" class="primary">Save</button></div>
+          <summary>Join another dataset or source</summary>
+          <div class="toolbar">
+            <select id="join-with"></select>
+            <span class="spacer"></span><button id="join" class="primary">Join and run</button>
+          </div>
+          <p class="muted">Joined on the columns both have by name, as a look-up: every row here is kept. Change the keys
+            in the graph below.</p>
+        </details>
+        <details class="owner-only">
+          <summary>Edit the graph as JSON</summary>
+          <textarea id="graph" spellcheck="false"></textarea>
+          <div class="toolbar"><span class="spacer"></span><button id="check">Check</button><button id="save-graph" class="primary">Save and run</button></div>
+          <p id="checked" class="muted"></p>
         </details>
       </div>
 

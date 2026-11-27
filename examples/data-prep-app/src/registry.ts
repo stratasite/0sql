@@ -1,13 +1,16 @@
-// Who may do what with which dataset: this app's records, not zsqld's.
+// Who may do what with which dataset and source: this app's records, not
+// zsqld's.
 //
-// zsqld keeps no user. A dataset is its project's and is addressed by its
-// id, so the access control is here, and every route checks it before
-// anything reaches zsqld:
+// zsqld keeps no user. A dataset or a source is its project's and is
+// addressed by its id, so the access control is here, and every route
+// checks it before anything reaches zsqld:
 //
-// - the user who imported a dataset owns it: they may read, change,
-//   share and delete it;
-// - a user it is shared with may read it, and use it in a blend, and
-//   nothing more.
+// - the user who imported a file owns its source and the dataset over
+//   it: they may read, change, share and delete them, and use the
+//   source in another dataset's pipeline;
+// - a user a dataset is shared with may read it, use it in a blend, and
+//   build on it in a pipeline of their own, and nothing more. Sharing a
+//   dataset shares its rows, not the sources it was made from.
 //
 // Kept in a JSON file for the demo. Your app keeps this in its own
 // database, beside whatever else it shares (charts, dashboards), and may
@@ -22,6 +25,10 @@ export interface Entry {
   owner: string;
   sharedWith: string[];
   created: string;
+  /** A source, or a dataset (the default). */
+  kind?: "source" | "dataset";
+  /** For a dataset over a file: the source a new version of the file goes to. */
+  source?: string;
 }
 
 export class Registry {
@@ -49,18 +56,18 @@ export class Registry {
     return this.#entries.get(id);
   }
 
-  /** The datasets `user` may see, with what they may do. */
-  visible(user: string): Map<string, Access> {
+  /** The datasets, or the sources, `user` may see, with what they may do. */
+  visible(user: string, kind: "source" | "dataset" = "dataset"): Map<string, Access> {
     const out = new Map<string, Access>();
-    for (const id of this.#entries.keys()) {
+    for (const [id, e] of this.#entries) {
       const a = this.access(user, id);
-      if (a) out.set(id, a);
+      if (a && (e.kind ?? "dataset") === kind) out.set(id, a);
     }
     return out;
   }
 
-  add(id: string, owner: string): void {
-    this.#entries.set(id, { owner, sharedWith: [], created: new Date().toISOString() });
+  add(id: string, owner: string, more: Pick<Entry, "kind" | "source"> = {}): void {
+    this.#entries.set(id, { owner, sharedWith: [], created: new Date().toISOString(), ...more });
     this.#save();
   }
 

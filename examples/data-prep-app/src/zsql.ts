@@ -1,14 +1,18 @@
-// A typed client for 0sql's data prep API: datasets, their recipes,
-// edits and lineage, and blends with the model. It is the part of this
-// example meant to be copied: it has no dependency beyond Node's fetch.
+// A typed client for 0sql's data prep API: sources, datasets, runs of
+// the graphs your application keeps, previews, and blends with the
+// model. It is the part of this example meant to be copied: it has no
+// dependency beyond Node's fetch.
 //
 // It runs on your backend, never in a browser. zsqld keeps no user: a
-// dataset is its project's, addressed by its id, and zsqld answers
-// whoever reaches it. Which user may read or change which dataset is
+// source or a dataset is its project's, addressed by its id, and zsqld
+// answers whoever reaches it. Which user may read or change which is
 // your application's to decide, before it calls anything here; see
 // `src/registry.ts` for how this example decides.
 //
-// See docs/ingestion.md in the 0sql repository for what each call means.
+// Your application owns each dataset's pipeline: the graph, its node
+// ids, its versions, the user's edits inside it, and when it runs. zsqld
+// checks a graph it is sent, runs it, keeps the output, and says what
+// each node did. See docs/ingestion.md in the 0sql repository.
 
 import { Readable } from "node:stream";
 
@@ -25,66 +29,81 @@ export interface Column {
   role: Role;
 }
 
-export interface SourceState {
-  id: string;
-  kind: "upload" | "semantic";
-  snapshot: number;
-  columns: Column[];
-  query?: { branch: string; spec?: unknown; expr?: string };
-}
-
-export interface Unresolved {
-  column: string;
-  step: number;
-  op: string;
-  edit?: string;
-  dataset?: string;
-}
-
-export interface Dataset {
-  id: string;
-  name: string;
-  created: string;
-  updated: string;
-  /** The recipe's latest version: what a change is made `against`. */
-  recipe: number;
-  /** The version the dataset answers with. */
-  live: number | null;
-  made: number;
-  sources: SourceState[];
-  columns: Column[];
-  rows: number;
-  /** What the last job said: a column gone, a type widened, a cascade. */
-  notes?: string[];
-  /** Set when columns the recipe reads are gone upstream; `live` is older. */
-  held?: { since: string; unresolved: Unresolved[] };
-  /** How much of the edit log is in force. */
-  edits: number;
-  backup?: { at: string; failed?: string };
-  /** A semantic query still running for it, or one that failed. */
-  pending?: { result: string; since: string; failed?: string; interrupted?: Interrupted };
-  /** A job a restart found in flight and did not run again; show `reason`. Ends with the dataset's next job. */
-  interrupted?: Interrupted;
-}
-
 /** Why a job did not finish: the process died with it (`crash`), or the server was stopped while it ran (`stop`); nothing is resumed. */
 export interface Interrupted {
-  job: "replace" | "refresh" | "create" | "change" | "confirm" | "edit" | "delete" | "update" | "cascade";
+  job: "upload" | "push" | "pull" | "run" | "delete";
   started: string;
   found: string;
   cause: "crash" | "stop";
   reason: string;
 }
 
+/** Where data comes from, and what came: what the "add an input" explorer lists. */
+export interface Source {
+  id: string;
+  name: string;
+  description?: string;
+  kind: "upload" | "push" | "query";
+  created: string;
+  updated: string;
+  /** The newest snapshot; 0 before the first. */
+  snapshot: number;
+  columns: Column[];
+  query?: { branch: string; spec?: unknown; expr?: string };
+  /** Columns read as other types, for every graph that reads it. */
+  types?: Record<string, ColumnType>;
+  /** The version of how it is read. */
+  read: number;
+  interrupted?: Interrupted;
+}
+
+export interface Snapshot {
+  source: string;
+  number: number;
+  kind: Source["kind"];
+  taken: string;
+  file_name?: string;
+  sha256: string;
+  bytes: number;
+  parse?: Record<string, unknown>;
+  origin?: unknown;
+  columns: Column[];
+  rows: number;
+  changes?: string[];
+}
+
+export type RunState = "running" | "suspended" | "succeeded" | "failed" | "held" | "interrupted";
+
+/** What is browsed, shared and blended. */
+export interface Dataset {
+  id: string;
+  name: string;
+  description?: string;
+  created: string;
+  updated: string;
+  /** The output version it answers with, once a run made one. */
+  live: number | null;
+  made: number;
+  columns: Column[];
+  rows: number;
+  /** What the run that made the live output let through: a warning, an orphaned edit. */
+  notes?: string[];
+  last_run?: { id: string; state: RunState; at: string };
+  backup?: { at: string; failed?: string };
+  /** A job a restart found in flight and did not run again; show `reason`. */
+  interrupted?: Interrupted;
+}
+
 export interface Page {
-  version: number;
+  version?: number;
+  snapshot?: number;
   columns: Column[];
   total: number;
   offset: number;
   rows: unknown[][];
 }
 
-/** One step of a recipe. Each is a closed shape; see docs/ingestion.md, "Steps". */
+/** One step of a `steps` node. Each is a closed shape; see docs/ingestion.md, "Steps". */
 export type Step =
   | { op: "rename_column"; column: string; to: string }
   | { op: "retype_column"; column: string; type: ColumnType; format?: string }
@@ -107,56 +126,76 @@ export type Step =
       by: string[];
       aggregates: { column?: string; fn: "sum" | "min" | "max" | "avg" | "count" | "count_distinct"; as: string }[];
     }
-  | { op: "sql"; query: string }
-  | { op: "append"; dataset: string }
+  | { op: "sql"; query: string };
+
+/** A user's edit, carried inline in an `edits` node, naming its rows by value. */
+export type Edit =
+  | { id: string; kind: "remap"; column: string; from: unknown; to: unknown }
+  | { id: string; kind: "set"; column: string; key: Record<string, unknown>; to: unknown; was?: unknown; all?: boolean }
+  | { id: string; kind: "delete"; key: Record<string, unknown>; all?: boolean }
+  | { id: string; kind: "add"; key: Record<string, unknown>; values?: Record<string, unknown> };
+
+/** What an input reads: the newest, a snapshot or version, a pull first, or a pull when older than `max_age` seconds. */
+export type Read = "latest" | "pull" | { snapshot: number } | { version: number } | { max_age: number };
+
+/** A node of a graph. Its id is yours, and everything a run says is keyed by it. */
+export type GraphNode = { id: string; note?: string } & (
+  | { kind: "source"; source: string; read?: Read; types?: Record<string, ColumnType> }
+  | { kind: "dataset"; dataset: string; read?: Read }
+  | { kind: "steps"; input: string; steps: Step[] }
   | {
-      op: "join";
-      dataset: string;
+      kind: "join";
+      left: string;
+      right: string;
       on: { left: string; right: string }[];
-      kind?: "left" | "inner";
+      type?: "left" | "inner";
       columns?: string[];
       prefix?: string;
-    };
-
-export interface Recipe {
-  version: number;
-  created: string;
-  roles?: Record<string, Role>;
-  steps?: Step[];
-  key?: string[];
-}
-
-/** A new recipe, whole, made against the version the user was looking at. */
-export interface RecipeChange {
-  against: number;
-  roles?: Record<string, Role>;
-  steps?: Step[];
-  key?: string[];
-}
-
-/** An edit as the grid makes it. */
-export type Edit =
-  | {
-      op: "cell";
-      column: string;
-      /** The row as the grid showed it. */
-      row?: Record<string, unknown>;
-      /** For a dimension remap: the value changed, when no row is sent. */
-      from?: unknown;
-      to: unknown;
-      /**
-       * Which rows: the columns whose values must be the row's. `[]` is
-       * every row with the value (a remap of the column); some columns,
-       * the rows that agree on them; the row's whole identity, that row.
-       * Left out: a dimension edit is of the column, a measure edit of the row.
-       */
-      match?: string[];
-      /** For a measure: every row `match` names, when it names several. */
-      all?: boolean;
     }
-  | { op: "delete"; row: Record<string, unknown>; all?: boolean }
-  | { op: "add"; values: Record<string, unknown> }
-  | { op: "undo"; edit: string };
+  | { kind: "append"; inputs: string[] }
+  | { kind: "sql"; inputs: Record<string, string>; query: string }
+  | { kind: "edits"; input: string; key?: string[]; edits: Edit[] }
+  | {
+      kind: "output";
+      input: string;
+      roles?: Record<string, Role>;
+      key?: string[];
+      checks?: { check: "unique" | "not_null"; columns: string[]; on_fail?: "hold" | "warn" }[];
+    }
+);
+
+/** A pipeline: from its inputs to one output. */
+export interface Graph {
+  nodes: GraphNode[];
+}
+
+/** Something wrong with a graph, said of its node. */
+export interface Problem {
+  node?: string;
+  code: "graph" | "not_found" | "invalid" | "missing_column" | "read" | "context" | "data";
+  message: string;
+  column?: string;
+  /** Columns that may be the one meant, and why. */
+  suggestions?: { column: string; because: string }[];
+}
+
+/** A source or dataset a graph reads: check each against who is asking. */
+export interface ReadRef {
+  kind: "source" | "dataset";
+  id: string;
+}
+
+export interface InputPlan {
+  node: string;
+  kind: "source" | "dataset";
+  id: string;
+  name: string;
+  will: "read" | "pull";
+  number?: number;
+  taken?: string;
+  age_secs?: number;
+  why: string;
+}
 
 export interface EditOutcome {
   id: string;
@@ -164,22 +203,75 @@ export interface EditOutcome {
   detail?: string;
 }
 
+/** What one node did: numbers counted by the run, and a summary written from them. */
+export interface NodeRecord {
+  id: string;
+  kind: GraphNode["kind"];
+  rows_in?: number[];
+  rows: number;
+  columns: number;
+  added?: string[];
+  removed?: string[];
+  retyped?: { column: string; from: ColumnType; to: ColumnType }[];
+  steps?: { step: number; op: string; rows: number; changed?: number; said: string }[];
+  join?: { matched: number; unmatched_left: number; unmatched_right: number; sample?: boolean };
+  append?: { only_in_some?: string[] };
+  edits?: EditOutcome[];
+  checks?: { check: string; columns: string[]; on_fail: string; passed: boolean; failing?: number }[];
+  warnings?: string[];
+  summary: string;
+  profile?: { column: string; type: ColumnType; role: Role; nulls: number; distinct: number; min?: string; max?: string }[];
+  ms: number;
+}
+
+export interface RunRecord {
+  id: string;
+  dataset: string;
+  state: RunState;
+  started: string;
+  ended?: string;
+  context: string;
+  reads: ReadRef[];
+  inputs?: InputPlan[];
+  version?: number;
+  nodes?: NodeRecord[];
+  problems?: Problem[];
+  error?: string;
+  summary: string;
+  interrupted?: Interrupted;
+}
+
+export interface Checked {
+  ok: boolean;
+  reads: ReadRef[];
+  inputs: InputPlan[];
+  nodes: { id: string; kind: string; columns: Column[] }[];
+  problems: Problem[];
+  said: string;
+}
+
+export interface Previewed {
+  node: string;
+  columns: Column[];
+  rows: unknown[][];
+  nodes: NodeRecord[];
+  problems: Problem[];
+  reads: ReadRef[];
+  inputs: InputPlan[];
+  /** How many rows of each input it read, at most; none when it read them all. */
+  sample: number | null;
+}
+
 export interface CsvOptions {
   /** Shown in the app; the file's name without `.csv` when not said. */
   name?: string;
-  /** Kept in the lineage. */
+  description?: string;
+  /** Kept in the snapshot. */
   fileName?: string;
   delimiter?: string;
   quote?: string;
   header?: boolean;
   maxBadRows?: number;
-}
-
-export interface Preview {
-  columns: Column[];
-  rows: unknown[][];
-  unresolved: string[];
-  sample: number;
 }
 
 export interface BlendJoin {
@@ -215,30 +307,42 @@ export interface Blended {
   datasets: { id: string; version: number }[];
 }
 
+/** A field of the model, as `fields` lists it. */
+export interface ModelField {
+  uid: string;
+  name: string;
+  kind: "dimension" | "measure";
+  data_type: string;
+  tables: string[];
+  hidden: boolean;
+  description?: string;
+}
+
 // ------------------------------------------------------------------ errors
 
 /** A refusal from zsqld, in its own words. `message` is written to be shown to a user. */
 export class ZsqlError extends Error {
   constructor(
     readonly status: number,
-    /** `Invalid`, `NotFound`, `Conflict`, `Unprocessable`, `Busy`, `Internal`, ... */
+    /** `Invalid`, `NotFound`, `Conflict`, `Unprocessable`, `Refused`, `Busy`, `Internal`, ... */
     readonly kind: string,
     message: string,
     /** Seconds to wait before asking again, when zsqld said. */
     readonly retryAfter?: number,
+    /** For a graph refused before it ran: each problem, of its node. */
+    readonly problems?: Problem[],
   ) {
     super(message);
     this.name = "ZsqlError";
   }
 
   /**
-   * Busy (503: nothing was done) and a dataset busy with another job
-   * (409 Conflict) are worth one more try. A 503 Timeout is not: the work
-   * goes on after the answer and may well land, and an edit sent again
-   * would be made twice. Read the dataset again instead.
+   * Busy (503: nothing was done) is worth one more try. A run is
+   * different: send it again with the same id and zsqld answers what the
+   * first did, so a retry never makes anything twice.
    */
   get retryable(): boolean {
-    return (this.status === 503 && this.kind === "Busy") || (this.status === 409 && /busy/.test(this.message));
+    return this.status === 503 && this.kind === "Busy";
   }
 }
 
@@ -247,17 +351,20 @@ export class ZsqlError extends Error {
 export interface ClientOptions {
   /** Where zsqld is: `http://127.0.0.1:3699`. */
   baseUrl: string;
-  /** The org the datasets are in; `default` when not said. */
+  /** The org; `default` when not said. */
   org?: string;
-  /**
-   * How long a call may take. zsqld's deadline for data prep is 90 seconds,
-   * so a little more than that, to read its own answer rather than give up first.
-   */
+  /** How long a call may take. A run longer than its `wait` is answered 202, and read again by its id. */
   timeoutMs?: number;
   fetch?: typeof fetch;
 }
 
-/** zsqld's data prep, for an org. {@link DataPrep.project} gives the calls on one project's datasets. */
+interface Call {
+  method?: string;
+  json?: unknown;
+  csv?: Readable | Buffer | string;
+}
+
+/** zsqld's data prep, for an org. {@link DataPrep.project} gives the calls on one project. */
 export class DataPrep {
   readonly #base: string;
   readonly #timeout: number;
@@ -270,13 +377,13 @@ export class DataPrep {
     this.#fetch = options.fetch ?? fetch;
   }
 
-  /** The calls on one project's datasets. */
+  /** The calls on one project's sources, datasets and runs. */
   project(project: string): ProjectClient {
     const base = `/projects/${encodeURIComponent(project)}`;
     return new ProjectClient(<T>(path: string, init?: Call) => this.call<T>(base + path, init));
   }
 
-  /** Brings back from the object store every dataset of the org this node lacks. */
+  /** Brings back from the object store every source and dataset of the org this node lacks. */
   async restore(): Promise<{ restored: string[] }> {
     return this.call("/datasets/restore", { method: "POST", json: {} });
   }
@@ -309,19 +416,13 @@ export class DataPrep {
     const text = await res.text();
     const parsed = text ? safeJson(text) : undefined;
     if (!res.ok) {
-      const err = (parsed as { error?: { class?: string; message?: string } } | undefined)?.error;
+      const p = parsed as { error?: { class?: string; message?: string }; problems?: Problem[] } | undefined;
       const retry = res.headers.get("retry-after");
-      throw new ZsqlError(res.status, err?.class ?? "Http", err?.message ?? (text || res.statusText), retry ? Number(retry) : undefined);
+      throw new ZsqlError(res.status, p?.error?.class ?? "Http", p?.error?.message ?? (text || res.statusText), retry ? Number(retry) : undefined, p?.problems);
     }
-    // A 202 (a query still running) is an answer too: the caller reads `pending`.
+    // A 202 (a run still going, a preview still pulling) is an answer too.
     return parsed as T;
   }
-}
-
-interface Call {
-  method?: string;
-  json?: unknown;
-  csv?: Readable | Buffer | string;
 }
 
 function safeJson(text: string): unknown {
@@ -341,112 +442,140 @@ function query(params: Record<string, string | number | boolean | undefined>): s
 
 const p = (id: string) => encodeURIComponent(id);
 
-/** A field of the model, as `fields` lists it. */
-export interface ModelField {
-  uid: string;
-  name: string;
-  kind: "dimension" | "measure";
-  data_type: string;
-  tables: string[];
-  hidden: boolean;
-  description?: string;
+function view(v: { offset?: number; limit?: number; sort?: { column: string; desc?: boolean }[]; filter?: string }) {
+  const sort = v.sort?.map((k) => `${k.column}${k.desc ? ":desc" : ""}`).join(",");
+  return { offset: v.offset, limit: v.limit, sort, filter: v.filter };
 }
 
-/** One project's datasets. Made by {@link DataPrep.project}. */
+/** One project's sources, datasets and runs. Made by {@link DataPrep.project}. */
 export class ProjectClient {
   constructor(private readonly call: <T>(path: string, init?: Call) => Promise<T>) {}
+
+  // ---------------------------------------------------------- sources
+
+  async sources(): Promise<Source[]> {
+    return (await this.call<{ sources: Source[] }>(`/sources`)).sources;
+  }
+
+  /**
+   * A new upload source from a CSV. With `dataset`, also a dataset over
+   * it as it is: one thing to list, which copies nothing. The project
+   * must be deployed on some branch.
+   */
+  createUpload(
+    csv: Readable | Buffer | string,
+    options: CsvOptions & { dataset?: boolean } = {},
+  ): Promise<{ source: Source; snapshot: Snapshot; dataset?: Dataset }> {
+    return this.call(`/sources${csvQuery(options, { kind: "upload", dataset: options.dataset || undefined })}`, { method: "POST", csv });
+  }
+
+  /** A new push source: rows your app or an agent got from a tool, and where from. */
+  createPush(
+    rows: Record<string, unknown>[],
+    options: { name?: string; description?: string; origin?: unknown; dataset?: boolean } = {},
+  ): Promise<{ source: Source; snapshot: Snapshot; dataset?: Dataset }> {
+    const q = query({ kind: "push", name: options.name, description: options.description, dataset: options.dataset || undefined });
+    return this.call(`/sources${q}`, { method: "POST", json: { rows, origin: options.origin } });
+  }
+
+  /** A new query source: a spec on a branch, pulled by a run under the context the run is sent with. */
+  createQuery(q: { branch: string; spec?: unknown; expr?: string }, options: { name?: string; description?: string } = {}): Promise<{ source: Source }> {
+    return this.call(`/sources${query({ kind: "query", name: options.name, description: options.description })}`, { method: "POST", json: q });
+  }
+
+  source(id: string): Promise<Source> {
+    return this.call(`/sources/${p(id)}`);
+  }
+
+  /** A source's name, description, or the types it is read with (a new version of how it is read). */
+  changeSource(id: string, change: { name?: string; description?: string; types?: Record<string, ColumnType> }): Promise<Source> {
+    return this.call(`/sources/${p(id)}`, { method: "PATCH", json: change });
+  }
+
+  /** A hard delete. A dataset whose output is one of its snapshots gets those rows first. */
+  deleteSource(id: string): Promise<{ removed: string; datasets_given_their_rows: string[] }> {
+    return this.call(`/sources/${p(id)}`, { method: "DELETE" });
+  }
+
+  /** A new file for an upload source. It runs nothing: run the graphs that read it when your app decides. */
+  addFile(id: string, csv: Readable | Buffer | string, options: Omit<CsvOptions, "name" | "description"> = {}): Promise<{ source: Source; snapshot: Snapshot }> {
+    return this.call(`/sources/${p(id)}/snapshots${csvQuery(options, {})}`, { method: "POST", csv });
+  }
+
+  /** New rows for a push source. */
+  addRows(id: string, rows: Record<string, unknown>[], origin?: unknown): Promise<{ source: Source; snapshot: Snapshot }> {
+    return this.call(`/sources/${p(id)}/snapshots`, { method: "POST", json: { rows, origin } });
+  }
+
+  async snapshots(id: string): Promise<Snapshot[]> {
+    return (await this.call<{ snapshots: Snapshot[] }>(`/sources/${p(id)}/snapshots`)).snapshots;
+  }
+
+  sourceRows(id: string, v: { snapshot?: number; offset?: number; limit?: number; sort?: { column: string; desc?: boolean }[]; filter?: string } = {}): Promise<Page> {
+    return this.call(`/sources/${p(id)}/rows${query({ snapshot: v.snapshot, ...view(v) })}`);
+  }
+
+  // --------------------------------------------------------- datasets
 
   async list(): Promise<Dataset[]> {
     return (await this.call<{ datasets: Dataset[] }>(`/datasets`)).datasets;
   }
 
-  /** A new dataset from a CSV. The project must be deployed on some branch. */
-  create(csv: Readable | Buffer | string, options: CsvOptions = {}): Promise<Dataset> {
-    return this.call(`/datasets${csvQuery(options)}`, { method: "POST", csv });
+  /** A new dataset: over a source as it is, or empty until a run makes its output. */
+  createDataset(d: { name?: string; description?: string; source?: string }): Promise<Dataset> {
+    return this.call(`/datasets`, { method: "POST", json: d });
   }
 
-  /** A new snapshot of the file; the dataset's recipe and edits run over it again. */
-  replace(id: string, csv: Readable | Buffer | string, options: Omit<CsvOptions, "name"> = {}): Promise<Dataset> {
-    return this.call(`/datasets/${p(id)}/upload${csvQuery(options)}`, { method: "PUT", csv });
-  }
-
-  /** A dataset, or, for one whose query is still running, what it waits on. */
   get(id: string): Promise<Dataset> {
     return this.call(`/datasets/${p(id)}`);
   }
 
-  /** A hard delete. One others read is refused unless `confirm`. */
-  delete(id: string, confirm = false): Promise<{ removed: string }> {
-    return this.call(`/datasets/${p(id)}${query({ confirm: confirm || undefined })}`, { method: "DELETE" });
+  delete(id: string): Promise<{ removed: string }> {
+    return this.call(`/datasets/${p(id)}`, { method: "DELETE" });
   }
 
-  /** A page of the live version (or `version`), sorted and filtered for viewing only. */
-  rows(
-    id: string,
-    view: { offset?: number; limit?: number; version?: number; sort?: { column: string; desc?: boolean }[]; filter?: string } = {},
-  ): Promise<Page> {
-    const sort = view.sort?.map((k) => `${k.column}${k.desc ? ":desc" : ""}`).join(",");
-    return this.call(
-      `/datasets/${p(id)}/rows${query({ offset: view.offset, limit: view.limit, version: view.version, sort, filter: view.filter })}`,
-    );
-  }
-
-  recipe(id: string, version?: number): Promise<Recipe> {
-    return this.call(`/datasets/${p(id)}/recipe${query({ version })}`);
-  }
-
-  /** A new recipe version. 409 when `against` is not the latest: read it again. */
-  changeRecipe(id: string, change: RecipeChange): Promise<Dataset> {
-    return this.call(`/datasets/${p(id)}/recipe`, { method: "POST", json: change });
-  }
-
-  /** Steps run over a sample, kept nowhere: what the grid shows while a step is made. */
-  preview(id: string, ask: { steps?: Step[]; roles?: Record<string, Role>; upto?: number; limit?: number }): Promise<Preview> {
-    return this.call(`/datasets/${p(id)}/preview`, { method: "POST", json: ask });
-  }
-
-  /** What reads a column, before it is removed. */
-  impact(id: string, column: string): Promise<{ column: string; readers: Unresolved[]; said: string[] }> {
-    return this.call(`/datasets/${p(id)}/impact${query({ column })}`);
-  }
-
-  /** Past a hold: a recipe version without the steps that held it. */
-  confirm(id: string, against: number): Promise<Dataset> {
-    return this.call(`/datasets/${p(id)}/confirm`, { method: "POST", json: { against } });
-  }
-
-  /** Cell edits, as one entry of the log. */
-  edit(id: string, against: number, edits: Edit[]): Promise<{ dataset: Dataset; outcomes: EditOutcome[] }> {
-    return this.call(`/datasets/${p(id)}/edits`, { method: "POST", json: { against, edits } });
-  }
-
-  editLog(id: string): Promise<{ entries: unknown[]; outcomes: EditOutcome[] }> {
-    return this.call(`/datasets/${p(id)}/edits`);
+  /** A page of the live output (or `version`), sorted and filtered for viewing only. */
+  rows(id: string, v: { version?: number; offset?: number; limit?: number; sort?: { column: string; desc?: boolean }[]; filter?: string } = {}): Promise<Page> {
+    return this.call(`/datasets/${p(id)}/rows${query({ version: v.version, ...view(v) })}`);
   }
 
   lineage(id: string, version?: number): Promise<Record<string, unknown>> {
     return this.call(`/datasets/${p(id)}/lineage${query({ version })}`);
   }
 
-  /** How a source's snapshot was parsed: delimiter, header, bad rows, renames. */
-  source(id: string, source = "s1", snapshot?: number): Promise<Record<string, unknown>> {
-    return this.call(`/datasets/${p(id)}/sources/${p(source)}${query({ snapshot })}`);
+  /** An output version: its manifest, lineage, the run that made it, and the graph it ran. */
+  version(id: string, k: number): Promise<{ manifest: Record<string, unknown>; lineage?: unknown; run?: RunRecord; graph?: Graph }> {
+    return this.call(`/datasets/${p(id)}/versions/${k}`);
   }
 
-  downstream(id: string): Promise<{ downstream: { id: string; name: string; live: number | null }[] }> {
-    return this.call(`/datasets/${p(id)}/downstream`);
+  // ------------------------------------------------------------- runs
+
+  /**
+   * Runs a graph into a dataset. `id` is yours: send the same id again
+   * and zsqld answers what the first did, never running it twice. A
+   * graph refused before it runs throws, with `problems`. `context` is
+   * the security context of the user it runs for: its query sources are
+   * pulled, and read, as that context only.
+   */
+  run(ask: { id: string; dataset: string; graph: Graph; context?: unknown; connection?: Record<string, unknown>; wait?: number }): Promise<RunRecord> {
+    return this.call(`/runs`, { method: "POST", json: ask });
   }
 
-  /** A dataset made from a semantic query, run fresh under `context`. A 202 answer has `pending`. */
-  fromQuery(
-    ask: { branch: string; spec?: unknown; expr?: string; name?: string; context?: unknown; connection?: Record<string, unknown>; wait?: number },
-  ): Promise<Dataset> {
-    return this.call(`/datasets/query`, { method: "POST", json: ask });
+  /** A dry run: what a run would read and pull, each node's columns, every problem. Nothing runs. */
+  check(graph: Graph, context?: unknown): Promise<Checked> {
+    return this.call(`/runs?check=true`, { method: "POST", json: { graph, context } });
   }
 
-  refresh(id: string, ask: { context?: unknown; connection?: Record<string, unknown>; wait?: number } = {}): Promise<Dataset> {
-    return this.call(`/datasets/${p(id)}/refresh`, { method: "POST", json: ask });
+  runRecord(id: string): Promise<RunRecord> {
+    return this.call(`/runs/${p(id)}`);
   }
+
+  /** A graph run up to `node`, over a sample unless `whole`, kept nowhere. */
+  preview(ask: { graph: Graph; node?: string; whole?: boolean; limit?: number; context?: unknown; connection?: Record<string, unknown>; wait?: number }): Promise<Previewed> {
+    return this.call(`/preview`, { method: "POST", json: ask });
+  }
+
+  // ----------------------------------------------------------- blends
 
   /** The model's fields on a branch: what a blend's projections and join keys name. */
   async fields(branch: string): Promise<ModelField[]> {
@@ -459,9 +588,11 @@ export class ProjectClient {
   }
 }
 
-function csvQuery(o: CsvOptions): string {
+function csvQuery(o: CsvOptions, extra: Record<string, string | boolean | undefined>): string {
   return query({
+    ...extra,
     name: o.name,
+    description: o.description,
     file_name: o.fileName,
     delimiter: o.delimiter,
     quote: o.quote,

@@ -1,90 +1,124 @@
-//! Where datasets are kept, and the only module that knows.
+//! Where sources and datasets are kept, and the only module that knows.
 //!
 //! ```text
-//! <data-dir>/<org>/<project>/.datasets/<id>/
-//!   dataset.json         the manifest: the registry entry, written last
-//!   recipe/r<m>.json     every recipe version
-//!   sources/<s>/<n>.*    snapshots: rows.arrow and its manifest
-//!   v<k>/                materializations: rows.arrow, manifest, lineage
+//! <data-dir>/<org>/<project>/.datasets/
+//!   .sources/<src>/source.json             a source: kind, name, how it is read
+//!   .sources/<src>/snapshots/<n>/          rows.arrow and its manifest
+//!   <ds>/dataset.json                      a dataset's manifest, written last
+//!   <ds>/v<k>/                             an output: rows.arrow, or a pointer to a
+//!                                          snapshot; manifest, lineage, run, graph
+//!   .runs/<run>.json                       a run's record, in flight or done
 //! ```
 //!
 //! Nothing is changed in place. A file is written beside where it goes
-//! and renamed there; a new dataset is built in a dot directory and
-//! renamed into place whole; `dataset.json` is written after what it
-//! points at, so a crash leaves the dataset as it was before the job.
-//! The directory starts with a dot, which no branch name does, so the
-//! server's loader passes over it.
+//! and renamed there; a new source or dataset is built in a dot
+//! directory and renamed into place whole; a manifest is written after
+//! what it points at, so a crash leaves things as they were before the
+//! job. The directory starts with a dot, which no branch name does, so
+//! the server's loader passes over it.
 
 use crate::error::{Error, Result};
 use crate::lineage::Lineage;
-use crate::schema::Column;
+use crate::schema::{Column, ColumnType};
 use crate::source::{Kind, Parse, Query, SemanticRead};
 use arrow_array::RecordBatch;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zsql_datasource::Batches;
 
 /// The directory, under a project's, that holds its datasets.
 pub const DIR: &str = ".datasets";
 
+/// Where, under that, sources are.
+pub(crate) const SOURCES: &str = ".sources";
+
+/// Where, under that, runs are recorded.
+pub(crate) const RUNS: &str = ".runs";
+
 pub(crate) const MANIFEST: &str = "dataset.json";
+pub(crate) const SOURCE: &str = "source.json";
 pub(crate) const ROWS: &str = "rows.arrow";
 
-/// A dataset's manifest.
+/// A dataset's manifest: what is browsed, shared and blended.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Dataset {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub created: String,
     pub updated: String,
-    /// The recipe's latest version.
-    pub recipe: u32,
-    /// The materialization the dataset answers with, once it has one.
+    /// The output it answers with, once a run made one.
     pub live: Option<u32>,
-    /// The last materialization made.
+    /// The last output made.
     pub made: u32,
-    pub sources: Vec<SourceState>,
-    /// The live materialization's columns and rows.
+    /// The live output's columns and rows.
     pub columns: Vec<Column>,
     pub rows: u64,
-    /// What the last job said: a column gone, a type widened.
+    /// What the run that made the live output said: a warning, a check
+    /// let through.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    /// Set when the latest snapshots lack columns the recipe reads: the
-    /// recipe has not run on them, and what is live is older.
+    /// The last run asked for it, whatever it came to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub held: Option<Held>,
-    /// How much of the edit log is in force.
-    #[serde(default)]
-    pub edits: u64,
+    pub last_run: Option<LastRun>,
     /// Where its copy in the object store stands, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<crate::backup::Backup>,
     /// The job a restart found in flight and did not run again, until
-    /// the dataset's next job. Kept beside the manifest, not in it.
+    /// its next job. Kept beside the manifest, not in it.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub interrupted: Option<crate::recovery::Interrupted>,
 }
 
-/// Why a dataset's latest snapshots have not been made into a version.
+/// A dataset's last run, as its manifest says.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Held {
-    pub since: String,
-    pub unresolved: Vec<crate::compile::Unresolved>,
+pub struct LastRun {
+    pub id: String,
+    pub state: crate::record::RunState,
+    pub at: String,
 }
 
-/// A source of a dataset, as it stands.
+/// A source: where data comes from, and what came.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SourceState {
+pub struct Source {
     pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub kind: Kind,
-    /// The latest snapshot.
+    pub created: String,
+    pub updated: String,
+    /// The newest snapshot; 0 before the first.
     pub snapshot: u32,
-    /// Its columns: the types every later snapshot meets.
+    /// The newest snapshot's columns: the types every later one meets.
     pub columns: Vec<Column>,
-    /// What a semantic source runs.
+    /// What a query source runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Query>,
+    /// Columns read as other types than they arrive as, for every graph
+    /// that reads it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, ColumnType>,
+    /// The version of how it is read: one more with each change of `types`.
+    pub read: u32,
+    /// Every version of how it is read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<ReadOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<crate::backup::Backup>,
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<crate::recovery::Interrupted>,
+}
+
+/// One version of how a source is read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReadOptions {
+    pub version: u32,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, ColumnType>,
 }
 
 /// A snapshot's manifest.
@@ -96,13 +130,16 @@ pub struct Snapshot {
     pub taken: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
-    /// The hash of what arrived: the file as uploaded.
+    /// The hash of what arrived: the file as uploaded, or the rows as kept.
     pub sha256: String,
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parse: Option<Parse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<SemanticRead>,
+    /// Where pushed rows came from, as the pusher said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<serde_json::Value>,
     pub columns: Vec<Column>,
     pub rows: u64,
     /// How its columns met the source's: new, gone, widened, converted.
@@ -110,7 +147,7 @@ pub struct Snapshot {
     pub changes: Vec<String>,
 }
 
-/// A materialization's manifest.
+/// An output's manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Materialization {
     pub version: u32,
@@ -118,6 +155,20 @@ pub struct Materialization {
     pub columns: Vec<Column>,
     pub rows: u64,
     pub bytes: u64,
+    /// Set when the output is a source's snapshot as it is: no rows of
+    /// its own are kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<Pointer>,
+    /// The run that made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
+/// A source's snapshot an output is.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Pointer {
+    pub source: String,
+    pub snapshot: u32,
 }
 
 pub struct Store {
@@ -158,33 +209,78 @@ impl Store {
 
     /// Every dataset of a project, by id.
     pub fn all(&self, org: &str, project: &str) -> Vec<(PathBuf, Dataset)> {
-        let Ok(entries) = std::fs::read_dir(self.root(org, project)) else { return Vec::new() };
-        let mut out: Vec<(PathBuf, Dataset)> = entries
-            .flatten()
-            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-            .filter_map(|e| {
-                let dir = e.path();
-                let mut d: Dataset = read_json(&dir.join(MANIFEST)).ok()?;
-                d.interrupted = read_json(&dir.join(crate::recovery::INTERRUPTED)).ok();
-                Some((dir, d))
-            })
-            .collect();
-        out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
-        out
+        datasets_in(&self.root(org, project))
+    }
+
+    /// Every source of a project, by id.
+    pub fn sources(&self, org: &str, project: &str) -> Vec<(PathBuf, Source)> {
+        sources_in(&self.root(org, project))
     }
 }
 
-pub(crate) fn snapshot_paths(dir: &Path, source: &str, n: u32) -> (PathBuf, PathBuf) {
-    let base = dir.join("sources").join(source);
-    (base.join(format!("{n}.arrow")), base.join(format!("{n}.json")))
+/// Every dataset under a project's root.
+pub(crate) fn datasets_in(root: &Path) -> Vec<(PathBuf, Dataset)> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, Dataset)> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let dir = e.path();
+            let mut d: Dataset = read_json(&dir.join(MANIFEST)).ok()?;
+            d.interrupted = read_json(&dir.join(crate::recovery::INTERRUPTED)).ok();
+            Some((dir, d))
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    out
 }
 
-pub(crate) fn recipe_path(dir: &Path, m: u32) -> PathBuf {
-    dir.join("recipe").join(format!("r{m}.json"))
+/// Every source under a project's root.
+pub(crate) fn sources_in(root: &Path) -> Vec<(PathBuf, Source)> {
+    let Ok(entries) = std::fs::read_dir(root.join(SOURCES)) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, Source)> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let dir = e.path();
+            let mut s: Source = read_json(&dir.join(SOURCE)).ok()?;
+            s.interrupted = read_json(&dir.join(crate::recovery::INTERRUPTED)).ok();
+            Some((dir, s))
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    out
+}
+
+pub(crate) fn source_dir(root: &Path, id: &str) -> PathBuf {
+    root.join(SOURCES).join(id)
+}
+
+pub(crate) fn snapshot_dir(source_dir: &Path, n: u32) -> PathBuf {
+    source_dir.join("snapshots").join(n.to_string())
 }
 
 pub(crate) fn version_dir(dir: &Path, k: u32) -> PathBuf {
     dir.join(format!("v{k}"))
+}
+
+pub(crate) fn run_path(root: &Path, id: &str) -> PathBuf {
+    root.join(RUNS).join(format!("{id}.json"))
+}
+
+/// An output's manifest and rows: its own, or the snapshot it points to.
+pub(crate) fn version_rows(dir: &Path, k: u32) -> Result<(Materialization, Batches)> {
+    let v = version_dir(dir, k);
+    let m: Materialization = read_json(&v.join("manifest.json"))?;
+    let path = match &m.pointer {
+        Some(p) => {
+            let root = dir.parent().unwrap_or(dir);
+            snapshot_dir(&source_dir(root, &p.source), p.snapshot).join(ROWS)
+        }
+        None => v.join(ROWS),
+    };
+    let rows = read_rows(&path)?;
+    Ok((m, rows))
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {

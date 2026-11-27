@@ -45,7 +45,7 @@
 //! POST /projects/{uid}/branches/{branch}/sql-exec      {"datasource": "...", "sql": "..."}: one statement, run as written
 //! GET  /results/{id}                                   a run: its record and a page of rows; DELETE cancels it
 //! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
-//! /projects/{uid}/datasets/...                      datasets: data prep, beside the model (see datasets.rs)
+//! /projects/{uid}/sources|datasets|runs|preview    data prep, beside the model: sources, datasets, runs of graphs (see datasets.rs)
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! ANY  /orgs/{org}/...                                 any route above, for one org
 //! GET  /orgs                                           the orgs with something deployed

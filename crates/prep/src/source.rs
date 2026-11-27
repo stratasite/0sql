@@ -1,6 +1,6 @@
-//! Where a dataset's rows come from. Each kind of source ends in a
-//! snapshot of the same shape, so the recipe never knows which kind
-//! fed it; this module is the CSV contract of an upload.
+//! Where rows come from. Each kind of source ends in a snapshot of the
+//! same shape, so a pipeline never knows which kind fed it; this module
+//! is the CSV contract of an upload.
 //!
 //! A CSV is parsed here, in Rust, and never by the engine: the engine
 //! has no access to files at all. Every choice the parse makes, said by
@@ -18,12 +18,14 @@ use serde::{Deserialize, Serialize};
 pub enum Kind {
     /// A file the application uploaded.
     Upload,
-    /// A spec run on a branch of the model, fresh, under the context the
-    /// refresh was sent with.
-    Semantic,
+    /// A spec run on a branch of the model, pulled by a run under the
+    /// context the run was sent with.
+    Query,
+    /// Rows an application or an agent posted, with where they came from.
+    Push,
 }
 
-/// What a semantic source runs: a spec, or the shorthand for one, on a
+/// What a query source runs: a spec, or the shorthand for one, on a
 /// branch.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

@@ -1,33 +1,39 @@
-//! Datasets: the routes of data prep, and nothing else of it. What a
-//! dataset is, where it is kept and how it is made is `zsql-prep`'s;
-//! this module checks the names and answers.
+//! Sources, datasets and runs: the routes of data prep, and nothing else
+//! of it. What a source or a dataset is, where it is kept and how a graph
+//! runs is `zsql-prep`'s; this module checks the names, pulls what a run
+//! reads from the model under the context it was sent with, and answers.
 //!
 //! ```text
-//! GET    /projects/{uid}/datasets                         the project's datasets
-//! POST   /projects/{uid}/datasets                         body: a CSV  ?name=&file_name=&delimiter=&quote=&header=&max_bad_rows=
-//! POST   /projects/{uid}/datasets/query                   {"name", "branch", "spec" | "expr", "context", "connection", "wait"}: a dataset from a semantic query
-//! POST   /projects/{uid}/datasets/{id}/refresh            {"context", "connection", "wait"}: its query run again, fresh
+//! GET    /projects/{uid}/sources                          the explorer: every source
+//! POST   /projects/{uid}/sources                          ?kind=upload (a CSV) | push ({"rows", "origin"}) | query ({"branch", "spec" | "expr"})
+//!                                                         &name=&description=&dataset=true&file_name=&delimiter=&quote=&header=&max_bad_rows=
+//! GET    /projects/{uid}/sources/{id}
+//! PATCH  /projects/{uid}/sources/{id}                     {"name", "description", "types": {"column": "text"}}
+//! DELETE /projects/{uid}/sources/{id}
+//! GET    /projects/{uid}/sources/{id}/snapshots           the snapshots kept, the newest first
+//! POST   /projects/{uid}/sources/{id}/snapshots           a CSV (upload), or {"rows", "origin"} (push); runs nothing
+//! GET    /projects/{uid}/sources/{id}/snapshots/{n}
+//! GET    /projects/{uid}/sources/{id}/rows                ?snapshot=&offset=&limit=&sort=&filter=
+//! GET    /projects/{uid}/datasets                         what is browsed
+//! POST   /projects/{uid}/datasets                         {"name", "description", "source"}: with a source, its newest snapshot as it is
 //! GET    /projects/{uid}/datasets/{id}
-//! DELETE /projects/{uid}/datasets/{id}                    a hard delete; ?confirm=true when others read it
-//! GET    /projects/{uid}/datasets/{id}/downstream         the datasets that read it, in the order they run
-//! PUT    /projects/{uid}/datasets/{id}/upload             body: a CSV, a new snapshot, and the recipe run over it
+//! DELETE /projects/{uid}/datasets/{id}
 //! GET    /projects/{uid}/datasets/{id}/rows               ?offset=&limit=&version=&sort=col:desc,col&filter=<formula>
 //! GET    /projects/{uid}/datasets/{id}/lineage            ?version=
-//! GET    /projects/{uid}/datasets/{id}/recipe             ?version=
-//! POST   /projects/{uid}/datasets/{id}/recipe             {"against": m, "roles": {...}, "steps": [...]}
-//! POST   /projects/{uid}/datasets/{id}/preview            {"steps": [...], "roles": {...}, "upto": n, "limit": n}: over a sample, kept nowhere
-//! GET    /projects/{uid}/datasets/{id}/impact             ?column=: what reads it
-//! GET    /projects/{uid}/datasets/{id}/edits              the edit log, and how each edit fared
-//! POST   /projects/{uid}/datasets/{id}/edits              {"against": m, "edits": [{"op": "cell" | "delete" | "add" | "undo", ...}]}
-//! POST   /projects/{uid}/datasets/{id}/confirm            {"against": m}: past a hold, without the steps that held it
-//! GET    /projects/{uid}/datasets/{id}/sources/{source}   ?snapshot=
-//! POST   /datasets/restore                                every dataset of the org the object store has and this node does not
+//! GET    /projects/{uid}/datasets/{id}/versions/{k}       its manifest, lineage, run and graph
+//! POST   /projects/{uid}/runs                             {"id", "dataset", "graph", "context", "connection", "wait"}
+//! POST   /projects/{uid}/runs?check=true                  {"graph", "context"}: a dry run
+//! GET    /projects/{uid}/runs/{id}
+//! POST   /projects/{uid}/preview                          {"graph", "node", "whole", "limit", "context", "connection", "wait"}
+//! POST   /datasets/restore                                every dataset and source of the org the object store has and this node does not
 //! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "offset", "limit"}
 //! ```
 //!
-//! A dataset is its project's, addressed by its id. Who may read or
-//! change which is the application's to decide, as who may deploy or
-//! run is: the server keeps no user.
+//! Sources and datasets are their project's, addressed by id. Who may
+//! read or change which is the application's to decide, as who may
+//! deploy or run is: the server keeps no user. Every answer that reads
+//! inputs carries `reads`, each source and dataset by kind and id, for
+//! the application to check against who is asking.
 
 use crate::error::{ApiError, Input, Org, Params, Search};
 use crate::names::check_uid;
@@ -38,10 +44,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zsql_exec::{Record, Status};
-use zsql_prep::{Arrived, Change, CsvOptions, Prep, Preview, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
+use zsql_prep::{Arrived, CsvOptions, Graph, Named, Prep, Pull, Query, Role, Scope, SemanticRead, SortKey, Upload, View};
 use zsql_spec::SecurityContext;
 
 impl From<zsql_prep::Error> for ApiError {
@@ -54,7 +61,21 @@ impl From<zsql_prep::Error> for ApiError {
             Conflict(m) => ApiError(StatusCode::CONFLICT, "Conflict", m),
             Internal(m) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", m),
             Stopping(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, "Busy", m),
+            Problems(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "Refused", e.to_string()),
         }
+    }
+}
+
+/// A refusal as answered: a graph's problems listed, each of its node,
+/// beside the error every refusal has.
+fn refusal(e: zsql_prep::Error) -> Response {
+    match e {
+        zsql_prep::Error::Problems(problems) => {
+            let message = problems.iter().map(zsql_prep::Problem::said).collect::<Vec<_>>().join("; ");
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": { "class": "Refused", "message": message }, "problems": problems })))
+                .into_response()
+        }
+        other => ApiError::from(other).into_response(),
     }
 }
 
@@ -65,22 +86,50 @@ fn prep(app: &Shared) -> Result<Arc<Prep>, ApiError> {
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "NotFound", "datasets are turned off on this server (ZSQL_DATASETS=off)".into()))
 }
 
-/// The project a request's datasets are in, checked.
+/// The project a request's sources and datasets are in, checked.
 fn scope(app: &Shared, org: String, uid: String) -> Result<(Arc<Prep>, Scope), ApiError> {
     let prep = prep(app)?;
     check_uid(&uid)?;
     Ok((prep, Scope { org, project: uid }))
 }
 
-/// A dataset as answered: its manifest.
-fn shown(d: &zsql_prep::Dataset) -> Value {
-    serde_json::to_value(d).unwrap_or(Value::Null)
+fn shown<T: serde::Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).unwrap_or(Value::Null)
 }
+
+fn invalid(m: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "Invalid", m.into())
+}
+
+/// A number in the path: a snapshot's, a version's.
+fn number(text: &str, what: &str) -> Result<u32, ApiError> {
+    text.parse().map_err(|_| ApiError(StatusCode::NOT_FOUND, "NotFound", format!("{what} is a number, and '{text}' is not one")))
+}
+
+/// A source or dataset is a project's, so the project has to be one:
+/// deployed on some branch of this org.
+fn deployed(app: &Shared, scope: &Scope) -> Result<(), ApiError> {
+    if !app.of_org(&scope.org).iter().any(|m| m.uid == scope.project) {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            format!("no project {} is deployed; deploy a branch of it before adding sources", scope.project),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- sources
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UploadQuery {
+pub(crate) struct NewSource {
+    kind: Option<String>,
     name: Option<String>,
+    description: Option<String>,
+    /// Also a dataset over it, as it is.
+    #[serde(default)]
+    dataset: bool,
     file_name: Option<String>,
     delimiter: Option<char>,
     quote: Option<char>,
@@ -88,225 +137,514 @@ pub(crate) struct UploadQuery {
     max_bad_rows: Option<usize>,
 }
 
-impl UploadQuery {
+impl NewSource {
     fn options(&self) -> CsvOptions {
         CsvOptions { delimiter: self.delimiter, quote: self.quote, header: self.header, max_bad_rows: self.max_bad_rows }
     }
+
+    fn named(&self) -> Named {
+        Named { name: self.name.clone(), description: self.description.clone() }
+    }
 }
+
+/// A query source's spec.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryBody {
+    branch: String,
+    #[serde(default)]
+    spec: Option<Value>,
+    #[serde(default)]
+    expr: Option<String>,
+}
+
+fn json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| invalid(format!("the body is not what this takes: {e}")))
+}
+
+pub(crate) async fn sources(State(app): State<Shared>, Org(org): Org, Params((uid,)): Params<(String,)>) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(json!({ "sources": prep.sources(&scope) })))).await
+}
+
+pub(crate) async fn create_source(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid,)): Params<(String,)>,
+    Search(q): Search<NewSource>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    deployed(&app, &scope)?;
+    let kind = q.kind.clone().unwrap_or_else(|| "upload".into());
+    if q.dataset && kind == "query" {
+        return Err(invalid("a query source has no snapshot until a run pulls it, so it is no dataset as it is yet"));
+    }
+    if kind == "query" {
+        let b: QueryBody = json_body(&body)?;
+        crate::names::check_branch(&b.branch)?;
+    }
+    blocking(move || {
+        let (source, snapshot) = match kind.as_str() {
+            "upload" => {
+                let upload = Upload { file_name: q.file_name.clone(), bytes: &body, options: q.options() };
+                let (s, snap) = prep.create_upload(&scope, q.named(), upload)?;
+                (s, Some(snap))
+            }
+            "push" => {
+                let (s, snap) = prep.create_push(&scope, q.named(), json_body(&body)?)?;
+                (s, Some(snap))
+            }
+            "query" => {
+                let b: QueryBody = json_body(&body)?;
+                (prep.create_query(&scope, q.named(), Query { branch: b.branch, spec: b.spec, expr: b.expr })?, None)
+            }
+            other => return Err(invalid(format!("a source is kind upload, push or query; not {other}"))),
+        };
+        let dataset = if q.dataset { Some(prep.create_dataset(&scope, q.named(), Some(&source.id))?) } else { None };
+        let mut v = json!({ "source": source });
+        if let Some(s) = snapshot {
+            v["snapshot"] = shown(&s);
+        }
+        if let Some(d) = dataset {
+            v["dataset"] = shown(&d);
+        }
+        Ok((StatusCode::CREATED, Json(v)).into_response())
+    })
+    .await
+}
+
+pub(crate) async fn get_source(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(shown(&prep.source(&scope, &id)?)))).await
+}
+
+pub(crate) async fn change_source(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    Input(change): Input<zsql_prep::SourceChange>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(shown(&prep.change_source(&scope, &id, change)?)))).await
+}
+
+pub(crate) async fn delete_source(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || {
+        let copied = prep.delete_source(&scope, &id)?;
+        Ok(Json(json!({ "removed": id, "datasets_given_their_rows": copied })))
+    })
+    .await
+}
+
+pub(crate) async fn snapshots(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(json!({ "snapshots": prep.snapshots(&scope, &id)? })))).await
+}
+
+pub(crate) async fn snapshot(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id, n)): Params<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    let n = number(&n, "a snapshot")?;
+    blocking(move || Ok(Json(shown(&prep.snapshot(&scope, &id, Some(n))?)))).await
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewSnapshot {
+    file_name: Option<String>,
+    delimiter: Option<char>,
+    quote: Option<char>,
+    header: Option<bool>,
+    max_bad_rows: Option<usize>,
+}
+
+pub(crate) async fn add_snapshot(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    Search(q): Search<NewSnapshot>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || {
+        let source = prep.source(&scope, &id)?;
+        let (s, snap) = match source.kind {
+            zsql_prep::Kind::Push => prep.add_push(&scope, &id, json_body(&body)?)?,
+            _ => {
+                let options = CsvOptions { delimiter: q.delimiter, quote: q.quote, header: q.header, max_bad_rows: q.max_bad_rows };
+                prep.add_upload(&scope, &id, Upload { file_name: q.file_name.clone(), bytes: &body, options })?
+            }
+        };
+        Ok((StatusCode::CREATED, Json(json!({ "source": s, "snapshot": snap }))).into_response())
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageQuery {
+    offset: Option<u64>,
+    limit: Option<u64>,
+    version: Option<u32>,
+    snapshot: Option<u32>,
+    /// `column`, or `column:desc`, comma-separated.
+    sort: Option<String>,
+    /// A formula, true for the rows shown.
+    filter: Option<String>,
+}
+
+fn sort_keys(sort: Option<&str>) -> Result<Vec<SortKey>, ApiError> {
+    let Some(sort) = sort else { return Ok(Vec::new()) };
+    sort.split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| {
+            let (column, dir) = k.rsplit_once(':').unwrap_or((k, "asc"));
+            match dir {
+                "asc" => Ok(SortKey { column: column.to_string(), desc: false }),
+                "desc" => Ok(SortKey { column: column.to_string(), desc: true }),
+                _ => Err(invalid(format!("'{k}' sorts by a column, then :asc or :desc"))),
+            }
+        })
+        .collect()
+}
+
+/// The most rows a page holds.
+const PAGE_MAX: u64 = 10_000;
+
+fn page_json(page: &zsql_prep::Page, which: &str) -> Result<Value, ApiError> {
+    let rows = zsql_exec::json::rows(&page.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
+    Ok(json!({ which: page.version, "columns": page.columns, "total": page.total, "offset": page.offset, "rows": rows }))
+}
+
+fn limit_of(q: &PageQuery) -> Result<u64, ApiError> {
+    let limit = q.limit.unwrap_or(100);
+    if limit == 0 || limit > PAGE_MAX {
+        return Err(invalid(format!("limit is 1 to {PAGE_MAX}")));
+    }
+    Ok(limit)
+}
+
+pub(crate) async fn source_rows(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    Search(q): Search<PageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    let limit = limit_of(&q)?;
+    let sort = sort_keys(q.sort.as_deref())?;
+    blocking(move || {
+        let view = View { sort: &sort, filter: q.filter.as_deref() };
+        let page = prep.source_rows(&scope, &id, q.snapshot, q.offset.unwrap_or(0), limit, &view)?;
+        Ok(Json(page_json(&page, "snapshot")?))
+    })
+    .await
+}
+
+// --------------------------------------------------------------- datasets
 
 pub(crate) async fn list(State(app): State<Shared>, Org(org): Org, Params((uid,)): Params<(String,)>) -> Result<Json<Value>, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(json!({ "datasets": prep.list(&scope).iter().map(shown).collect::<Vec<_>>() })))).await
+    blocking(move || Ok(Json(json!({ "datasets": prep.list(&scope) })))).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewDataset {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    /// A source whose newest snapshot is the dataset's first output, as
+    /// it is.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 pub(crate) async fn create(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid,)): Params<(String,)>,
-    Search(q): Search<UploadQuery>,
-    body: Bytes,
+    Input(req): Input<NewDataset>,
 ) -> Result<Response, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
-    // A dataset is a project's, so the project has to be one: deployed
-    // on some branch of this org.
-    if !app.of_org(&scope.org).iter().any(|m| m.uid == scope.project) {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            "NotFound",
-            format!("no project {} is deployed; deploy a branch of it before adding datasets", scope.project),
-        ));
-    }
+    deployed(&app, &scope)?;
     blocking(move || {
-        let upload = Upload { file_name: q.file_name.clone(), bytes: &body, options: q.options() };
-        let d = prep.create(&scope, q.name.as_deref(), upload)?;
+        let d = prep.create_dataset(&scope, Named { name: req.name, description: req.description }, req.source.as_deref())?;
         Ok((StatusCode::CREATED, Json(shown(&d))).into_response())
     })
     .await
 }
 
-/// A dataset; or, for one whose query is still running or failed
-/// after its request was answered, what it waits on.
 pub(crate) async fn get(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(shown(&prep.get(&scope, &id)?)))).await
+}
+
+pub(crate) async fn delete(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
     blocking(move || {
-        let pending = prep.pending(&scope, &id);
-        match prep.get(&scope, &id) {
-            Ok(d) => {
-                let mut v = shown(&d);
-                if let Some(p) = pending {
-                    v["pending"] = json!(p);
-                }
-                Ok(Json(v).into_response())
-            }
-            Err(zsql_prep::Error::NotFound(_)) if pending.is_some() => {
-                Ok((StatusCode::ACCEPTED, Json(json!({ "id": id, "pending": pending }))).into_response())
-            }
-            Err(e) => Err(e.into()),
-        }
+        prep.delete(&scope, &id)?;
+        Ok(Json(json!({ "removed": id })))
     })
     .await
 }
 
-/// A dataset made from a semantic query.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FromQuery {
-    #[serde(default)]
-    name: Option<String>,
-    branch: String,
-    #[serde(default)]
-    spec: Option<Value>,
-    #[serde(default)]
-    expr: Option<String>,
-    #[serde(default)]
-    context: Option<SecurityContext>,
-    #[serde(default)]
-    connection: Map<String, Value>,
-    #[serde(default)]
-    wait: Option<f64>,
-}
-
-/// A semantic source run again.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Refresh {
-    #[serde(default)]
-    context: Option<SecurityContext>,
-    #[serde(default)]
-    connection: Map<String, Value>,
-    #[serde(default)]
-    wait: Option<f64>,
-}
-
-/// What the rows of a query become.
-#[derive(Clone)]
-enum Then {
-    Create { name: Option<String> },
-    Refresh,
-}
-
-/// How long a query a request stopped waiting for is waited on after.
-const AFTER: Duration = Duration::from_secs(3600);
-
-pub(crate) async fn from_query(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid,)): Params<(String,)>,
-    Input(req): Input<FromQuery>,
-) -> Result<Response, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    if req.spec.is_some() == req.expr.is_some() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", "a query is a spec or an expr, one of them".into()));
-    }
-    let query = Query { branch: req.branch, spec: req.spec, expr: req.expr };
-    let id = zsql_prep::new_id(&scope.project);
-    run_into(app, prep, scope, id, query, (req.context, req.connection, req.wait), Then::Create { name: req.name }).await
-}
-
-pub(crate) async fn refresh(
+pub(crate) async fn rows(
     State(app): State<Shared>,
     Org(org): Org,
     Params((uid, id)): Params<(String, String)>,
-    Input(req): Input<Refresh>,
+    Search(q): Search<PageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    let limit = limit_of(&q)?;
+    let sort = sort_keys(q.sort.as_deref())?;
+    blocking(move || {
+        let view = View { sort: &sort, filter: q.filter.as_deref() };
+        let page = prep.page(&scope, &id, q.version, q.offset.unwrap_or(0), limit, &view)?;
+        Ok(Json(page_json(&page, "version")?))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VersionQuery {
+    version: Option<u32>,
+}
+
+pub(crate) async fn lineage(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+    Search(q): Search<VersionQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(Json(shown(&prep.lineage(&scope, &id, q.version)?)))).await
+}
+
+pub(crate) async fn version(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id, k)): Params<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    let k = number(&k, "a version")?;
+    blocking(move || Ok(Json(shown(&prep.version(&scope, &id, Some(k))?)))).await
+}
+
+// ------------------------------------------------------------------- runs
+
+/// How long a run's request waits before it is answered 202, unless it
+/// says: and the most it may say.
+const WAIT: Duration = Duration::from_secs(30);
+const WAIT_MAX: Duration = Duration::from_secs(300);
+
+/// How long a pull is waited on, after its request was answered.
+const PULL_LIMIT: Duration = Duration::from_secs(3600);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    dataset: Option<String>,
+    graph: Graph,
+    #[serde(default)]
+    context: Option<SecurityContext>,
+    #[serde(default)]
+    connection: Map<String, Value>,
+    #[serde(default)]
+    wait: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunQuery {
+    #[serde(default)]
+    check: bool,
+}
+
+/// The fingerprint of the context a run is sent with: what its query
+/// sources' snapshots are kept under, and read only as.
+fn fingerprint(context: &Option<SecurityContext>) -> String {
+    zsql_exec::sha256(&serde_json::to_string(context).unwrap_or_default())
+}
+
+fn wait_of(wait: Option<f64>) -> Result<Duration, ApiError> {
+    match wait {
+        None => Ok(WAIT),
+        Some(w) if w.is_finite() && w >= 0.0 => Ok(Duration::from_secs_f64(w).min(WAIT_MAX)),
+        Some(_) => Err(invalid("wait is a number of seconds, 0 or more")),
+    }
+}
+
+/// A run's record as answered: 200 when it is over, 202 while it runs.
+fn answered(r: &zsql_prep::RunRecord) -> Response {
+    let status = if r.state.is_final() { StatusCode::OK } else { StatusCode::ACCEPTED };
+    (status, Json(shown(r))).into_response()
+}
+
+pub(crate) async fn run(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid,)): Params<(String,)>,
+    Search(q): Search<RunQuery>,
+    Input(body): Input<RunBody>,
 ) -> Result<Response, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
-    let query = {
-        let (prep, scope, id) = (prep.clone(), scope.clone(), id.clone());
-        blocking(move || Ok(prep.query(&scope, &id)?)).await?
+    let print = fingerprint(&body.context);
+    if q.check {
+        let graph = body.graph;
+        return blocking(move || Ok(Json(shown(&prep.check(&scope, &graph, &print)?)).into_response())).await;
+    }
+    let (Some(id), Some(dataset)) = (body.id.clone(), body.dataset.clone()) else {
+        return Err(invalid("a run says its id, which a retry sends again, and the dataset it makes"));
     };
-    run_into(app, prep, scope, id, query, (req.context, req.connection, req.wait), Then::Refresh).await
+    let wait = wait_of(body.wait)?;
+    let begun = {
+        let (prep, scope, print) = (prep.clone(), scope.clone(), print.clone());
+        let request = zsql_prep::RunRequest { id: id.clone(), dataset, graph: body.graph };
+        blocking(move || Ok(prep.begin(&scope, request, &print))).await?
+    };
+    let ticket = match begun {
+        Ok(zsql_prep::Begun::Answered(r)) => return Ok(answered(&r)),
+        Ok(zsql_prep::Begun::Started(t)) => t,
+        Err(e) => return Ok(refusal(e)),
+    };
+    let (context, connection) = (body.context, body.connection);
+    let work = {
+        let (app, prep) = (app.clone(), prep.clone());
+        tokio::spawn(async move { carry_out(app, prep, *ticket, context, connection).await })
+    };
+    // Answered when it is over, or as it stands when the wait is up; it
+    // goes on either way, and GET /runs/{id} says how it ended.
+    let _ = tokio::time::timeout(wait, work).await;
+    let r = blocking(move || Ok(prep.run(&scope, &id)?)).await?;
+    Ok(answered(&r))
 }
 
-/// Runs a query fresh, under the context the request sends, and makes
-/// its rows a snapshot. A run that outlasts the request's wait is
-/// answered 202 and waited on after; the dataset says what it waits on.
-async fn run_into(
+/// A started run, carried to its end: each pull run fresh under the
+/// run's context and kept as a snapshot, then the graph.
+async fn carry_out(
     app: Shared,
     prep: Arc<Prep>,
-    scope: Scope,
-    id: String,
-    query: Query,
-    (context, connection, wait): (Option<SecurityContext>, Map<String, Value>, Option<f64>),
-    then: Then,
-) -> Result<Response, ApiError> {
-    crate::names::check_branch(&query.branch)?;
-    let fingerprint = zsql_exec::sha256(&serde_json::to_string(&context).unwrap_or_default());
-    let (record, wait) = {
-        let (app, org, uid, q) = (app.clone(), scope.org.clone(), scope.project.clone(), query.clone());
-        blocking(move || crate::exec::submit_fresh(&app, (&org, &uid, &q.branch), q.spec, q.expr, context, connection, wait)).await?
-    };
-    let record = crate::exec::settled(&app, record, wait).await?;
-    if record.status.is_final() {
-        let d = finish(&app, &prep, &scope, &id, &query, record, &fingerprint, &then).await?;
-        let status = if matches!(then, Then::Create { .. }) { StatusCode::CREATED } else { StatusCode::OK };
-        return Ok((status, Json(shown(&d))).into_response());
-    }
-    prep.waiting(
-        &scope,
-        zsql_prep::recovery::QueryJob {
-            id: id.clone(),
-            result: record.id.clone(),
-            since: zsql_prep::time::now(),
-            then: match &then {
-                Then::Create { name } => zsql_prep::recovery::Then::Create { name: name.clone() },
-                Then::Refresh => zsql_prep::recovery::Then::Refresh,
-            },
-            query: query.clone(),
-            state: zsql_prep::recovery::State::Running,
-            interrupted: None,
-        },
-    );
-    let result = record.id.clone();
-    let after = (app.clone(), prep.clone(), scope.clone(), id.clone());
-    tokio::spawn(async move {
-        let (app, prep, scope, id) = after;
-        let outcome = match crate::exec::settled(&app, record, AFTER).await {
-            Ok(r) if r.status.is_final() => finish(&app, &prep, &scope, &id, &query, r, &fingerprint, &then).await.map(|_| ()),
-            Ok(r) => {
-                Err(ApiError(StatusCode::GATEWAY_TIMEOUT, "Timeout", format!("run {} was still running after {}s", r.id, AFTER.as_secs())))
+    mut ticket: zsql_prep::Ticket,
+    context: Option<SecurityContext>,
+    connection: Map<String, Value>,
+) {
+    let pulls = ticket.pulls.clone();
+    for p in pulls {
+        match pull(&app, &ticket.scope, &p, context.clone(), connection.clone(), PULL_LIMIT, true).await {
+            Ok(arrived) => {
+                let source = p.source.clone();
+                let kept = {
+                    let prep = prep.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let r = prep.pulled_for(&mut ticket, &source, arrived);
+                        (ticket, r)
+                    })
+                    .await
+                };
+                match kept {
+                    Ok((t, Ok(()))) => ticket = t,
+                    Ok((t, Err(e))) => {
+                        let why = format!("{} was pulled and could not be kept: {e}", p.name);
+                        let _ = tokio::task::spawn_blocking(move || prep.fail(t, &why)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("a run's pull could not be kept: {e}");
+                        return;
+                    }
+                }
             }
-            Err(e) => Err(e),
-        };
-        match outcome {
-            Ok(()) => prep.done(&scope, &id),
             Err(e) => {
-                tracing::warn!("dataset {id} in {}/{}: its query did not make a snapshot: {}", scope.org, scope.project, e.2);
-                prep.failed(&scope, &id, &e.2);
+                let why = format!("pulling {}: {}", p.name, e.2);
+                let _ = tokio::task::spawn_blocking(move || prep.fail(ticket, &why)).await;
+                return;
             }
         }
-    });
-    Ok((StatusCode::ACCEPTED, Json(json!({ "id": id, "pending": { "result": result } }))).into_response())
+    }
+    let seat = crate::guard::seat();
+    let _ = tokio::task::spawn_blocking(move || {
+        let held = seat;
+        prep.execute(ticket);
+        drop(held);
+    })
+    .await;
 }
 
-/// A finished run's rows, made a snapshot: of a new dataset, or the next
-/// of one there.
-#[allow(clippy::too_many_arguments)]
-async fn finish(
+/// A query source's spec, run under the context given, waited on, and
+/// its rows as a snapshot takes them. `fresh` for a run's pull; a
+/// preview's joins a run already going or answered, so sending it again
+/// is answered when the warehouse is done.
+async fn pull(
     app: &Shared,
-    prep: &Arc<Prep>,
     scope: &Scope,
-    id: &str,
-    query: &Query,
-    record: Record,
-    fingerprint: &str,
-    then: &Then,
-) -> Result<zsql_prep::Dataset, ApiError> {
+    p: &Pull,
+    context: Option<SecurityContext>,
+    connection: Map<String, Value>,
+    wait: Duration,
+    fresh: bool,
+) -> Result<Arrived, ApiError> {
+    crate::names::check_branch(&p.query.branch)?;
+    let fingerprint = fingerprint(&context);
+    let (record, _, _) = {
+        let (app, org, uid, q) = (app.clone(), scope.org.clone(), scope.project.clone(), p.query.clone());
+        blocking(move || crate::exec::submit_spec(&app, (&org, &uid, &q.branch), (q.spec, q.expr), context, connection, Some(0.0), fresh))
+            .await?
+    };
+    let record = crate::exec::settled(app, record, wait).await?;
+    if !record.status.is_final() {
+        return Err(ApiError(
+            StatusCode::ACCEPTED,
+            "Pulling",
+            format!("{} is still running in the warehouse (result {}); send the same request again", p.name, record.id),
+        ));
+    }
+    arrived(app, scope, &p.query, record, fingerprint).await
+}
+
+/// A finished run's rows, with the model's role and field for each
+/// column that is one.
+async fn arrived(app: &Shared, scope: &Scope, query: &Query, record: Record, fingerprint: String) -> Result<Arrived, ApiError> {
     if record.status != Status::Succeeded {
         let why = record.error.clone().unwrap_or_else(|| format!("{:?}", record.status).to_lowercase());
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable", format!("the query did not succeed: {why}")));
     }
-    let (app, prep, scope, id, query, fingerprint, then) =
-        (app.clone(), prep.clone(), scope.clone(), id.to_string(), query.clone(), fingerprint.to_string(), then.clone());
+    let (app, scope, query) = (app.clone(), scope.clone(), query.clone());
     blocking(move || {
         let model = app.model(&scope.org, &scope.project, &query.branch)?;
         let path = app.runs.rows(&record).map_err(crate::exec::internal)?;
         let rows = zsql_exec::page(&path, 0, u64::MAX).map_err(crate::exec::internal)?;
-        // Each column's role, and its field, from the model where the
-        // column is a field of it.
         let mut roles = std::collections::BTreeMap::new();
         let mut fields = std::collections::BTreeMap::new();
         for f in rows.schema.fields() {
@@ -331,257 +669,95 @@ async fn finish(
             context: fingerprint,
             fields,
         };
-        let arrived = Arrived { rows, roles, read };
-        Ok(match then {
-            Then::Create { name } => prep.create_from_query(&scope, &id, name.as_deref(), query, arrived)?,
-            Then::Refresh => prep.refresh(&scope, &id, arrived)?,
-        })
+        Ok(Arrived { rows, roles, read })
     })
     .await
 }
 
-#[derive(Deserialize, Default)]
+pub(crate) async fn get_run(
+    State(app): State<Shared>,
+    Org(org): Org,
+    Params((uid, id)): Params<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (prep, scope) = scope(&app, org, uid)?;
+    blocking(move || Ok(answered(&prep.run(&scope, &id)?))).await
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DeleteQuery {
+pub(crate) struct PreviewBody {
+    graph: Graph,
     #[serde(default)]
-    confirm: bool,
-}
-
-pub(crate) async fn delete(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<DeleteQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || {
-        prep.delete(&scope, &id, q.confirm)?;
-        Ok(Json(json!({ "removed": id })))
-    })
-    .await
-}
-
-pub(crate) async fn replace(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<UploadQuery>,
-    body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    if q.name.is_some() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", "a replacement keeps the dataset's name; name is for a new one".into()));
-    }
-    blocking(move || {
-        let upload = Upload { file_name: q.file_name.clone(), bytes: &body, options: q.options() };
-        Ok(Json(shown(&prep.replace(&scope, &id, upload)?)))
-    })
-    .await
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PageQuery {
-    offset: Option<u64>,
+    node: Option<String>,
+    #[serde(default)]
+    whole: bool,
+    #[serde(default)]
     limit: Option<u64>,
-    version: Option<u32>,
-    /// `column`, or `column:desc`, comma-separated.
-    sort: Option<String>,
-    /// A formula, true for the rows shown.
-    filter: Option<String>,
+    #[serde(default)]
+    context: Option<SecurityContext>,
+    #[serde(default)]
+    connection: Map<String, Value>,
+    #[serde(default)]
+    wait: Option<f64>,
 }
 
-fn sort_keys(sort: Option<&str>) -> Result<Vec<SortKey>, ApiError> {
-    let Some(sort) = sort else { return Ok(Vec::new()) };
-    sort.split(',')
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .map(|k| {
-            let (column, dir) = k.rsplit_once(':').unwrap_or((k, "asc"));
-            match dir {
-                "asc" => Ok(SortKey { column: column.to_string(), desc: false }),
-                "desc" => Ok(SortKey { column: column.to_string(), desc: true }),
-                _ => Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("'{k}' sorts by a column, then :asc or :desc"))),
-            }
-        })
-        .collect()
-}
-
-/// The most rows a page holds.
-const PAGE_MAX: u64 = 10_000;
-
-pub(crate) async fn rows(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    let limit = q.limit.unwrap_or(100);
-    if limit == 0 || limit > PAGE_MAX {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "Invalid", format!("limit is 1 to {PAGE_MAX}")));
-    }
-    let sort = sort_keys(q.sort.as_deref())?;
-    blocking(move || {
-        let view = View { sort: &sort, filter: q.filter.as_deref() };
-        let page = prep.page(&scope, &id, q.version, q.offset.unwrap_or(0), limit, &view)?;
-        let rows = zsql_exec::json::rows(&page.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
-        Ok(Json(json!({
-            "version": page.version,
-            "columns": page.columns,
-            "total": page.total,
-            "offset": page.offset,
-            "rows": rows,
-        })))
-    })
-    .await
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct VersionQuery {
-    version: Option<u32>,
-}
-
-pub(crate) async fn lineage(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<VersionQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(serde_json::to_value(prep.lineage(&scope, &id, q.version)?).unwrap_or(Value::Null)))).await
-}
-
-pub(crate) async fn recipe(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<VersionQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(serde_json::to_value(prep.recipe(&scope, &id, q.version)?).unwrap_or(Value::Null)))).await
-}
-
-pub(crate) async fn change(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Input(change): Input<Change>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(shown(&prep.change(&scope, &id, change)?)))).await
-}
+/// How long a preview waits on its pulls before it says to send it again.
+const PREVIEW_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn preview(
     State(app): State<Shared>,
     Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Input(preview): Input<Preview>,
-) -> Result<Json<Value>, ApiError> {
+    Params((uid,)): Params<(String,)>,
+    Input(body): Input<PreviewBody>,
+) -> Result<Response, ApiError> {
     let (prep, scope) = scope(&app, org, uid)?;
+    let print = fingerprint(&body.context);
+    let wait = body.wait.map(|w| wait_of(Some(w))).transpose()?.unwrap_or(PREVIEW_WAIT);
+    let request = zsql_prep::PreviewRequest { graph: body.graph, node: body.node, whole: body.whole, limit: body.limit };
+    let pulls = {
+        let (prep, scope, print, request) = (prep.clone(), scope.clone(), print.clone(), request.clone());
+        match blocking(move || Ok(prep.preview_pulls(&scope, &request, &print))).await? {
+            Ok(p) => p,
+            Err(e) => return Ok(refusal(e)),
+        }
+    };
+    // A query source not taken as this context is pulled first, as a
+    // run would; the snapshot is kept, and the preview reads it.
+    let mut pulled = HashMap::new();
+    for p in &pulls {
+        let arrived = match pull(&app, &scope, p, body.context.clone(), body.connection.clone(), wait, false).await {
+            Ok(a) => a,
+            Err(e) if e.0 == StatusCode::ACCEPTED => {
+                return Ok((StatusCode::ACCEPTED, Json(json!({ "status": "pulling", "source": p.source, "message": e.2 }))).into_response())
+            }
+            Err(e) => return Err(e),
+        };
+        let (prep, scope, source) = (prep.clone(), scope.clone(), p.source.clone());
+        let (_, snap) = blocking(move || Ok(prep.pulled(&scope, &source, arrived)?)).await?;
+        pulled.insert(p.source.clone(), snap.number);
+    }
     blocking(move || {
-        let p = prep.preview(&scope, &id, preview)?;
+        let p = match prep.preview(&scope, &request, &print, &pulled) {
+            Ok(p) => p,
+            Err(e) => return Ok(refusal(e)),
+        };
         let rows = zsql_exec::json::rows(&p.rows).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string()))?;
-        let unresolved: Vec<String> = p.unresolved.iter().map(zsql_prep::Unresolved::describe).collect();
-        Ok(Json(json!({ "columns": p.columns, "rows": rows, "unresolved": unresolved, "sample": p.sample })))
+        Ok(Json(json!({
+            "node": p.node,
+            "columns": p.columns,
+            "rows": rows,
+            "nodes": p.nodes,
+            "problems": p.problems,
+            "reads": p.reads,
+            "inputs": p.inputs,
+            "sample": p.sample,
+        }))
+        .into_response())
     })
     .await
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ImpactQuery {
-    column: String,
-}
-
-pub(crate) async fn impact(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Search(q): Search<ImpactQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || {
-        let readers = prep.impact(&scope, &id, &q.column)?;
-        let said: Vec<String> = readers.iter().map(zsql_prep::Unresolved::describe).collect();
-        Ok(Json(json!({ "column": q.column, "readers": readers, "said": said })))
-    })
-    .await
-}
-
-pub(crate) async fn edit(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Input(request): Input<zsql_prep::edits::Request>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || {
-        let (d, outcomes) = prep.edit(&scope, &id, request)?;
-        Ok(Json(json!({ "dataset": shown(&d), "outcomes": outcomes })))
-    })
-    .await
-}
-
-pub(crate) async fn edit_log(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || {
-        let (log, outcomes) = prep.edit_log(&scope, &id)?;
-        Ok(Json(json!({ "entries": log, "outcomes": outcomes })))
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Against {
-    against: u32,
-}
-
-pub(crate) async fn confirm(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-    Input(a): Input<Against>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(shown(&prep.confirm(&scope, &id, a.against)?)))).await
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SnapshotQuery {
-    snapshot: Option<u32>,
-}
-
-pub(crate) async fn source(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id, source)): Params<(String, String, String)>,
-    Search(q): Search<SnapshotQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || Ok(Json(serde_json::to_value(prep.snapshot(&scope, &id, &source, q.snapshot)?).unwrap_or(Value::Null)))).await
-}
-
-pub(crate) async fn downstream(
-    State(app): State<Shared>,
-    Org(org): Org,
-    Params((uid, id)): Params<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let (prep, scope) = scope(&app, org, uid)?;
-    blocking(move || {
-        let below: Vec<Value> =
-            prep.downstream(&scope, &id)?.iter().map(|d| json!({ "id": d.id, "name": d.name, "live": d.live })).collect();
-        Ok(Json(json!({ "downstream": below })))
-    })
-    .await
-}
+// ----------------------------------------------------------------- blends
 
 /// A query of the model with datasets beside it.
 #[derive(Deserialize)]
@@ -627,10 +803,6 @@ fn is_measure(model: &zsql_core::Model, written: &str) -> bool {
         (_, Some(f)) => f.kind == zsql_semantic::FieldKind::Measure,
         _ => false,
     }
-}
-
-fn invalid(m: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, "Invalid", m.into())
 }
 
 /// Splits a blend's spec: projections of an attached alias are the
@@ -782,8 +954,8 @@ pub(crate) async fn blend(
     .await
 }
 
-/// Brings back from the object store every dataset of the org this
-/// node does not have: the restore of the backup.
+/// Brings back from the object store every dataset and source of the
+/// org this node does not have: the restore of the backup.
 pub(crate) async fn restore(State(app): State<Shared>, Org(org): Org) -> Result<Json<Value>, ApiError> {
     let prep = prep(&app)?;
     blocking(move || Ok(Json(json!({ "restored": prep.restore(&org)? })))).await

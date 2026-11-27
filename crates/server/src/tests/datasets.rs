@@ -29,9 +29,7 @@ async fn the_datasets_directory_survives_everything_a_branch_goes_through() {
         let a = s.deploy(CS, branch, archive(CS, branch)).await;
         assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     }
-    let a = s.upload(&format!("/projects/{CS}/datasets?name=budget"), BUDGET).await;
-    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
-    let id = a.body["id"].as_str().unwrap().to_string();
+    let (src, id) = s.upload_dataset(BUDGET).await;
     let dataset = s.datasets_dir("default", CS).join(&id);
     assert!(dataset.join("dataset.json").exists());
 
@@ -55,241 +53,228 @@ async fn the_datasets_directory_survives_everything_a_branch_goes_through() {
     // The project's removal takes them.
     let a = s.send(Method::DELETE, &format!("/projects/{CS}"), &[], None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    assert_eq!(a.body["datasets"], json!([id]));
+    assert_eq!(a.body["datasets"], json!([id, src]));
     assert!(!s.data_dir.join("default").join(CS).exists());
-}
-
-#[tokio::test]
-async fn a_dataset_through_its_routes() {
-    let s = server();
-    let a = s.deploy(CS, "main", archive(CS, "main")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let base = format!("/projects/{CS}/datasets");
-
-    // A dataset needs a project that is deployed.
-    let a = s.upload("/projects/nowhere/datasets", BUDGET).await;
-    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
-    let a = s.upload(&format!("{base}?bogus=1"), BUDGET).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
-
-    let a = s.upload(&format!("{base}?file_name=budget.csv"), BUDGET).await;
-    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
-    assert_eq!(a.body["name"], "budget");
-    assert_eq!(a.body["columns"][2], json!({ "name": "amount", "type": "integer", "role": "measure" }));
-    let id = a.body["id"].as_str().unwrap().to_string();
-
-    let a = s.call(Method::GET, &base).await;
-    assert_eq!(a.body["datasets"].as_array().unwrap().len(), 1);
-
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows?limit=1")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!((a.body["total"].as_u64(), a.body["version"].as_u64()), (Some(2), Some(1)));
-    assert_eq!(a.body["rows"], json!([["EMEA", "2026-01-01", 100]]));
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows?limit=0")).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
-
-    let a = s.call(Method::GET, &format!("{base}/{id}/lineage")).await;
-    assert_eq!(a.body["sources"][0]["file_name"], "budget.csv", "{}", a.body);
-    let a = s.call(Method::GET, &format!("{base}/{id}/sources/s1")).await;
-    assert_eq!(a.body["parse"]["delimiter"], ",", "{}", a.body);
-
-    // A recipe change names the version it was made against.
-    let change = json!({ "against": 1, "roles": { "amount": "dimension" } });
-    let a =
-        s.send(Method::POST, &format!("{base}/{id}/recipe"), &[], Some(("application/json", serde_json::to_vec(&change).unwrap()))).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!((a.body["recipe"].as_u64(), a.body["live"].as_u64()), (Some(2), Some(2)));
-    let a =
-        s.send(Method::POST, &format!("{base}/{id}/recipe"), &[], Some(("application/json", serde_json::to_vec(&change).unwrap()))).await;
-    assert_eq!((a.status, a.class()), (StatusCode::CONFLICT, "Conflict"), "{}", a.body);
-    let a = s.call(Method::GET, &format!("{base}/{id}/recipe?version=1")).await;
-    assert_eq!(a.body["version"], 1);
-
-    // A replacement is a new snapshot; one that will not convert is refused.
-    let a = s
-        .send(Method::PUT, &format!("{base}/{id}/upload"), &[], Some(("text/csv", b"region,month,amount\nEMEA,2026-02-01,1.5\n".to_vec())))
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["columns"][2]["type"], "decimal(1)");
-    let a =
-        s.send(Method::PUT, &format!("{base}/{id}/upload"), &[], Some(("text/csv", b"region,month,amount\nEMEA,later,1\n".to_vec()))).await;
-    assert_eq!((a.status, a.class()), (StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable"), "{}", a.body);
-
-    // An org's datasets are its own.
-    let a = s.deploy_to("acme", CS, "main", archive(CS, "acme")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let a = s.call(Method::GET, &format!("/orgs/acme{base}/{id}")).await;
-    assert_eq!(a.status, StatusCode::NOT_FOUND);
-    let a = s.upload(&format!("/orgs/acme{base}"), BUDGET).await;
-    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
-    assert!(s.datasets_dir("acme", CS).join(a.body["id"].as_str().unwrap()).exists());
-
-    let a = s.call(Method::DELETE, &format!("{base}/{id}")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let a = s.call(Method::GET, &format!("{base}/{id}")).await;
-    assert_eq!(a.status, StatusCode::NOT_FOUND);
-
-    // Another org's are not touched by any of it.
-    let a = s.call(Method::GET, &format!("/orgs/acme{base}")).await;
-    assert_eq!(a.body["datasets"].as_array().unwrap().len(), 1, "another org's are not touched");
 }
 
 impl Server {
     async fn post_json(&self, path: &str, body: Value) -> Answer {
         self.send(Method::POST, path, &[], Some(("application/json", serde_json::to_vec(&body).unwrap()))).await
     }
+
+    /// An upload source and a dataset over it: their ids.
+    async fn upload_dataset(&self, csv: &str) -> (String, String) {
+        let a = self.upload(&format!("/projects/{CS}/sources?dataset=true&file_name=budget.csv"), csv).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+        (a.body["source"]["id"].as_str().unwrap().to_string(), a.body["dataset"]["id"].as_str().unwrap().to_string())
+    }
 }
 
-/// Steps, a preview, a page sorted and filtered for viewing, what reads
-/// a column, and a hold confirmed.
+fn steps_graph(source: &str, steps: Value) -> Value {
+    json!({ "nodes": [
+        { "id": "in", "kind": "source", "source": source },
+        { "id": "shape", "kind": "steps", "input": "in", "steps": steps },
+        { "id": "out", "kind": "output", "input": "shape" },
+    ]})
+}
+
 #[tokio::test]
-async fn a_recipe_of_steps_through_its_routes() {
+async fn sources_and_datasets_through_their_routes() {
     let s = server();
     let a = s.deploy(CS, "main", archive(CS, "main")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let base = format!("/projects/{CS}/datasets");
-    let a = s.upload(&base, "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n").await;
-    let id = a.body["id"].as_str().unwrap().to_string();
+    let sources = format!("/projects/{CS}/sources");
+    let datasets = format!("/projects/{CS}/datasets");
+
+    // A source needs a project that is deployed.
+    let a = s.upload("/projects/nowhere/sources", BUDGET).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    let a = s.upload(&format!("{sources}?bogus=1"), BUDGET).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    let a = s.upload(&format!("{sources}?kind=nope"), BUDGET).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+
+    // An upload used as it is: a source, and a dataset over it that copies nothing.
+    let a = s.upload(&format!("{sources}?file_name=budget.csv&dataset=true&description=the%20plan"), BUDGET).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!((a.body["source"]["name"].as_str(), a.body["source"]["kind"].as_str()), (Some("budget"), Some("upload")));
+    assert_eq!(a.body["snapshot"]["parse"]["delimiter"], ",", "{}", a.body);
+    assert_eq!(a.body["dataset"]["columns"][2], json!({ "name": "amount", "type": "integer", "role": "measure" }));
+    let (src, id) = (a.body["source"]["id"].as_str().unwrap().to_string(), a.body["dataset"]["id"].as_str().unwrap().to_string());
+    assert_eq!(s.call(Method::GET, &sources).await.body["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(s.call(Method::GET, &datasets).await.body["datasets"].as_array().unwrap().len(), 1);
+    let a = s.call(Method::GET, &format!("{datasets}/{id}/rows?limit=1")).await;
+    assert_eq!((a.body["total"].as_u64(), a.body["version"].as_u64()), (Some(2), Some(1)), "{}", a.body);
+    assert_eq!(a.body["rows"], json!([["EMEA", "2026-01-01", 100]]));
+    assert_eq!(s.call(Method::GET, &format!("{datasets}/{id}/rows?limit=0")).await.status, StatusCode::BAD_REQUEST);
+    let a = s.call(Method::GET, &format!("{datasets}/{id}/versions/1")).await;
+    assert_eq!(a.body["manifest"]["pointer"]["source"], src.as_str(), "{}", a.body);
+    assert_eq!(a.body["graph"]["nodes"][0]["kind"], "source");
+    let a = s.call(Method::GET, &format!("{datasets}/{id}/lineage")).await;
+    assert_eq!(a.body["sources"][0]["file_name"], "budget.csv", "{}", a.body);
+
+    // A new file is a new snapshot, and runs nothing.
+    let a = s.upload(&format!("{sources}/{src}/snapshots"), "region,month,amount\nEMEA,2026-02-01,1.5\n").await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(a.body["snapshot"]["number"], 2);
+    assert_eq!(s.call(Method::GET, &format!("{datasets}/{id}")).await.body["live"], 1);
+    let a = s.upload(&format!("{sources}/{src}/snapshots"), "region,month,amount\nEMEA,later,1\n").await;
+    assert_eq!((a.status, a.class()), (StatusCode::UNPROCESSABLE_ENTITY, "Unprocessable"), "{}", a.body);
+    let a = s.call(Method::GET, &format!("{sources}/{src}/snapshots")).await;
+    assert_eq!(a.body["snapshots"].as_array().unwrap().len(), 2);
+    let a = s.call(Method::GET, &format!("{sources}/{src}/rows?snapshot=1&sort=amount:desc")).await;
+    assert_eq!(a.body["rows"][0], json!(["EMEA", "2026-01-01", 100]), "{}", a.body);
+    assert_eq!(s.call(Method::GET, &format!("{sources}/{src}/rows?sort=amount:sideways")).await.status, StatusCode::BAD_REQUEST);
+    let a = s
+        .send(
+            Method::PATCH,
+            &format!("{sources}/{src}"),
+            &[],
+            Some(("application/json", br#"{"name": "plan", "types": {"amount": "text"}}"#.to_vec())),
+        )
+        .await;
+    assert_eq!((a.status, a.body["name"].as_str(), a.body["read"].as_u64()), (StatusCode::OK, Some("plan"), Some(2)), "{}", a.body);
+
+    // Pushed rows, and a dataset made empty for a run to fill.
+    let a =
+        s.post_json(&format!("{sources}?kind=push&name=deals"), json!({ "rows": [{ "deal": "Acme", "value": 3 }], "origin": "crm" })).await;
+    assert_eq!((a.status, a.body["snapshot"]["origin"].as_str()), (StatusCode::CREATED, Some("crm")), "{}", a.body);
+    let a = s.post_json(&datasets, json!({ "name": "empty" })).await;
+    assert_eq!((a.status, a.body["live"].clone()), (StatusCode::CREATED, Value::Null), "{}", a.body);
+
+    // An org's are its own.
+    let a = s.deploy_to("acme", CS, "main", archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    assert_eq!(s.call(Method::GET, &format!("/orgs/acme{datasets}/{id}")).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(s.call(Method::GET, &format!("/orgs/acme{sources}/{src}")).await.status, StatusCode::NOT_FOUND);
+
+    let a = s.call(Method::DELETE, &format!("{sources}/{src}")).await;
+    assert_eq!(a.body["datasets_given_their_rows"], json!([id]), "{}", a.body);
+    assert_eq!(s.call(Method::GET, &format!("{datasets}/{id}/rows")).await.body["total"], 2, "it still answers");
+    assert_eq!(s.call(Method::DELETE, &format!("{datasets}/{id}")).await.status, StatusCode::OK);
+    assert_eq!(s.call(Method::GET, &format!("{datasets}/{id}")).await.status, StatusCode::NOT_FOUND);
+}
+
+/// A run of a graph: a dry run first, a preview of a node, the run, its
+/// record, and a retry answered with it.
+#[tokio::test]
+async fn a_run_of_a_graph_through_its_routes() {
+    let s = server();
+    let a = s.deploy(CS, "main", archive(CS, "main")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
+    let (src, id) = s.upload_dataset("region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n").await;
     let steps = json!([
         { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
         { "op": "add_column", "column": "label", "formula": "region & '/' & store" },
     ]);
+    let graph = steps_graph(&src, steps);
+    let runs = format!("/projects/{CS}/runs");
 
-    let a = s.post_json(&format!("{base}/{id}/preview"), json!({ "steps": steps, "limit": 1 })).await;
+    let a = s.post_json(&format!("{runs}?check=true"), json!({ "graph": graph })).await;
+    assert_eq!((a.status, a.body["ok"].as_bool()), (StatusCode::OK, Some(true)), "{}", a.body);
+    assert_eq!(a.body["nodes"][1]["columns"][3]["name"], "label");
+    assert_eq!(a.body["reads"], json!([{ "kind": "source", "id": src }]));
+
+    let a = s.post_json(&format!("/projects/{CS}/preview"), json!({ "graph": graph, "node": "shape", "limit": 1 })).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(a.body["rows"], json!([["New York", "a", 10, "New York/a"]]));
-    let a = s.post_json(&format!("{base}/{id}/preview"), json!({ "steps": [{ "op": "sql", "sql": "select 1" }] })).await;
-    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "an unknown step is not a step: {}", a.body);
+    assert_eq!(a.body["nodes"][1]["steps"][0]["said"], "remapped 2 value(s) of region");
 
-    let a = s.post_json(&format!("{base}/{id}/recipe"), json!({ "against": 1, "steps": steps })).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows?sort=amount:desc&filter=amount%20%3C%2010")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["total"], 2);
-    assert_eq!(a.body["rows"], json!([["New York", "c", 7, "New York/c"], ["CA", "b", 5, "CA/b"]]));
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows?sort=amount:sideways")).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = s.post_json(&runs, json!({ "id": "r-1", "dataset": id, "graph": graph })).await;
+    assert_eq!(
+        (a.status, a.body["state"].as_str(), a.body["version"].as_u64()),
+        (StatusCode::OK, Some("succeeded"), Some(2)),
+        "{}",
+        a.body
+    );
+    assert!(a.body["nodes"][1]["summary"].as_str().unwrap().starts_with("2 steps: 3 rows in, 3 out"), "{}", a.body);
+    let a = s.call(Method::GET, &format!("/projects/{CS}/datasets/{id}/rows?sort=amount:desc&filter=amount%20%3C%2010")).await;
+    assert_eq!(a.body["rows"], json!([["New York", "c", 7, "New York/c"], ["CA", "b", 5, "CA/b"]]), "{}", a.body);
+    let a = s.call(Method::GET, &format!("{runs}/r-1")).await;
+    assert_eq!((a.status, a.body["version"].as_u64()), (StatusCode::OK, Some(2)));
+    let a = s.post_json(&runs, json!({ "id": "r-1", "dataset": id, "graph": graph })).await;
+    assert_eq!(a.body["version"], 2, "a retry is answered, not run again: {}", a.body);
+    let a = s.post_json(&runs, json!({ "id": "r-1", "dataset": id, "graph": steps_graph(&src, json!([])) })).await;
+    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
 
-    let a = s.call(Method::GET, &format!("{base}/{id}/impact?column=store")).await;
-    assert_eq!(a.body["said"], json!(["step 2 (add_column) reads column 'store', which is not there at that step"]), "{}", a.body);
+    // Refused before it runs: each problem, by node.
+    let bad = steps_graph(&src, json!([{ "op": "trim_val", "columns": ["regoin"] }]));
+    let a = s.post_json(&runs, json!({ "id": "r-2", "dataset": id, "graph": bad })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::UNPROCESSABLE_ENTITY, "Refused"), "{}", a.body);
+    assert_eq!(a.body["problems"][0]["node"], "shape");
+    assert_eq!(a.body["problems"][0]["code"], "missing_column");
+    assert_eq!(a.body["problems"][0]["suggestions"][0]["column"], "region");
+    let a = s.post_json(&runs, json!({ "dataset": id, "graph": graph })).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a run says its id: {}", a.body);
+    let a =
+        s.post_json(&runs, json!({ "id": "r-3", "dataset": id, "graph": { "nodes": [{ "id": "x", "kind": "sql", "sql": "1" }] } })).await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "an unknown field is no graph: {}", a.body);
+    assert_eq!(s.call(Method::GET, &format!("{runs}/nope")).await.status, StatusCode::NOT_FOUND);
 
-    // A new snapshot without `store` holds the dataset; confirming drops the formula.
-    let a = s.send(Method::PUT, &format!("{base}/{id}/upload"), &[], Some(("text/csv", b"region,amount\nNY,1\n".to_vec()))).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["held"]["unresolved"][0]["column"], "store", "{}", a.body);
-    assert_eq!(a.body["live"], 2);
-    let a = s.post_json(&format!("{base}/{id}/confirm"), json!({ "against": 2 })).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert!(a.body.get("held").is_none());
-    assert_eq!((a.body["live"].as_u64(), a.body["recipe"].as_u64()), (Some(3), Some(3)));
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows")).await;
-    assert_eq!(a.body["rows"], json!([["New York", 1]]));
+    // Edits ride in the graph, by key.
+    let edited = json!({ "nodes": [
+        { "id": "in", "kind": "source", "source": src },
+        { "id": "fix", "kind": "edits", "input": "in", "key": ["store"], "edits": [
+            { "id": "e1", "kind": "set", "column": "amount", "key": { "store": "b" }, "to": 6, "was": 5 },
+            { "id": "e2", "kind": "remap", "column": "region", "from": "CA", "to": "California" },
+        ]},
+        { "id": "out", "kind": "output", "input": "fix", "key": ["store"] },
+    ]});
+    let a = s.post_json(&runs, json!({ "id": "r-4", "dataset": id, "graph": edited })).await;
+    assert_eq!(a.body["state"], "succeeded", "{}", a.body);
+    assert_eq!(a.body["nodes"][1]["edits"].as_array().unwrap().len(), 2);
+    let a = s.call(Method::GET, &format!("/projects/{CS}/datasets/{id}/rows")).await;
+    assert_eq!(a.body["rows"][1], json!(["California", "b", 6]), "{}", a.body);
 }
 
-/// Edits through the route: a remap, an override, and the log.
+/// A query source: pulled by a run, as the run's context, from the
+/// warehouse; its snapshot read again only as that context.
 #[tokio::test]
-async fn edits_through_their_routes() {
-    let s = server();
-    let a = s.deploy(CS, "main", archive(CS, "main")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let base = format!("/projects/{CS}/datasets");
-    let id = s.upload(&base, BUDGET).await.body["id"].as_str().unwrap().to_string();
-    let a = s
-        .post_json(
-            &format!("{base}/{id}/edits"),
-            json!({ "against": 1, "edits": [
-                { "op": "cell", "column": "region", "from": "EMEA", "to": "Europe" },
-                { "op": "cell", "column": "amount", "row": { "region": "APAC", "month": "2026-01-01" }, "to": 81 },
-            ]}),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["outcomes"].as_array().unwrap().len(), 2);
-    assert_eq!(a.body["dataset"]["edits"], 1);
-    let a = s.call(Method::GET, &format!("{base}/{id}/rows")).await;
-    assert_eq!(a.body["rows"], json!([["Europe", "2026-01-01", 100], ["APAC", "2026-01-01", 81]]));
-    let a = s.call(Method::GET, &format!("{base}/{id}/edits")).await;
-    assert_eq!(a.body["entries"][0]["edits"][1]["was"], 80, "{}", a.body);
-    let a = s
-        .post_json(
-            &format!("{base}/{id}/edits"),
-            json!({ "against": 1, "edits": [{ "op": "cell", "column": "nope", "from": "x", "to": "y" }] }),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
-    assert!(a.error().contains("edit 1: there is no column 'nope'"), "{}", a.body);
-}
-
-/// A dataset made from a semantic query, run fresh against the
-/// warehouse, and refreshed by request.
-#[tokio::test]
-async fn a_semantic_query_as_a_source() {
+async fn a_query_source_is_pulled_by_a_run() {
     let s = server();
     let a = s.deploy(CS, "main", archive(CS, "main")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let file = sales("prep");
     let connection = json!({ "file": file.to_str().unwrap() });
-    let base = format!("/projects/{CS}/datasets");
     let a = s
-        .post_json(
-            &format!("{base}/query"),
-            json!({ "name": "revenue", "branch": "main", "expr": "category asc, revenue", "connection": connection }),
-        )
+        .post_json(&format!("/projects/{CS}/sources?kind=query&name=revenue"), json!({ "branch": "main", "expr": "category asc, revenue" }))
         .await;
-    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
-    let id = a.body["id"].as_str().unwrap().to_string();
-    assert_eq!(a.body["sources"][0]["kind"], "semantic");
-    let roles: Vec<(&str, &str)> =
-        a.body["columns"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap(), c["role"].as_str().unwrap())).collect();
-    assert_eq!(roles[1].1, "measure", "the model says revenue is a measure: {roles:?}");
-    assert_eq!(roles[0].1, "dimension");
-    let rows = s.call(Method::GET, &format!("{base}/{id}/rows")).await;
+    assert_eq!((a.status, a.body["source"]["snapshot"].as_u64()), (StatusCode::CREATED, Some(0)), "{}", a.body);
+    let src = a.body["source"]["id"].as_str().unwrap().to_string();
+    let id = s.post_json(&format!("/projects/{CS}/datasets"), json!({ "name": "revenue" })).await.body["id"].as_str().unwrap().to_string();
+    let graph = json!({ "nodes": [
+        { "id": "rev", "kind": "source", "source": src },
+        { "id": "out", "kind": "output", "input": "rev" },
+    ]});
+    let a = s.post_json(&format!("/projects/{CS}/runs?check=true"), json!({ "graph": graph })).await;
+    assert!(a.body["said"].as_str().unwrap().starts_with("Pulls revenue (it has never been pulled)"), "{}", a.body);
+    let a =
+        s.post_json(&format!("/projects/{CS}/runs"), json!({ "id": "q-1", "dataset": id, "graph": graph, "connection": connection })).await;
+    assert_eq!(a.body["state"], "succeeded", "{}", a.body);
+    assert_eq!(a.body["inputs"][0]["will"], "pull");
+    let a = s.call(Method::GET, &format!("/projects/{CS}/datasets/{id}")).await;
+    let roles: Vec<&str> = a.body["columns"].as_array().unwrap().iter().map(|c| c["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["dimension", "measure"], "the model says revenue is a measure");
+    let rows = s.call(Method::GET, &format!("/projects/{CS}/datasets/{id}/rows")).await;
     assert_eq!(rows.body["rows"], json!([["books", "30.50"], ["games", "5.25"], ["toys", "1.00"]]), "{}", rows.body);
-    let lineage = s.call(Method::GET, &format!("{base}/{id}/lineage")).await;
+    let lineage = s.call(Method::GET, &format!("/projects/{CS}/datasets/{id}/lineage")).await;
     let read = &lineage.body["sources"][0]["semantic"];
     assert_eq!((read["branch"].as_str(), read["sql_sha256"].as_str().map(str::len)), (Some("main"), Some(64)), "{}", lineage.body);
-    assert!(read["context"].is_string() && read["fields"].is_object(), "{read}");
-
-    let a = s.post_json(&format!("{base}/{id}/refresh"), json!({ "connection": connection })).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!((a.body["sources"][0]["snapshot"].as_u64(), a.body["live"].as_u64()), (Some(2), Some(2)));
-    let lineage = s.call(Method::GET, &format!("{base}/{id}/lineage")).await;
-    assert_eq!(lineage.body["sources"][0]["snapshot"], 2);
-
-    // A refresh is for a query's dataset; a bad query is refused as the planner refuses it.
-    let upload = s.upload(&base, BUDGET).await.body["id"].as_str().unwrap().to_string();
-    let a = s.post_json(&format!("{base}/{upload}/refresh"), json!({})).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    // The same context reads the snapshot it took; a preview does not pull.
     let a =
-        s.post_json(&format!("{base}/query"), json!({ "branch": "main", "expr": "nothing_by_this_name", "connection": connection })).await;
-    assert!(a.status.is_client_error(), "{}", a.body);
-    let a = s.post_json(&format!("{base}/query"), json!({ "branch": "nope", "expr": "revenue" })).await;
-    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
-}
-
-/// A dataset that reads another, and what that means for a delete.
-#[tokio::test]
-async fn combining_datasets_through_the_routes() {
-    let s = server();
-    let a = s.deploy(CS, "main", archive(CS, "main")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.error());
-    let base = format!("/projects/{CS}/datasets");
-    let budget = s.upload(&base, BUDGET).await.body["id"].as_str().unwrap().to_string();
-    let owners = s.upload(&base, "area,manager\nEMEA,kim\nAPAC,lee\n").await.body["id"].as_str().unwrap().to_string();
-    let a = s
-        .post_json(
-            &format!("{base}/{budget}/recipe"),
-            json!({ "against": 1, "steps": [{ "op": "join", "dataset": owners, "on": [{ "left": "region", "right": "area" }] }] }),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["columns"][3]["name"], "manager");
-    let a = s.call(Method::GET, &format!("{base}/{owners}/downstream")).await;
-    assert_eq!(a.body["downstream"][0]["id"], budget.as_str(), "{}", a.body);
-    let a = s.call(Method::DELETE, &format!("{base}/{owners}")).await;
-    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
-    let a = s.call(Method::DELETE, &format!("{base}/{owners}?confirm=true")).await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        s.post_json(&format!("/projects/{CS}/runs"), json!({ "id": "q-2", "dataset": id, "graph": graph, "connection": connection })).await;
+    assert_eq!(a.body["inputs"][0]["will"], "read", "{}", a.body);
+    let a = s.post_json(&format!("/projects/{CS}/preview"), json!({ "graph": graph, "connection": connection })).await;
+    assert_eq!(a.body["rows"].as_array().unwrap().len(), 3, "{}", a.body);
+    // A query the planner refuses fails the run, saying so.
+    let a = s.post_json(&format!("/projects/{CS}/sources?kind=query"), json!({ "branch": "main", "expr": "nothing_by_this_name" })).await;
+    let bad = a.body["source"]["id"].as_str().unwrap().to_string();
+    let g = json!({ "nodes": [{ "id": "x", "kind": "source", "source": bad }, { "id": "out", "kind": "output", "input": "x" }] });
+    let a = s.post_json(&format!("/projects/{CS}/runs"), json!({ "id": "q-3", "dataset": id, "graph": g, "connection": connection })).await;
+    assert_eq!(a.body["state"], "failed", "{}", a.body);
+    assert!(a.body["error"].as_str().unwrap().starts_with("pulling query on main"), "{}", a.body);
+    let a = s.post_json(&format!("/projects/{CS}/sources?kind=query"), json!({ "branch": "../x", "expr": "revenue" })).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
 }
 
 /// Budget against actual: the model's part run in the warehouse, the
@@ -301,9 +286,8 @@ async fn a_blend_sets_a_dataset_beside_the_model() {
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     let file = sales("blend");
     let connection = json!({ "file": file.to_str().unwrap() });
-    let base = format!("/projects/{CS}/datasets");
-    let budget = s.upload(&base, "category,amount\nbooks,40\ngames,5\nmusic,7\n").await.body["id"].as_str().unwrap().to_string();
-    let targets = s.upload(&base, "category\nbooks\n").await.body["id"].as_str().unwrap().to_string();
+    let budget = s.upload_dataset("category,amount\nbooks,40\ngames,5\nmusic,7\n").await.1;
+    let targets = s.upload_dataset("category\nbooks\n").await.1;
     let route = format!("/projects/{CS}/branches/main/blend");
     let ask = |datasets: Value, blend: Value, projections: Value| json!({ "spec": { "projections": projections }, "datasets": datasets, "blend": blend, "connection": connection });
     let enrich = ask(
@@ -380,8 +364,7 @@ async fn datasets_change_nothing_the_model_plans() {
     let tables = || s.get(&tables_path);
     let before = (plan().await.body, catalog().await.body, tables().await.body);
     for csv in ["category,amount\nbooks,1\n", "Revenue,Category\n1,x\n"] {
-        let a = s.upload(&format!("/projects/{CS}/datasets?name=category"), csv).await;
-        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+        s.upload_dataset(csv).await;
     }
     let after = (plan().await.body, catalog().await.body, tables().await.body);
     assert_eq!(before.0["sql"], after.0["sql"], "the same SQL, byte for byte");

@@ -1,62 +1,73 @@
-//! A recipe, compiled: a view for each step over the one before, the
-//! columns at the end with their types, roles and ancestry, and the
-//! checks a run makes before it trusts a conversion.
+//! Compiling: a `steps` node's steps as tables, each over the one
+//! before, with the columns there at each, their types, roles and
+//! ancestry, and the checks a run makes before it trusts a conversion;
+//! and the joins and appends between nodes.
 //!
 //! The compiler walks the steps with the columns there at each, so it
 //! knows what every step reads before anything runs. A step that reads
 //! a column not there at its point is unresolved: it is passed over,
 //! and so is every later step that reads what it would have made, and
-//! all of them are named. That is the column graph: a column gone
-//! upstream with nothing reading it is a note, and one with readers
-//! holds the run, naming each.
+//! all of them are named. A graph with one is refused, naming its node.
 
-use crate::edits::Edit;
 use crate::error::{Error, Result};
 use crate::formula;
 use crate::lineage::Origin;
-use crate::recipe::{AggregateFn, Mapping, Recipe, SortKey, Step};
 use crate::schema::{ident, literal, Column, ColumnType, Role};
 use crate::source::infer;
-use crate::store::SourceState;
+use crate::steps::{AggregateFn, JoinKey, JoinKind, Mapping, SortKey, Step, STEPS_LIMIT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A recipe, ready to run.
-pub struct Compiled {
-    /// `(name, select)` for each view, in order; the first reads the
-    /// source table, each later one the view before it.
-    pub views: Vec<(String, String)>,
-    /// The relation the result is read from.
-    pub last: String,
-    pub columns: Vec<Column>,
-    /// Each column's ancestry, beside it.
-    pub ancestry: Vec<Vec<Origin>>,
-    /// Conversions to check before the result is read.
-    pub checks: Vec<Check>,
-    /// The edits, each set applied once the views before it exist.
-    pub edits: Vec<EditStage>,
-    /// Steps and roles that read a column not there; empty when the
-    /// recipe runs.
-    pub unresolved: Vec<Unresolved>,
-    /// The `sql` steps, by the name of the view each stands for: run in
-    /// a session of their own, not as a view.
-    pub sql: std::collections::BTreeMap<String, crate::sql::SqlStage>,
-}
-
-/// Edits that apply at one point of the recipe: after the first `at`
-/// views, as the view `name`, which the later views read.
-pub struct EditStage {
-    pub at: usize,
-    pub input: String,
+/// A relation in a run's session: its name, as SQL, and its columns,
+/// each with where it came from.
+#[derive(Clone, Debug)]
+pub struct Rel {
     pub name: String,
     pub columns: Vec<Column>,
-    pub edits: Vec<Edit>,
+    pub ancestry: Vec<Vec<Origin>>,
 }
 
-/// A retype that keeps a value only if it converts: the rows of
-/// `relation` where `failing` holds are the ones that do not.
-pub struct Check {
+/// One step, compiled: the table it makes.
+pub struct Stage {
+    /// The table's name, unquoted.
+    pub name: String,
+    /// The step, from 1.
     pub step: usize,
+    pub op: &'static str,
+    /// What it reads, as SQL.
+    pub input: String,
+    pub sql: StageSql,
+    /// The columns before it and after.
+    pub before: Vec<Column>,
+    pub after: Vec<Column>,
+    /// The columns it rewrites in place, by their names after it: what
+    /// a run counts the values it changed in.
+    pub rewrites: Vec<String>,
+}
+
+/// How a stage is made.
+pub enum StageSql {
+    /// A select over the stage before.
+    Select(String),
+    /// A `sql` step, run in a session of its own.
+    Sql(crate::sql::SqlStage),
+}
+
+/// A node's steps, compiled.
+pub struct Chain {
+    pub stages: Vec<Stage>,
+    /// What the last stage makes.
+    pub out: Rel,
+    /// Conversions to check before the result is read.
+    pub checks: Vec<Check>,
+    /// Steps that read a column not there; empty when it runs.
+    pub unresolved: Vec<Unresolved>,
+}
+
+/// A conversion, or a join, that keeps a value only if it is sound: the
+/// rows of `relation` where `failing` holds are the ones that are not.
+#[derive(Clone, Debug)]
+pub struct Check {
     pub relation: String,
     /// The column whose values are shown when it fails.
     pub column: String,
@@ -65,47 +76,25 @@ pub struct Check {
     pub says: String,
 }
 
-/// What a `sql` step's query makes over these columns: DuckDB's answer,
-/// or its refusal in its own words. See `sql::describe`.
-pub type Describe<'a> = &'a dyn Fn(&[(String, ColumnType)], &str) -> Result<std::result::Result<Vec<(String, ColumnType)>, String>>;
+/// What a `sql` step's query makes over these inputs, each by its
+/// alias: DuckDB's answer, or its refusal in its own words. See
+/// `sql::describe`.
+pub type Describe<'a> =
+    &'a dyn Fn(&[(String, Vec<(String, ColumnType)>)], &str) -> Result<std::result::Result<Vec<(String, ColumnType)>, String>>;
 
-/// The other datasets a recipe reads: each one's columns, by id.
-pub type Inputs = std::collections::BTreeMap<String, Vec<Column>>;
-
-/// The table a dataset read by a step is loaded as.
-pub fn input_table(id: &str) -> String {
-    format!("d_{id}")
-}
-
-/// A step, or a role, that reads a column not there at its point.
+/// A step that reads a column not there at its point.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Unresolved {
     pub column: String,
-    /// The step, from 1; 0 for a role the recipe gives.
+    /// The step, from 1; 0 for what a node reads that is not a step.
     pub step: usize,
     pub op: String,
-    /// The edit, when it is an edit that reads it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit: Option<String>,
-    /// The dataset it is a column of, when it is another's; or, for a
-    /// reader, the dataset that reads it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dataset: Option<String>,
 }
 
 impl Unresolved {
     pub fn describe(&self) -> String {
-        if self.op == "reader" {
-            let d = self.dataset.as_deref().unwrap_or("?");
-            format!("dataset {d} reads column '{}' of this one", self.column)
-        } else if let Some(d) = &self.dataset {
-            format!("step {} ({}) reads column '{}' of dataset {d}, which it does not have", self.step, self.op, self.column)
-        } else if let Some(id) = &self.edit {
-            format!("edit {id} reads column '{}', which is not there where it applies", self.column)
-        } else if self.op == "key" {
-            format!("the key names column '{}', which the dataset does not have", self.column)
-        } else if self.step == 0 {
-            format!("the role given to column '{}'", self.column)
+        if self.step == 0 {
+            format!("{} reads column '{}', which is not there", self.op, self.column)
         } else {
             format!("step {} ({}) reads column '{}', which is not there at that step", self.step, self.op, self.column)
         }
@@ -115,12 +104,16 @@ impl Unresolved {
 /// The longest name a column is given.
 const NAME_LIMIT: usize = 200;
 
-struct Cols {
-    columns: Vec<Column>,
-    ancestry: Vec<Vec<Origin>>,
+pub struct Cols {
+    pub columns: Vec<Column>,
+    pub ancestry: Vec<Vec<Origin>>,
 }
 
 impl Cols {
+    pub fn of(rel: &Rel) -> Cols {
+        Cols { columns: rel.columns.clone(), ancestry: rel.ancestry.clone() }
+    }
+
     fn find(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
     }
@@ -148,164 +141,110 @@ impl Cols {
     }
 }
 
-/// Compiles a recipe over the sources as they now are, with `today()`
-/// pinned to `pinned_at`.
-pub fn compile(
-    recipe: &Recipe,
-    edits: &[(usize, Edit)],
-    (sources, inputs): (&[SourceState], &Inputs),
-    pinned_at: &str,
-    describe: Describe<'_>,
-) -> Result<Compiled> {
-    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, (sources, inputs), pinned_at, describe)
-}
-
-/// Steps alone, with no edits and no key.
-pub fn compile_steps(
-    steps: &[Step],
-    roles: &std::collections::BTreeMap<String, Role>,
-    sources: &[SourceState],
-    pinned_at: &str,
-) -> Result<Compiled> {
-    let no_engine: Describe<'_> = &|_, _| Ok(Err("no engine here".into()));
-    compile_all(steps, roles, &[], &[], (sources, &Inputs::new()), pinned_at, no_engine)
-}
-
-pub fn compile_all(
-    steps: &[Step],
-    roles: &std::collections::BTreeMap<String, Role>,
-    key: &[String],
-    edits: &[(usize, Edit)],
-    (sources, inputs): (&[SourceState], &Inputs),
-    pinned_at: &str,
-    describe: Describe<'_>,
-) -> Result<Compiled> {
-    let mut sql_stages = std::collections::BTreeMap::new();
-    let [source] = sources else {
-        return Err(Error::Internal(format!("a dataset has {} sources, and reading more than one comes with combining", sources.len())));
-    };
-    let mut cols = Cols {
-        columns: source.columns.clone(),
-        ancestry: source.columns.iter().map(|c| vec![Origin { source: source.id.clone(), column: c.name.clone() }]).collect(),
-    };
-    let mut views: Vec<(String, String)> = Vec::new();
+/// A node's steps over `input`, with `today()` pinned to `pinned_at`.
+/// Each stage's table is named `{prefix}_t{n}`.
+pub fn chain(prefix: &str, input: &Rel, steps: &[Step], pinned_at: &str, describe: Describe<'_>) -> Result<Chain> {
+    if steps.len() > STEPS_LIMIT {
+        return Err(Error::Invalid(format!("a steps node has at most {STEPS_LIMIT} steps")));
+    }
+    let mut cols = Cols::of(input);
+    let mut prev = input.name.clone();
+    let mut stages = Vec::new();
     let mut checks = Vec::new();
     let mut unresolved = Vec::new();
-    let mut stages = Vec::new();
-    let mut prev = ident(&source.id);
-    // The edits made after `p` steps, applied there; one made after
-    // more steps than the recipe now has applies at its end.
-    let mut edit_stage = |p: usize, prev: &mut String, cols: &Cols, views: &Vec<(String, String)>, unresolved: &mut Vec<Unresolved>| {
-        let mut here = Vec::new();
-        for (after, e) in edits {
-            if (*after).min(steps.len()) != p {
-                continue;
-            }
-            let missing: Vec<String> = e.reads().into_iter().filter(|c| cols.find(c).is_none()).collect();
-            if missing.is_empty() {
-                here.push(e.clone());
-            } else {
-                unresolved.extend(missing.into_iter().map(|column| Unresolved {
-                    column,
-                    step: p,
-                    op: "edit".into(),
-                    edit: Some(e.id().to_string()),
-                    dataset: None,
-                }));
-            }
-        }
-        if !here.is_empty() {
-            let name = format!("e{p}");
-            stages.push(EditStage { at: views.len(), input: prev.clone(), name: name.clone(), columns: cols.columns.clone(), edits: here });
-            *prev = ident(&name);
-        }
-    };
-    edit_stage(0, &mut prev, &cols, &views, &mut unresolved);
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         // What the step reads that is not there: it is passed over.
-        let mut missing: Vec<Unresolved> = reads(step)?
+        let missing: Vec<Unresolved> = reads(step)?
             .into_iter()
             .filter(|c| cols.find(c).is_none())
-            .map(|column| Unresolved { column, step: n, op: step.op().into(), edit: None, dataset: None })
+            .map(|column| Unresolved { column, step: n, op: step.op().into() })
             .collect();
-        if let Some(d) = step.dataset() {
-            let input = inputs.get(d).ok_or_else(|| {
-                Error::Invalid(format!("step {n} ({}) reads dataset {d}, which is not a dataset of this project with a version", step.op()))
-            })?;
-            missing.extend(
-                step.needs().into_iter().filter(|c| !input.iter().any(|x| x.name.eq_ignore_ascii_case(c))).map(|column| Unresolved {
-                    column,
-                    step: n,
-                    op: step.op().into(),
-                    edit: None,
-                    dataset: Some(d.to_string()),
-                }),
-            );
-        }
         if !missing.is_empty() {
             unresolved.extend(missing);
-            edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
             continue;
         }
         let at = |e: Error| match e {
             Error::Invalid(m) => Error::Invalid(format!("step {n} ({}): {m}", step.op())),
             other => other,
         };
-        if let Step::Sql { query } = step {
+        let before = cols.columns.clone();
+        let rewrites: Vec<String> = rewritten(step).iter().filter_map(|c| cols.find(c)).map(|i| cols.columns[i].name.clone()).collect();
+        let name = format!("{prefix}_t{n}");
+        let sql = if let Step::Sql { query } = step {
             let query = crate::sql::checked(query).map_err(at)?;
-            let input: Vec<(String, ColumnType)> = cols.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
-            match describe(&input, &query)? {
+            let typed: Vec<(String, ColumnType)> = cols.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
+            match describe(&[("input".to_string(), typed.clone())], &query)? {
                 Ok(made) => {
-                    // A black box: each column it makes is from all it was given.
-                    let mut from: Vec<Origin> = cols.ancestry.iter().flatten().cloned().collect();
-                    from.sort();
-                    from.dedup();
-                    // A column it keeps by name keeps its role, while it is
-                    // still a number or still not one; the rest are inferred.
-                    let columns: Vec<Column> = made
-                        .iter()
-                        .map(|(name, ty)| {
-                            let kept = cols.find(name).map(|i| &cols.columns[i]).filter(|c| c.ty.is_number() == ty.is_number());
-                            Column { name: name.clone(), ty: *ty, role: kept.map_or_else(|| Role::inferred(name, *ty), |c| c.role) }
-                        })
-                        .collect();
-                    let name = format!("t{n}");
-                    sql_stages.insert(
-                        name.clone(),
-                        crate::sql::SqlStage { step: n, input: prev.clone(), input_columns: input, query, columns: made },
-                    );
-                    cols.ancestry = vec![from; columns.len()];
-                    cols.columns = columns;
-                    views.push((name.clone(), String::new()));
-                    prev = ident(&name);
+                    sql_columns(&mut cols, &made);
+                    StageSql::Sql(crate::sql::SqlStage {
+                        label: format!("step {n} (sql)"),
+                        inputs: vec![crate::sql::SqlInput { alias: "input".into(), relation: prev.clone(), columns: typed }],
+                        query,
+                        columns: made,
+                    })
                 }
                 Err(refusal) => match crate::sql::missing_column(&refusal) {
-                    Some(column) => unresolved.push(Unresolved { column, step: n, op: "sql".into(), edit: None, dataset: None }),
+                    Some(column) => {
+                        unresolved.push(Unresolved { column, step: n, op: "sql".into() });
+                        continue;
+                    }
                     None => return Err(Error::Invalid(format!("step {n} (sql): {refusal}"))),
                 },
             }
-            edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
-            continue;
-        }
-        let select = one(step, n, &prev, &mut cols, &mut checks, (inputs, pinned_at)).map_err(at)?;
-        let name = format!("t{n}");
-        views.push((name.clone(), select));
+        } else {
+            StageSql::Select(one(step, n, &prev, &mut cols, &mut checks, pinned_at).map_err(at)?)
+        };
+        stages.push(Stage {
+            name: name.clone(),
+            step: n,
+            op: step.op(),
+            input: prev.clone(),
+            sql,
+            before,
+            after: cols.columns.clone(),
+            rewrites,
+        });
         prev = ident(&name);
-        edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
     }
-    for (name, role) in roles {
-        match cols.find(name) {
-            Some(i) => cols.columns[i].role = *role,
-            None => unresolved.push(Unresolved { column: name.clone(), step: 0, op: "role".into(), edit: None, dataset: None }),
-        }
+    Ok(Chain { stages, out: Rel { name: prev, columns: cols.columns, ancestry: cols.ancestry }, checks, unresolved })
+}
+
+/// What a `sql` query made, as the columns after it: a black box, each
+/// column it makes from all it was given. A column it keeps by name
+/// keeps its role, while it is still a number or still not one; the
+/// rest are inferred.
+pub(crate) fn sql_columns(cols: &mut Cols, made: &[(String, ColumnType)]) {
+    let mut from: Vec<Origin> = cols.ancestry.iter().flatten().cloned().collect();
+    from.sort();
+    from.dedup();
+    let columns: Vec<Column> = made
+        .iter()
+        .map(|(name, ty)| {
+            let kept = cols.find(name).map(|i| &cols.columns[i]).filter(|c| c.ty.is_number() == ty.is_number());
+            Column { name: name.clone(), ty: *ty, role: kept.map_or_else(|| Role::inferred(name, *ty), |c| c.role) }
+        })
+        .collect();
+    cols.ancestry = vec![from; columns.len()];
+    cols.columns = columns;
+}
+
+/// The columns a step rewrites in place, as it names them.
+fn rewritten(step: &Step) -> Vec<String> {
+    match step {
+        Step::FillEmpty { column, .. }
+        | Step::FindAndReplaceVal { column, .. }
+        | Step::RemapVal { column, .. }
+        | Step::UpdateColumn { column, .. } => vec![column.clone()],
+        Step::TrimVal { columns }
+        | Step::UpperCase { columns }
+        | Step::LowerCase { columns }
+        | Step::TitleCase { columns }
+        | Step::SnakeCase { columns }
+        | Step::CamelCase { columns }
+        | Step::FillDown { columns } => columns.clone(),
+        _ => Vec::new(),
     }
-    for k in key {
-        if cols.find(k).is_none() {
-            unresolved.push(Unresolved { column: k.clone(), step: 0, op: "key".into(), edit: None, dataset: None });
-        }
-    }
-    Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, edits: stages, unresolved, sql: sql_stages })
 }
 
 /// The columns a step reads, by name as the step writes them.
@@ -330,9 +269,8 @@ pub fn reads(step: &Step) -> Result<Vec<String>> {
         }
         Step::Sort { by } => by.iter().map(|k| k.column.clone()).collect(),
         Step::Group { by, aggregates } => by.iter().cloned().chain(aggregates.iter().filter_map(|a| a.column.clone())).collect(),
-        Step::Join { on, .. } => on.iter().map(|k| k.left.clone()).collect(),
         // A black box: what it reads is found when DuckDB is asked.
-        Step::Append { .. } | Step::Sql { .. } => Vec::new(),
+        Step::Sql { .. } => Vec::new(),
     })
 }
 
@@ -376,14 +314,7 @@ pub(crate) fn value_sql(v: &Value, ty: ColumnType, column: &str) -> Result<Strin
     Ok(format!("CAST({} AS {})", literal(text.trim_matches(|c: char| c.is_whitespace() && ty != ColumnType::Text)), ty.sql()))
 }
 
-fn one(
-    step: &Step,
-    n: usize,
-    prev: &str,
-    cols: &mut Cols,
-    checks: &mut Vec<Check>,
-    (inputs, pinned_at): (&Inputs, &str),
-) -> Result<String> {
+fn one(step: &Step, n: usize, prev: &str, cols: &mut Cols, checks: &mut Vec<Check>, pinned_at: &str) -> Result<String> {
     let found = |cols: &Cols, name: &str| cols.find(name).ok_or_else(|| Error::Internal(format!("'{name}' was resolved and is not there")));
     Ok(match step {
         Step::RenameColumn { column, to } => {
@@ -431,7 +362,7 @@ fn one(
                     "step {n} (retype_column) makes column '{}' {ty} from {from}, and {{n}} value(s) do not convert without loss",
                     cols.columns[i].name
                 );
-                checks.push(Check { step: n, relation: prev.to_string(), column: cols.columns[i].name.clone(), failing, says });
+                checks.push(Check { relation: prev.to_string(), column: cols.columns[i].name.clone(), failing, says });
             }
             cols.columns[i].ty = *ty;
             if !ty.is_number() && cols.columns[i].role == Role::Measure {
@@ -595,47 +526,77 @@ fn one(
         }
         Step::Unpivot { columns, keep, name, value, keep_empty } => unpivot(prev, cols, (columns, keep), (name, value), *keep_empty)?,
         Step::Group { by, aggregates } => group(by, aggregates, prev, cols)?,
-        Step::Join { dataset, on, kind, columns, prefix } => {
-            let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
-            join(n, prev, cols, checks, (dataset, input), (on, *kind, columns.as_deref(), prefix.as_deref()))?
-        }
         Step::Sql { .. } => return Err(Error::Internal("a sql step is compiled on its own".into())),
-        Step::Append { dataset } => {
-            let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
-            append(prev, cols, dataset, input)?
-        }
     })
 }
 
-fn input_column<'a>(input: &'a [Column], name: &str) -> Result<&'a Column> {
-    input
+/// A join between two nodes, as a node asks for it.
+pub struct JoinSpec<'a> {
+    pub on: &'a [JoinKey],
+    pub kind: JoinKind,
+    /// The columns brought from the right; all but its keys when none.
+    pub columns: Option<&'a [String]>,
+    /// Put before each brought column's name.
+    pub prefix: Option<&'a str>,
+}
+
+impl JoinSpec<'_> {
+    /// The columns it names that a side does not have: `(right, name)`.
+    pub fn missing(&self, left: &Rel, right: &Rel) -> Vec<(bool, String)> {
+        let has = |r: &Rel, n: &str| r.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+        let mut out = Vec::new();
+        for k in self.on {
+            if !has(left, &k.left) {
+                out.push((false, k.left.clone()));
+            }
+            if !has(right, &k.right) {
+                out.push((true, k.right.clone()));
+            }
+        }
+        for c in self.columns.into_iter().flatten() {
+            if !has(right, c) {
+                out.push((true, c.clone()));
+            }
+        }
+        out
+    }
+}
+
+/// A join, compiled.
+pub struct Joined {
+    pub select: String,
+    pub out: Cols,
+    /// The right side repeating a key: refused at run time, since it
+    /// would multiply rows.
+    pub check: Check,
+    /// The condition between `l` and `r`, for counting what matched.
+    pub on: String,
+}
+
+fn column_of<'a>(rel: &'a Rel, name: &str) -> Result<&'a Column> {
+    rel.columns
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| Error::Internal(format!("'{name}' was resolved and is not there")))
 }
 
-/// Another dataset's columns beside these, by keys whose types meet;
-/// refused at run time when that side repeats a key.
-fn join(
-    n: usize,
-    prev: &str,
-    cols: &mut Cols,
-    checks: &mut Vec<Check>,
-    (id, input): (&str, &[Column]),
-    (on, kind, columns, prefix): (&[crate::recipe::JoinKey], crate::recipe::JoinKind, Option<&[String]>, Option<&str>),
-) -> Result<String> {
-    if on.is_empty() {
+/// The right side's columns beside the left's, by keys whose types meet:
+/// `left` keeps every row of the left (a look-up), `inner` only those
+/// that match. The right must be unique on its keys, so no row is
+/// multiplied. `right_label` names it in what is said.
+pub fn join(left: &Rel, right: &Rel, right_label: &str, spec: &JoinSpec<'_>) -> Result<Joined> {
+    if spec.on.is_empty() {
         return Err(Error::Invalid("a join names its keys: on".into()));
     }
-    let table = ident(&input_table(id));
+    let mut cols = Cols::of(left);
     let mut conds = Vec::new();
     let mut right_keys = Vec::new();
-    for k in on {
-        let l = &cols.columns[cols.find(&k.left).ok_or_else(|| Error::Internal(format!("'{}' was resolved and is not there", k.left)))?];
-        let r = input_column(input, &k.right)?;
+    for k in spec.on {
+        let l = column_of(left, &k.left)?;
+        let r = column_of(right, &k.right)?;
         let t = crate::schema::common(l.ty, r.ty).ok_or_else(|| {
             Error::Invalid(format!(
-                "its keys meet '{}' ({}) with '{}' of {id} ({}), which do not widen to one type",
+                "its keys meet '{}' ({}) with '{}' of {right_label} ({}), which do not widen to one type",
                 l.name, l.ty, r.name, r.ty
             ))
         })?;
@@ -643,57 +604,70 @@ fn join(
         right_keys.push(r.name.clone());
     }
     let keys: Vec<String> = right_keys.iter().map(|k| ident(k)).collect();
-    checks.push(Check {
-        step: n,
+    let check = Check {
         // A null key joins nothing, so two of them are no repeat.
         relation: format!(
             "(SELECT {k} FROM {table} WHERE {nn} GROUP BY {k} HAVING count(*) > 1)",
             k = keys.join(", "),
+            table = right.name,
             nn = keys.iter().map(|k| format!("{k} IS NOT NULL")).collect::<Vec<_>>().join(" AND ")
         ),
         column: right_keys[0].clone(),
         failing: "TRUE".into(),
-        says: format!("step {n} (join): dataset {id} is not unique on its keys, and {{n}} key value(s) repeat; it would multiply rows"),
-    });
-    let brought: Vec<&Column> = match columns {
-        Some(names) => names.iter().map(|c| input_column(input, c)).collect::<Result<_>>()?,
-        None => input.iter().filter(|c| !right_keys.iter().any(|k| k.eq_ignore_ascii_case(&c.name))).collect(),
+        says: format!("{right_label} is not unique on its keys, and {{n}} key value(s) repeat; joining it would multiply rows"),
+    };
+    let brought: Vec<(usize, &Column)> = match spec.columns {
+        Some(names) => names
+            .iter()
+            .map(|c| {
+                let i = right.columns.iter().position(|x| x.name.eq_ignore_ascii_case(c));
+                i.map(|i| (i, &right.columns[i])).ok_or_else(|| Error::Internal(format!("'{c}' was resolved and is not there")))
+            })
+            .collect::<Result<_>>()?,
+        None => right.columns.iter().enumerate().filter(|(_, c)| !right_keys.iter().any(|k| k.eq_ignore_ascii_case(&c.name))).collect(),
     };
     let mut select: Vec<String> = cols.columns.iter().map(|c| format!("l.{}", ident(&c.name))).collect();
-    for c in brought {
-        let name = format!("{}{}", prefix.unwrap_or(""), c.name);
-        check_name(&name, cols, &format!("it brings '{}' of {id} as", c.name))?;
+    for (i, c) in brought {
+        let name = format!("{}{}", spec.prefix.unwrap_or(""), c.name);
+        check_name(&name, &cols, &format!("it brings '{}' of {right_label} as", c.name))?;
         select.push(format!("r.{} AS {}", ident(&c.name), ident(&name)));
         cols.columns.push(Column { name, ..c.clone() });
-        cols.ancestry.push(vec![Origin { source: format!("dataset:{id}"), column: c.name.clone() }]);
+        cols.ancestry.push(right.ancestry.get(i).cloned().unwrap_or_default());
     }
-    let how = match kind {
-        crate::recipe::JoinKind::Left => "LEFT JOIN",
-        crate::recipe::JoinKind::Inner => "JOIN",
+    let how = match spec.kind {
+        JoinKind::Left => "LEFT JOIN",
+        JoinKind::Inner => "JOIN",
     };
-    Ok(format!(
-        "SELECT {} FROM (SELECT *, row_number() OVER () AS \"__position\" FROM {prev}) l {how} {table} r ON {} ORDER BY l.\"__position\"",
+    let on = conds.join(" AND ");
+    let select = format!(
+        "SELECT {} FROM (SELECT *, row_number() OVER () AS \"__position\" FROM {}) l {how} {} r ON {on} ORDER BY l.\"__position\"",
         select.join(", "),
-        conds.join(" AND ")
-    ))
+        left.name,
+        right.name,
+    );
+    Ok(Joined { select, out: cols, check, on })
 }
 
-/// Another dataset's rows after these: columns met by name, each at the
+/// The other side's rows after these: columns met by name, each at the
 /// type both widen to; a column only one side has is empty on the other.
-fn append(prev: &str, cols: &mut Cols, id: &str, input: &[Column]) -> Result<String> {
+pub fn append(prev: &Rel, other: &Rel, label: &str) -> Result<(String, Cols)> {
+    let mut cols = Cols::of(prev);
     let mut left = Vec::new();
     let mut right = Vec::new();
     for (i, c) in cols.columns.iter_mut().enumerate() {
         let x = ident(&c.name);
-        match input.iter().find(|r| r.name.eq_ignore_ascii_case(&c.name)) {
-            Some(r) => {
+        match other.columns.iter().position(|r| r.name.eq_ignore_ascii_case(&c.name)) {
+            Some(j) => {
+                let r = &other.columns[j];
                 let t = crate::schema::common(c.ty, r.ty).ok_or_else(|| {
-                    Error::Invalid(format!("column '{}' is {} here and {} in {id}, which do not widen to one type", c.name, c.ty, r.ty))
+                    Error::Invalid(format!("column '{}' is {} here and {} in {label}, which do not widen to one type", c.name, c.ty, r.ty))
                 })?;
                 left.push(format!("CAST({x} AS {}) AS {x}", t.sql()));
                 right.push(format!("CAST({} AS {}) AS {x}", ident(&r.name), t.sql()));
                 c.ty = t;
-                cols.ancestry[i].push(Origin { source: format!("dataset:{id}"), column: r.name.clone() });
+                cols.ancestry[i].extend(other.ancestry.get(j).cloned().unwrap_or_default());
+                cols.ancestry[i].sort();
+                cols.ancestry[i].dedup();
             }
             None => {
                 left.push(x.clone());
@@ -701,7 +675,7 @@ fn append(prev: &str, cols: &mut Cols, id: &str, input: &[Column]) -> Result<Str
             }
         }
     }
-    for r in input {
+    for (j, r) in other.columns.iter().enumerate() {
         if cols.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&r.name)) {
             continue;
         }
@@ -709,9 +683,9 @@ fn append(prev: &str, cols: &mut Cols, id: &str, input: &[Column]) -> Result<Str
         left.push(format!("CAST(NULL AS {}) AS {x}", r.ty.sql()));
         right.push(x);
         cols.columns.push(r.clone());
-        cols.ancestry.push(vec![Origin { source: format!("dataset:{id}"), column: r.name.clone() }]);
+        cols.ancestry.push(other.ancestry.get(j).cloned().unwrap_or_default());
     }
-    Ok(format!("SELECT {} FROM {prev} UNION ALL SELECT {} FROM {}", left.join(", "), right.join(", "), ident(&input_table(id))))
+    Ok((format!("SELECT {} FROM {} UNION ALL SELECT {} FROM {}", left.join(", "), prev.name, right.join(", "), other.name), cols))
 }
 
 /// The most columns an unpivot makes rows of.
@@ -820,7 +794,7 @@ pub(crate) fn remap_sql(c: &Column, values: &[Mapping]) -> Result<String> {
     Ok(format!("CASE {} ELSE {x} END", arms.join(" ")))
 }
 
-fn group(by: &[String], aggregates: &[crate::recipe::Aggregate], prev: &str, cols: &mut Cols) -> Result<String> {
+fn group(by: &[String], aggregates: &[crate::steps::Aggregate], prev: &str, cols: &mut Cols) -> Result<String> {
     if by.is_empty() && aggregates.is_empty() {
         return Err(Error::Invalid("it groups by nothing and aggregates nothing".into()));
     }
@@ -887,23 +861,24 @@ fn group(by: &[String], aggregates: &[crate::recipe::Aggregate], prev: &str, col
 mod tests {
     use super::*;
     use crate::engine::tests::engine;
-    use crate::recipe::{Aggregate, Mapping};
+    use crate::steps::{Aggregate, Mapping};
     use serde_json::json;
 
-    fn source() -> SourceState {
+    fn source() -> Rel {
         let c = |n: &str, ty: ColumnType, role: Role| Column { name: n.into(), ty, role };
-        SourceState {
-            id: "s1".into(),
-            kind: crate::source::Kind::Upload,
-            snapshot: 1,
-            query: None,
-            columns: vec![
-                c("region", ColumnType::Text, Role::Dimension),
-                c("store", ColumnType::Text, Role::Dimension),
-                c("amount", ColumnType::Decimal(2), Role::Measure),
-                c("day", ColumnType::Text, Role::Dimension),
-            ],
-        }
+        let columns = vec![
+            c("region", ColumnType::Text, Role::Dimension),
+            c("store", ColumnType::Text, Role::Dimension),
+            c("amount", ColumnType::Decimal(2), Role::Measure),
+            c("day", ColumnType::Text, Role::Dimension),
+        ];
+        let ancestry = columns.iter().map(|c| vec![Origin { source: "s1".into(), column: c.name.clone() }]).collect();
+        Rel { name: "s1".into(), columns, ancestry }
+    }
+
+    fn compile_steps(steps: &[Step]) -> Result<Chain> {
+        let no_engine: Describe<'_> = &|_, _| Ok(Err("no engine here".into()));
+        chain("n", &source(), steps, "2026-11-26T00:00:00.000Z", no_engine)
     }
 
     fn steps(v: serde_json::Value) -> Vec<Step> {
@@ -921,10 +896,11 @@ mod tests {
              ('NY', ' a ', 10.00::DECIMAL(38,2), '2026-01-31')) AS t(region, store, amount, day)",
         )
         .unwrap();
-        let c = compile_steps(&steps(v), &Default::default(), &[source()], "2026-11-26T00:00:00.000Z")?;
+        let c = compile_steps(&steps(v))?;
         assert!(c.unresolved.is_empty(), "{:?}", c.unresolved);
-        for (name, sql) in &c.views {
-            s.execute(&format!("CREATE VIEW {} AS {sql}", ident(name)))?;
+        for stage in &c.stages {
+            let StageSql::Select(sql) = &stage.sql else { panic!("no sql step here") };
+            s.execute(&format!("CREATE VIEW {} AS {sql}", ident(&stage.name)))?;
         }
         for check in &c.checks {
             let n = s.count(&format!("SELECT count(*) FROM {} WHERE {}", check.relation, check.failing))?;
@@ -932,10 +908,10 @@ mod tests {
                 return Err(Error::Unprocessable(format!("{n} values of {} do not convert", check.column)));
             }
         }
-        let list: Vec<String> = c.columns.iter().map(|c| format!("COALESCE(CAST({} AS VARCHAR), 'NULL')", ident(&c.name))).collect();
-        let sql = format!("SELECT {} FROM {}", list.join(" || '|' || "), c.last);
+        let list: Vec<String> = c.out.columns.iter().map(|c| format!("COALESCE(CAST({} AS VARCHAR), 'NULL')", ident(&c.name))).collect();
+        let sql = format!("SELECT {} FROM {}", list.join(" || '|' || "), c.out.name);
         let rows = s.texts(&sql)?.into_iter().map(|r| r.split('|').map(str::to_string).collect()).collect();
-        Ok((c.columns, rows))
+        Ok((c.out.columns, rows))
     }
 
     #[test]
@@ -993,18 +969,13 @@ mod tests {
 
     #[test]
     fn a_step_on_a_column_that_is_not_there_is_named_with_what_follows_from_it() {
-        let c = compile_steps(
-            &steps(json!([
-                { "op": "add_column", "column": "x", "formula": "upper(gone)" },
-                { "op": "remap_val", "column": "x", "values": [{ "from": "A", "to": "B" }] },
-                { "op": "remove_columns", "columns": ["store"] },
-                { "op": "trim_val", "columns": ["store"] },
-                { "op": "sort", "by": [{ "column": "region" }] },
-            ])),
-            &[("missing".to_string(), Role::Measure)].into_iter().collect(),
-            &[source()],
-            "2026-11-26T00:00:00.000Z",
-        )
+        let c = compile_steps(&steps(json!([
+            { "op": "add_column", "column": "x", "formula": "upper(gone)" },
+            { "op": "remap_val", "column": "x", "values": [{ "from": "A", "to": "B" }] },
+            { "op": "remove_columns", "columns": ["store"] },
+            { "op": "trim_val", "columns": ["store"] },
+            { "op": "sort", "by": [{ "column": "region" }] },
+        ])))
         .unwrap();
         let said: Vec<String> = c.unresolved.iter().map(Unresolved::describe).collect();
         assert_eq!(
@@ -1013,10 +984,10 @@ mod tests {
                 "step 1 (add_column) reads column 'gone', which is not there at that step",
                 "step 2 (remap_val) reads column 'x', which is not there at that step",
                 "step 4 (trim_val) reads column 'store', which is not there at that step",
-                "the role given to column 'missing'",
             ]
         );
-        assert_eq!(c.views.len(), 2, "the steps that resolve still compile");
+        assert_eq!(c.stages.len(), 2, "the steps that resolve still compile");
+        assert_eq!(c.stages[1].name, "n_t5", "each stage is named by its node and step");
     }
 
     #[test]
@@ -1030,7 +1001,7 @@ mod tests {
             (json!([{ "op": "add_column", "column": "", "formula": "1" }]), "not a column name"),
             (json!([{ "op": "find_and_replace_val", "column": "store", "find": "", "with": "x" }]), "finds nothing"),
         ] {
-            let e = compile_steps(&steps(v.clone()), &Default::default(), &[source()], "2026-11-26T00:00:00.000Z").err();
+            let e = compile_steps(&steps(v.clone())).err();
             let e = e.unwrap_or_else(|| panic!("{v} compiled"));
             assert!(e.to_string().contains(says), "{v}: {e}");
             assert!(e.to_string().starts_with("step 1 ("), "{e}");
@@ -1041,17 +1012,12 @@ mod tests {
 
     #[test]
     fn ancestry_follows_formulas_and_groups() {
-        let c = compile_steps(
-            &steps(json!([
-                { "op": "add_column", "column": "label", "formula": "region & store" },
-                { "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] },
-            ])),
-            &Default::default(),
-            &[source()],
-            "2026-11-26T00:00:00.000Z",
-        )
+        let c = compile_steps(&steps(json!([
+            { "op": "add_column", "column": "label", "formula": "region & store" },
+            { "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] },
+        ])))
         .unwrap();
-        let from = |i: usize| c.ancestry[i].iter().map(|o| o.column.as_str()).collect::<Vec<_>>();
+        let from = |i: usize| c.out.ancestry[i].iter().map(|o| o.column.as_str()).collect::<Vec<_>>();
         assert_eq!(from(0), ["region", "store"]);
         assert_eq!(from(1), ["amount"]);
         let _ = Aggregate { column: None, func: AggregateFn::Count, name: "n".into() };

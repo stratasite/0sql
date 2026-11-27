@@ -259,22 +259,9 @@ pub(crate) async fn sql_exec(
     answer(&app, record, None, page, wants_arrow(&headers)).await
 }
 
-/// A spec run fresh, never answered from the cache: what a dataset's
-/// semantic source is refreshed by.
-pub(crate) fn submit_fresh(
-    app: &Shared,
-    (org, uid, branch): (&str, &str, &str),
-    spec: Option<Value>,
-    expr: Option<String>,
-    context: Option<SecurityContext>,
-    connection: Map<String, Value>,
-    wait: Option<f64>,
-) -> Result<(Record, Duration), ApiError> {
-    submit_spec(app, (org, uid, branch), (spec, expr), context, connection, wait, true).map(|(r, _, w)| (r, w))
-}
-
 /// A spec run as `/run` runs it: answered from a kept result unless
-/// `fresh`. What a blend's model part is run by.
+/// `fresh`. What a blend's model part is run by, and a query source's
+/// pull: fresh for a run, joined to a kept run for a preview.
 pub(crate) fn submit_spec(
     app: &Shared,
     (org, uid, branch): (&str, &str, &str),

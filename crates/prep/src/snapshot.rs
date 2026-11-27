@@ -25,15 +25,85 @@ const EXAMPLES: usize = 3;
 /// `established` (none for a new source).
 pub(crate) fn from_csv(session: &Session, bytes: &[u8], options: &CsvOptions, established: &[Column], max_rows: usize) -> Result<Taken> {
     let mut parsed = parse_csv(bytes, options, max_rows)?;
-    let fields: Vec<Field> = parsed.columns.iter().map(|(n, _)| Field::new(n, DataType::Utf8, true)).collect();
-    let arrays: Vec<ArrayRef> =
-        std::mem::take(&mut parsed.values).into_iter().map(|v| Arc::new(StringArray::from(v)) as ArrayRef).collect();
+    let values = std::mem::take(&mut parsed.values);
+    let mut taken = from_texts(session, &parsed.columns, values, established)?;
+    taken.parse = Some(parsed.parse);
+    Ok(taken)
+}
+
+/// Columns of text, each read as the type it was inferred as, then met
+/// with the source's types as an upload's are.
+pub(crate) fn from_texts(
+    session: &Session,
+    columns: &[(String, ColumnType)],
+    values: Vec<Vec<Option<String>>>,
+    established: &[Column],
+) -> Result<Taken> {
+    let fields: Vec<Field> = columns.iter().map(|(n, _)| Field::new(n, DataType::Utf8, true)).collect();
+    let arrays: Vec<ArrayRef> = values.into_iter().map(|v| Arc::new(StringArray::from(v)) as ArrayRef).collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-    let raw: Vec<(String, ColumnType)> = parsed.columns.iter().map(|(n, _)| (n.clone(), ColumnType::Text)).collect();
+    let raw: Vec<(String, ColumnType)> = columns.iter().map(|(n, _)| (n.clone(), ColumnType::Text)).collect();
     session.load("raw", &raw, &[batch])?;
-    let (exprs, columns, changes) = meet_established(session, "raw", &parsed.columns, established)?;
-    let rows = session.query(&format!("SELECT {} FROM raw", exprs.join(", ")))?;
-    Ok(Taken { rows, columns, parse: Some(parsed.parse), changes })
+    let (exprs, columns, changes) = meet_established(session, "raw", columns, established)?;
+    let list = if exprs.is_empty() { "NULL AS \"_\"".to_string() } else { exprs.join(", ") };
+    let rows = session.query(&format!("SELECT {list} FROM raw"))?;
+    Ok(Taken { rows, columns, parse: None, changes })
+}
+
+/// Rows an application or an agent posted, each an object of column
+/// to value, as columns of text and the types they are inferred as. A
+/// column is every name any row has, in the order first seen; a value
+/// that is not a scalar is kept as its JSON.
+pub(crate) fn pushed(
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    max_rows: usize,
+) -> Result<(Vec<(String, ColumnType)>, Vec<Vec<Option<String>>>)> {
+    use crate::source::{COLUMN_LIMIT, FIELD_LIMIT};
+    if rows.len() > max_rows {
+        return Err(Error::Unprocessable(format!("{} rows were pushed, more than the {max_rows} a dataset holds", rows.len())));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for r in rows {
+        for k in r.keys() {
+            if !names.iter().any(|n| n == k) {
+                if names.iter().any(|n| n.eq_ignore_ascii_case(k)) {
+                    return Err(Error::Unprocessable(format!("two columns are named '{k}', but for case")));
+                }
+                if k.trim().is_empty() {
+                    return Err(Error::Unprocessable("a pushed row has a column with no name".into()));
+                }
+                names.push(k.clone());
+            }
+        }
+        if names.len() > COLUMN_LIMIT {
+            return Err(Error::Unprocessable(format!("the rows have more than {COLUMN_LIMIT} columns")));
+        }
+    }
+    let mut values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); names.len()];
+    for r in rows {
+        for (i, n) in names.iter().enumerate() {
+            let v = match r.get(n) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+                Some(serde_json::Value::Number(x)) => Some(x.to_string()),
+                Some(other) => Some(other.to_string()),
+            };
+            if v.as_ref().is_some_and(|t| t.len() > FIELD_LIMIT) {
+                return Err(Error::Unprocessable(format!("a value of '{n}' is more than {} KB", FIELD_LIMIT >> 10)));
+            }
+            values[i].push(v);
+        }
+    }
+    let columns = names
+        .into_iter()
+        .zip(&values)
+        .map(|(n, v)| {
+            let t = crate::source::infer(v.iter().flatten().map(String::as_str));
+            (n, t)
+        })
+        .collect();
+    Ok((columns, values))
 }
 
 /// Rows a run returned, as a snapshot. Each column is cast to the type

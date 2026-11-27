@@ -1,12 +1,13 @@
-//! The `sql` step: a query the user or a client wrote, run as a black
-//! box over the step before it.
+//! The `sql` step and the `sql` node: a query the user or a client
+//! wrote, run as a black box over what it is given.
 //!
-//! - **It sees one table, `input`:** the rows of the step before, copied
-//!   into a session of its own. The source, the other steps' views and
-//!   the datasets other steps read are not there, so it cannot skip the
-//!   recipe or lean on names that are this crate's own.
+//! - **It sees only its inputs:** a `sql` step one table, `input`, the
+//!   rows of the step before; a `sql` node each of its inputs, by the
+//!   alias the node gives it. They are copied into a session of their
+//!   own, so nothing else of the run is there, and nothing it reads
+//!   leans on names that are this crate's own.
 //! - **It is one query, checked by DuckDB's own parser** before it runs:
-//!   one `SELECT`, reading `input` and the tables its own `WITH` makes,
+//!   one `SELECT`, reading its inputs and the tables its own `WITH` makes,
 //!   and no other table, catalog or table function but `range`,
 //!   `generate_series` and `unnest`. The parse is what is checked, not
 //!   the text, so no quoting hides a call.
@@ -65,15 +66,41 @@ const CLOSED_PREFIXES: [&str; 4] = ["duckdb_", "pragma_", "pg_", "read_"];
 /// their arguments.
 const TABLE_FUNCTIONS: [&str; 3] = ["range", "generate_series", "unnest"];
 
-/// A `sql` step, compiled: where it reads from, and what it makes.
+/// A `sql` step or node, compiled: what it reads, and what it makes.
 #[derive(Clone, Debug)]
 pub struct SqlStage {
-    pub step: usize,
-    /// The relation in the run's session it reads, as `input`.
-    pub input: String,
-    pub input_columns: Vec<(String, ColumnType)>,
+    /// How a failure names it: `step 3 (sql)`, `node q`.
+    pub label: String,
+    pub inputs: Vec<SqlInput>,
     pub query: String,
     pub columns: Vec<(String, ColumnType)>,
+}
+
+/// One table a query reads: its alias there, and the relation of the
+/// run's session copied in as it.
+#[derive(Clone, Debug)]
+pub struct SqlInput {
+    pub alias: String,
+    pub relation: String,
+    pub columns: Vec<(String, ColumnType)>,
+}
+
+/// The longest alias a `sql` node gives an input.
+const ALIAS_LIMIT: usize = 64;
+
+/// Refused unless an alias is a plain name a query can write bare: a
+/// letter, then letters, digits and `_`.
+pub fn check_alias(alias: &str) -> Result<()> {
+    let mut chars = alias.chars();
+    let plain = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && alias.len() <= ALIAS_LIMIT;
+    if !plain {
+        return Err(Error::Invalid(format!(
+            "'{alias}' is not an alias a query reads: a letter, then letters, digits and _, at most {ALIAS_LIMIT}"
+        )));
+    }
+    Ok(())
 }
 
 /// The query as it is run: with any trailing `;` gone, and not too long.
@@ -93,18 +120,28 @@ pub fn checked(query: &str) -> Result<String> {
 }
 
 /// The query as DuckDB parses it, checked: one `SELECT`, reading only
-/// `input` and its own `WITH` tables, calling nothing on the closed lists.
-fn vet(session: &Session, query: &str) -> Result<std::result::Result<(), String>> {
+/// `tables` and its own `WITH` tables, calling nothing on the closed
+/// lists.
+fn vet(session: &Session, query: &str, tables: &[String]) -> Result<std::result::Result<(), String>> {
     let parsed = session.text_of("SELECT json_serialize_sql(?)", query)?;
     let tree: serde_json::Value = serde_json::from_str(&parsed).map_err(|e| Error::Internal(format!("the engine's parse: {e}")))?;
     if tree["error"].as_bool() == Some(true) {
         let m = tree["error_message"].as_str().unwrap_or("it does not parse");
-        return Ok(Err(if m.contains("Only SELECT") { "a sql step is one query, a SELECT".into() } else { plain(m) }));
+        return Ok(Err(if m.contains("Only SELECT") { "a query here is one query, a SELECT".into() } else { plain(m) }));
     }
     if tree["statements"].as_array().map_or(0, Vec::len) != 1 {
-        return Ok(Err("a sql step is one query, a SELECT".into()));
+        return Ok(Err("a query here is one query, a SELECT".into()));
     }
-    Ok(walk(&tree, &[]))
+    let tables: Vec<String> = tables.iter().map(|t| t.to_lowercase()).collect();
+    Ok(walk(&tree, &[], &tables))
+}
+
+/// The tables a query reads, as it is told.
+fn listed(tables: &[String]) -> String {
+    match tables {
+        [one] => one.clone(),
+        _ => tables.join(", "),
+    }
 }
 
 /// The names a node's own `WITH` makes. They are seen in that node and
@@ -117,7 +154,7 @@ fn ctes_of(o: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), String> {
+fn walk(v: &serde_json::Value, outer: &[String], tables: &[String]) -> std::result::Result<(), String> {
     match v {
         serde_json::Value::Object(o) => {
             let own = ctes_of(o);
@@ -132,20 +169,21 @@ fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), Stri
             match (text("type").as_str(), text("class").as_str()) {
                 ("base_table", _) => {
                     let (table, schema, catalog) = (text("table_name"), text("schema_name"), text("catalog_name"));
-                    if !schema.is_empty() || !catalog.is_empty() || !(table == "input" || ctes.contains(&table)) {
+                    if !schema.is_empty() || !catalog.is_empty() || !(tables.contains(&table) || ctes.contains(&table)) {
                         let shown = [catalog, schema, table].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(".");
-                        return Err(format!("it reads {shown}; a sql step reads input, and the tables its own WITH makes"));
+                        return Err(format!("it reads {shown}; it reads {}, and the tables its own WITH makes", listed(tables)));
                     }
                 }
                 ("table_function", _) => {
                     let f = o.get("function").and_then(|f| f["function_name"].as_str()).unwrap_or("").to_lowercase();
                     if !TABLE_FUNCTIONS.contains(&f.as_str()) {
                         return Err(format!(
-                            "{f}() is not a table a sql step reads; it reads input, and range(), generate_series() and unnest()"
+                            "{f}() is not a table a query here reads; it reads {}, and range(), generate_series() and unnest()",
+                            listed(tables)
                         ));
                     }
                 }
-                ("show_ref", _) => return Err("a sql step is one query, a SELECT".into()),
+                ("show_ref", _) => return Err("a query here is one query, a SELECT".into()),
                 // `current_date` and its kind are written without parentheses.
                 (_, "column_ref") => {
                     if let Some([only]) = o.get("column_names").and_then(|c| c.as_array()).map(Vec::as_slice) {
@@ -162,15 +200,15 @@ fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), Stri
             if let Some(f) = o.get("function_name").and_then(|f| f.as_str()) {
                 if !text("schema").is_empty() || !text("catalog").is_empty() {
                     return Err(format!(
-                        "{}() is named with a schema; a sql step calls DuckDB's functions by their names",
+                        "{}() is named with a schema; a query here calls DuckDB's functions by their names",
                         f.to_lowercase()
                     ));
                 }
                 closed(&f.to_lowercase())?;
             }
-            o.values().try_for_each(|x| walk(x, ctes))
+            o.values().try_for_each(|x| walk(x, ctes, tables))
         }
-        serde_json::Value::Array(a) => a.iter().try_for_each(|x| walk(x, outer)),
+        serde_json::Value::Array(a) => a.iter().try_for_each(|x| walk(x, outer, tables)),
         _ => Ok(()),
     }
 }
@@ -179,11 +217,11 @@ fn walk(v: &serde_json::Value, outer: &[String]) -> std::result::Result<(), Stri
 fn closed(f: &str) -> std::result::Result<(), String> {
     if UNSTABLE.contains(&f) {
         return Err(format!(
-            "{f} is not the same on every run, and a recipe runs again on every new file; use a column of the data, or a formula step's today()"
+            "{f} is not the same on every run, and a pipeline runs again on every new file; use a column of the data, or a formula step's today()"
         ));
     }
     if CLOSED.contains(&f) || CLOSED_PREFIXES.iter().any(|p| f.starts_with(p)) {
-        return Err(format!("{f}() reads the engine or runs other SQL, which a sql step does not; it reads input"));
+        return Err(format!("{f}() reads the engine or runs other SQL, which a query here does not; it reads only its inputs"));
     }
     Ok(())
 }
@@ -201,18 +239,22 @@ fn wrapped(query: &str) -> String {
     format!("({query}\n) AS \"__q\"")
 }
 
-/// What a query makes over `input` with these columns, learned by running
-/// it with no rows. `Ok(Err(..))` is the engine's refusal, in its words.
+/// What a query makes over its inputs, each by its alias with these
+/// columns, learned by running it with no rows. `Ok(Err(..))` is the
+/// engine's refusal, in its words.
 pub fn describe(
     engine: &Engine,
-    input: &[(String, ColumnType)],
+    inputs: &[(String, Vec<(String, ColumnType)>)],
     query: &str,
 ) -> Result<std::result::Result<Vec<(String, ColumnType)>, String>> {
     let session = engine.session()?;
-    if let Err(refusal) = vet(&session, query)? {
+    let tables: Vec<String> = inputs.iter().map(|(a, _)| a.clone()).collect();
+    if let Err(refusal) = vet(&session, query, &tables)? {
         return Ok(Err(refusal));
     }
-    session.load("input", input, &[])?;
+    for (alias, columns) in inputs {
+        session.load(alias, columns, &[])?;
+    }
     let rows = match session.query_within(&format!("SELECT * FROM {} LIMIT 0", wrapped(query)), Duration::from_secs(10)) {
         Ok(rows) => rows,
         Err(e) => return Ok(Err(plain(&e))),
@@ -264,17 +306,20 @@ pub fn missing_column(message: &str) -> Option<String> {
     Some(rest[..rest.find('"')?].to_string())
 }
 
-/// Runs a `sql` step: its input copied into a session of its own as
-/// `input`, the query run there, and what it makes loaded back as `name`.
+/// Runs a `sql` step or node: its inputs copied into a session of its
+/// own, each as its alias, the query run there, and what it makes
+/// loaded back as `name`.
 pub fn run(engine: &Engine, session: &Session, name: &str, stage: &SqlStage) -> Result<()> {
-    let rows = session.query(&format!("SELECT * FROM {}", stage.input))?;
     // No more time than the job has left.
     let own = engine.session_until(session.deadline())?;
-    own.load("input", &stage.input_columns, &rows.batches)?;
+    for i in &stage.inputs {
+        let rows = session.query(&format!("SELECT * FROM {}", i.relation))?;
+        own.load(&i.alias, &i.columns, &rows.batches)?;
+    }
     let list: Vec<String> = stage.columns.iter().map(|(c, t)| format!("CAST(\"__q\".{x} AS {}) AS {x}", t.sql(), x = ident(c))).collect();
     let made = own
         .query_within(&format!("SELECT {} FROM {}", list.join(", "), wrapped(&stage.query)), TIME_LIMIT)
-        .map_err(|e| Error::Unprocessable(format!("step {} (sql): {}", stage.step, plain(&e))))?;
+        .map_err(|e| Error::Unprocessable(format!("{}: {}", stage.label, plain(&e))))?;
     session.load(name, &stage.columns, &made.batches)
 }
 
@@ -284,7 +329,7 @@ mod tests {
 
     fn vetted(q: &str) -> std::result::Result<(), String> {
         let s = crate::engine::tests::engine().session().unwrap();
-        vet(&s, &checked(q).map_err(|e| e.to_string())?).unwrap()
+        vet(&s, &checked(q).map_err(|e| e.to_string())?, &["input".into()]).unwrap()
     }
 
     #[test]
@@ -314,7 +359,7 @@ mod tests {
             ("SELECT $$'$$ AS x, now() AS t, '$$' AS y FROM input", "now is not the same"),
             ("SELECT E'\\'' AS x, now() AS t, '' AS y FROM input", "now is not the same"),
             ("SELECT * FROM query('SELECT now()')", "query() is not a table"),
-            ("SELECT * FROM s1", "it reads s1"),
+            ("SELECT * FROM s1", "it reads s1; it reads input"),
             ("SELECT * FROM pg_catalog.pg_class", "it reads pg_catalog.pg_class"),
             ("SELECT * FROM information_schema.tables", "it reads information_schema.tables"),
             ("SELECT * FROM main.input", "it reads main.input"),
@@ -332,6 +377,19 @@ mod tests {
         ] {
             let got = vetted(q);
             assert!(got.as_ref().err().is_some_and(|e| e.contains(says)), "{q}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_reads_its_aliases_and_nothing_else() {
+        let s = crate::engine::tests::engine().session().unwrap();
+        let tables = ["sales".to_string(), "stores".to_string()];
+        assert_eq!(vet(&s, "SELECT * FROM sales JOIN stores USING (id)", &tables).unwrap(), Ok(()));
+        let got = vet(&s, "SELECT * FROM input", &tables).unwrap();
+        assert!(got.as_ref().err().is_some_and(|e| e.contains("it reads sales, stores")), "{got:?}");
+        assert!(check_alias("sales_2").is_ok());
+        for bad in ["2x", "a-b", "", "a b"] {
+            assert!(check_alias(bad).is_err(), "{bad}");
         }
     }
 

@@ -1,8 +1,8 @@
-//! A dataset's life, through the facade the server calls.
+//! Sources, datasets and runs, through the facade the server calls.
 
 use super::*;
 use crate::schema::ColumnType::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 struct Dir(PathBuf);
 
@@ -15,11 +15,14 @@ impl Drop for Dir {
 fn prep() -> (Dir, Prep) {
     let dir = std::env::temp_dir().join(format!("zsql-prep-tests-{}-{}", std::process::id(), time::nanos()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut settings = Settings::defaults(&dir);
+    (Dir(dir.clone()), reopen(&dir))
+}
+
+fn reopen(dir: &Path) -> Prep {
+    let mut settings = Settings::defaults(dir);
     settings.engine.memory = "256MB".into();
     settings.engine.threads = 1;
-    let prep = Prep::open(&dir, settings).unwrap();
-    (Dir(dir), prep)
+    Prep::open(dir, settings).unwrap()
 }
 
 fn scope() -> Scope {
@@ -31,216 +34,315 @@ fn csv(text: &str) -> Upload<'_> {
 }
 
 const BUDGET: &str = "region,month,amount\nEMEA,2026-01-01,100\nAPAC,2026-01-01,80\n";
+const SALES: &str = "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n";
+
+/// The fingerprint of a context, as the server makes it.
+const ANN: &str = "context-of-ann";
 
 fn json_rows(page: &Page) -> Vec<Value> {
     zsql_exec::json::rows(&page.rows).unwrap()
 }
 
+fn rows_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Value> {
+    json_rows(&prep.page(scope, id, None, 0, 100, &View::default()).unwrap())
+}
+
+/// An upload source, and a dataset over it as it is.
+fn upload(prep: &Prep, scope: &Scope, text: &str) -> (Source, Dataset) {
+    let (s, _) = prep.create_upload(scope, Named::default(), csv(text)).unwrap();
+    let d = prep.create_dataset(scope, Named::default(), Some(&s.id)).unwrap();
+    (s, d)
+}
+
+fn source(prep: &Prep, scope: &Scope, text: &str) -> String {
+    prep.create_upload(scope, Named::default(), csv(text)).unwrap().0.id
+}
+
+fn graph(v: Value) -> Graph {
+    serde_json::from_value(json!({ "nodes": v })).unwrap()
+}
+
+/// A source, its steps, and the output.
+fn steps_graph(src: &str, steps: Value) -> Graph {
+    graph(json!([
+        { "id": "in", "kind": "source", "source": src },
+        { "id": "shape", "kind": "steps", "input": "in", "steps": steps },
+        { "id": "out", "kind": "output", "input": "shape" },
+    ]))
+}
+
+static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn run_id() -> String {
+    format!("run-{}", RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A run of `g` into dataset `ds`, its pulls none; refused before it
+/// starts, the words of the refusal.
+fn run(prep: &Prep, scope: &Scope, ds: &str, g: Graph) -> std::result::Result<RunRecord, String> {
+    let request = RunRequest { id: run_id(), dataset: ds.into(), graph: g };
+    match prep.begin(scope, request, ANN).map_err(|e| e.to_string())? {
+        Begun::Started(t) => {
+            assert!(t.pulls.is_empty(), "a run here pulls nothing: {:?}", t.pulls);
+            Ok(prep.execute(*t))
+        }
+        Begun::Answered(r) => Ok(*r),
+    }
+}
+
+/// A run that succeeds.
+fn ran(prep: &Prep, scope: &Scope, ds: &str, g: Graph) -> RunRecord {
+    let r = run(prep, scope, ds, g).unwrap();
+    assert_eq!(r.state, RunState::Succeeded, "{}", r.summary);
+    r
+}
+
+/// A new dataset of `text` shaped by `steps`: its id, or the words of
+/// why the run did not make it.
+fn shaped(prep: &Prep, scope: &Scope, text: &str, steps: Value) -> std::result::Result<(String, RunRecord), String> {
+    let src = source(prep, scope, text);
+    let d = prep.create_dataset(scope, Named::default(), None).unwrap();
+    let r = run(prep, scope, &d.id, steps_graph(&src, steps))?;
+    if r.state != RunState::Succeeded {
+        return Err(r.summary);
+    }
+    Ok((d.id, r))
+}
+
+/// The output's columns.
+fn columns_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Column> {
+    prep.get(scope, id).unwrap().columns
+}
+
+/// What a preview of steps over a source says is wrong, in words.
+fn refused(prep: &Prep, scope: &Scope, src: &str, steps: Value) -> String {
+    let p = prep
+        .preview(scope, &PreviewRequest { graph: steps_graph(src, steps), node: None, whole: false, limit: None }, ANN, &HashMap::new())
+        .unwrap();
+    p.problems.iter().map(Problem::said).collect::<Vec<_>>().join("; ")
+}
+
+fn shown(row: &Value) -> Vec<String> {
+    row.as_array().unwrap().iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect()
+}
+
+// ------------------------------------------------- sources and datasets
+
 #[test]
-fn an_upload_becomes_a_dataset_with_a_live_version() {
+fn an_upload_is_a_source_and_a_dataset_over_it_copies_nothing() {
     let (dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    assert!(is_id(&d.id));
-    assert_eq!(d.name, "budget");
-    assert_eq!((d.recipe, d.live, d.rows), (1, Some(1), 2));
+    let (s, d) = upload(&prep, &ann, BUDGET);
+    assert!(is_source_id(&s.id) && is_id(&d.id));
+    assert_eq!((s.name.as_str(), s.kind, s.snapshot), ("budget", Kind::Upload, 1));
+    assert_eq!((d.name.as_str(), d.live, d.rows), ("budget", Some(1), 2));
     let types: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
     assert_eq!(types, [("region", Text, Role::Dimension), ("month", Date, Role::Dimension), ("amount", Integer, Role::Measure)]);
 
-    let base = dir.0.join("default/shop").join(DIR).join(&d.id);
-    for f in [
-        "dataset.json",
-        "recipe/r1.json",
-        "sources/s1/1.arrow",
-        "sources/s1/1.json",
-        "v1/rows.arrow",
-        "v1/manifest.json",
-        "v1/lineage.json",
-    ] {
-        assert!(base.join(f).exists(), "{f}");
+    let root = dir.0.join("default/shop").join(DIR);
+    for f in
+        [format!(".sources/{}/source.json", s.id), format!(".sources/{}/snapshots/1/rows.arrow", s.id), format!("{}/dataset.json", d.id)]
+    {
+        assert!(root.join(&f).exists(), "{f}");
     }
+    assert!(root.join(&d.id).join("v1/manifest.json").exists());
+    assert!(!root.join(&d.id).join("v1/rows.arrow").exists(), "the output is the snapshot: no rows are copied");
     let page = prep.page(&ann, &d.id, None, 0, 10, &View::default()).unwrap();
-    assert_eq!(page.total, 2);
-    assert_eq!(json_rows(&page)[0], serde_json::json!(["EMEA", "2026-01-01", 100]));
-    let page = prep.page(&ann, &d.id, None, 1, 10, &View::default()).unwrap();
-    assert_eq!(json_rows(&page).len(), 1);
+    assert_eq!((page.total, json_rows(&page)[0].clone()), (2, json!(["EMEA", "2026-01-01", 100])));
+    assert_eq!(json_rows(&prep.page(&ann, &d.id, None, 1, 10, &View::default()).unwrap()).len(), 1);
 
     let lineage = prep.lineage(&ann, &d.id, None).unwrap();
-    assert_eq!((lineage.version, lineage.recipe), (1, 1));
+    assert_eq!((lineage.sources[0].source.as_str(), lineage.sources[0].snapshot), (s.id.as_str(), 1));
     assert_eq!(lineage.sources[0].file_name.as_deref(), Some("budget.csv"));
-    assert_eq!(lineage.sources[0].sha256.len(), 64);
     assert_eq!(lineage.columns[2].from[0].column, "amount");
-    assert!(lineage.made_by.duckdb.starts_with('v'));
+    let v = prep.version(&ann, &d.id, None).unwrap();
+    assert_eq!(v.graph.unwrap().nodes.len(), 2, "the graph it is: a source and the output");
+    assert_eq!(prep.sources(&ann).len(), 1);
+    assert_eq!(prep.list(&ann).len(), 1);
 }
 
 #[test]
-fn a_dataset_is_its_projects() {
+fn a_dataset_and_a_source_are_their_projects() {
     let (_dir, prep) = prep();
-    let d = prep.create(&scope(), None, csv(BUDGET)).unwrap();
-    assert_eq!(prep.list(&scope()).len(), 1);
-    // Another project, or another org, is another place.
+    let (s, d) = upload(&prep, &scope(), BUDGET);
     let elsewhere = Scope { project: "other".into(), ..scope() };
     assert!(matches!(prep.get(&elsewhere, &d.id), Err(Error::NotFound(_))));
-    assert!(prep.list(&elsewhere).is_empty());
+    assert!(matches!(prep.source(&elsewhere, &s.id), Err(Error::NotFound(_))));
+    assert!(prep.list(&elsewhere).is_empty() && prep.sources(&elsewhere).is_empty());
     let other_org = Scope { org: "acme".into(), ..scope() };
     assert!(matches!(prep.get(&other_org, &d.id), Err(Error::NotFound(_))));
     // An id is checked before it names a directory.
     assert!(matches!(prep.get(&scope(), "../../etc"), Err(Error::NotFound(_))));
+    assert!(matches!(prep.source(&scope(), "src_../x"), Err(Error::NotFound(_))));
+    assert!(matches!(prep.run(&scope(), "../x"), Err(Error::NotFound(_))));
 }
 
 #[test]
-fn a_replacement_is_a_new_snapshot_and_a_new_version() {
+fn a_new_snapshot_runs_nothing_until_a_run_reads_it() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    let d = prep.replace(&ann, &d.id, csv("region,month,amount,owner\nEMEA,2026-01-01,100.5,kim\n")).unwrap();
-    assert_eq!((d.live, d.sources[0].snapshot, d.rows), (Some(2), 2, 1));
-    assert_eq!(d.columns[2].ty, Decimal(1));
-    assert!(d.notes.iter().any(|n| n.contains("widened")), "{:?}", d.notes);
-    assert!(d.notes.iter().any(|n| n.contains("'owner' is new")));
+    let (s, d) = upload(&prep, &ann, BUDGET);
+    let (s2, snap) = prep.add_upload(&ann, &s.id, csv("region,month,amount,owner\nEMEA,2026-01-01,100.5,kim\n")).unwrap();
+    assert_eq!((s2.snapshot, snap.number), (2, 2));
+    assert!(snap.changes.iter().any(|n| n.contains("widened")), "{:?}", snap.changes);
+    assert!(snap.changes.iter().any(|n| n.contains("'owner' is new")));
+    assert_eq!(prep.get(&ann, &d.id).unwrap().live, Some(1), "nothing ran");
+    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 2);
+    // The application runs it: the newest snapshot, as it is.
+    let r = ran(&prep, &ann, &d.id, prep.version(&ann, &d.id, None).unwrap().graph.unwrap());
+    assert_eq!(r.version, Some(2));
+    let d = prep.get(&ann, &d.id).unwrap();
+    assert_eq!((d.live, d.rows, d.columns[2].ty), (Some(2), 1, Decimal(1)));
+    assert_eq!(prep.lineage(&ann, &d.id, None).unwrap().sources[0].snapshot, 2);
     // Every version is still there.
     assert_eq!(prep.page(&ann, &d.id, Some(1), 0, 10, &View::default()).unwrap().total, 2);
-    assert_eq!(prep.lineage(&ann, &d.id, Some(2)).unwrap().sources[0].snapshot, 2);
-
-    // A snapshot whose values will not convert changes nothing.
-    let e = prep.replace(&ann, &d.id, csv("region,month,amount\nEMEA,soon,1\n")).err().unwrap();
+    // A snapshot whose values will not convert is refused, and changes nothing.
+    let e = prep.add_upload(&ann, &s.id, csv("region,month,amount\nEMEA,soon,1\n")).err().unwrap();
     assert!(matches!(e, Error::Unprocessable(_)) && e.to_string().contains("'month' is date"), "{e}");
-    let after = prep.get(&ann, &d.id).unwrap();
-    assert_eq!((after.live, after.sources[0].snapshot), (Some(2), 2));
+    assert_eq!(prep.source(&ann, &s.id).unwrap().snapshot, 2);
+    // A source takes only its kind of snapshot.
+    assert!(prep.add_push(&ann, &s.id, Pushed { rows: vec![], origin: None }).is_err());
 }
 
 #[test]
-fn roles_change_through_a_recipe_version_made_against_the_latest() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    let mut roles = std::collections::BTreeMap::new();
-    roles.insert("amount".to_string(), Role::Dimension);
-    let d2 = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: roles.clone(), steps: vec![] }).unwrap();
-    assert_eq!((d2.recipe, d2.live), (2, Some(2)));
-    assert_eq!(d2.columns[2].role, Role::Dimension);
-    let stale = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: roles.clone(), steps: vec![] });
-    assert!(matches!(stale, Err(Error::Conflict(_))));
-    roles.insert("nope".to_string(), Role::Measure);
-    assert!(matches!(prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles, steps: vec![] }), Err(Error::Invalid(_))));
-    // Undo is the old version, which is kept.
-    assert!(prep.recipe(&ann, &d.id, Some(1)).unwrap().roles.is_empty());
-    // A new snapshot keeps the user's role.
-    let d3 = prep.replace(&ann, &d.id, csv(BUDGET)).unwrap();
-    assert_eq!(d3.columns[2].role, Role::Dimension);
-}
-
-#[test]
-fn the_caps_hold_at_import_and_after() {
+fn the_caps_hold_and_a_failure_leaves_nothing() {
     let (dir, _) = prep();
     let mut settings = Settings::defaults(&dir.0);
     settings.max_rows = 1;
     let prep = Prep::open(&dir.0, settings).unwrap();
-    let e = prep.create(&scope(), None, csv(BUDGET)).err().unwrap();
+    let e = prep.create_upload(&scope(), Named::default(), csv(BUDGET)).err().unwrap();
     assert!(e.to_string().contains("more than 1 rows"), "{e}");
     let mut settings = Settings::defaults(&dir.0);
     settings.max_bytes = 10;
     let prep = Prep::open(&dir.0, settings).unwrap();
-    assert!(prep.create(&scope(), None, csv(BUDGET)).err().unwrap().to_string().contains("bytes"));
-    // A failed creation leaves nothing behind.
-    let root = dir.0.join("default/shop").join(DIR);
-    assert_eq!(std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0), 0);
+    assert!(prep.create_upload(&scope(), Named::default(), csv(BUDGET)).err().unwrap().to_string().contains("bytes"));
+    let sources = dir.0.join("default/shop").join(DIR).join(store::SOURCES);
+    assert_eq!(std::fs::read_dir(&sources).map(|r| r.count()).unwrap_or(0), 0);
 }
 
 #[test]
-fn deletes_are_hard() {
+fn deletes_are_hard_and_a_source_gone_leaves_its_datasets_answering() {
     let (dir, prep) = prep();
-    let a = prep.create(&scope(), None, csv(BUDGET)).unwrap();
-    let b = prep.create(&scope(), None, csv(BUDGET)).unwrap();
-    let elsewhere = prep.create(&Scope { project: "other".into(), ..scope() }, None, csv(BUDGET)).unwrap();
-    prep.delete(&scope(), &a.id, false).unwrap();
-    assert!(!dir.0.join("default/shop").join(DIR).join(&a.id).exists());
-    assert!(matches!(prep.get(&scope(), &a.id), Err(Error::NotFound(_))));
-    assert_eq!(prep.delete_project("default", "shop").unwrap(), vec![b.id]);
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, BUDGET);
+    let other = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    ran(&prep, &ann, &other.id, steps_graph(&s.id, json!([{ "op": "filter", "formula": "amount > 90" }])));
+    // The source goes: the dataset over it as it was gets its rows.
+    assert_eq!(prep.delete_source(&ann, &s.id).unwrap(), std::slice::from_ref(&d.id));
+    assert!(prep.source(&ann, &s.id).is_err());
+    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 2, "it still answers");
+    assert_eq!(rows_of(&prep, &ann, &other.id).len(), 1);
+    // A run that reads it fails, saying so.
+    let e = run(&prep, &ann, &other.id, steps_graph(&s.id, json!([]))).err().unwrap();
+    assert!(e.contains("node in: it reads source") && e.contains("not in this project"), "{e}");
+    prep.delete(&ann, &d.id).unwrap();
+    assert!(!dir.0.join("default/shop").join(DIR).join(&d.id).exists());
+    let elsewhere = Scope { project: "other".into(), ..scope() };
+    let (_, kept) = upload(&prep, &elsewhere, BUDGET);
+    let removed = prep.delete_project("default", "shop").unwrap();
+    assert_eq!(removed, [other.id]);
     assert!(!dir.0.join("default/shop").join(DIR).exists());
-    assert!(prep.get(&Scope { project: "other".into(), ..scope() }, &elsewhere.id).is_ok(), "another project's stays");
+    assert!(prep.get(&elsewhere, &kept.id).is_ok(), "another project's stays");
 }
-
-fn steps(v: Value) -> Vec<Step> {
-    serde_json::from_value(v).unwrap()
-}
-
-const SALES: &str = "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n";
 
 #[test]
-fn a_recipe_of_steps_makes_each_version() {
+fn pushed_rows_are_a_source_and_say_where_they_came_from() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(SALES)).unwrap();
-    let change = Change {
-        key: vec![],
-        against: 1,
-        roles: Default::default(),
-        steps: steps(serde_json::json!([
+    let rows: Vec<serde_json::Map<String, Value>> = serde_json::from_value(json!([
+        { "deal": "Acme", "value": 1200, "won": true },
+        { "deal": "Globex", "value": 99.5, "stage": "lost" },
+    ]))
+    .unwrap();
+    let origin = json!({ "tool": "crm.deals", "at": "2026-11-27" });
+    let named = Named { name: Some("deals".into()), description: Some("from the CRM".into()) };
+    let (s, snap) = prep.create_push(&ann, named, Pushed { rows, origin: Some(origin.clone()) }).unwrap();
+    assert_eq!((s.kind, s.description.as_deref(), snap.origin), (Kind::Push, Some("from the CRM"), Some(origin)));
+    let types: Vec<(&str, ColumnType)> = snap.columns.iter().map(|c| (c.name.as_str(), c.ty)).collect();
+    assert_eq!(types, [("deal", Text), ("value", Decimal(1)), ("won", Boolean), ("stage", Text)]);
+    let page = prep.source_rows(&ann, &s.id, None, 0, 10, &View::default()).unwrap();
+    assert_eq!(json_rows(&page)[1], json!(["Globex", "99.5", null, "lost"]));
+    let bad: Vec<serde_json::Map<String, Value>> = serde_json::from_value(json!([{ "a": 1, "A": 2 }])).unwrap();
+    assert!(prep.add_push(&ann, &s.id, Pushed { rows: bad, origin: None }).err().unwrap().to_string().contains("but for case"));
+}
+
+// ---------------------------------------------------------------- steps
+
+#[test]
+fn a_steps_node_makes_each_version_and_says_what_each_step_did() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (id, r) = shaped(
+        &prep,
+        &ann,
+        SALES,
+        json!([
             { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
             { "op": "group", "by": ["region"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] },
-        ])),
-    };
-    let d = prep.change(&ann, &d.id, change).unwrap();
-    assert_eq!((d.recipe, d.live, d.rows), (2, Some(2), 2));
-    let page = prep.page(&ann, &d.id, None, 0, 10, &View::default()).unwrap();
-    assert_eq!(json_rows(&page), [serde_json::json!(["CA", 5]), serde_json::json!(["New York", 17])]);
+        ]),
+    )
+    .unwrap();
+    assert_eq!(rows_of(&prep, &ann, &id), [json!(["CA", 5]), json!(["New York", 17])]);
     // Sorted and filtered for viewing, which changes nothing kept.
     let sort = [SortKey { column: "total".into(), desc: true }];
-    let page = prep.page(&ann, &d.id, None, 0, 10, &View { sort: &sort, filter: Some("total > 6") }).unwrap();
-    assert_eq!((page.total, json_rows(&page)), (1, vec![serde_json::json!(["New York", 17])]));
+    let page = prep.page(&ann, &id, None, 0, 10, &View { sort: &sort, filter: Some("total > 6") }).unwrap();
+    assert_eq!((page.total, json_rows(&page)), (1, vec![json!(["New York", 17])]));
     // Lineage follows each column through the steps.
-    let lineage = prep.lineage(&ann, &d.id, None).unwrap();
-    assert_eq!(lineage.columns[1].from[0].column, "amount");
-    // The same recipe runs over a new snapshot.
-    let d = prep.replace(&ann, &d.id, csv("region,store,amount\nNY,a,1\n")).unwrap();
-    let page = prep.page(&ann, &d.id, None, 0, 10, &View::default()).unwrap();
-    assert_eq!(json_rows(&page), [serde_json::json!(["New York", 1])]);
+    assert_eq!(prep.lineage(&ann, &id, None).unwrap().columns[1].from[0].column, "amount");
+    // The record says what each node did.
+    let shape = r.nodes.iter().find(|n| n.id == "shape").unwrap();
+    assert_eq!((shape.rows_in.clone(), shape.rows), (vec![3], 2));
+    assert_eq!(shape.steps[0].changed, Some(2));
+    assert_eq!(shape.steps[0].said, "remapped 2 value(s) of region");
+    assert_eq!(shape.steps[1].said, "grouped 3 rows into 2");
+    assert_eq!(shape.summary, "2 steps: 3 rows in, 2 out; remapped 2 value(s) of region; grouped 3 rows into 2.");
+    assert_eq!(shape.added, ["total"]);
+    assert_eq!(shape.removed, ["store", "amount"]);
+    let input = r.nodes.iter().find(|n| n.id == "in").unwrap();
+    assert!(input.summary.starts_with("Read budget.csv (source budget, snapshot 1"), "{}", input.summary);
+    let total = shape.profile.iter().find(|p| p.column == "total").unwrap();
+    assert_eq!((total.nulls, total.distinct, total.min.as_deref(), total.max.as_deref()), (0, 2, Some("5"), Some("17")));
+    assert!(r.summary.starts_with("Made version 1: 2 rows, 2 columns, from budget"), "{}", r.summary);
+    let v = prep.version(&ann, &id, Some(1)).unwrap();
+    assert_eq!(v.run.unwrap().id, r.id);
+    assert_eq!(v.graph.unwrap().nodes.len(), 3);
 }
 
 #[test]
 fn an_unpivot_makes_month_columns_rows_and_takes_a_new_month_in_a_later_file() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("dept,Jan,Feb,Mar\nGROCERY,100,110,\nPRODUCE,40,,45\n")).unwrap();
-    let unpivot = serde_json::json!([{ "op": "unpivot", "keep": ["dept"], "name": "month", "value": "budget" }]);
-    let d = prep.change(&ann, &d.id, change(1, unpivot)).unwrap();
-    let names: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
+    let src = source(&prep, &ann, "dept,Jan,Feb,Mar\nGROCERY,100,110,\nPRODUCE,40,,45\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let unpivot = json!([{ "op": "unpivot", "keep": ["dept"], "name": "month", "value": "budget" }]);
+    ran(&prep, &ann, &d.id, steps_graph(&src, unpivot.clone()));
+    let names: Vec<(String, ColumnType, Role)> = columns_of(&prep, &ann, &d.id).into_iter().map(|c| (c.name, c.ty, c.role)).collect();
     assert_eq!(
         names,
-        [
-            ("dept", ColumnType::Text, Role::Dimension),
-            ("month", ColumnType::Text, Role::Dimension),
-            ("budget", ColumnType::Integer, Role::Measure)
-        ]
+        [("dept".into(), Text, Role::Dimension), ("month".into(), Text, Role::Dimension), ("budget".into(), Integer, Role::Measure)]
     );
     assert_eq!(
         rows_of(&prep, &ann, &d.id),
-        [
-            serde_json::json!(["GROCERY", "Jan", 100]),
-            serde_json::json!(["GROCERY", "Feb", 110]),
-            serde_json::json!(["PRODUCE", "Jan", 40]),
-            serde_json::json!(["PRODUCE", "Mar", 45]),
-        ],
+        [json!(["GROCERY", "Jan", 100]), json!(["GROCERY", "Feb", 110]), json!(["PRODUCE", "Jan", 40]), json!(["PRODUCE", "Mar", 45])],
         "a row per month, in order, and no row for an empty value"
     );
     // Kept by naming what stays: April, new in the next file, is unpivoted too.
-    let d = prep.replace(&ann, &d.id, csv("dept,Jan,Apr\nGROCERY,1,2.5\n")).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["GROCERY", "Jan", "1.0"]), serde_json::json!(["GROCERY", "Apr", "2.5"])]);
+    prep.add_upload(&ann, &src, csv("dept,Jan,Apr\nGROCERY,1,2.5\n")).unwrap();
+    ran(&prep, &ann, &d.id, steps_graph(&src, unpivot));
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["GROCERY", "Jan", "1.0"]), json!(["GROCERY", "Apr", "2.5"])]);
     // Empty values kept, when asked; columns named instead.
-    let named = serde_json::json!([{ "op": "unpivot", "columns": ["Jan"], "name": "month", "value": "budget", "keep_empty": true }]);
-    let d = prep.replace(&ann, &d.id, csv("dept,Jan,Apr\nGROCERY,,3\n")).unwrap();
-    let d = prep.change(&ann, &d.id, change(d.recipe, named)).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["GROCERY", "3.0", "Jan", null])], "Apr stays the decimal it was");
-    // Refused: both or neither, a clash, types that do not meet.
+    prep.add_upload(&ann, &src, csv("dept,Jan,Apr\nGROCERY,,3\n")).unwrap();
+    let named = json!([{ "op": "unpivot", "columns": ["Jan"], "name": "month", "value": "budget", "keep_empty": true }]);
+    ran(&prep, &ann, &d.id, steps_graph(&src, named));
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["GROCERY", "3.0", "Jan", null])], "Apr stays the decimal it was");
     for (step, says) in [
-        (serde_json::json!({ "op": "unpivot", "columns": ["Jan"], "keep": ["dept"], "name": "m", "value": "v" }), "and not both"),
-        (serde_json::json!({ "op": "unpivot", "columns": ["Jan"], "name": "dept", "value": "v" }), "there is a column 'dept' already"),
-        (serde_json::json!({ "op": "unpivot", "columns": ["dept", "Apr"], "name": "m", "value": "v" }), "do not widen to one type"),
-        (serde_json::json!({ "op": "unpivot", "keep": ["dept", "Jan", "Apr"], "name": "m", "value": "v" }), "nothing to unpivot"),
+        (json!({ "op": "unpivot", "columns": ["Jan"], "keep": ["dept"], "name": "m", "value": "v" }), "and not both"),
+        (json!({ "op": "unpivot", "columns": ["Jan"], "name": "dept", "value": "v" }), "there is a column 'dept' already"),
+        (json!({ "op": "unpivot", "columns": ["dept", "Apr"], "name": "m", "value": "v" }), "do not widen to one type"),
+        (json!({ "op": "unpivot", "keep": ["dept", "Jan", "Apr"], "name": "m", "value": "v" }), "nothing to unpivot"),
     ] {
-        let e = prep.preview(&ann, &d.id, Preview { steps: Some(steps(serde_json::json!([step]))), ..Default::default() }).err().unwrap();
-        assert!(e.to_string().contains(says), "{says}: {e}");
+        let e = refused(&prep, &ann, &src, json!([step]));
+        assert!(e.contains(says) && e.starts_with("node shape: step 1 (unpivot)"), "{says}: {e}");
     }
 }
 
@@ -248,31 +350,22 @@ fn an_unpivot_makes_month_columns_rows_and_takes_a_new_month_in_a_later_file() {
 fn update_column_computes_a_column_again_and_takes_its_formulas_type() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("name,price\n  Milk ,1.234\nEggs,2.5\n")).unwrap();
-    let update = serde_json::json!([
+    let update = json!([
         { "op": "update_column", "column": "name", "formula": "upper(trim(name))" },
         { "op": "update_column", "column": "price", "formula": "round(price, 1)" },
         { "op": "add_column", "column": "label", "formula": "name & ' ' & to_text(price)" },
         { "op": "update_column", "column": "price", "formula": "if(price > 2, 'dear', 'cheap')" },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, update)).unwrap();
-    assert_eq!(
-        rows_of(&prep, &ann, &d.id),
-        [serde_json::json!(["MILK", "cheap", "MILK 1.2"]), serde_json::json!(["EGGS", "dear", "EGGS 2.5"])]
-    );
-    let price = d.columns.iter().find(|c| c.name == "price").unwrap();
-    assert_eq!((price.ty, price.role), (ColumnType::Text, Role::Dimension), "a measure made text is a dimension");
-    let e = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview {
-                steps: Some(steps(serde_json::json!([{ "op": "update_column", "column": "gone", "formula": "1" }]))),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(e.unresolved[0].describe(), "step 1 (update_column) reads column 'gone', which is not there at that step");
+    let (id, r) = shaped(&prep, &ann, "name,price\n  Milk ,1.234\nEggs,2.5\n", update).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &id), [json!(["MILK", "cheap", "MILK 1.2"]), json!(["EGGS", "dear", "EGGS 2.5"])]);
+    let price = columns_of(&prep, &ann, &id).into_iter().find(|c| c.name == "price").unwrap();
+    assert_eq!((price.ty, price.role), (Text, Role::Dimension), "a measure made text is a dimension");
+    let shape = &r.nodes[1];
+    assert_eq!(shape.steps[0].said, "computed name again: 2 value(s) changed");
+    assert_eq!(shape.retyped.len(), 1, "price, from a decimal to text");
+    let src = source(&prep, &ann, "name\nx\n");
+    let e = refused(&prep, &ann, &src, json!([{ "op": "update_column", "column": "gone", "formula": "1" }]));
+    assert_eq!(e, "node shape: step 1 (update_column) reads column 'gone', which is not there");
 }
 
 #[test]
@@ -280,16 +373,14 @@ fn to_number_reads_numbers_as_people_write_them() {
     let (_dir, prep) = prep();
     let ann = scope();
     let file = "v\n1234.5\n\"$1,234.50\"\n(500)\n12%\n(12.5%)\nUSD 10\n10 EUR\n1 234\n1e3\n\"€ 9,99\"\n1.5\n12 apples\n1.2.3\n";
-    let d = prep.create(&ann, None, csv(file)).unwrap();
-    let add = serde_json::json!([
+    let add = json!([
         { "op": "add_column", "column": "n", "formula": "to_number(v)" },
         { "op": "add_column", "column": "eu", "formula": "to_number(v, ',')" },
         { "op": "add_column", "column": "i", "formula": "to_integer(v)" },
         { "op": "add_column", "column": "ok", "formula": "is_number(v)" },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
-    assert_eq!(d.columns[1].ty, ColumnType::Decimal(6));
-    let got: Vec<Value> = rows_of(&prep, &ann, &d.id);
+    let (id, _) = shaped(&prep, &ann, file, add).unwrap();
+    assert_eq!(columns_of(&prep, &ann, &id)[1].ty, Decimal(6));
     let want = [
         ["1234.5", "1234.500000", "12345.000000", "null", "true"],
         ["$1,234.50", "1234.500000", "1.234500", "null", "true"],
@@ -305,23 +396,12 @@ fn to_number_reads_numbers_as_people_write_them() {
         ["12 apples", "null", "null", "null", "false"],
         ["1.2.3", "null", "123.000000", "null", "false"],
     ];
-    for (row, w) in got.iter().zip(want) {
-        let shown: Vec<String> =
-            row.as_array().unwrap().iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect();
-        assert_eq!(shown, w, "{}", w[0]);
+    for (row, w) in rows_of(&prep, &ann, &id).iter().zip(want) {
+        assert_eq!(shown(row), w, "{}", w[0]);
     }
-    let e = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview {
-                steps: Some(steps(serde_json::json!([{ "op": "filter", "formula": "to_number(v, ';') > 1" }]))),
-                ..Default::default()
-            },
-        )
-        .err()
-        .unwrap();
-    assert!(e.to_string().contains("decimal mark is '.' or ','"), "{e}");
+    let src = source(&prep, &ann, "v\n1\n");
+    let e = refused(&prep, &ann, &src, json!([{ "op": "filter", "formula": "to_number(v, ';') > 1" }]));
+    assert!(e.contains("decimal mark is '.' or ','"), "{e}");
 }
 
 #[test]
@@ -329,8 +409,7 @@ fn to_date_reads_every_unambiguous_way_a_date_is_written() {
     let (_dir, prep) = prep();
     let ann = scope();
     let file = "v\n2026-01-05\n2026/1/5\n2026.01.05\n2026-01-05T10:30:00Z\n20260105\n202601\n2026-01\n5 Jan 2026\n\"January 5, 2026\"\n05-jan-2026\nSeptember 2026\n31/01/2026\n01/31/2026\n46027\n2026-13-01\n202613\nsoon\n";
-    let d = prep.create(&ann, None, csv(file)).unwrap();
-    let add = serde_json::json!([
+    let add = json!([
         { "op": "add_column", "column": "auto", "formula": "to_date(v)" },
         { "op": "add_column", "column": "dmy", "formula": "to_date(v, 'dmy')" },
         { "op": "add_column", "column": "mdy", "formula": "to_date(v, 'mdy')" },
@@ -338,7 +417,7 @@ fn to_date_reads_every_unambiguous_way_a_date_is_written() {
         { "op": "add_column", "column": "fmt", "formula": "to_date(v, '%d/%m/%Y')" },
         { "op": "add_column", "column": "ok", "formula": "is_date(v)" },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
+    let (id, _) = shaped(&prep, &ann, file, add).unwrap();
     let n = "null";
     let want = [
         ["2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
@@ -359,22 +438,14 @@ fn to_date_reads_every_unambiguous_way_a_date_is_written() {
         ["202613", n, n, n, n, n, "false"],
         ["soon", n, n, n, n, n, "false"],
     ];
-    let got = rows_of(&prep, &ann, &d.id);
+    let got = rows_of(&prep, &ann, &id);
     assert_eq!(got.len(), want.len());
     for (row, w) in got.iter().zip(want) {
-        let shown: Vec<String> =
-            row.as_array().unwrap().iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect();
-        assert_eq!(shown, w, "{}", w[0]);
+        assert_eq!(shown(row), w, "{}", w[0]);
     }
-    let e = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview { steps: Some(steps(serde_json::json!([{ "op": "filter", "formula": "is_date(v, 'ydm')" }]))), ..Default::default() },
-        )
-        .err()
-        .unwrap();
-    assert!(e.to_string().contains("'dmy' (31/01/2026)"), "{e}");
+    let src = source(&prep, &ann, "v\nx\n");
+    let e = refused(&prep, &ann, &src, json!([{ "op": "filter", "formula": "is_date(v, 'ydm')" }]));
+    assert!(e.contains("'dmy' (31/01/2026)"), "{e}");
 }
 
 #[test]
@@ -382,8 +453,7 @@ fn switch_ifs_and_the_boolean_and_timestamp_readers() {
     let (_dir, prep) = prep();
     let ann = scope();
     let file = "region,amount,flag,at\nNY,150,Yes,2026-01-05 10:30\nCA,50,n,31/01/2026 14:05\nTX,5,maybe,46027.5\n,20,1,5 Jan 2026\n";
-    let d = prep.create(&ann, None, csv(file)).unwrap();
-    let add = serde_json::json!([
+    let add = json!([
         { "op": "add_column", "column": "name", "formula": "switch(region, 'NY', 'New York', 'CA', 'California', region)" },
         { "op": "add_column", "column": "no_default", "formula": "switch(region, 'NY', 1)" },
         { "op": "add_column", "column": "size", "formula": "ifs(amount > 100, 'big', amount > 10, 'mid', 'small')" },
@@ -393,39 +463,27 @@ fn switch_ifs_and_the_boolean_and_timestamp_readers() {
         { "op": "add_column", "column": "excel", "formula": "to_timestamp(at, 'excel')" },
         { "op": "remove_columns", "columns": ["region", "amount", "flag", "at"] },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
-    let types: Vec<ColumnType> = d.columns.iter().map(|c| c.ty).collect();
+    let (id, _) = shaped(&prep, &ann, file, add).unwrap();
+    let types: Vec<ColumnType> = columns_of(&prep, &ann, &id).iter().map(|c| c.ty).collect();
+    assert_eq!(types, [Text, Integer, Text, Boolean, Timestamp, Timestamp, Timestamp]);
+    let n = Value::Null;
     assert_eq!(
-        types,
+        rows_of(&prep, &ann, &id),
         [
-            ColumnType::Text,
-            ColumnType::Integer,
-            ColumnType::Text,
-            ColumnType::Boolean,
-            ColumnType::Timestamp,
-            ColumnType::Timestamp,
-            ColumnType::Timestamp
+            json!(["New York", 1, "big", true, "2026-01-05T10:30:00", "2026-01-05T10:30:00", "2026-01-05T10:30:00"]),
+            json!(["California", n, "mid", false, n, "2026-01-31T14:05:00", n]),
+            json!(["TX", n, "small", n, n, n, "2026-01-05T12:00:00"]),
+            json!([n, n, "mid", true, "2026-01-05T00:00:00", "2026-01-05T00:00:00", "2026-01-05T00:00:00"]),
         ]
     );
-    let n = serde_json::Value::Null;
-    assert_eq!(
-        rows_of(&prep, &ann, &d.id),
-        [
-            serde_json::json!(["New York", 1, "big", true, "2026-01-05T10:30:00", "2026-01-05T10:30:00", "2026-01-05T10:30:00"]),
-            serde_json::json!(["California", n, "mid", false, n, "2026-01-31T14:05:00", n]),
-            serde_json::json!(["TX", n, "small", n, n, n, "2026-01-05T12:00:00"]),
-            serde_json::json!([n, n, "mid", true, "2026-01-05T00:00:00", "2026-01-05T00:00:00", "2026-01-05T00:00:00"]),
-        ]
-    );
+    let src = source(&prep, &ann, "region,amount\nNY,1\n");
     for (formula, says) in [
         ("switch(region, 'NY')", "switch() takes a value, then pairs"),
         ("switch(region, 1, 'x')", "switch()'s values meets text with integer"),
         ("ifs(amount, 'x')", "ifs()'s conditions takes boolean"),
         ("switch(region, 'NY', 1, 'CA', 'x')", "switch()'s results"),
     ] {
-        let step = serde_json::json!([{ "op": "add_column", "column": "k", "formula": formula }]);
-        let e = prep.preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() }).err();
-        let e = e.map(|e| e.to_string()).unwrap_or_default();
+        let e = refused(&prep, &ann, &src, json!([{ "op": "add_column", "column": "k", "formula": formula }]));
         assert!(e.contains(says), "{formula}: {e}");
     }
 }
@@ -434,73 +492,69 @@ fn switch_ifs_and_the_boolean_and_timestamp_readers() {
 fn a_sql_step_is_a_black_box_over_input_alone() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep
-        .create(&ann, None, csv("region,store,month,amount\nNY,a,2026-01,10\nNY,b,2026-01,5\nNY,a,2026-02,7\nCA,c,2026-01,3\n"))
-        .unwrap();
+    let file = "region,store,month,amount\nNY,a,2026-01,10\nNY,b,2026-01,5\nNY,a,2026-02,7\nCA,c,2026-01,3\n";
+    let src = source(&prep, &ann, file);
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
     let q = "SELECT region, month, sum(amount) AS total, \
              sum(sum(amount)) OVER (PARTITION BY region ORDER BY month) AS running, \
              regexp_extract(month, '-(\\d+)', 1) AS m \
              FROM input GROUP BY region, month ORDER BY region, month;";
-    let recipe = serde_json::json!([
+    let steps = json!([
         { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
         { "op": "sql", "query": q },
         { "op": "add_column", "column": "share", "formula": "total / running" },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, recipe)).unwrap();
-    let shape: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
+    ran(&prep, &ann, &d.id, steps_graph(&src, steps.clone()));
+    let shape: Vec<(String, ColumnType, Role)> = columns_of(&prep, &ann, &d.id).into_iter().map(|c| (c.name, c.ty, c.role)).collect();
     assert_eq!(
         shape,
         [
-            ("region", ColumnType::Text, Role::Dimension),
-            ("month", ColumnType::Text, Role::Dimension),
-            ("total", ColumnType::Integer, Role::Measure),
-            ("running", ColumnType::Integer, Role::Measure),
-            ("m", ColumnType::Text, Role::Dimension),
-            ("share", ColumnType::Double, Role::Measure),
+            ("region".into(), Text, Role::Dimension),
+            ("month".into(), Text, Role::Dimension),
+            ("total".into(), Integer, Role::Measure),
+            ("running".into(), Integer, Role::Measure),
+            ("m".into(), Text, Role::Dimension),
+            ("share".into(), Double, Role::Measure),
         ]
     );
     assert_eq!(
         rows_of(&prep, &ann, &d.id),
         [
-            serde_json::json!(["CA", "2026-01", 3, 3, "01", 1.0]),
-            serde_json::json!(["New York", "2026-01", 15, 15, "01", 1.0]),
-            serde_json::json!(["New York", "2026-02", 7, 22, "02", 7.0 / 22.0]),
+            json!(["CA", "2026-01", 3, 3, "01", 1.0]),
+            json!(["New York", "2026-01", 15, 15, "01", 1.0]),
+            json!(["New York", "2026-02", 7, 22, "02", 7.0 / 22.0])
         ],
         "it reads the step before it: NY was remapped first"
     );
-    // A column it reads, gone upstream, holds the dataset, naming it.
-    let held = prep.replace(&ann, &d.id, csv("region,store,amount\nNY,a,1\n")).unwrap();
-    let why: Vec<String> = held.held.unwrap().unresolved.iter().map(|u| u.describe()).collect();
+    // A column it reads, gone upstream, refuses the run, naming it and what follows.
+    prep.add_upload(&ann, &src, csv("region,store,amount\nNY,a,1\n")).unwrap();
+    let request = RunRequest { id: run_id(), dataset: d.id.clone(), graph: steps_graph(&src, steps) };
+    let Err(Error::Problems(problems)) = prep.begin(&ann, request, ANN) else { panic!("refused") };
+    let said: Vec<String> = problems.iter().map(Problem::said).collect();
     assert_eq!(
-        why,
+        said,
         [
-            "step 2 (sql) reads column 'month', which is not there at that step",
-            "step 3 (add_column) reads column 'running', which is not there at that step",
-            "step 3 (add_column) reads column 'total', which is not there at that step",
-        ],
-        "and what reads what it would have made"
+            "node shape: step 2 (sql) reads column 'month', which is not there",
+            "node shape: step 3 (add_column) reads column 'running', which is not there",
+            "node shape: step 3 (add_column) reads column 'total', which is not there",
+        ]
     );
-    // It sees input and nothing else; it is one query; it is the same every run.
+    assert_eq!(prep.get(&ann, &d.id).unwrap().live, Some(1), "what was live stays live");
     for (query, says) in [
         ("SELECT * FROM s1", "s1"),
-        ("SELECT * FROM t1", "t1"),
+        ("SELECT * FROM shape_t1", "shape_t1"),
         ("SELECT * FROM read_csv('/etc/passwd')", "read_csv"),
         ("SELECT getenv('HOME') AS h", "getenv"),
         ("SELECT * FROM input; DROP TABLE input", "one query"),
         ("SELECT *, now() AS at FROM input", "now is not the same on every run"),
         ("SELECT [1, 2] AS l FROM input", "CAST it to text"),
     ] {
-        let step = serde_json::json!([{ "op": "sql", "query": query }]);
-        let e = prep
-            .preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() })
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let e = refused(&prep, &ann, &src, json!([{ "op": "sql", "query": query }]));
         assert!(e.contains("step 1 (sql)") && e.contains(says), "{query}: {e}");
     }
     // Names are DuckDB's: a repeat is numbered, an expression is its text.
-    let step = serde_json::json!([{ "op": "sql", "query": "SELECT region, region, upper(region) FROM input" }]);
-    let p = prep.preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() }).unwrap();
+    let g = steps_graph(&src, json!([{ "op": "sql", "query": "SELECT region, region, upper(region) FROM input" }]));
+    let p = prep.preview(&ann, &PreviewRequest { graph: g, node: None, whole: false, limit: None }, ANN, &HashMap::new()).unwrap();
     assert_eq!(p.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "region_1", "upper(region)"]);
 }
 
@@ -508,44 +562,40 @@ fn a_sql_step_is_a_black_box_over_input_alone() {
 fn a_sql_steps_types_are_ones_a_dataset_holds() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("big,a\n12345678901234567890,1.5\n98765432109876543210,2.5\n")).unwrap();
-    assert_eq!(d.columns[0].ty, ColumnType::Decimal(0));
     let q = "SELECT big, CAST(a AS DECIMAL(38,20)) AS fine, sum(1) OVER () AS n FROM input";
-    let d = prep.change(&ann, &d.id, change(1, serde_json::json!([{ "op": "sql", "query": q }]))).unwrap();
-    let types: Vec<(&str, ColumnType)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty)).collect();
+    let (id, _) =
+        shaped(&prep, &ann, "big,a\n12345678901234567890,1.5\n98765432109876543210,2.5\n", json!([{ "op": "sql", "query": q }])).unwrap();
+    let types: Vec<(String, ColumnType)> = columns_of(&prep, &ann, &id).into_iter().map(|c| (c.name, c.ty)).collect();
     assert_eq!(
         types,
-        [("big", ColumnType::Decimal(0)), ("fine", ColumnType::Double), ("n", ColumnType::Integer)],
+        [("big".into(), Decimal(0)), ("fine".into(), Double), ("n".into(), Integer)],
         "20 digits stay a decimal, more places than 18 are a float, and a sum of integers is one"
     );
-    // And the dataset reads back: its manifest holds only types it names.
-    assert_eq!(prep.get(&ann, &d.id).unwrap().columns.len(), 3);
-    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 2);
+    assert_eq!(rows_of(&prep, &ann, &id).len(), 2);
 }
 
 #[test]
 fn a_formula_that_would_make_a_huge_value_is_refused_and_double_equals_compares() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("region,amount\nNY,1\nCA,2\n")).unwrap();
+    let src = source(&prep, &ann, "region,amount\nNY,1\nCA,2\n");
     let nested = (0..6).fold("region".to_string(), |x, _| format!("replace({x}, 'N', 'NNNNNNNNNNNNNNNN')"));
-    let e =
-        prep.change(&ann, &d.id, change(1, serde_json::json!([{ "op": "add_column", "column": "big", "formula": nested }]))).err().unwrap();
-    assert!(e.to_string().contains("replace() would make a value longer than"), "{e}");
-    let d = prep
-        .change(
-            &ann,
-            &d.id,
-            change(
-                1,
-                serde_json::json!([
-                    { "op": "add_column", "column": "ny", "formula": "region == 'NY'" },
-                    { "op": "add_column", "column": "r", "formula": "replace(replace(region, 'N', 'n'), 'Y', 'y')" },
-                ]),
-            ),
-        )
-        .unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["NY", 1, true, "ny"]), serde_json::json!(["CA", 2, false, "CA"])]);
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let r = run(&prep, &ann, &d.id, steps_graph(&src, json!([{ "op": "add_column", "column": "big", "formula": nested }]))).unwrap();
+    assert!(r.summary.contains("replace() would make a value longer than"), "{}", r.summary);
+    ran(
+        &prep,
+        &ann,
+        &d.id,
+        steps_graph(
+            &src,
+            json!([
+                { "op": "add_column", "column": "ny", "formula": "region == 'NY'" },
+                { "op": "add_column", "column": "r", "formula": "replace(replace(region, 'N', 'n'), 'Y', 'y')" },
+            ]),
+        ),
+    );
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["NY", 1, true, "ny"]), json!(["CA", 2, false, "CA"])]);
 }
 
 #[test]
@@ -553,10 +603,10 @@ fn a_file_too_wide_or_of_too_long_a_field_is_refused_as_it_is_read() {
     let (_dir, prep) = prep();
     let ann = scope();
     let wide = format!("{}\n", vec!["a"; crate::source::COLUMN_LIMIT + 1].join(","));
-    let e = prep.create(&ann, None, csv(&wide)).err().unwrap();
+    let e = prep.create_upload(&ann, Named::default(), csv(&wide)).err().unwrap();
     assert!(e.to_string().contains("columns a dataset has"), "{e}");
     let long = format!("a,b\n{},1\n", "x".repeat(crate::source::FIELD_LIMIT + 1));
-    let e = prep.create(&ann, None, csv(&long)).err().unwrap();
+    let e = prep.create_upload(&ann, Named::default(), csv(&long)).err().unwrap();
     assert!(e.to_string().contains("more than the 1048576 a value is"), "{e}");
 }
 
@@ -564,416 +614,338 @@ fn a_file_too_wide_or_of_too_long_a_field_is_refused_as_it_is_read() {
 fn case_steps_rewrite_text_values() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("a,b,c,d,e\ngrocery store,Grocery Store,GroceryStore,order-ID 2,  Ünïcode wörd \n")).unwrap();
-    let cases = serde_json::json!([
+    let cases = json!([
         { "op": "upper_case", "columns": ["a"] },
         { "op": "lower_case", "columns": ["b"] },
         { "op": "title_case", "columns": ["c"] },
         { "op": "snake_case", "columns": ["d", "e"] },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, cases)).unwrap();
-    assert_eq!(
-        rows_of(&prep, &ann, &d.id),
-        [serde_json::json!(["GROCERY STORE", "grocery store", "Grocerystore", "order_id_2", "ünïcode_wörd"])]
-    );
-    let camel = serde_json::json!([{ "op": "camel_case", "columns": ["a", "b", "c", "d", "e"] }]);
-    let d = prep.change(&ann, &d.id, change(d.recipe, camel)).unwrap();
-    assert_eq!(
-        rows_of(&prep, &ann, &d.id),
-        [serde_json::json!(["groceryStore", "groceryStore", "groceryStore", "orderId2", "ünïcodeWörd"])]
-    );
-    // The same, as functions, nested in a formula.
-    let d = prep.replace(&ann, &d.id, csv("a,b,c,d,e\n  Grocery Store ,x,y,z,2026\n")).unwrap();
-    let nested = serde_json::json!([
+    let file = "a,b,c,d,e\ngrocery store,Grocery Store,GroceryStore,order-ID 2,  Ünïcode wörd \n";
+    let (id, _) = shaped(&prep, &ann, file, cases).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &id), [json!(["GROCERY STORE", "grocery store", "Grocerystore", "order_id_2", "ünïcode_wörd"])]);
+    let camel = json!([{ "op": "camel_case", "columns": ["a", "b", "c", "d", "e"] }]);
+    let (id, _) = shaped(&prep, &ann, file, camel).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &id), [json!(["groceryStore", "groceryStore", "groceryStore", "orderId2", "ünïcodeWörd"])]);
+    let nested = json!([
         { "op": "add_column", "column": "key", "formula": "snake_case(trim(a)) & '_' & to_text(e)" },
         { "op": "add_column", "column": "camel", "formula": "camel_case(a)" },
         { "op": "add_column", "column": "title", "formula": "title_case(lower(trim(a)))" },
         { "op": "remove_columns", "columns": ["a", "b", "c", "d", "e"] },
     ]);
-    let d = prep.change(&ann, &d.id, change(d.recipe, nested)).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["grocery_store_2026", "groceryStore", "Grocery Store"])]);
-    let e = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview {
-                steps: Some(steps(serde_json::json!([{ "op": "add_column", "column": "k", "formula": "snake_case(1)" }]))),
-                ..Default::default()
-            },
-        )
-        .err()
-        .unwrap();
-    assert!(e.to_string().contains("snake_case()"), "{e}");
+    let (id, _) = shaped(&prep, &ann, "a,b,c,d,e\n  Grocery Store ,x,y,z,2026\n", nested).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &id), [json!(["grocery_store_2026", "groceryStore", "Grocery Store"])]);
+    let src = source(&prep, &ann, "a\nx\n");
+    assert!(refused(&prep, &ann, &src, json!([{ "op": "add_column", "column": "k", "formula": "snake_case(1)" }])).contains("snake_case()"));
 }
 
 #[test]
 fn fill_down_carries_a_label_to_the_rows_below() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv("dept,item,qty\nGROCERY,milk,1\n,eggs,\n,bread,3\nPRODUCE,apples,4\n,pears,5\n")).unwrap();
-    let fill = serde_json::json!([
+    let fill = json!([
         { "op": "find_and_replace_val", "column": "item", "find": "eggs", "with": " ", "whole": true },
         { "op": "find_and_replace_val", "column": "item", "find": "bread", "with": " bread ", "whole": true },
         { "op": "fill_down", "columns": ["dept", "item", "qty"] },
     ]);
-    let d = prep.change(&ann, &d.id, change(1, fill)).unwrap();
+    let (id, r) = shaped(&prep, &ann, "dept,item,qty\nGROCERY,milk,1\n,eggs,\n,bread,3\nPRODUCE,apples,4\n,pears,5\n", fill).unwrap();
     assert_eq!(
-        rows_of(&prep, &ann, &d.id),
+        rows_of(&prep, &ann, &id),
         [
-            serde_json::json!(["GROCERY", "milk", 1]),
-            serde_json::json!(["GROCERY", "milk", 1]),
-            serde_json::json!(["GROCERY", " bread ", 3]),
-            serde_json::json!(["PRODUCE", "apples", 4]),
-            serde_json::json!(["PRODUCE", "pears", 5]),
+            json!(["GROCERY", "milk", 1]),
+            json!(["GROCERY", "milk", 1]),
+            json!(["GROCERY", " bread ", 3]),
+            json!(["PRODUCE", "apples", 4]),
+            json!(["PRODUCE", "pears", 5])
         ],
         "an empty value, or blank text, is the one above it; a value there is kept as it is"
     );
+    assert_eq!(r.nodes[1].steps[2].said, "filled 3 blank(s) in dept, item, qty from the row above");
 }
 
 #[test]
-fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
+fn a_column_gone_upstream_fails_the_run_naming_it_with_what_it_likely_became() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(SALES)).unwrap();
-    // Nothing reads `store`: its going is a note.
-    let d = prep.replace(&ann, &d.id, csv("region,amount\nNY,1\n")).unwrap();
-    assert!(d.held.is_none());
-    assert!(d.notes.iter().any(|n| n.contains("'store' is not in this snapshot")), "{:?}", d.notes);
-    // A step reads `region`: its going holds the dataset, and v2 stays live.
-    let change = Change {
-        key: vec![],
-        against: 1,
-        roles: Default::default(),
-        steps: steps(serde_json::json!([{ "op": "add_column", "column": "label", "formula": "upper(region)" }])),
-    };
-    let d = prep.change(&ann, &d.id, change).unwrap();
-    assert_eq!(d.live, Some(3));
-    let d = prep.replace(&ann, &d.id, csv("area,amount\nNY,1\n")).unwrap();
-    let held = d.held.clone().expect("held");
-    assert_eq!(held.unresolved[0].describe(), "step 1 (add_column) reads column 'region', which is not there at that step");
-    assert_eq!(d.live, Some(3), "what was live stays live");
-    // Confirming drops the step and runs the rest.
-    let d = prep.confirm(&ann, &d.id, 2).unwrap();
-    assert!(d.held.is_none());
-    assert_eq!(d.live, Some(4));
-    // A column new upstream comes after the ones the source had.
-    assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["amount", "area"]);
-    assert!(prep.recipe(&ann, &d.id, None).unwrap().steps.is_empty());
+    let src = source(&prep, &ann, "region,amount\nNY,1\nCA,2\nTX,3\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let steps = json!([{ "op": "add_column", "column": "label", "formula": "upper(region)" }]);
+    ran(&prep, &ann, &d.id, steps_graph(&src, steps.clone()));
+    // `region` is gone; `Area` is new and has its values.
+    prep.add_upload(&ann, &src, csv("Area,amount,regoin\nNY,1,x\nCA,2,y\n")).unwrap();
+    let request = RunRequest { id: run_id(), dataset: d.id.clone(), graph: steps_graph(&src, steps.clone()) };
+    let Err(Error::Problems(problems)) = prep.begin(&ann, request, ANN) else { panic!("refused") };
+    let p = &problems[0];
+    assert_eq!((p.node.as_deref(), p.code, p.column.as_deref()), (Some("shape"), graph::Code::MissingColumn, Some("region")));
+    let s: Vec<&str> = p.suggestions.iter().map(|s| s.column.as_str()).collect();
+    assert_eq!(s, ["Area", "regoin"], "by its values first, then by its name");
+    assert!(p.suggestions[0].because.contains("67% of the values 'region' had are in it"), "{}", p.suggestions[0].because);
+    assert_eq!(prep.get(&ann, &d.id).unwrap().live, Some(1));
+    // The application points the step at the new name, and it runs.
+    ran(&prep, &ann, &d.id, steps_graph(&src, json!([{ "op": "add_column", "column": "label", "formula": "upper(Area)" }])));
+    // A dry run says the same as the run, before it.
+    let c = prep.check(&ann, &steps_graph(&src, steps), ANN).unwrap();
+    assert!(!c.ok && c.said.starts_with("It would not run: node shape: step 1 (add_column) reads column 'region'"), "{}", c.said);
 }
 
 #[test]
-fn a_rename_upstream_is_fixed_by_pointing_the_steps_at_the_new_name() {
+fn a_preview_stops_at_a_node_over_a_sample_and_keeps_nothing() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(SALES)).unwrap();
-    let remap = |column: &str| serde_json::json!([{ "op": "remap_val", "column": column, "values": [{ "from": "NY", "to": "New York" }] }]);
-    let d = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: steps(remap("region")) }).unwrap();
-    let d = prep.replace(&ann, &d.id, csv("area,amount\nNY,1\n")).unwrap();
-    assert!(d.held.is_some());
-    let d = prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles: Default::default(), steps: steps(remap("area")) }).unwrap();
-    assert!(d.held.is_none());
-    let page = prep.page(&ann, &d.id, None, 0, 10, &View::default()).unwrap();
-    assert_eq!(json_rows(&page), [serde_json::json!([1, "New York"])]);
-}
-
-#[test]
-fn a_removal_with_readers_is_refused_naming_them() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(SALES)).unwrap();
-    let with = |extra: serde_json::Value| {
-        let mut v = vec![serde_json::json!({ "op": "add_column", "column": "label", "formula": "region & store" })];
-        v.extend(extra.as_array().cloned().unwrap_or_default());
-        steps(Value::Array(v))
-    };
-    let d = prep
-        .change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: with(serde_json::json!([])) })
-        .unwrap();
-    let impact = prep.impact(&ann, &d.id, "store").unwrap();
-    assert_eq!(
-        impact.iter().map(Unresolved::describe).collect::<Vec<_>>(),
-        ["step 1 (add_column) reads column 'store', which is not there at that step"]
-    );
-    assert!(prep.impact(&ann, &d.id, "amount").unwrap().is_empty());
-    assert!(prep.impact(&ann, &d.id, "label").unwrap().is_empty());
-    // A removal put before its reader is refused, naming it.
-    let mut bad = steps(serde_json::json!([{ "op": "remove_columns", "columns": ["store"] }]));
-    bad.extend(with(serde_json::json!([])));
-    let e = prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles: Default::default(), steps: bad }).err().unwrap();
-    assert!(e.to_string().contains("step 2 (add_column) reads column 'store'"), "{e}");
-    // At the end it removes the column.
-    let d = prep
-        .change(
-            &ann,
-            &d.id,
-            Change {
-                key: vec![],
-                against: 2,
-                roles: Default::default(),
-                steps: with(serde_json::json!([{ "op": "remove_columns", "columns": ["store"] }])),
-            },
-        )
-        .unwrap();
-    assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "amount", "label"]);
-}
-
-#[test]
-fn a_preview_runs_a_step_over_a_sample_and_keeps_nothing() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(SALES)).unwrap();
+    let (s, d) = upload(&prep, &ann, SALES);
+    let g = graph(json!([
+        { "id": "in", "kind": "source", "source": s.id },
+        { "id": "big", "kind": "steps", "input": "in", "steps": [{ "op": "filter", "formula": "amount > 6" }] },
+        { "id": "never", "kind": "steps", "input": "big", "steps": [{ "op": "trim_val", "columns": ["gone"] }] },
+    ]));
     let p = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview { steps: Some(steps(serde_json::json!([{ "op": "filter", "formula": "amount > 6" }]))), ..Preview::default() },
-        )
+        .preview(&ann, &PreviewRequest { graph: g.clone(), node: Some("big".into()), whole: false, limit: None }, ANN, &HashMap::new())
         .unwrap();
-    assert_eq!(p.rows.num_rows(), 2);
+    assert_eq!((p.rows.num_rows(), p.node.as_str(), p.sample), (2, "big", Some(1000)));
+    assert!(p.problems.is_empty(), "what is past the node is not compiled: {:?}", p.problems);
+    assert_eq!(p.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["in", "big"]);
+    assert_eq!(p.reads[0].id, s.id);
     let p = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview { steps: Some(steps(serde_json::json!([{ "op": "trim_val", "columns": ["gone"] }]))), ..Preview::default() },
-        )
+        .preview(&ann, &PreviewRequest { graph: g, node: Some("never".into()), whole: true, limit: None }, ANN, &HashMap::new())
         .unwrap();
-    assert_eq!(p.unresolved.len(), 1, "a preview shows what will not resolve rather than refusing");
+    assert_eq!((p.problems.len(), p.sample), (1, None), "a preview shows what will not resolve rather than refusing");
     assert_eq!(prep.get(&ann, &d.id).unwrap().made, 1, "nothing was made");
-    let e = prep
-        .preview(
-            &ann,
-            &d.id,
-            Preview {
-                steps: Some(steps(serde_json::json!([{ "op": "retype_column", "column": "region", "type": "integer" }]))),
-                ..Preview::default()
-            },
-        )
-        .err()
-        .unwrap();
-    assert!(e.to_string().contains("do not convert without loss, such as 'NY'"), "{e}");
+    let e = refused(&prep, &ann, &s.id, json!([{ "op": "retype_column", "column": "region", "type": "integer" }]));
+    assert!(e.contains("do not convert without loss, such as 'NY'"), "{e}");
 }
 
-fn edits(against: u32, v: Value) -> edits::Request {
-    edits::Request { against, edits: serde_json::from_value(v).unwrap() }
-}
-
-const BUDGETS: &str = "region,month,amount\nNY,2026-01-01,100\nCA,2026-01-01,80\nNY,2026-02-01,90\n";
-
-fn rows_of(prep: &Prep, scope: &Scope, id: &str) -> Vec<Value> {
-    json_rows(&prep.page(scope, id, None, 0, 100, &View::default()).unwrap())
-}
+// -------------------------------------------------- joins, appends, sql
 
 #[test]
-fn a_dimension_edit_is_a_remap_and_holds_through_a_sync() {
+fn a_join_node_brings_the_right_sides_columns_and_refuses_to_multiply_rows() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let (d, out) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
-        .unwrap();
-    assert_eq!((d.edits, d.recipe, d.live), (1, 1, Some(2)), "an edit is a log entry, not a recipe version");
-    assert_eq!(out[0].state, State::Applied);
-    let rows = rows_of(&prep, &ann, &d.id);
-    assert_eq!(rows[0][0], "New York");
-    assert_eq!(rows[2][0], "New York");
-    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-03-01,1\n")).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["New York", "2026-03-01", 1])]);
-    assert_eq!(prep.lineage(&ann, &d.id, None).unwrap().edits, 1);
-}
-
-#[test]
-fn a_measure_edit_overrides_one_row_and_is_flagged_when_upstream_moves() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let row = serde_json::json!({ "region": "NY", "month": "2026-01-01", "amount": 100 });
-    let (d, out) =
-        prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 120 }]))).unwrap();
-    assert_eq!(out[0].state, State::Applied);
-    assert_eq!(rows_of(&prep, &ann, &d.id)[0], serde_json::json!(["NY", "2026-01-01", 120]));
-    // Upstream moves the value it replaced: the user's value wins, flagged.
-    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-01-01,105\nCA,2026-01-01,80\n")).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id)[0], serde_json::json!(["NY", "2026-01-01", 120]));
-    let (_, outcomes) = prep.edit_log(&ann, &d.id).unwrap();
-    assert_eq!(outcomes[0].state, State::Flagged, "{outcomes:?}");
-    assert!(d.notes.iter().any(|n| n.contains("flagged")), "{:?}", d.notes);
-    // The row goes upstream: orphaned, kept, not applied.
-    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nCA,2026-01-01,80\n")).unwrap();
-    let (log, outcomes) = prep.edit_log(&ann, &d.id).unwrap();
-    assert_eq!((log.len(), outcomes[0].state.clone()), (1, State::Orphaned));
-    // It comes back, and so does the edit.
-    let d = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-01-01,100\n")).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id)[0][2], 120);
-}
-
-#[test]
-fn an_edit_that_does_not_name_one_row_is_refused_unless_a_key_or_all_says() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv("region,store,amount\nNY,a,1\nNY,a,2\nCA,b,3\n")).unwrap();
-    let row = serde_json::json!({ "region": "NY", "store": "a" });
-    let e = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 9 }]))).err().unwrap();
-    assert!(e.to_string().contains("2 rows have these values") && e.to_string().contains("mark a key"), "{e}");
-    let e = prep
-        .edit(
-            &ann,
-            &d.id,
-            edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": { "region": "TX", "store": "z" }, "to": 9 }])),
-        )
-        .err();
-    assert!(e.unwrap().to_string().contains("no row has these values"));
-    let (d, _) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 9, "all": true }])))
-        .unwrap();
-    let amounts: Vec<Value> = rows_of(&prep, &ann, &d.id).iter().map(|r| r[2].clone()).collect();
-    assert_eq!(amounts, [9, 9, 3]);
-}
-
-#[test]
-fn a_dimension_edit_for_one_row_rows_added_and_deleted_and_undo() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let (d, out) = prep
-        .edit(
-            &ann,
-            &d.id,
-            edits(
-                1,
-                serde_json::json!([
-                    { "op": "cell", "column": "region", "row": { "region": "NY", "month": "2026-02-01" }, "to": "NJ", "match": ["month"] },
-                    { "op": "delete", "row": { "region": "CA", "month": "2026-01-01" } },
-                    { "op": "add", "values": { "region": "TX", "month": "2026-01-01", "amount": 5 } },
-                ]),
-            ),
-        )
-        .unwrap();
-    assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
-    let rows = rows_of(&prep, &ann, &d.id);
-    assert_eq!(
-        rows,
-        [
-            serde_json::json!(["NY", "2026-01-01", 100]),
-            serde_json::json!(["NJ", "2026-02-01", 90]),
-            serde_json::json!(["TX", "2026-01-01", 5]),
-        ]
-    );
-    let e =
-        prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "add", "values": { "region": "NY", "month": "2026-01-01" } }]))).err();
-    assert!(e.unwrap().to_string().contains("is there already"));
-    let (d, _) = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "undo", "edit": "1.2" }]))).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 4, "the deleted row is back");
-    let e = prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "undo", "edit": "1.2" }]))).err().unwrap();
-    assert!(e.to_string().contains("undone already"), "{e}");
-    assert!(matches!(prep.edit(&ann, &d.id, edits(2, serde_json::json!([{ "op": "undo", "edit": "1.1" }]))), Err(Error::Conflict(_))));
-}
-
-#[test]
-fn edits_apply_in_the_order_they_were_made() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let (d, out) = prep
-        .edit(
-            &ann,
-            &d.id,
-            edits(
-                1,
-                serde_json::json!([
-                    { "op": "delete", "row": { "region": "CA", "month": "2026-01-01" } },
-                    { "op": "cell", "column": "region", "from": "CA", "to": "California" },
-                    { "op": "cell", "column": "region", "from": "NY", "to": "New York" },
-                    { "op": "cell", "column": "region", "from": "New York", "to": "NYC" },
-                    { "op": "add", "values": { "region": "TX", "month": "2026-01-01", "amount": 5 } },
-                ]),
-            ),
-        )
-        .unwrap();
-    assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
-    // Its own entry, after the add: one place in the recipe, two entries.
-    let (d, out) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "delete", "row": { "region": "TX", "month": "2026-01-01" } }])))
-        .unwrap();
-    assert!(out.iter().all(|o| o.state == State::Applied), "{out:?}");
+    let sales = source(&prep, &ann, "region,amount\nNY,10\nCA,5\nTX,1\n");
+    let (owners, owners_ds) = upload(&prep, &ann, "area,manager\nNY,kim\nCA,lee\n,ann\n,bo\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let joined = |right: Value, how: &str| {
+        graph(json!([
+            { "id": "sales", "kind": "source", "source": sales },
+            right,
+            { "id": "j", "kind": "join", "left": "sales", "right": "owners", "on": [{ "left": "region", "right": "area" }], "type": how },
+            { "id": "out", "kind": "output", "input": "j" },
+        ]))
+    };
+    // The other side may be a dataset's output, or a source.
+    let r = ran(&prep, &ann, &d.id, joined(json!({ "id": "owners", "kind": "dataset", "dataset": owners_ds.id }), "left"));
     assert_eq!(
         rows_of(&prep, &ann, &d.id),
-        [serde_json::json!(["NYC", "2026-01-01", 100]), serde_json::json!(["NYC", "2026-02-01", 90])],
-        "the delete came before the remap of what it named; remaps chain; a row added then deleted is gone"
+        [json!(["NY", 10, "kim"]), json!(["CA", 5, "lee"]), json!(["TX", 1, null])],
+        "null keys repeat nothing"
     );
-}
-
-#[test]
-fn an_edit_for_the_rows_that_agree_is_for_every_such_row_after_a_sync() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let cell = serde_json::json!([
-        { "op": "cell", "column": "region", "row": { "region": "NY", "month": "2026-02-01" }, "to": "NJ", "match": ["month"] },
-    ]);
-    let (d, _) = prep.edit(&ann, &d.id, edits(1, cell)).unwrap();
-    let r = prep.replace(&ann, &d.id, csv("region,month,amount\nNY,2026-02-01,90\nNY,2026-02-01,7\nCA,2026-01-01,80\n")).unwrap();
+    let j = r.nodes.iter().find(|n| n.id == "j").unwrap();
     assert_eq!(
-        rows_of(&prep, &ann, &r.id),
-        [
-            serde_json::json!(["NJ", "2026-02-01", 90]),
-            serde_json::json!(["NJ", "2026-02-01", 7]),
-            serde_json::json!(["CA", "2026-01-01", 80]),
-        ],
-        "it matched one row when it was made, and is for both now"
+        (j.join.as_ref().unwrap().matched, j.join.as_ref().unwrap().unmatched_left, j.join.as_ref().unwrap().unmatched_right),
+        (2, 1, 2)
     );
+    assert_eq!(j.summary, "Joined owners: 2 of 3 rows matched; 1 have no match and are kept.");
+    let lineage = prep.lineage(&ann, &d.id, None).unwrap();
+    assert_eq!((lineage.datasets[0].id.as_str(), lineage.datasets[0].node.as_deref()), (owners_ds.id.as_str(), Some("owners")));
+    assert_eq!(lineage.columns[2].from[0].source, format!("dataset:{}", owners_ds.id));
+    assert_eq!(r.reads.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>(), ["source", "dataset"]);
+    let r = ran(&prep, &ann, &d.id, joined(json!({ "id": "owners", "kind": "source", "source": owners.id }), "inner"));
+    assert_eq!(prep.get(&ann, &d.id).unwrap().rows, 2);
+    assert!(r.nodes[2].summary.contains("are dropped"), "{}", r.nodes[2].summary);
+    // A side that repeats a key would multiply rows: the run fails at the join.
+    let dup = source(&prep, &ann, "area,manager\nNY,kim\nNY,ann\n");
+    let r = run(&prep, &ann, &d.id, joined(json!({ "id": "owners", "kind": "source", "source": dup }), "left")).unwrap();
+    assert_eq!((r.state, r.problems[0].node.as_deref(), r.problems[0].code), (RunState::Failed, Some("j"), graph::Code::Data));
+    assert!(
+        r.problems[0].message.contains("node owners is not unique on its keys") && r.problems[0].message.contains("'NY'"),
+        "{:?}",
+        r.problems
+    );
+    // A key it names that a side does not have.
+    let e = run(
+        &prep,
+        &ann,
+        &d.id,
+        graph(json!([
+            { "id": "sales", "kind": "source", "source": sales },
+            { "id": "owners", "kind": "source", "source": owners.id },
+            { "id": "j", "kind": "join", "left": "sales", "right": "owners", "on": [{ "left": "region", "right": "areas" }] },
+            { "id": "out", "kind": "output", "input": "j" },
+        ])),
+    )
+    .err()
+    .unwrap();
+    assert!(e.contains("node j: the join reads column 'areas' of its right side, owners, which is not there"), "{e}");
+    // A dataset of another project is not there to be read.
+    let (_, theirs) = upload(&prep, &Scope { project: "other".into(), ..scope() }, "area,manager\nNY,x\n");
+    let e = run(&prep, &ann, &d.id, joined(json!({ "id": "owners", "kind": "dataset", "dataset": theirs.id }), "left")).err().unwrap();
+    assert!(e.contains("it reads dataset") && e.contains("not in this project"), "{e}");
 }
 
 #[test]
-fn an_entry_never_acknowledged_is_not_an_edit_and_its_number_is_taken_again() {
-    let (dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    // A job wrote its entry and failed before the manifest said so.
-    let log = prep.store.root(&ann.org, &ann.project).join(&d.id).join(edits::LOG);
-    let stale = serde_json::json!({ "seq": 1, "at": "2026-01-01T00:00:00Z", "recipe": 1, "after": 0, "edits": [
-        { "kind": "delete", "id": "1.1", "key": { "region": "NY", "month": "2026-01-01" }, "all": false }
-    ] });
-    std::fs::write(&log, format!("{stale}\n")).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 3);
-    let (d, _) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "CA", "to": "California" }])))
-        .unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 3, "the stale delete is not in force");
-    let (entries, _) = prep.edit_log(&ann, &d.id).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(matches!(&entries[0].edits[0], edits::Edit::Remap { id, .. } if id == "1.1"));
-    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1, "the stale entry is gone from the log");
-    drop(dir);
-}
-
-#[test]
-fn edits_apply_where_they_were_made_and_an_edit_on_a_gone_column_holds() {
+fn an_append_node_meets_columns_by_name() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGETS)).unwrap();
-    let (d, _) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }])))
-        .unwrap();
-    // A step added later runs after the edit: it sees the remapped value.
-    let change = Change {
-        key: vec![],
-        against: 1,
-        roles: Default::default(),
-        steps: steps(serde_json::json!([{ "op": "filter", "formula": "region = 'New York'" }])),
-    };
-    let d = prep.change(&ann, &d.id, change).unwrap();
-    assert_eq!(d.rows, 2, "the filter runs after the edit made before it");
-    // The edited column goes upstream: the edit holds the dataset; confirming undoes it.
-    let d = prep.replace(&ann, &d.id, csv("area,month,amount\nNY,2026-01-01,1\n")).unwrap();
-    let held = d.held.clone().unwrap();
-    assert!(held.unresolved.iter().any(|u| u.edit.as_deref() == Some("1.1")), "{:?}", held.unresolved);
-    let d = prep.confirm(&ann, &d.id, 2).unwrap();
-    assert!(d.held.is_none());
-    let (log, _) = prep.edit_log(&ann, &d.id).unwrap();
-    assert!(matches!(&log.last().unwrap().edits[0], Edit::Undo { undoes, .. } if undoes == "1.1"));
+    let jan = source(&prep, &ann, "region,amount\nNY,10\n");
+    let feb = source(&prep, &ann, "amount,region,note\n2.5,CA,late\n");
+    let mar = source(&prep, &ann, "region\nTX\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let r = ran(
+        &prep,
+        &ann,
+        &d.id,
+        graph(json!([
+            { "id": "jan", "kind": "source", "source": jan },
+            { "id": "feb", "kind": "source", "source": feb },
+            { "id": "mar", "kind": "source", "source": mar },
+            { "id": "all", "kind": "append", "inputs": ["jan", "feb", "mar"] },
+            { "id": "out", "kind": "output", "input": "all" },
+        ])),
+    );
+    let cols: Vec<(String, ColumnType)> = columns_of(&prep, &ann, &d.id).into_iter().map(|c| (c.name, c.ty)).collect();
+    assert_eq!(cols, [("region".into(), Text), ("amount".into(), Decimal(1)), ("note".into(), Text)]);
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["NY", "10.0", null]), json!(["CA", "2.5", "late"]), json!(["TX", null, null])]);
+    let all = r.nodes.iter().find(|n| n.id == "all").unwrap();
+    assert_eq!(all.summary, "Appended 3 inputs: 1 + 1 + 1 rows, 3 in all; 2 column(s) only in some, empty in the rest.");
 }
 
-fn arrived(regions: &[&str], revenue: &[i128]) -> Arrived {
+#[test]
+fn a_sql_node_reads_its_inputs_by_the_aliases_it_gives_them() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let sales = source(&prep, &ann, SALES);
+    let stores = source(&prep, &ann, "store,city\na,Albany\nb,Fresno\nc,Ithaca\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let g = |q: &str| {
+        graph(json!([
+            { "id": "s", "kind": "source", "source": sales },
+            { "id": "t", "kind": "source", "source": stores },
+            { "id": "q", "kind": "sql", "inputs": { "sales": "s", "stores": "t" }, "query": q },
+            { "id": "out", "kind": "output", "input": "q" },
+        ]))
+    };
+    let r =
+        ran(&prep, &ann, &d.id, g("SELECT city, sum(amount) AS total FROM sales JOIN stores USING (store) GROUP BY city ORDER BY city"));
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["Albany", 10]), json!(["Fresno", 5]), json!(["Ithaca", 7])]);
+    assert_eq!(r.nodes[2].summary, "Ran a query: 6 rows in, 3 rows, 2 columns out.");
+    let e = run(&prep, &ann, &d.id, g("SELECT * FROM s")).err().unwrap();
+    assert!(e.contains("node q: it reads s; it reads sales, stores"), "{e}");
+    let e = run(&prep, &ann, &d.id, g("SELECT nope FROM sales")).err().unwrap();
+    assert!(e.contains("node q: its query reads column 'nope'"), "{e}");
+}
+
+#[test]
+fn a_graph_reads_a_datasets_output_and_a_version_of_it() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, base) = upload(&prep, &ann, SALES);
+    prep.add_upload(&ann, &s.id, csv("region,store,amount\nNY,a,1\n")).unwrap();
+    ran(&prep, &ann, &base.id, prep.version(&ann, &base.id, None).unwrap().graph.unwrap());
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let reading = |read: Value| {
+        graph(json!([{ "id": "b", "kind": "dataset", "dataset": base.id, "read": read }, { "id": "out", "kind": "output", "input": "b" }]))
+    };
+    ran(&prep, &ann, &d.id, reading(json!("latest")));
+    assert_eq!(prep.get(&ann, &d.id).unwrap().rows, 1);
+    let r = ran(&prep, &ann, &d.id, reading(json!({ "version": 1 })));
+    assert_eq!((prep.get(&ann, &d.id).unwrap().rows, r.inputs[0].number), (3, Some(1)));
+    assert!(run(&prep, &ann, &d.id, reading(json!("pull"))).err().unwrap().contains("it is not pulled"));
+    assert!(run(&prep, &ann, &d.id, reading(json!({ "snapshot": 1 }))).err().unwrap().contains("versions, not snapshots"));
+}
+
+// ------------------------------------------------------------- edits
+
+#[test]
+fn an_edits_node_applies_edits_by_key_and_says_how_each_fared() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let src = source(&prep, &ann, "store,region,amount\n1,NY,10\n2,CA,5\n3,NY,7\n4,TX,1\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let with = |edits: Value| {
+        graph(json!([
+            { "id": "in", "kind": "source", "source": src },
+            { "id": "fix", "kind": "edits", "input": "in", "key": ["store"], "edits": edits },
+            { "id": "big", "kind": "steps", "input": "fix", "steps": [{ "op": "filter", "formula": "amount > 2" }] },
+            { "id": "out", "kind": "output", "input": "big" },
+        ]))
+    };
+    let edits = json!([
+        { "id": "e1", "kind": "remap", "column": "region", "from": "NY", "to": "New York" },
+        { "id": "e2", "kind": "set", "column": "amount", "key": { "store": 2 }, "to": 50, "was": 5 },
+        { "id": "e3", "kind": "delete", "key": { "store": 4 } },
+        { "id": "e4", "kind": "add", "key": { "store": 9 }, "values": { "region": "WA", "amount": 3 } },
+        { "id": "e5", "kind": "set", "column": "amount", "key": { "store": 77 }, "to": 1 },
+    ]);
+    let r = ran(&prep, &ann, &d.id, with(edits.clone()));
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [json!([1, "New York", 10]), json!([2, "CA", 50]), json!([3, "New York", 7]), json!([9, "WA", 3])],
+        "applied where the node is: before the filter, which then keeps the row edited up"
+    );
+    let fix = r.nodes.iter().find(|n| n.id == "fix").unwrap();
+    let states: Vec<(&str, State)> = fix.edits.iter().map(|o| (o.id.as_str(), o.state.clone())).collect();
+    assert!(states.contains(&("e5", State::Orphaned)) && states.contains(&("e2", State::Applied)), "{states:?}");
+    assert_eq!(fix.summary, "5 edits: 4 applied, 1 found no row.");
+    assert!(prep.get(&ann, &d.id).unwrap().notes.iter().any(|n| n.contains("e5")), "an orphan is a note");
+    // Upstream moves the value an edit replaced: the user's value wins, flagged.
+    prep.add_upload(&ann, &src, csv("store,region,amount\n1,NY,10\n2,CA,6\n")).unwrap();
+    let r = ran(&prep, &ann, &d.id, with(edits));
+    assert_eq!(rows_of(&prep, &ann, &d.id)[1], json!([2, "CA", 50]));
+    let fix = r.nodes.iter().find(|n| n.id == "fix").unwrap();
+    assert_eq!(fix.edits.iter().find(|o| o.id == "e2").unwrap().state, State::Flagged);
+    // A key that is not unique where the node is fails the run.
+    prep.add_upload(&ann, &src, csv("store,region,amount\n1,NY,10\n1,CA,6\n")).unwrap();
+    let r = run(&prep, &ann, &d.id, with(json!([]))).unwrap();
+    assert!(r.problems[0].message.contains("its key store is not unique here"), "{:?}", r.problems);
+    // Edits that do not fit the node are refused before anything runs.
+    for (edits, says) in [
+        (
+            json!([{ "id": "x", "kind": "set", "column": "amount", "key": { "region": "NY" }, "to": 1 }]),
+            "its key names region; the node's key is store",
+        ),
+        (json!([{ "id": "x", "kind": "remap", "column": "gone", "from": 1, "to": 2 }]), "edit x reads column 'gone'"),
+        (json!([{ "id": "x", "kind": "set", "column": "amount", "key": { "store": 1 }, "to": "lots" }]), "not a value of column 'amount'"),
+        (
+            json!([{ "id": "x", "kind": "delete", "key": { "store": 1 } }, { "id": "x", "kind": "delete", "key": { "store": 2 } }]),
+            "two edits have the id 'x'",
+        ),
+    ] {
+        let e = run(&prep, &ann, &d.id, with(edits)).err().unwrap();
+        assert!(e.contains("node fix") && e.contains(says), "{says}: {e}");
+    }
+}
+
+// ----------------------------------------------------- output contracts
+
+#[test]
+fn an_output_check_that_holds_keeps_nothing_and_one_that_warns_lets_it_through() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let src = source(&prep, &ann, "store,amount\n1,10\n2,5\n");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let out = |extra: Value| {
+        let mut o = json!({ "id": "out", "kind": "output", "input": "in", "key": ["store"], "roles": { "store": "dimension" } });
+        o.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+        graph(json!([{ "id": "in", "kind": "source", "source": src }, o]))
+    };
+    let r = ran(&prep, &ann, &d.id, out(json!({})));
+    assert_eq!(r.nodes[1].summary, "Output: 2 rows, 2 columns; 2 checks passed.");
+    assert_eq!(columns_of(&prep, &ann, &d.id)[0].role, Role::Dimension, "the output gives the roles");
+    prep.add_upload(&ann, &src, csv("store,amount\n1,10\n1,5\n,3\n")).unwrap();
+    let r = run(&prep, &ann, &d.id, out(json!({}))).unwrap();
+    assert_eq!(r.state, RunState::Held);
+    assert_eq!(r.summary, "Held: store unique, store never empty failed; version 1 is still live.");
+    assert_eq!(r.nodes[1].checks.iter().map(|c| c.failing).collect::<Vec<_>>(), [1, 1]);
+    assert_eq!(prep.get(&ann, &d.id).unwrap().live, Some(1));
+    let warn = out(json!({ "key": [], "checks": [{ "check": "not_null", "columns": ["store"], "on_fail": "warn" }] }));
+    let r = ran(&prep, &ann, &d.id, warn);
+    assert!(r.summary.contains("check failed, let through: store never empty (1 failing)"), "{}", r.summary);
+    assert_eq!(prep.get(&ann, &d.id).unwrap().live, Some(2));
+    let e = run(&prep, &ann, &d.id, out(json!({ "checks": [{ "check": "unique", "columns": ["nope"] }] }))).err().unwrap();
+    assert!(e.contains("node out: check 1 reads column 'nope'"), "{e}");
+}
+
+// ------------------------------------------------- query sources, runs
+
+fn arrived(regions: &[&str], revenue: &[i128], context: &str) -> Arrived {
     use arrow_array::{ArrayRef, Decimal128Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     let schema = std::sync::Arc::new(Schema::new(vec![
@@ -997,160 +969,151 @@ fn arrived(regions: &[&str], revenue: &[i128]) -> Arrived {
         read: SemanticRead {
             branch: "main".into(),
             deployed_at: "2026-11-26T10:00Z".into(),
-            spec: Some(serde_json::json!({ "fields": ["region", "year", "revenue"] })),
+            spec: Some(json!({ "fields": ["region", "year", "revenue"] })),
             expr: None,
             sql_sha256: "ab".repeat(32),
-            context: "cd".repeat(32),
+            context: context.into(),
             fields: [("revenue".to_string(), "orders.revenue".to_string())].into_iter().collect(),
         },
     }
 }
 
-#[test]
-fn a_semantic_query_is_a_source_refreshed_by_request() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let query = Query { branch: "main".into(), spec: Some(serde_json::json!({ "fields": ["region", "revenue"] })), expr: None };
-    let id = new_id("shop");
-    let d = prep.create_from_query(&ann, &id, Some("revenue"), query.clone(), arrived(&["NY", "CA"], &[1050, 200])).unwrap();
-    assert_eq!(d.id, id);
-    let kinds: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
-    assert_eq!(kinds, [("region", Text, Role::Dimension), ("year", Integer, Role::Dimension), ("revenue", Decimal(2), Role::Measure)]);
-    assert_eq!(prep.query(&ann, &id).unwrap(), query);
-    let lineage = prep.lineage(&ann, &id, None).unwrap();
-    let read = lineage.sources[0].semantic.as_ref().unwrap();
-    assert_eq!((read.branch.as_str(), read.fields["revenue"].as_str()), ("main", "orders.revenue"));
-    // A refresh is a new snapshot, and the recipe runs on it.
-    let d = prep
-        .change(
-            &ann,
-            &id,
-            Change {
-                key: vec![],
-                against: 1,
-                roles: Default::default(),
-                steps: steps(serde_json::json!([{ "op": "remove_columns", "columns": ["year"] }])),
-            },
-        )
-        .unwrap();
-    let d = prep.refresh(&ann, &d.id, arrived(&["NY"], &[99])).unwrap();
-    assert_eq!((d.sources[0].snapshot, d.rows), (2, 1));
-    assert_eq!(rows_of(&prep, &ann, &id), [serde_json::json!(["NY", "0.99"])]);
-    assert!(prep.replace(&ann, &id, csv(BUDGET)).is_err(), "a query's dataset is not replaced by an upload");
-    assert!(prep.create_from_query(&ann, &id, None, query, arrived(&[], &[])).is_err(), "an id is made once");
-}
-
-fn change(against: u32, v: Value) -> Change {
-    Change { key: vec![], against, roles: Default::default(), steps: steps(v) }
+/// A run whose pulls the test answers, as the server would, with rows
+/// taken as `context`.
+fn run_pulling(prep: &Prep, scope: &Scope, ds: &str, g: Graph, context: &str, rows: &[&str]) -> (Vec<String>, RunRecord) {
+    let request = RunRequest { id: run_id(), dataset: ds.into(), graph: g };
+    let Begun::Started(mut t) = prep.begin(scope, request, context).unwrap() else { panic!("a new run id") };
+    let pulled: Vec<String> = t.pulls.iter().map(|p| p.source.clone()).collect();
+    for p in pulled.clone() {
+        prep.pulled_for(&mut t, &p, arrived(rows, &vec![100; rows.len()], context)).unwrap();
+    }
+    (pulled, prep.execute(*t))
 }
 
 #[test]
-fn a_join_side_with_null_keys_is_not_a_repeat() {
+fn a_query_source_is_pulled_by_a_run_as_its_context_and_read_only_as_it() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let sales = prep.create(&ann, None, csv("region,amount\nNY,10\nCA,5\n")).unwrap();
-    let owners = prep.create(&ann, None, csv("area,manager\nNY,kim\n,ann\n,bo\n")).unwrap();
-    let join = serde_json::json!([{ "op": "join", "dataset": owners.id, "on": [{ "left": "region", "right": "area" }] }]);
-    let d = prep.change(&ann, &sales.id, change(1, join)).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["NY", 10, "kim"]), serde_json::json!(["CA", 5, null])]);
-}
-
-#[test]
-fn a_join_brings_another_datasets_columns_and_refuses_to_multiply_rows() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let sales = prep.create(&ann, None, csv("region,amount\nNY,10\nCA,5\nTX,1\n")).unwrap();
-    let owners = prep.create(&ann, None, csv("area,manager\nNY,kim\nCA,lee\n")).unwrap();
-    let join = serde_json::json!([{ "op": "join", "dataset": owners.id, "on": [{ "left": "region", "right": "area" }] }]);
-    let d = prep.change(&ann, &sales.id, change(1, join.clone())).unwrap();
+    let query = Query { branch: "main".into(), spec: Some(json!({ "fields": ["region", "revenue"] })), expr: None };
+    let s = prep.create_query(&ann, Named { name: Some("revenue".into()), description: None }, query.clone()).unwrap();
+    assert_eq!((s.kind, s.snapshot, s.query.clone()), (Kind::Query, 0, Some(query)));
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let g = |read: Value| {
+        graph(json!([{ "id": "rev", "kind": "source", "source": s.id, "read": read }, { "id": "out", "kind": "output", "input": "rev" }]))
+    };
+    // Never pulled: the dry run says so, and a run pulls it.
+    let c = prep.check(&ann, &g(json!("latest")), "ann").unwrap();
+    assert!(c.ok && c.said.starts_with("Pulls revenue (it has never been pulled)"), "{}", c.said);
+    let (pulled, r) = run_pulling(&prep, &ann, &d.id, g(json!("latest")), "ann", &["NY", "CA"]);
+    assert_eq!((pulled, r.state), (vec![s.id.clone()], RunState::Succeeded), "{}", r.summary);
+    assert_eq!(r.inputs[0].will, record::Will::Pull);
+    let kinds: Vec<(String, ColumnType, Role)> = columns_of(&prep, &ann, &d.id).into_iter().map(|c| (c.name, c.ty, c.role)).collect();
     assert_eq!(
-        rows_of(&prep, &ann, &d.id),
-        [serde_json::json!(["NY", 10, "kim"]), serde_json::json!(["CA", 5, "lee"]), serde_json::json!(["TX", 1, null]),]
+        kinds,
+        [
+            ("region".into(), Text, Role::Dimension),
+            ("year".into(), Integer, Role::Dimension),
+            ("revenue".into(), Decimal(2), Role::Measure)
+        ]
     );
-    let lineage = prep.lineage(&ann, &d.id, None).unwrap();
-    assert_eq!(lineage.datasets[0].id, owners.id);
-    assert_eq!(lineage.columns[2].from[0].source, format!("dataset:{}", owners.id));
-    // An inner join keeps only what matches.
-    let inner = serde_json::json!([{ "op": "join", "dataset": owners.id, "on": [{ "left": "region", "right": "area" }], "kind": "inner" }]);
-    assert_eq!(prep.change(&ann, &sales.id, change(2, inner)).unwrap().rows, 2);
-    // A side that repeats a key would multiply rows: refused.
-    let dup = prep.create(&ann, None, csv("area,manager\nNY,kim\nNY,ann\n")).unwrap();
-    let bad = serde_json::json!([{ "op": "join", "dataset": dup.id, "on": [{ "left": "region", "right": "area" }] }]);
-    let e = prep.change(&ann, &sales.id, change(3, bad)).err().unwrap();
-    assert!(e.to_string().contains("not unique on its keys") && e.to_string().contains("'NY'"), "{e}");
-    // A dataset of another project is not there to be read.
-    let theirs = prep.create(&Scope { project: "other".into(), ..scope() }, None, csv("area,manager\nNY,x\n")).unwrap();
-    let e = prep.change(
-        &ann,
-        &sales.id,
-        change(3, serde_json::json!([{ "op": "join", "dataset": theirs.id, "on": [{ "left": "region", "right": "area" }] }])),
-    );
-    assert!(e.err().unwrap().to_string().contains("not a dataset of this project"));
+    let read = prep.lineage(&ann, &d.id, None).unwrap().sources[0].semantic.clone().unwrap();
+    assert_eq!((read.context.as_str(), read.fields["revenue"].as_str()), ("ann", "orders.revenue"));
+    // Latest, as the same context: the snapshot it took, no pull.
+    let (pulled, _) = run_pulling(&prep, &ann, &d.id, g(json!("latest")), "ann", &[]);
+    assert!(pulled.is_empty());
+    // Another context reads its own: a pull, never ann's rows.
+    let (pulled, _) = run_pulling(&prep, &ann, &d.id, g(json!("latest")), "bo", &["TX"]);
+    assert_eq!(pulled.len(), 1);
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!(["TX", 2026, "1.00"])]);
+    // Pull, and a max age a fresh snapshot is inside.
+    assert_eq!(run_pulling(&prep, &ann, &d.id, g(json!("pull")), "ann", &["NY"]).0.len(), 1);
+    assert!(run_pulling(&prep, &ann, &d.id, g(json!({ "max_age": 3600 })), "ann", &[]).0.is_empty());
+    // A snapshot named that another context took is refused.
+    let e = prep.begin(&ann, RunRequest { id: run_id(), dataset: d.id.clone(), graph: g(json!({ "snapshot": 2 })) }, "ann").err().unwrap();
+    assert!(e.to_string().contains("snapshot 2 of revenue was taken as another context"), "{e}");
+    // A query source takes no file.
+    assert!(prep.add_upload(&ann, &s.id, csv(BUDGET)).err().unwrap().to_string().contains("pulled by a run"));
 }
 
 #[test]
-fn an_append_meets_columns_by_name() {
+fn a_run_id_answers_its_first_request_and_a_dataset_takes_one_run_at_a_time() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let jan = prep.create(&ann, None, csv("region,amount\nNY,10\n")).unwrap();
-    let feb = prep.create(&ann, None, csv("amount,region,note\n2.5,CA,late\n")).unwrap();
-    let d = prep.change(&ann, &jan.id, change(1, serde_json::json!([{ "op": "append", "dataset": feb.id }]))).unwrap();
-    assert_eq!(
-        d.columns.iter().map(|c| (c.name.as_str(), c.ty)).collect::<Vec<_>>(),
-        [("region", Text), ("amount", Decimal(1)), ("note", Text)]
-    );
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["NY", "10.0", null]), serde_json::json!(["CA", "2.5", "late"])]);
+    let (s, d) = upload(&prep, &ann, SALES);
+    let g = steps_graph(&s.id, json!([]));
+    let ask = |id: &str, g: Graph| prep.begin(&ann, RunRequest { id: id.into(), dataset: d.id.clone(), graph: g }, ANN);
+    let Begun::Started(t) = ask("r1", g.clone()).unwrap() else { panic!() };
+    assert!(matches!(ask("r2", g.clone()), Err(Error::Conflict(m)) if m.contains("being made by run r1")));
+    let Begun::Answered(running) = ask("r1", g.clone()).unwrap() else { panic!("a retry") };
+    assert_eq!(running.state, RunState::Running);
+    let done = prep.execute(*t);
+    let Begun::Answered(again) = ask("r1", g.clone()).unwrap() else { panic!() };
+    assert_eq!((again.state, again.version), (RunState::Succeeded, done.version));
+    assert_eq!(prep.run(&ann, "r1").unwrap().version, Some(2));
+    let other = steps_graph(&s.id, json!([{ "op": "sort", "by": [{ "column": "amount" }] }]));
+    assert!(matches!(ask("r1", other), Err(Error::Conflict(m)) if m.contains("a new run takes a new id")));
+    assert!(matches!(ask("../r", g), Err(Error::Invalid(_))));
+    assert_eq!(prep.get(&ann, &d.id).unwrap().last_run.unwrap().id, "r1");
 }
 
 #[test]
-fn datasets_that_read_datasets_are_a_dag_run_downstream_in_order() {
+fn a_dry_run_says_what_a_run_would_read_and_each_nodes_columns() {
     let (_dir, prep) = prep();
     let ann = scope();
-    let a = prep.create(&ann, None, csv("k,v\n1,10\n")).unwrap();
-    let b = prep.create(&ann, None, csv("k\n1\n")).unwrap();
-    let c = prep.create(&ann, None, csv("k\n1\n")).unwrap();
-    let join_to = |id: &str| serde_json::json!([{ "op": "join", "dataset": id, "on": [{ "left": "k", "right": "k" }], "prefix": format!("{}_", &id[3..6]) }]);
-    // b reads a; c reads a and b.
-    prep.change(&ann, &b.id, change(1, join_to(&a.id))).unwrap();
-    let mut both = join_to(&a.id).as_array().unwrap().clone();
-    both.extend(join_to(&b.id).as_array().unwrap().clone());
-    prep.change(&ann, &c.id, change(1, Value::Array(both))).unwrap();
-    // a reading c would close a loop.
-    let e = prep.change(&ann, &a.id, change(1, join_to(&c.id))).err().unwrap();
-    assert!(e.to_string().contains("would make a cycle"), "{e}");
-    assert!(prep.change(&ann, &a.id, change(1, join_to(&a.id))).err().unwrap().to_string().contains("cannot read itself"));
-    assert_eq!(prep.downstream(&ann, &a.id).unwrap().iter().map(|d| d.id.clone()).collect::<Vec<_>>(), [b.id.clone(), c.id.clone()]);
-
-    // A new snapshot of a runs b, then c over the versions just made.
-    let a2 = prep.replace(&ann, &a.id, csv("k,v\n1,99\n")).unwrap();
-    assert!(a2.notes.iter().any(|n| n.contains(&b.id) && n.contains("version")), "{:?}", a2.notes);
-    let c_now = prep.get(&ann, &c.id).unwrap();
-    let lineage = prep.lineage(&ann, &c.id, None).unwrap();
-    let read_b = lineage.datasets.iter().find(|r| r.id == b.id).unwrap().version;
-    assert_eq!(read_b, prep.get(&ann, &b.id).unwrap().live.unwrap(), "c read the b this cascade made");
-    assert!(rows_of(&prep, &ann, &c_now.id)[0].as_array().unwrap().contains(&serde_json::json!(99)));
-
-    // A column b names of a goes from a: a is held, naming b.
-    let e = prep.replace(&ann, &a.id, csv("v\n1\n")).unwrap();
-    let held = e.held.unwrap();
-    assert!(
-        held.unresolved.iter().any(|u| u.describe() == format!("dataset {} reads column 'k' of this one", b.id)),
-        "{:?}",
-        held.unresolved
-    );
-    // Confirmed, a moves on, and b and c are held in turn, keeping their versions.
-    let b_before = prep.get(&ann, &b.id).unwrap().live;
-    let a3 = prep.confirm(&ann, &a.id, 1).unwrap();
-    assert!(a3.held.is_none());
-    let b_after = prep.get(&ann, &b.id).unwrap();
-    assert!(b_after.held.is_some());
-    assert_eq!(b_after.live, b_before);
-    assert!(a3.notes.iter().any(|n| n.contains(&c.id) && n.contains("was not run again")), "{:?}", a3.notes);
-
-    // A dataset others read is deleted only when confirmed.
-    assert!(matches!(prep.delete(&ann, &a.id, false), Err(Error::Conflict(_))));
-    prep.delete(&ann, &a.id, true).unwrap();
+    let src = source(&prep, &ann, SALES);
+    let c = prep.check(&ann, &steps_graph(&src, json!([{ "op": "remove_columns", "columns": ["store"] }])), ANN).unwrap();
+    assert!(c.ok);
+    assert_eq!(c.said, "Reads budget (snapshot 1, its newest), runs 3 nodes.");
+    let shape = c.nodes.iter().find(|n| n.id == "shape").unwrap();
+    assert_eq!(shape.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "amount"]);
+    let c = prep.check(&ann, &graph(json!([{ "id": "a", "kind": "source", "source": src }])), ANN).unwrap();
+    assert!(!c.ok && c.problems[0].message.contains("has none"), "{:?}", c.problems);
+    assert!(prep.list(&ann).is_empty(), "a dry run makes nothing");
 }
+
+#[test]
+fn a_sources_types_are_how_it_is_read_and_a_node_reads_with_its_own() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let src = source(&prep, &ann, "store,code\n1,2134\n2,10001\n");
+    assert_eq!(prep.source(&ann, &src).unwrap().columns[1].ty, Integer, "a code looks like a number");
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let types: BTreeMap<String, ColumnType> = [("code".to_string(), Text)].into_iter().collect();
+    let s = prep.change_source(&ann, &src, SourceChange { types: Some(types), ..Default::default() }).unwrap();
+    assert_eq!((s.read, s.reads.len()), (2, 2));
+    let r = ran(&prep, &ann, &d.id, steps_graph(&src, json!([])));
+    assert_eq!(columns_of(&prep, &ann, &d.id)[1].ty, Text);
+    assert!(r.nodes[0].summary.contains("read code as text"), "{}", r.nodes[0].summary);
+    assert_eq!(prep.lineage(&ann, &d.id, None).unwrap().sources[0].read, 2);
+    // A node reads with its own, for itself only.
+    let g = graph(json!([
+        { "id": "in", "kind": "source", "source": src, "types": { "store": "text" } },
+        { "id": "out", "kind": "output", "input": "in" },
+    ]));
+    ran(&prep, &ann, &d.id, g);
+    assert_eq!(columns_of(&prep, &ann, &d.id).iter().map(|c| c.ty).collect::<Vec<_>>(), [Text, Text]);
+    assert!(prep.create_dataset(&ann, Named::default(), Some(&src)).is_err(), "read with types, it is not a dataset as it is");
+    let g = graph(
+        json!([{ "id": "in", "kind": "source", "source": src, "types": { "nope": "text" } }, { "id": "out", "kind": "output", "input": "in" }]),
+    );
+    assert!(run(&prep, &ann, &d.id, g).err().unwrap().contains("the types it is read with reads column 'nope'"));
+}
+
+#[test]
+fn a_source_keeps_its_newest_snapshots_and_every_one_an_output_needs() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, "a\n1\n");
+    for i in 2..=23 {
+        prep.add_upload(&ann, &s.id, csv(&format!("a\n{i}\n"))).unwrap();
+    }
+    let kept: Vec<u32> = prep.snapshots(&ann, &s.id).unwrap().iter().map(|x| x.number).collect();
+    assert_eq!(kept.len(), 21, "the newest 20 and the one the dataset is: {kept:?}");
+    assert!(kept.contains(&1) && !kept.contains(&2) && kept.contains(&23));
+    assert_eq!(rows_of(&prep, &ann, &d.id), [json!([1])]);
+}
+
+// ---------------------------------------------------------------- blends
 
 mod blends {
     use super::*;
@@ -1198,6 +1161,7 @@ mod blends {
         prep: Prep,
         ann: Scope,
         budget: String,
+        budget_source: String,
         owners: String,
         targets: String,
     }
@@ -1205,10 +1169,10 @@ mod blends {
     fn fixture() -> Fixture {
         let (dir, prep) = prep();
         let ann = scope();
-        let budget = prep.create(&ann, None, csv("region,month,amount\nNY,2026-01,100\nNY,2026-02,90\nCA,2026-01,50\n")).unwrap().id;
-        let owners = prep.create(&ann, None, csv("region,manager\nNY,kim\nCA,lee\n")).unwrap().id;
-        let targets = prep.create(&ann, None, csv("region\nNY\nNY\n")).unwrap().id;
-        Fixture { _dir: dir, prep, ann, budget, owners, targets }
+        let (bs, budget) = upload(&prep, &ann, "region,month,amount\nNY,2026-01,100\nNY,2026-02,90\nCA,2026-01,50\n");
+        let owners = upload(&prep, &ann, "region,manager\nNY,kim\nCA,lee\n").1.id;
+        let targets = upload(&prep, &ann, "region\nNY\nNY\n").1.id;
+        Fixture { _dir: dir, prep, ann, budget: budget.id, budget_source: bs.id, owners, targets }
     }
 
     #[test]
@@ -1243,10 +1207,10 @@ mod blends {
         assert_eq!(
             got,
             [
-                serde_json::json!(["CA", "2026-01", null, 50, "lee"]),
-                serde_json::json!(["CA", "2026-03", "5.00", null, "lee"]),
-                serde_json::json!(["NY", "2026-01", "120.00", 100, "kim"]),
-                serde_json::json!(["NY", "2026-02", null, 90, "kim"]),
+                json!(["CA", "2026-01", null, 50, "lee"]),
+                json!(["CA", "2026-03", "5.00", null, "lee"]),
+                json!(["NY", "2026-01", "120.00", 100, "kim"]),
+                json!(["NY", "2026-02", null, 90, "kim"]),
             ],
             "a month with a budget and no sales still shows"
         );
@@ -1255,14 +1219,14 @@ mod blends {
         assert!(f.prep.blend(&f.ann, &plan, &m, "select 1").unwrap().hit, "the same question over the same data is kept");
         assert!(!f.prep.blend(&f.ann, &plan, &m, "select 2").unwrap().hit, "another run of the model's part is another question");
         // A new version of a dataset is another question too.
-        f.prep.replace(&f.ann, &f.budget, csv("region,month,amount\nNY,2026-01,1\n")).unwrap();
+        f.prep.add_upload(&f.ann, &f.budget_source, csv("region,month,amount\nNY,2026-01,1\n")).unwrap();
+        ran(&f.prep, &f.ann, &f.budget, steps_graph(&f.budget_source, json!([])));
         assert!(!f.prep.blend(&f.ann, &plan, &m, "select 1").unwrap().hit);
     }
 
     #[test]
     fn a_join_key_not_asked_for_is_refused() {
         let f = fixture();
-        // Joined on region and month, and asked for by region alone.
         let m = model(&[("NY", "2026-01", 100), ("NY", "2026-02", 200)]);
         let plan = Blend {
             datasets: vec![Attach { id: f.budget.clone(), alias: "budget".into() }],
@@ -1281,28 +1245,22 @@ mod blends {
     #[test]
     fn a_join_on_no_keys_is_a_cross_join() {
         let f = fixture();
-        let target = f.prep.create(&f.ann, None, csv("target\n150\n")).unwrap().id;
+        let target = upload(&f.prep, &f.ann, "target\n150\n").1.id;
         let m = model(&[("NY", "2026-01", 12000), ("CA", "2026-01", 500)]);
         let mut plan = Blend {
             datasets: vec![Attach { id: target, alias: "goal".into() }],
             joins: vec![Join { join: "goal".into(), to: "model".into(), on: vec![], kind: Kind::Enrich }],
             outputs: vec![out_model("__m0", "region", false), out_model("__m2", "revenue", true), out_ds("goal", "target")],
         };
-        assert_eq!(
-            rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()),
-            [serde_json::json!(["NY", "120.00", 150]), serde_json::json!(["CA", "5.00", 150])],
-            "no key to ask for, and every row beside the target"
-        );
+        assert_eq!(rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()), [json!(["NY", "120.00", 150]), json!(["CA", "5.00", 150])]);
         plan.joins[0].kind = Kind::Filter;
         plan.outputs.pop();
-        let e = f.prep.blend(&f.ann, &plan, &m, "q2").err().unwrap();
-        assert!(e.to_string().contains("a filter on nothing"), "{e}");
+        assert!(f.prep.blend(&f.ann, &plan, &m, "q2").err().unwrap().to_string().contains("a filter on nothing"));
     }
 
     #[test]
     fn a_dimension_the_dataset_does_not_have_is_refused() {
         let f = fixture();
-        // The model is by region and month; budget joined on region alone.
         let m = model(&[("NY", "2026-01", 100)]);
         let plan = Blend {
             datasets: vec![Attach { id: f.budget.clone(), alias: "budget".into() }],
@@ -1332,16 +1290,11 @@ mod blends {
             }],
             outputs: vec![out_model("__m0", "region", false), out_model("__m2", "revenue", true)],
         };
-        assert_eq!(
-            rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()),
-            [serde_json::json!(["NY", "1.00"])],
-            "a semi-join: no row repeats"
-        );
+        assert_eq!(rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()), [json!(["NY", "1.00"])], "a semi-join: no row repeats");
         let mut lookup = plan;
         lookup.joins[0].kind = Kind::Enrich;
         lookup.outputs.push(out_ds("targets", "region"));
-        let e = f.prep.blend(&f.ann, &lookup, &m, "q").err().unwrap();
-        assert!(e.to_string().contains("not unique on its keys"), "{e}");
+        assert!(f.prep.blend(&f.ann, &lookup, &m, "q").err().unwrap().to_string().contains("not unique on its keys"));
     }
 
     #[test]
@@ -1369,206 +1322,151 @@ mod blends {
             let e = f.prep.blend(&f.ann, &plan, &m, "q").err().unwrap();
             assert!(e.to_string().contains(says), "{says}: {e}");
         }
-        // A dataset of another project is not there to attach.
         let plan = Blend { datasets: attach, joins: vec![join("model")], outputs };
         assert!(matches!(f.prep.blend(&Scope { project: "other".into(), ..scope() }, &plan, &m, "q"), Err(Error::NotFound(_))));
     }
 }
 
+// ---------------------------------------------------------------- backup
+
 #[test]
-fn every_dataset_is_copied_to_the_object_store_and_restored_from_it() {
+fn every_source_and_dataset_is_copied_to_the_object_store_and_restored_from_it() {
     let (dir, _) = prep();
     let store_dir = dir.0.join("store");
     std::fs::create_dir_all(&store_dir).unwrap();
     let objects = std::sync::Arc::new(zsql_exec::Objects::open(&format!("file://{}", store_dir.display()), &[]).unwrap());
     let data = dir.0.join("data");
-    let open = || {
-        let mut s = Settings::defaults(&data);
-        s.engine.threads = 1;
-        Prep::open(&data, s).unwrap().with_backup(Some(objects.clone()))
-    };
+    let open = || reopen(&data).with_backup(Some(objects.clone()));
     let prep = open();
     let ann = scope();
-    let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-    assert_eq!(d.backup.as_ref().map(|b| b.failed.clone()), Some(None), "{:?}", d.backup);
-    let (d, _) = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "EMEA", "to": "Europe" }])))
-        .unwrap();
+    let (s, d) = upload(&prep, &ann, BUDGET);
+    assert_eq!(prep.get(&ann, &d.id).unwrap().backup.map(|b| b.failed), Some(None));
+    assert_eq!(prep.source(&ann, &s.id).unwrap().backup.map(|b| b.failed), Some(None));
+    let fix = graph(json!([
+        { "id": "in", "kind": "source", "source": s.id },
+        { "id": "fix", "kind": "edits", "input": "in", "edits": [{ "id": "e1", "kind": "remap", "column": "region", "from": "EMEA", "to": "Europe" }] },
+        { "id": "out", "kind": "output", "input": "fix" },
+    ]));
+    ran(&prep, &ann, &d.id, fix);
     let copied: Vec<String> = objects.list(&["datasets", "default", "shop", &d.id]).unwrap().into_iter().map(|k| k.join("/")).collect();
-    for f in ["dataset.json", "edits.log", "recipe/r1.json", "sources/s1/1.arrow", "v1/rows.arrow", "v2/lineage.json"] {
+    for f in ["dataset.json", "v1/manifest.json", "v2/rows.arrow", "v2/lineage.json", "v2/graph.json", "v2/run.json"] {
         assert!(copied.contains(&f.to_string()), "{f} not in {copied:?}");
     }
+    let sent: Vec<String> =
+        objects.list(&["datasets", "default", "shop", "sources", &s.id]).unwrap().into_iter().map(|k| k.join("/")).collect();
+    assert!(sent.contains(&"source.json".to_string()) && sent.contains(&"snapshots/1/rows.arrow".to_string()), "{sent:?}");
 
-    // The disk is lost; a restore brings the dataset back whole.
+    // The disk is lost; a restore brings both back whole, the source first.
     std::fs::remove_dir_all(data.join("default")).unwrap();
     let prep = open();
     assert!(prep.get(&ann, &d.id).is_err());
-    assert_eq!(prep.restore("default").unwrap(), [format!("shop/{}", d.id)]);
+    assert_eq!(prep.restore("default").unwrap(), [format!("shop/{}", s.id), format!("shop/{}", d.id)]);
     assert_eq!(rows_of(&prep, &ann, &d.id)[0][0], "Europe");
+    assert_eq!(
+        json_rows(&prep.page(&ann, &d.id, Some(1), 0, 10, &View::default()).unwrap())[0][0],
+        "EMEA",
+        "the output that is the snapshot"
+    );
     assert!(prep.restore("default").unwrap().is_empty(), "what is here is not brought back again");
-
-    // A delete removes the copy too.
-    prep.delete(&ann, &d.id, false).unwrap();
+    prep.delete(&ann, &d.id).unwrap();
     assert!(objects.list(&["datasets", "default", "shop", &d.id]).unwrap().is_empty());
-    // With no object store there is nothing to restore from.
+    prep.delete_source(&ann, &s.id).unwrap();
+    assert!(objects.list(&["datasets", "default", "shop", "sources", &s.id]).unwrap().is_empty());
     let (_d2, plain) = self::prep();
     assert!(matches!(plain.restore("default"), Err(Error::Invalid(_))));
 }
 
-#[test]
-fn a_dimension_edit_is_for_the_column_for_rows_that_agree_on_others_or_for_one_row() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let three = "region,store,month,amount\nNY,a,2026-01-01,1\nNY,b,2026-01-01,2\nNY,a,2026-02-01,3\nCA,a,2026-01-01,4\n";
-    let regions = |prep: &Prep, id: &str| -> Vec<Value> { rows_of(prep, &ann, id).iter().map(|r| r[0].clone()).collect() };
-
-    // Every NY: the column.
-    let d = prep.create(&ann, None, csv(three)).unwrap();
-    prep.edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "region", "from": "NY", "to": "New York" }]))).unwrap();
-    assert_eq!(regions(&prep, &d.id), ["New York", "New York", "New York", "CA"]);
-
-    // NY where store is a: the rows that agree on store, however many.
-    let d = prep.create(&ann, None, csv(three)).unwrap();
-    let row = serde_json::json!({ "region": "NY", "store": "a", "month": "2026-01-01", "amount": 1 });
-    let (_, out) = prep
-        .edit(
-            &ann,
-            &d.id,
-            edits(1, serde_json::json!([{ "op": "cell", "column": "region", "row": row, "to": "Manhattan", "match": ["store"] }])),
-        )
-        .unwrap();
-    assert_eq!(out[0].state, State::Applied);
-    assert_eq!(regions(&prep, &d.id), ["Manhattan", "NY", "Manhattan", "CA"]);
-
-    // That row alone: its whole identity.
-    let d = prep.create(&ann, None, csv(three)).unwrap();
-    let (_, out) = prep
-        .edit(
-            &ann,
-            &d.id,
-            edits(1, serde_json::json!([{ "op": "cell", "column": "region", "row": row, "to": "Brooklyn", "match": ["store", "month"] }])),
-        )
-        .unwrap();
-    assert_eq!(out[0].state, State::Applied);
-    assert_eq!(regions(&prep, &d.id), ["Brooklyn", "NY", "NY", "CA"]);
-
-    // Its conditions hold through a new file: rows that agree are edited, others not.
-    let d = prep.replace(&ann, &d.id, csv("region,store,month,amount\nNY,a,2026-01-01,9\nNY,c,2026-01-01,1\n")).unwrap();
-    assert_eq!(regions(&prep, &d.id), ["Brooklyn", "NY"]);
-
-    // A measure's default is its row; a measure edit that names several rows needs all.
-    let d = prep.create(&ann, None, csv(three)).unwrap();
-    let e = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["store"] }])))
-        .err()
-        .unwrap();
-    assert!(e.to_string().contains("3 rows have these values"), "{e}");
-    prep.edit(
-        &ann,
-        &d.id,
-        edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["store"], "all": true }])),
-    )
-    .unwrap();
-    let amounts: Vec<Value> = rows_of(&prep, &ann, &d.id).iter().map(|r| r[3].clone()).collect();
-    assert_eq!(amounts, [0, 2, 0, 0]);
-    let e = prep
-        .edit(&ann, &d.id, edits(1, serde_json::json!([{ "op": "cell", "column": "amount", "row": row, "to": 0, "match": ["nope"] }])))
-        .err();
-    assert!(e.unwrap().to_string().contains("no column 'nope'"));
-}
-
-#[test]
-fn an_edit_stays_after_the_steps_it_was_made_on_when_the_recipe_changes_around_it() {
-    let (_dir, prep) = prep();
-    let ann = scope();
-    let d = prep.create(&ann, None, csv("region,store,amount\nny,a,1\nny,b,2\nca,a,3\n")).unwrap();
-    let label = serde_json::json!({ "op": "add_column", "column": "label", "formula": "upper(region)" });
-    let d = prep.change(&ann, &d.id, change(1, serde_json::json!([label]))).unwrap();
-    // An edit of `label`, made after the step that makes it.
-    let (d, _) =
-        prep.edit(&ann, &d.id, edits(2, serde_json::json!([{ "op": "cell", "column": "label", "from": "NY", "to": "NEW YORK" }]))).unwrap();
-    // A step put before it, and a group after: the edit stays between.
-    let trim = serde_json::json!({ "op": "trim_val", "columns": ["store"] });
-    let group = serde_json::json!({ "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] });
-    let d = prep.change(&ann, &d.id, change(2, serde_json::json!([trim, label, group]))).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["CA", 3]), serde_json::json!(["NEW YORK", 3])]);
-    // The step before it removed: still after the formula, still before the group.
-    let d = prep.change(&ann, &d.id, change(3, serde_json::json!([label, group]))).unwrap();
-    assert_eq!(rows_of(&prep, &ann, &d.id)[1], serde_json::json!(["NEW YORK", 3]));
-}
-
-#[test]
-fn a_position_is_carried_to_the_steps_a_recipe_still_has() {
-    let s = |n: &str| -> Step { serde_json::from_value(serde_json::json!({ "op": "trim_val", "columns": [n] })).unwrap() };
-    let (a, b, c, x) = (s("a"), s("b"), s("c"), s("x"));
-    use crate::edits::relocate;
-    let old = [a.clone(), b.clone(), c.clone()];
-    assert_eq!(relocate(2, Some(&old), &old), 2);
-    assert_eq!(relocate(2, Some(&old), &[x.clone(), a.clone(), b.clone(), c.clone()]), 3, "a step put before moves it on");
-    assert_eq!(relocate(2, Some(&old), &[a.clone(), c.clone()]), 1, "the step it followed gone: after the one before");
-    assert_eq!(relocate(2, Some(&old), std::slice::from_ref(&c)), 0);
-    assert_eq!(relocate(3, None, &[a]), 1, "a version not found: as far as the recipe goes");
-}
+// -------------------------------------------------------------- recovery
 
 mod recovery_tests {
     use super::*;
-    use crate::recovery::{Cause, JobKind, QueryJob, State, Then};
-
-    fn reopen(dir: &Dir) -> Prep {
-        let mut settings = Settings::defaults(&dir.0);
-        settings.engine.memory = "256MB".into();
-        settings.engine.threads = 1;
-        Prep::open(&dir.0, settings).unwrap()
-    }
-
-    fn dataset_dir(prep: &Prep, id: &str) -> PathBuf {
-        prep.store.root(&scope().org, &scope().project).join(id)
-    }
+    use crate::recovery::{Cause, JobKind};
 
     #[test]
-    fn a_job_found_running_at_start_is_interrupted_not_run_again_until_the_next_job() {
+    fn a_run_found_running_at_start_is_interrupted_and_never_run_again() {
         let (dir, prep) = prep();
         let ann = scope();
-        let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-        let ddir = dataset_dir(&prep, &d.id);
-        assert!(!ddir.join(recovery::MARKER).exists(), "a job that ended leaves no marker");
-        // The process died during a recipe change.
-        let marker = serde_json::json!({ "job": "change", "started": "2026-11-27T00:00:00.000Z", "state": "running" });
-        std::fs::write(ddir.join(recovery::MARKER), marker.to_string()).unwrap();
+        let (s, d) = upload(&prep, &ann, BUDGET);
+        let Begun::Started(_t) = prep
+            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN)
+            .unwrap()
+        else {
+            panic!()
+        };
+        // The process dies with it running.
         drop(prep);
-        let prep = reopen(&dir);
-        let got = prep.get(&ann, &d.id).unwrap();
-        let i = got.interrupted.clone().expect("interrupted");
-        assert_eq!((i.job, i.cause), (JobKind::Change, Cause::Crash));
+        let prep = reopen(&dir.0);
+        let r = prep.run(&ann, "crashed").unwrap();
+        assert_eq!(r.state, RunState::Interrupted);
+        let i = r.interrupted.unwrap();
+        assert_eq!((i.job, i.cause), (JobKind::Run, Cause::Crash));
         assert!(
             i.reason.contains("may be what stopped the server, so it was not run again") && i.reason.contains("Send it again"),
             "{}",
             i.reason
         );
-        assert_eq!(got.live, d.live, "it keeps the version it had");
-        assert!(!ddir.join(recovery::MARKER).exists());
-        assert!(serde_json::to_value(prep.list(&ann)).unwrap()[0]["interrupted"].is_object(), "the list says so too");
-        // The next job the user asks for ends it.
-        let d = prep.change(&ann, &d.id, change(1, serde_json::json!([{ "op": "sort", "by": [{ "column": "amount" }] }]))).unwrap();
-        assert!(d.interrupted.is_none());
+        let got = prep.get(&ann, &d.id).unwrap();
+        assert_eq!((got.live, got.last_run.map(|l| l.state)), (Some(1), Some(RunState::Interrupted)), "it keeps the output it had");
+        assert!(got.interrupted.is_some());
+        // The next run the application sends ends it.
+        ran(&prep, &ann, &d.id, steps_graph(&s.id, json!([])));
         assert!(prep.get(&ann, &d.id).unwrap().interrupted.is_none());
-        drop(dir);
+        // So does the same id: it answers what it came to.
+        let Begun::Answered(again) = prep
+            .begin(&ann, RunRequest { id: "crashed".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(again.state, RunState::Interrupted);
     }
 
     #[test]
-    fn what_a_job_left_half_made_is_swept_at_start() {
+    fn a_stop_suspends_what_runs_past_its_grace_and_the_next_start_says_so() {
         let (dir, prep) = prep();
         let ann = scope();
-        let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-        let ddir = dataset_dir(&prep, &d.id);
-        let root = ddir.parent().unwrap().to_path_buf();
+        let (s, d) = upload(&prep, &ann, BUDGET);
+        let slow = json!([{ "op": "sql", "query": "SELECT region, month, amount FROM input, range(100000000000) a, range(1000) b" }]);
+        let Begun::Started(t) =
+            prep.begin(&ann, RunRequest { id: "slow".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, slow) }, ANN).unwrap()
+        else {
+            panic!()
+        };
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let job = scope.spawn(|| prep.execute(*t));
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            prep.stop(std::time::Duration::from_millis(200));
+            assert_eq!(job.join().unwrap().state, RunState::Suspended);
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        let e = prep.begin(&ann, RunRequest { id: "late".into(), dataset: d.id.clone(), graph: steps_graph(&s.id, json!([])) }, ANN);
+        assert!(matches!(e, Err(Error::Stopping(_))), "nothing new starts");
+        assert!(matches!(prep.add_upload(&ann, &s.id, csv(BUDGET)), Err(Error::Stopping(_))));
+        drop(prep);
+        let prep = reopen(&dir.0);
+        let i = prep.run(&ann, "slow").unwrap().interrupted.unwrap();
+        assert_eq!((i.job, i.cause), (JobKind::Run, Cause::Stop));
+        assert!(i.reason.contains("stopped while this run ran, and nothing is resumed"), "{}", i.reason);
+    }
+
+    #[test]
+    fn a_snapshot_cut_short_marks_its_source_and_what_it_left_is_swept() {
+        let (dir, prep) = prep();
+        let ann = scope();
+        let (s, d) = upload(&prep, &ann, BUDGET);
+        let root = dir.0.join("default/shop").join(DIR);
+        let sdir = root.join(store::SOURCES).join(&s.id);
+        let marker = json!({ "job": "upload", "started": "2026-11-27T00:00:00.000Z", "state": "running" });
+        std::fs::write(sdir.join(recovery::MARKER), marker.to_string()).unwrap();
         let left = [
             dir.0.join(".cache/prep/s999-0-1"),
             root.join(".new-ds_0000000000000000"),
+            root.join(store::SOURCES).join(".new-src_0000000000000000"),
             root.join(".deleting-ds_1111111111111111-5"),
-            ddir.join(".v9.staging-123"),
-            ddir.join("recipe/r1.tmp-999"),
-            ddir.join("dataset.tmp-999"),
+            root.join(&d.id).join(".v9.staging-123"),
+            sdir.join("snapshots/.s2.staging-123"),
+            root.join(&d.id).join("dataset.tmp-999"),
         ];
         for p in &left {
             if p.extension().is_some_and(|e| e.to_string_lossy().starts_with("tmp-")) {
@@ -1578,96 +1476,15 @@ mod recovery_tests {
             }
         }
         drop(prep);
-        let prep = reopen(&dir);
+        let prep = reopen(&dir.0);
         for p in &left {
             assert!(!p.exists(), "{} is swept", p.display());
         }
-        assert_eq!(rows_of(&prep, &ann, &d.id).len(), 2, "the dataset itself is untouched");
-        drop(dir);
-    }
-
-    #[test]
-    fn a_stop_suspends_what_runs_past_its_grace_and_the_next_start_says_so() {
-        let (dir, prep) = prep();
-        let ann = scope();
-        let d = prep.create(&ann, None, csv(BUDGET)).unwrap();
-        let slow =
-            serde_json::json!([{ "op": "sql", "query": "SELECT region, month, amount FROM input, range(100000000000) a, range(1000) b" }]);
-        let started = std::time::Instant::now();
-        std::thread::scope(|t| {
-            let job = t.spawn(|| prep.change(&ann, &d.id, change(1, slow)));
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            prep.stop(std::time::Duration::from_millis(200));
-            let e = job.join().unwrap().err().unwrap();
-            assert!(e.to_string().contains("stopping"), "{e}");
-        });
-        assert!(started.elapsed() < std::time::Duration::from_secs(20));
-        assert!(matches!(prep.change(&ann, &d.id, change(1, serde_json::json!([]))), Err(Error::Stopping(_))), "nothing new starts");
-        let m: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dataset_dir(&prep, &d.id).join(recovery::MARKER)).unwrap()).unwrap();
-        assert_eq!(m["state"].as_str(), Some("suspended"));
-        drop(prep);
-        // Nothing is resumed: the start says the stop interrupted it.
-        let prep = reopen(&dir);
-        let i = prep.get(&ann, &d.id).unwrap().interrupted.unwrap();
-        assert_eq!((i.job, i.cause), (JobKind::Change, Cause::Stop));
-        assert!(i.reason.contains("stopped while this recipe change ran"), "{}", i.reason);
-        drop(dir);
-    }
-
-    fn query_job(id: &str, then: Then, state: State) -> QueryJob {
-        QueryJob {
-            id: id.into(),
-            result: "r_1".into(),
-            since: time::now(),
-            then,
-            query: Query { branch: "main".into(), spec: Some(serde_json::json!({ "projections": [] })), expr: None },
-            state,
-            interrupted: None,
-        }
-    }
-
-    #[test]
-    fn a_query_waited_on_is_kept_and_a_start_interrupts_it_as_it_was_left() {
-        let (dir, prep) = prep();
-        let ann = scope();
-        let refreshed = prep.create(&ann, None, csv(BUDGET)).unwrap();
-        let (crashed, stopped) = (new_id("shop"), new_id("shop"));
-        prep.waiting(&ann, query_job(&crashed, Then::Create { name: Some("q".into()) }, State::Running));
-        prep.waiting(&ann, query_job(&stopped, Then::Create { name: None }, State::Running));
-        prep.waiting(&ann, query_job(&refreshed.id, Then::Refresh, State::Running));
-        // A query that ends is forgotten.
-        let done = new_id("shop");
-        prep.waiting(&ann, query_job(&done, Then::Refresh, State::Running));
-        prep.done(&ann, &done);
-        // The stop suspends them all; then pretend two were a crash.
-        prep.stop(std::time::Duration::from_millis(10));
-        let jobs = dataset_dir(&prep, "x").parent().unwrap().join(recovery::QUERIES);
-        let path = jobs.join(format!("{crashed}.json"));
-        let mut q: QueryJob = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        q.state = State::Running;
-        std::fs::write(&path, serde_json::to_string(&q).unwrap()).unwrap();
-        let path = jobs.join(format!("{}.json", refreshed.id));
-        let mut q: QueryJob = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        q.state = State::Running;
-        std::fs::write(&path, serde_json::to_string(&q).unwrap()).unwrap();
-        drop(prep);
-
-        let prep = reopen(&dir);
-        assert!(!std::fs::read_to_string(jobs.join(format!("{stopped}.json"))).unwrap().contains("context"), "no context is kept");
-        let p = prep.pending(&ann, &crashed).expect("its id still answers");
-        let i = p.interrupted.unwrap();
-        assert_eq!((i.job, i.cause), (JobKind::Create, Cause::Crash));
-        assert!(p.failed.unwrap().contains("Make it again"));
-        let i = prep.pending(&ann, &stopped).unwrap().interrupted.unwrap();
-        assert_eq!((i.job, i.cause), (JobKind::Create, Cause::Stop), "a stop resumes nothing");
-        let i = prep.get(&ann, &refreshed.id).unwrap().interrupted.unwrap();
-        assert_eq!((i.job, i.cause), (JobKind::Refresh, Cause::Crash));
-        assert!(prep.pending(&ann, &done).is_none());
-        // The tombstones survive another start.
-        drop(prep);
-        let prep = reopen(&dir);
-        assert!(prep.pending(&ann, &crashed).unwrap().interrupted.is_some());
-        drop(dir);
+        let i = prep.source(&ann, &s.id).unwrap().interrupted.unwrap();
+        assert_eq!((i.job, i.cause), (JobKind::Upload, Cause::Crash));
+        assert!(!sdir.join(recovery::MARKER).exists());
+        assert_eq!(rows_of(&prep, &ann, &d.id).len(), 2, "what was kept is untouched");
+        prep.add_upload(&ann, &s.id, csv(BUDGET)).unwrap();
+        assert!(prep.source(&ann, &s.id).unwrap().interrupted.is_none(), "its next job ends it");
     }
 }

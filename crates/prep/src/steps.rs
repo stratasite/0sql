@@ -1,31 +1,13 @@
-//! The recipe: what is done to a dataset's sources to make it. Every
-//! version is kept, and a change names the version it was made against,
-//! so two editors never overwrite each other and undo is going back to
-//! a version that is still there.
+//! The steps of a `steps` node: a closed set of operations on one
+//! input's rows, each declaring the columns it reads, compiled by
+//! `compile` and never written as SQL by anyone but a `sql` step's
+//! author.
 
-use crate::error::{Error, Result};
-use crate::schema::{Column, ColumnType, Role};
+use crate::schema::ColumnType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Recipe {
-    pub version: u32,
-    pub created: String,
-    /// Roles the user gave columns, over the ones they were inferred
-    /// with.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub roles: BTreeMap<String, Role>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<Step>,
-    /// The columns that name a row, for edits, when the dimensions do
-    /// not; none means every dimension.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub key: Vec<String>,
-}
-
-/// One operation of a recipe: a closed set, each declaring the columns
+/// One operation of a `steps` node: a closed set, each declaring the columns
 /// it reads, compiled by `compile` and never written as SQL by anyone.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -146,29 +128,10 @@ pub enum Step {
         keep_empty: bool,
     },
     /// A query, run as a black box over the step before, which it reads
-    /// as `input` and as nothing else; see `sql`.
+    /// as `input` and as nothing else; see `sql`. A `sql` node reads
+    /// several inputs by alias.
     Sql {
         query: String,
-    },
-    /// Another dataset's rows after these, its columns met by name.
-    Append {
-        dataset: String,
-    },
-    // Combine.
-    /// Another dataset's columns beside these, by keys: `left` keeps every
-    /// row here (a look-up), `inner` only those that match. The other
-    /// side must be unique on its keys, so no row is multiplied.
-    Join {
-        dataset: String,
-        on: Vec<JoinKey>,
-        #[serde(default)]
-        kind: JoinKind,
-        /// The columns brought; all but its keys when not said.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        columns: Option<Vec<String>>,
-        /// Put before each brought column's name.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prefix: Option<String>,
     },
 }
 
@@ -177,7 +140,7 @@ pub enum Step {
 pub struct JoinKey {
     /// A column here.
     pub left: String,
-    /// A column of the other dataset.
+    /// A column of the other side.
     pub right: String,
 }
 
@@ -253,89 +216,9 @@ impl Step {
             Step::Group { .. } => "group",
             Step::Unpivot { .. } => "unpivot",
             Step::Sql { .. } => "sql",
-            Step::Append { .. } => "append",
-            Step::Join { .. } => "join",
-        }
-    }
-
-    /// The dataset the step reads, when it reads one.
-    pub fn dataset(&self) -> Option<&str> {
-        match self {
-            Step::Append { dataset } | Step::Join { dataset, .. } => Some(dataset),
-            _ => None,
-        }
-    }
-
-    /// What the step needs of the dataset it reads, by name: a join's
-    /// keys and the columns it names. An append or a join that brings
-    /// every column needs no one column in particular.
-    pub fn needs(&self) -> Vec<String> {
-        match self {
-            Step::Join { on, columns, .. } => on.iter().map(|k| k.right.clone()).chain(columns.iter().flatten().cloned()).collect(),
-            _ => Vec::new(),
         }
     }
 }
 
-impl Recipe {
-    /// The datasets its steps read.
-    pub fn inputs(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.steps.iter().filter_map(Step::dataset).map(str::to_string).collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-}
-
-/// The most steps a recipe has.
+/// The most steps a node has.
 pub const STEPS_LIMIT: usize = 500;
-
-/// A change to a recipe, as a request makes it: the whole of the new
-/// recipe, and the version it replaces.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Change {
-    pub against: u32,
-    #[serde(default)]
-    pub roles: BTreeMap<String, Role>,
-    #[serde(default)]
-    pub steps: Vec<Step>,
-    #[serde(default)]
-    pub key: Vec<String>,
-}
-
-impl Recipe {
-    /// The recipe a dataset starts with: its sources as they are.
-    pub fn first(created: String) -> Recipe {
-        Recipe { version: 1, created, roles: BTreeMap::new(), steps: Vec::new(), key: Vec::new() }
-    }
-
-    /// The recipe a change makes of this one, refused when the change
-    /// was made against another version.
-    pub fn changed(&self, change: Change, created: String) -> Result<Recipe> {
-        if change.against != self.version {
-            return Err(Error::Conflict(format!(
-                "this change was made against recipe version {}, and the recipe is at version {} now; read it again and make the change on that",
-                change.against, self.version
-            )));
-        }
-        if change.steps.len() > STEPS_LIMIT {
-            return Err(Error::Invalid(format!("a recipe has at most {STEPS_LIMIT} steps")));
-        }
-        Ok(Recipe { version: self.version + 1, created, roles: change.roles, steps: change.steps, key: change.key })
-    }
-
-    /// The result's columns, with the user's roles over the ones they
-    /// came with; the names of roles given to columns the result does
-    /// not have.
-    pub fn apply_roles(&self, columns: &mut [Column]) -> Vec<String> {
-        let mut missing = Vec::new();
-        for (name, role) in &self.roles {
-            match columns.iter_mut().find(|c| &c.name == name) {
-                Some(c) => c.role = *role,
-                None => missing.push(name.clone()),
-            }
-        }
-        missing
-    }
-}
