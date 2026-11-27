@@ -177,7 +177,7 @@ fn a_recipe_of_steps_makes_each_version() {
         against: 1,
         roles: Default::default(),
         steps: steps(serde_json::json!([
-            { "op": "remap", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
+            { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
             { "op": "group", "by": ["region"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] },
         ])),
     };
@@ -199,6 +199,381 @@ fn a_recipe_of_steps_makes_each_version() {
 }
 
 #[test]
+fn an_unpivot_makes_month_columns_rows_and_takes_a_new_month_in_a_later_file() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep.create(&ann, None, csv("dept,Jan,Feb,Mar\nGROCERY,100,110,\nPRODUCE,40,,45\n")).unwrap();
+    let unpivot = serde_json::json!([{ "op": "unpivot", "keep": ["dept"], "name": "month", "value": "budget" }]);
+    let d = prep.change(&ann, &d.id, change(1, unpivot)).unwrap();
+    let names: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
+    assert_eq!(
+        names,
+        [
+            ("dept", ColumnType::Text, Role::Dimension),
+            ("month", ColumnType::Text, Role::Dimension),
+            ("budget", ColumnType::Integer, Role::Measure)
+        ]
+    );
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [
+            serde_json::json!(["GROCERY", "Jan", 100]),
+            serde_json::json!(["GROCERY", "Feb", 110]),
+            serde_json::json!(["PRODUCE", "Jan", 40]),
+            serde_json::json!(["PRODUCE", "Mar", 45]),
+        ],
+        "a row per month, in order, and no row for an empty value"
+    );
+    // Kept by naming what stays: April, new in the next file, is unpivoted too.
+    let d = prep.replace(&ann, &d.id, csv("dept,Jan,Apr\nGROCERY,1,2.5\n")).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["GROCERY", "Jan", "1.0"]), serde_json::json!(["GROCERY", "Apr", "2.5"])]);
+    // Empty values kept, when asked; columns named instead.
+    let named = serde_json::json!([{ "op": "unpivot", "columns": ["Jan"], "name": "month", "value": "budget", "keep_empty": true }]);
+    let d = prep.replace(&ann, &d.id, csv("dept,Jan,Apr\nGROCERY,,3\n")).unwrap();
+    let d = prep.change(&ann, &d.id, change(d.recipe, named)).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["GROCERY", "3.0", "Jan", null])], "Apr stays the decimal it was");
+    // Refused: both or neither, a clash, types that do not meet.
+    for (step, says) in [
+        (serde_json::json!({ "op": "unpivot", "columns": ["Jan"], "keep": ["dept"], "name": "m", "value": "v" }), "and not both"),
+        (serde_json::json!({ "op": "unpivot", "columns": ["Jan"], "name": "dept", "value": "v" }), "there is a column 'dept' already"),
+        (serde_json::json!({ "op": "unpivot", "columns": ["dept", "Apr"], "name": "m", "value": "v" }), "do not widen to one type"),
+        (serde_json::json!({ "op": "unpivot", "keep": ["dept", "Jan", "Apr"], "name": "m", "value": "v" }), "nothing to unpivot"),
+    ] {
+        let e = prep.preview(&ann, &d.id, Preview { steps: Some(steps(serde_json::json!([step]))), ..Default::default() }).err().unwrap();
+        assert!(e.to_string().contains(says), "{says}: {e}");
+    }
+}
+
+#[test]
+fn update_column_computes_a_column_again_and_takes_its_formulas_type() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep.create(&ann, None, csv("name,price\n  Milk ,1.234\nEggs,2.5\n")).unwrap();
+    let update = serde_json::json!([
+        { "op": "update_column", "column": "name", "formula": "upper(trim(name))" },
+        { "op": "update_column", "column": "price", "formula": "round(price, 1)" },
+        { "op": "add_column", "column": "label", "formula": "name & ' ' & to_text(price)" },
+        { "op": "update_column", "column": "price", "formula": "if(price > 2, 'dear', 'cheap')" },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, update)).unwrap();
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [serde_json::json!(["MILK", "cheap", "MILK 1.2"]), serde_json::json!(["EGGS", "dear", "EGGS 2.5"])]
+    );
+    let price = d.columns.iter().find(|c| c.name == "price").unwrap();
+    assert_eq!((price.ty, price.role), (ColumnType::Text, Role::Dimension), "a measure made text is a dimension");
+    let e = prep
+        .preview(
+            &ann,
+            &d.id,
+            Preview {
+                steps: Some(steps(serde_json::json!([{ "op": "update_column", "column": "gone", "formula": "1" }]))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(e.unresolved[0].describe(), "step 1 (update_column) reads column 'gone', which is not there at that step");
+}
+
+#[test]
+fn to_number_reads_numbers_as_people_write_them() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let file = "v\n1234.5\n\"$1,234.50\"\n(500)\n12%\n(12.5%)\nUSD 10\n10 EUR\n1 234\n1e3\n\"€ 9,99\"\n1.5\n12 apples\n1.2.3\n";
+    let d = prep.create(&ann, None, csv(file)).unwrap();
+    let add = serde_json::json!([
+        { "op": "add_column", "column": "n", "formula": "to_number(v)" },
+        { "op": "add_column", "column": "eu", "formula": "to_number(v, ',')" },
+        { "op": "add_column", "column": "i", "formula": "to_integer(v)" },
+        { "op": "add_column", "column": "ok", "formula": "is_number(v)" },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
+    assert_eq!(d.columns[1].ty, ColumnType::Decimal(6));
+    let got: Vec<Value> = rows_of(&prep, &ann, &d.id);
+    let want = [
+        ["1234.5", "1234.500000", "12345.000000", "null", "true"],
+        ["$1,234.50", "1234.500000", "1.234500", "null", "true"],
+        ["(500)", "-500.000000", "-500.000000", "-500", "true"],
+        ["12%", "0.120000", "0.120000", "null", "true"],
+        ["(12.5%)", "-0.125000", "-1.250000", "null", "true"],
+        ["USD 10", "10.000000", "10.000000", "10", "true"],
+        ["10 EUR", "10.000000", "10.000000", "10", "true"],
+        ["1 234", "1234.000000", "1234.000000", "1234", "true"],
+        ["1e3", "1000.000000", "1000.000000", "1000", "true"],
+        ["€ 9,99", "999.000000", "9.990000", "999", "true"],
+        ["1.5", "1.500000", "15.000000", "null", "true"],
+        ["12 apples", "null", "null", "null", "false"],
+        ["1.2.3", "null", "123.000000", "null", "false"],
+    ];
+    for (row, w) in got.iter().zip(want) {
+        let shown: Vec<String> =
+            row.as_array().unwrap().iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect();
+        assert_eq!(shown, w, "{}", w[0]);
+    }
+    let e = prep
+        .preview(
+            &ann,
+            &d.id,
+            Preview {
+                steps: Some(steps(serde_json::json!([{ "op": "filter", "formula": "to_number(v, ';') > 1" }]))),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("decimal mark is '.' or ','"), "{e}");
+}
+
+#[test]
+fn to_date_reads_every_unambiguous_way_a_date_is_written() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let file = "v\n2026-01-05\n2026/1/5\n2026.01.05\n2026-01-05T10:30:00Z\n20260105\n202601\n2026-01\n5 Jan 2026\n\"January 5, 2026\"\n05-jan-2026\nSeptember 2026\n31/01/2026\n01/31/2026\n46027\n2026-13-01\n202613\nsoon\n";
+    let d = prep.create(&ann, None, csv(file)).unwrap();
+    let add = serde_json::json!([
+        { "op": "add_column", "column": "auto", "formula": "to_date(v)" },
+        { "op": "add_column", "column": "dmy", "formula": "to_date(v, 'dmy')" },
+        { "op": "add_column", "column": "mdy", "formula": "to_date(v, 'mdy')" },
+        { "op": "add_column", "column": "excel", "formula": "to_date(v, 'excel')" },
+        { "op": "add_column", "column": "fmt", "formula": "to_date(v, '%d/%m/%Y')" },
+        { "op": "add_column", "column": "ok", "formula": "is_date(v)" },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
+    let n = "null";
+    let want = [
+        ["2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["2026/1/5", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["2026.01.05", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["2026-01-05T10:30:00Z", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["20260105", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["202601", "2026-01-01", "2026-01-01", "2026-01-01", "2026-01-01", n, "true"],
+        ["2026-01", "2026-01-01", "2026-01-01", "2026-01-01", "2026-01-01", n, "true"],
+        ["5 Jan 2026", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["January 5, 2026", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["05-jan-2026", "2026-01-05", "2026-01-05", "2026-01-05", "2026-01-05", n, "true"],
+        ["September 2026", "2026-09-01", "2026-09-01", "2026-09-01", "2026-09-01", n, "true"],
+        ["31/01/2026", n, "2026-01-31", n, n, "2026-01-31", "false"],
+        ["01/31/2026", n, n, "2026-01-31", n, n, "false"],
+        ["46027", n, n, n, "2026-01-05", n, "false"],
+        ["2026-13-01", n, n, n, n, n, "false"],
+        ["202613", n, n, n, n, n, "false"],
+        ["soon", n, n, n, n, n, "false"],
+    ];
+    let got = rows_of(&prep, &ann, &d.id);
+    assert_eq!(got.len(), want.len());
+    for (row, w) in got.iter().zip(want) {
+        let shown: Vec<String> =
+            row.as_array().unwrap().iter().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).collect();
+        assert_eq!(shown, w, "{}", w[0]);
+    }
+    let e = prep
+        .preview(
+            &ann,
+            &d.id,
+            Preview { steps: Some(steps(serde_json::json!([{ "op": "filter", "formula": "is_date(v, 'ydm')" }]))), ..Default::default() },
+        )
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("'dmy' (31/01/2026)"), "{e}");
+}
+
+#[test]
+fn switch_ifs_and_the_boolean_and_timestamp_readers() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let file = "region,amount,flag,at\nNY,150,Yes,2026-01-05 10:30\nCA,50,n,31/01/2026 14:05\nTX,5,maybe,46027.5\n,20,1,5 Jan 2026\n";
+    let d = prep.create(&ann, None, csv(file)).unwrap();
+    let add = serde_json::json!([
+        { "op": "add_column", "column": "name", "formula": "switch(region, 'NY', 'New York', 'CA', 'California', region)" },
+        { "op": "add_column", "column": "no_default", "formula": "switch(region, 'NY', 1)" },
+        { "op": "add_column", "column": "size", "formula": "ifs(amount > 100, 'big', amount > 10, 'mid', 'small')" },
+        { "op": "add_column", "column": "yes", "formula": "to_boolean(flag)" },
+        { "op": "add_column", "column": "auto", "formula": "to_timestamp(at)" },
+        { "op": "add_column", "column": "dmy", "formula": "to_timestamp(at, 'dmy')" },
+        { "op": "add_column", "column": "excel", "formula": "to_timestamp(at, 'excel')" },
+        { "op": "remove_columns", "columns": ["region", "amount", "flag", "at"] },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, add)).unwrap();
+    let types: Vec<ColumnType> = d.columns.iter().map(|c| c.ty).collect();
+    assert_eq!(
+        types,
+        [
+            ColumnType::Text,
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Boolean,
+            ColumnType::Timestamp,
+            ColumnType::Timestamp,
+            ColumnType::Timestamp
+        ]
+    );
+    let n = serde_json::Value::Null;
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [
+            serde_json::json!(["New York", 1, "big", true, "2026-01-05T10:30:00", "2026-01-05T10:30:00", "2026-01-05T10:30:00"]),
+            serde_json::json!(["California", n, "mid", false, n, "2026-01-31T14:05:00", n]),
+            serde_json::json!(["TX", n, "small", n, n, n, "2026-01-05T12:00:00"]),
+            serde_json::json!([n, n, "mid", true, "2026-01-05T00:00:00", "2026-01-05T00:00:00", "2026-01-05T00:00:00"]),
+        ]
+    );
+    for (formula, says) in [
+        ("switch(region, 'NY')", "switch() takes a value, then pairs"),
+        ("switch(region, 1, 'x')", "switch()'s values meets text with integer"),
+        ("ifs(amount, 'x')", "ifs()'s conditions takes boolean"),
+        ("switch(region, 'NY', 1, 'CA', 'x')", "switch()'s results"),
+    ] {
+        let step = serde_json::json!([{ "op": "add_column", "column": "k", "formula": formula }]);
+        let e = prep.preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() }).err();
+        let e = e.map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains(says), "{formula}: {e}");
+    }
+}
+
+#[test]
+fn a_sql_step_is_a_black_box_over_input_alone() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep
+        .create(&ann, None, csv("region,store,month,amount\nNY,a,2026-01,10\nNY,b,2026-01,5\nNY,a,2026-02,7\nCA,c,2026-01,3\n"))
+        .unwrap();
+    let q = "SELECT region, month, sum(amount) AS total, \
+             sum(sum(amount)) OVER (PARTITION BY region ORDER BY month) AS running, \
+             regexp_extract(month, '-(\\d+)', 1) AS m \
+             FROM input GROUP BY region, month ORDER BY region, month;";
+    let recipe = serde_json::json!([
+        { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
+        { "op": "sql", "query": q },
+        { "op": "add_column", "column": "share", "formula": "total / running" },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, recipe)).unwrap();
+    let shape: Vec<(&str, ColumnType, Role)> = d.columns.iter().map(|c| (c.name.as_str(), c.ty, c.role)).collect();
+    assert_eq!(
+        shape,
+        [
+            ("region", ColumnType::Text, Role::Dimension),
+            ("month", ColumnType::Text, Role::Dimension),
+            ("total", ColumnType::Integer, Role::Measure),
+            ("running", ColumnType::Integer, Role::Measure),
+            ("m", ColumnType::Text, Role::Dimension),
+            ("share", ColumnType::Double, Role::Measure),
+        ]
+    );
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [
+            serde_json::json!(["CA", "2026-01", 3, 3, "01", 1.0]),
+            serde_json::json!(["New York", "2026-01", 15, 15, "01", 1.0]),
+            serde_json::json!(["New York", "2026-02", 7, 22, "02", 7.0 / 22.0]),
+        ],
+        "it reads the step before it: NY was remapped first"
+    );
+    // A column it reads, gone upstream, holds the dataset, naming it.
+    let held = prep.replace(&ann, &d.id, csv("region,store,amount\nNY,a,1\n")).unwrap();
+    let why: Vec<String> = held.held.unwrap().unresolved.iter().map(|u| u.describe()).collect();
+    assert_eq!(
+        why,
+        [
+            "step 2 (sql) reads column 'month', which is not there at that step",
+            "step 3 (add_column) reads column 'running', which is not there at that step",
+            "step 3 (add_column) reads column 'total', which is not there at that step",
+        ],
+        "and what reads what it would have made"
+    );
+    // It sees input and nothing else; it is one query; it is the same every run.
+    for (query, says) in [
+        ("SELECT * FROM s1", "s1"),
+        ("SELECT * FROM t1", "t1"),
+        ("SELECT * FROM read_csv('/etc/passwd')", "read_csv"),
+        ("SELECT getenv('HOME') AS h", "getenv"),
+        ("SELECT * FROM input; DROP TABLE input", "one query"),
+        ("SELECT *, now() AS at FROM input", "now is not the same on every run"),
+        ("SELECT [1, 2] AS l FROM input", "CAST it to text"),
+    ] {
+        let step = serde_json::json!([{ "op": "sql", "query": query }]);
+        let e = prep
+            .preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() })
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("step 1 (sql)") && e.contains(says), "{query}: {e}");
+    }
+    // Names are DuckDB's: a repeat is numbered, an expression is its text.
+    let step = serde_json::json!([{ "op": "sql", "query": "SELECT region, region, upper(region) FROM input" }]);
+    let p = prep.preview(&ann, &d.id, Preview { steps: Some(steps(step)), ..Default::default() }).unwrap();
+    assert_eq!(p.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["region", "region_1", "upper(region)"]);
+}
+
+#[test]
+fn case_steps_rewrite_text_values() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep.create(&ann, None, csv("a,b,c,d,e\ngrocery store,Grocery Store,GroceryStore,order-ID 2,  Ünïcode wörd \n")).unwrap();
+    let cases = serde_json::json!([
+        { "op": "upper_case", "columns": ["a"] },
+        { "op": "lower_case", "columns": ["b"] },
+        { "op": "title_case", "columns": ["c"] },
+        { "op": "snake_case", "columns": ["d", "e"] },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, cases)).unwrap();
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [serde_json::json!(["GROCERY STORE", "grocery store", "Grocerystore", "order_id_2", "ünïcode_wörd"])]
+    );
+    let camel = serde_json::json!([{ "op": "camel_case", "columns": ["a", "b", "c", "d", "e"] }]);
+    let d = prep.change(&ann, &d.id, change(d.recipe, camel)).unwrap();
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [serde_json::json!(["groceryStore", "groceryStore", "groceryStore", "orderId2", "ünïcodeWörd"])]
+    );
+    // The same, as functions, nested in a formula.
+    let d = prep.replace(&ann, &d.id, csv("a,b,c,d,e\n  Grocery Store ,x,y,z,2026\n")).unwrap();
+    let nested = serde_json::json!([
+        { "op": "add_column", "column": "key", "formula": "snake_case(trim(a)) & '_' & to_text(e)" },
+        { "op": "add_column", "column": "camel", "formula": "camel_case(a)" },
+        { "op": "add_column", "column": "title", "formula": "title_case(lower(trim(a)))" },
+        { "op": "remove_columns", "columns": ["a", "b", "c", "d", "e"] },
+    ]);
+    let d = prep.change(&ann, &d.id, change(d.recipe, nested)).unwrap();
+    assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["grocery_store_2026", "groceryStore", "Grocery Store"])]);
+    let e = prep
+        .preview(
+            &ann,
+            &d.id,
+            Preview {
+                steps: Some(steps(serde_json::json!([{ "op": "add_column", "column": "k", "formula": "snake_case(1)" }]))),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("snake_case()"), "{e}");
+}
+
+#[test]
+fn fill_down_carries_a_label_to_the_rows_below() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let d = prep.create(&ann, None, csv("dept,item,qty\nGROCERY,milk,1\n,eggs,\n,bread,3\nPRODUCE,apples,4\n,pears,5\n")).unwrap();
+    let fill = serde_json::json!([
+        { "op": "find_and_replace_val", "column": "item", "find": "eggs", "with": " ", "whole": true },
+        { "op": "fill_down", "columns": ["dept", "item", "qty"] },
+    ]);
+    let d = prep.change(&ann, &d.id, change(1, fill)).unwrap();
+    assert_eq!(
+        rows_of(&prep, &ann, &d.id),
+        [
+            serde_json::json!(["GROCERY", "milk", 1]),
+            serde_json::json!(["GROCERY", "milk", 1]),
+            serde_json::json!(["GROCERY", "bread", 3]),
+            serde_json::json!(["PRODUCE", "apples", 4]),
+            serde_json::json!(["PRODUCE", "pears", 5]),
+        ],
+        "an empty value, or blank text, is the one above it; the first rows' have nothing above"
+    );
+}
+
+#[test]
 fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
     let (_dir, prep) = prep();
     let ann = scope();
@@ -212,13 +587,13 @@ fn a_column_gone_upstream_is_a_note_or_holds_the_dataset() {
         key: vec![],
         against: 1,
         roles: Default::default(),
-        steps: steps(serde_json::json!([{ "op": "formula", "column": "label", "formula": "upper(region)" }])),
+        steps: steps(serde_json::json!([{ "op": "add_column", "column": "label", "formula": "upper(region)" }])),
     };
     let d = prep.change(&ann, &d.id, change).unwrap();
     assert_eq!(d.live, Some(3));
     let d = prep.replace(&ann, &d.id, csv("area,amount\nNY,1\n")).unwrap();
     let held = d.held.clone().expect("held");
-    assert_eq!(held.unresolved[0].describe(), "step 1 (formula) reads column 'region', which is not there at that step");
+    assert_eq!(held.unresolved[0].describe(), "step 1 (add_column) reads column 'region', which is not there at that step");
     assert_eq!(d.live, Some(3), "what was live stays live");
     // Confirming drops the step and runs the rest.
     let d = prep.confirm(&ann, &d.id, 2).unwrap();
@@ -234,7 +609,7 @@ fn a_rename_upstream_is_fixed_by_pointing_the_steps_at_the_new_name() {
     let (_dir, prep) = prep();
     let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
-    let remap = |column: &str| serde_json::json!([{ "op": "remap", "column": column, "values": [{ "from": "NY", "to": "New York" }] }]);
+    let remap = |column: &str| serde_json::json!([{ "op": "remap_val", "column": column, "values": [{ "from": "NY", "to": "New York" }] }]);
     let d = prep.change(&ann, &d.id, Change { key: vec![], against: 1, roles: Default::default(), steps: steps(remap("region")) }).unwrap();
     let d = prep.replace(&ann, &d.id, csv("area,amount\nNY,1\n")).unwrap();
     assert!(d.held.is_some());
@@ -250,7 +625,7 @@ fn a_removal_with_readers_is_refused_naming_them() {
     let ann = scope();
     let d = prep.create(&ann, None, csv(SALES)).unwrap();
     let with = |extra: serde_json::Value| {
-        let mut v = vec![serde_json::json!({ "op": "formula", "column": "label", "formula": "region & store" })];
+        let mut v = vec![serde_json::json!({ "op": "add_column", "column": "label", "formula": "region & store" })];
         v.extend(extra.as_array().cloned().unwrap_or_default());
         steps(Value::Array(v))
     };
@@ -260,15 +635,15 @@ fn a_removal_with_readers_is_refused_naming_them() {
     let impact = prep.impact(&ann, &d.id, "store").unwrap();
     assert_eq!(
         impact.iter().map(Unresolved::describe).collect::<Vec<_>>(),
-        ["step 1 (formula) reads column 'store', which is not there at that step"]
+        ["step 1 (add_column) reads column 'store', which is not there at that step"]
     );
     assert!(prep.impact(&ann, &d.id, "amount").unwrap().is_empty());
     assert!(prep.impact(&ann, &d.id, "label").unwrap().is_empty());
     // A removal put before its reader is refused, naming it.
-    let mut bad = steps(serde_json::json!([{ "op": "remove", "columns": ["store"] }]));
+    let mut bad = steps(serde_json::json!([{ "op": "remove_columns", "columns": ["store"] }]));
     bad.extend(with(serde_json::json!([])));
     let e = prep.change(&ann, &d.id, Change { key: vec![], against: 2, roles: Default::default(), steps: bad }).err().unwrap();
-    assert!(e.to_string().contains("step 2 (formula) reads column 'store'"), "{e}");
+    assert!(e.to_string().contains("step 2 (add_column) reads column 'store'"), "{e}");
     // At the end it removes the column.
     let d = prep
         .change(
@@ -278,7 +653,7 @@ fn a_removal_with_readers_is_refused_naming_them() {
                 key: vec![],
                 against: 2,
                 roles: Default::default(),
-                steps: with(serde_json::json!([{ "op": "remove", "columns": ["store"] }])),
+                steps: with(serde_json::json!([{ "op": "remove_columns", "columns": ["store"] }])),
             },
         )
         .unwrap();
@@ -302,7 +677,7 @@ fn a_preview_runs_a_step_over_a_sample_and_keeps_nothing() {
         .preview(
             &ann,
             &d.id,
-            Preview { steps: Some(steps(serde_json::json!([{ "op": "trim", "columns": ["gone"] }]))), ..Preview::default() },
+            Preview { steps: Some(steps(serde_json::json!([{ "op": "trim_val", "columns": ["gone"] }]))), ..Preview::default() },
         )
         .unwrap();
     assert_eq!(p.unresolved.len(), 1, "a preview shows what will not resolve rather than refusing");
@@ -312,7 +687,7 @@ fn a_preview_runs_a_step_over_a_sample_and_keeps_nothing() {
             &ann,
             &d.id,
             Preview {
-                steps: Some(steps(serde_json::json!([{ "op": "retype", "column": "region", "type": "integer" }]))),
+                steps: Some(steps(serde_json::json!([{ "op": "retype_column", "column": "region", "type": "integer" }]))),
                 ..Preview::default()
             },
         )
@@ -519,7 +894,7 @@ fn a_semantic_query_is_a_source_refreshed_by_request() {
                 key: vec![],
                 against: 1,
                 roles: Default::default(),
-                steps: steps(serde_json::json!([{ "op": "remove", "columns": ["year"] }])),
+                steps: steps(serde_json::json!([{ "op": "remove_columns", "columns": ["year"] }])),
             },
         )
         .unwrap();
@@ -639,7 +1014,7 @@ mod blends {
     use std::sync::Arc;
 
     /// Revenue by region and month, as the warehouse would answer it.
-    fn model(rows: &[(&str, &str, i128)], key_only: &[&str]) -> ModelPart {
+    fn model(rows: &[(&str, &str, i128)]) -> ModelPart {
         let schema = Arc::new(Schema::new(vec![
             Field::new("__m0", DataType::Utf8, true),
             Field::new("__m1", DataType::Utf8, true),
@@ -653,12 +1028,11 @@ mod blends {
         ModelPart {
             rows: Batches { schema: schema.clone(), batches: vec![RecordBatch::try_new(schema, arrays).unwrap()] },
             keys: [("store.region", "__m0"), ("date.month", "__m1")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
-            key_only: key_only.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    fn out_model(column: &str, name: &str, measure: bool, additive: bool) -> Output {
-        Output::Model { column: column.into(), name: name.into(), measure, additive }
+    fn out_model(column: &str, name: &str, measure: bool) -> Output {
+        Output::Model { column: column.into(), name: name.into(), measure }
     }
 
     fn out_ds(alias: &str, column: &str) -> Output {
@@ -694,7 +1068,7 @@ mod blends {
     #[test]
     fn budget_against_actual_keeps_rows_from_both_sides() {
         let f = fixture();
-        let m = model(&[("NY", "2026-01", 12000), ("CA", "2026-03", 500)], &[]);
+        let m = model(&[("NY", "2026-01", 12000), ("CA", "2026-03", 500)]);
         let plan = Blend {
             datasets: vec![
                 Attach { id: f.budget.clone(), alias: "budget".into() },
@@ -710,9 +1084,9 @@ mod blends {
                 Join { join: "owners".into(), to: "budget".into(), on: vec![on("budget.region", "owners.region")], kind: Kind::Enrich },
             ],
             outputs: vec![
-                out_model("__m0", "region", false, true),
-                out_model("__m1", "month", false, true),
-                out_model("__m2", "revenue", true, true),
+                out_model("__m0", "region", false),
+                out_model("__m1", "month", false),
+                out_model("__m2", "revenue", true),
                 out_ds("budget", "amount"),
                 out_ds("owners", "manager"),
             ],
@@ -740,10 +1114,11 @@ mod blends {
     }
 
     #[test]
-    fn a_coarser_grain_regroups_only_what_adds_up() {
+    fn a_join_key_not_asked_for_is_refused() {
         let f = fixture();
-        let m = model(&[("NY", "2026-01", 100), ("NY", "2026-02", 200), ("CA", "2026-01", 50)], &["__m1"]);
-        let mut plan = Blend {
+        // Joined on region and month, and asked for by region alone.
+        let m = model(&[("NY", "2026-01", 100), ("NY", "2026-02", 200)]);
+        let plan = Blend {
             datasets: vec![Attach { id: f.budget.clone(), alias: "budget".into() }],
             joins: vec![Join {
                 join: "budget".into(),
@@ -751,20 +1126,38 @@ mod blends {
                 on: vec![on("store.region", "budget.region"), on("date.month", "budget.month")],
                 kind: Kind::Enrich,
             }],
-            outputs: vec![out_model("__m0", "region", false, true), out_model("__m2", "revenue", true, true), out_ds("budget", "amount")],
+            outputs: vec![out_model("__m0", "region", false), out_model("__m2", "revenue", true), out_ds("budget", "amount")],
         };
-        let b = f.prep.blend(&f.ann, &plan, &m, "q").unwrap();
-        assert_eq!(rows(&b), [serde_json::json!(["CA", "0.50", 50]), serde_json::json!(["NY", "3.00", 190])]);
-        plan.outputs[1] = out_model("__m2", "distinct products", true, false);
+        let e = f.prep.blend(&f.ann, &plan, &m, "q").err().unwrap();
+        assert!(e.to_string().contains("'date.month' joins a dataset to the model, so ask for it too"), "{e}");
+    }
+
+    #[test]
+    fn a_join_on_no_keys_is_a_cross_join() {
+        let f = fixture();
+        let target = f.prep.create(&f.ann, None, csv("target\n150\n")).unwrap().id;
+        let m = model(&[("NY", "2026-01", 12000), ("CA", "2026-01", 500)]);
+        let mut plan = Blend {
+            datasets: vec![Attach { id: target, alias: "goal".into() }],
+            joins: vec![Join { join: "goal".into(), to: "model".into(), on: vec![], kind: Kind::Enrich }],
+            outputs: vec![out_model("__m0", "region", false), out_model("__m2", "revenue", true), out_ds("goal", "target")],
+        };
+        assert_eq!(
+            rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()),
+            [serde_json::json!(["NY", "120.00", 150]), serde_json::json!(["CA", "5.00", 150])],
+            "no key to ask for, and every row beside the target"
+        );
+        plan.joins[0].kind = Kind::Filter;
+        plan.outputs.pop();
         let e = f.prep.blend(&f.ann, &plan, &m, "q2").err().unwrap();
-        assert!(e.to_string().contains("does not add up"), "{e}");
+        assert!(e.to_string().contains("a filter on nothing"), "{e}");
     }
 
     #[test]
     fn a_dimension_the_dataset_does_not_have_is_refused() {
         let f = fixture();
         // The model is by region and month; budget joined on region alone.
-        let m = model(&[("NY", "2026-01", 100)], &[]);
+        let m = model(&[("NY", "2026-01", 100)]);
         let plan = Blend {
             datasets: vec![Attach { id: f.budget.clone(), alias: "budget".into() }],
             joins: vec![Join {
@@ -773,7 +1166,7 @@ mod blends {
                 on: vec![on("store.region", "budget.region")],
                 kind: Kind::Enrich,
             }],
-            outputs: vec![out_model("__m0", "region", false, true), out_model("__m1", "month", false, true), out_ds("budget", "amount")],
+            outputs: vec![out_model("__m0", "region", false), out_model("__m1", "month", false), out_ds("budget", "amount")],
         };
         let e = f.prep.blend(&f.ann, &plan, &m, "q").err().unwrap();
         assert!(e.to_string().contains("'month' is asked for") && e.to_string().contains("would repeat"), "{e}");
@@ -782,7 +1175,7 @@ mod blends {
     #[test]
     fn a_filter_keeps_what_the_dataset_has_and_a_lookup_must_be_unique() {
         let f = fixture();
-        let m = model(&[("NY", "2026-01", 100), ("CA", "2026-01", 50)], &[]);
+        let m = model(&[("NY", "2026-01", 100), ("CA", "2026-01", 50)]);
         let plan = Blend {
             datasets: vec![Attach { id: f.targets.clone(), alias: "targets".into() }],
             joins: vec![Join {
@@ -791,7 +1184,7 @@ mod blends {
                 on: vec![on("store.region", "targets.region")],
                 kind: Kind::Filter,
             }],
-            outputs: vec![out_model("__m0", "region", false, true), out_model("__m2", "revenue", true, true)],
+            outputs: vec![out_model("__m0", "region", false), out_model("__m2", "revenue", true)],
         };
         assert_eq!(
             rows(&f.prep.blend(&f.ann, &plan, &m, "q").unwrap()),
@@ -808,11 +1201,11 @@ mod blends {
     #[test]
     fn every_dataset_is_joined_once_and_only_as_the_request_says() {
         let f = fixture();
-        let m = model(&[("NY", "2026-01", 100)], &[]);
+        let m = model(&[("NY", "2026-01", 100)]);
         let attach = vec![Attach { id: f.owners.clone(), alias: "owners".into() }];
         let join =
             |to: &str| Join { join: "owners".into(), to: to.into(), on: vec![on("store.region", "owners.region")], kind: Kind::Enrich };
-        let outputs = vec![out_model("__m0", "region", false, true)];
+        let outputs = vec![out_model("__m0", "region", false)];
         let cases: Vec<(Blend, &str)> = vec![
             (Blend { datasets: attach.clone(), joins: vec![], outputs: outputs.clone() }, "joined to nothing"),
             (Blend { datasets: attach.clone(), joins: vec![join("model"), join("model")], outputs: outputs.clone() }, "joined 2 times"),
@@ -943,13 +1336,13 @@ fn an_edit_stays_after_the_steps_it_was_made_on_when_the_recipe_changes_around_i
     let (_dir, prep) = prep();
     let ann = scope();
     let d = prep.create(&ann, None, csv("region,store,amount\nny,a,1\nny,b,2\nca,a,3\n")).unwrap();
-    let label = serde_json::json!({ "op": "formula", "column": "label", "formula": "upper(region)" });
+    let label = serde_json::json!({ "op": "add_column", "column": "label", "formula": "upper(region)" });
     let d = prep.change(&ann, &d.id, change(1, serde_json::json!([label]))).unwrap();
     // An edit of `label`, made after the step that makes it.
     let (d, _) =
         prep.edit(&ann, &d.id, edits(2, serde_json::json!([{ "op": "cell", "column": "label", "from": "NY", "to": "NEW YORK" }]))).unwrap();
     // A step put before it, and a group after: the edit stays between.
-    let trim = serde_json::json!({ "op": "trim", "columns": ["store"] });
+    let trim = serde_json::json!({ "op": "trim_val", "columns": ["store"] });
     let group = serde_json::json!({ "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] });
     let d = prep.change(&ann, &d.id, change(2, serde_json::json!([trim, label, group]))).unwrap();
     assert_eq!(rows_of(&prep, &ann, &d.id), [serde_json::json!(["CA", 3]), serde_json::json!(["NEW YORK", 3])]);
@@ -960,7 +1353,7 @@ fn an_edit_stays_after_the_steps_it_was_made_on_when_the_recipe_changes_around_i
 
 #[test]
 fn a_position_is_carried_to_the_steps_a_recipe_still_has() {
-    let s = |n: &str| -> Step { serde_json::from_value(serde_json::json!({ "op": "trim", "columns": [n] })).unwrap() };
+    let s = |n: &str| -> Step { serde_json::from_value(serde_json::json!({ "op": "trim_val", "columns": [n] })).unwrap() };
     let (a, b, c, x) = (s("a"), s("b"), s("c"), s("x"));
     use crate::edits::relocate;
     let old = [a.clone(), b.clone(), c.clone()];

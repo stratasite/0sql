@@ -22,7 +22,7 @@ csv = "1"
 # dataset has is read and written here, in Rust, and DuckDB only ever
 # sees tables it was handed. `appender-arrow` is Rust only and adds no
 # C++ to the bundled build the rest of the workspace already compiles.
-duckdb = { version = "1.20000.0", features = ["bundled", "appender-arrow"] }
+duckdb = { version = "1.20000.0", features = ["bundled", "appender-arrow", "json"] }
 # Snapshots and materializations are Arrow IPC files, as results are.
 arrow-ipc = { version = "60", features = ["lz4"] }
 arrow-array = "60"

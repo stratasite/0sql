@@ -31,28 +31,34 @@ pub struct Recipe {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Step {
     // Columns.
-    Rename {
+    RenameColumn {
         column: String,
         to: String,
     },
     /// A new type, kept only if every value converts; text to a date may
     /// name its format, in strptime's form.
-    Retype {
+    RetypeColumn {
         column: String,
         #[serde(rename = "type")]
         ty: ColumnType,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<String>,
     },
-    Remove {
+    RemoveColumns {
         columns: Vec<String>,
     },
     /// These columns first, in this order, and the rest after as they were.
-    Reorder {
+    ReorderColumns {
         columns: Vec<String>,
     },
     /// A new column, computed by a formula.
-    Formula {
+    AddColumn {
+        column: String,
+        formula: String,
+    },
+    /// A column computed again by a formula, which may read it: its
+    /// values, and its type, are the formula's.
+    UpdateColumn {
         column: String,
         formula: String,
     },
@@ -71,13 +77,18 @@ pub enum Step {
         columns: Vec<String>,
     },
     /// An empty value made this one.
-    Fill {
+    FillEmpty {
         column: String,
         value: Value,
     },
+    /// Each empty value made the nearest one above it, in the order the
+    /// rows are in: a label a spreadsheet wrote once for the rows below.
+    FillDown {
+        columns: Vec<String>,
+    },
     // Values.
     /// Text found and replaced: within a value, or the whole value.
-    Replace {
+    FindAndReplaceVal {
         column: String,
         find: String,
         with: String,
@@ -85,22 +96,59 @@ pub enum Step {
         whole: bool,
     },
     /// Whole values made others: `NY` to `New York`.
-    Remap {
+    RemapVal {
         column: String,
         values: Vec<Mapping>,
     },
-    Trim {
+    TrimVal {
         columns: Vec<String>,
     },
-    Case {
+    /// `Grocery Store` to `GROCERY STORE`.
+    UpperCase {
         columns: Vec<String>,
-        to: Case,
+    },
+    /// To `grocery store`.
+    LowerCase {
+        columns: Vec<String>,
+    },
+    /// To `Grocery Store`.
+    TitleCase {
+        columns: Vec<String>,
+    },
+    /// To `grocery_store`; `GroceryStore` too.
+    SnakeCase {
+        columns: Vec<String>,
+    },
+    /// To `groceryStore`.
+    CamelCase {
+        columns: Vec<String>,
     },
     // Shape.
     /// A row per set of values of `by`, and the aggregates over it.
     Group {
         by: Vec<String>,
         aggregates: Vec<Aggregate>,
+    },
+    /// Columns made rows: each row becomes one per column unpivoted, with
+    /// that column's name in `name` and its value in `value`; the other
+    /// columns repeat. Name the columns to unpivot, or the ones to
+    /// `keep` as they are, so that a column a later file adds (a new
+    /// month) is unpivoted too. Empty values make no row unless
+    /// `keep_empty`.
+    Unpivot {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keep: Vec<String>,
+        name: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_empty: bool,
+    },
+    /// A query, run as a black box over the step before, which it reads
+    /// as `input` and as nothing else; see `sql`.
+    Sql {
+        query: String,
     },
     /// Another dataset's rows after these, its columns met by name.
     Append {
@@ -156,14 +204,6 @@ pub struct Mapping {
     pub to: Value,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Case {
-    Upper,
-    Lower,
-    Title,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Aggregate {
@@ -188,23 +228,31 @@ pub enum AggregateFn {
 }
 
 impl Step {
-    /// The step's name, as it is told to a user: `step 3 (remap)`.
+    /// The step's name, as it is told to a user: `step 3 (remap_val)`.
     pub fn op(&self) -> &'static str {
         match self {
-            Step::Rename { .. } => "rename",
-            Step::Retype { .. } => "retype",
-            Step::Remove { .. } => "remove",
-            Step::Reorder { .. } => "reorder",
-            Step::Formula { .. } => "formula",
+            Step::RenameColumn { .. } => "rename_column",
+            Step::RetypeColumn { .. } => "retype_column",
+            Step::RemoveColumns { .. } => "remove_columns",
+            Step::ReorderColumns { .. } => "reorder_columns",
+            Step::AddColumn { .. } => "add_column",
+            Step::UpdateColumn { .. } => "update_column",
             Step::Filter { .. } => "filter",
             Step::Sort { .. } => "sort",
             Step::Dedupe { .. } => "dedupe",
-            Step::Fill { .. } => "fill",
-            Step::Replace { .. } => "replace",
-            Step::Remap { .. } => "remap",
-            Step::Trim { .. } => "trim",
-            Step::Case { .. } => "case",
+            Step::FillEmpty { .. } => "fill_empty",
+            Step::FillDown { .. } => "fill_down",
+            Step::FindAndReplaceVal { .. } => "find_and_replace_val",
+            Step::RemapVal { .. } => "remap_val",
+            Step::TrimVal { .. } => "trim_val",
+            Step::UpperCase { .. } => "upper_case",
+            Step::LowerCase { .. } => "lower_case",
+            Step::TitleCase { .. } => "title_case",
+            Step::SnakeCase { .. } => "snake_case",
+            Step::CamelCase { .. } => "camel_case",
             Step::Group { .. } => "group",
+            Step::Unpivot { .. } => "unpivot",
+            Step::Sql { .. } => "sql",
             Step::Append { .. } => "append",
             Step::Join { .. } => "join",
         }

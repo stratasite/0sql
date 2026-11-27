@@ -19,11 +19,12 @@
 //!   rows from both sides, and every dimension the request asks for must
 //!   be one of those keys. A look-up joined to such a dataset on its keys
 //!   is applied after, on the keys both sides now share.
-//! - **The model is regrouped only when it adds up.** When a join key
-//!   the request did not ask for made the model's part finer, the result
-//!   is grouped back to the request's dimensions, which every measure of
-//!   the model must survive: a sum or a count, not a distinct count or a
-//!   ratio.
+//! - **A join on no keys is a cross join,** an `enrich` only: each row of
+//!   the dataset beside each row it joins to, as it is (a rate, a
+//!   target, a few scenarios), bounded by [`CROSS_MAX`] rows.
+//! - **Every model key a join names is asked for.** A dataset is at its
+//!   keys' grain, so the answer is too: nothing is planned finer than the
+//!   answer to be added up after.
 
 use crate::engine::Session;
 use crate::error::{Error, Result};
@@ -73,7 +74,7 @@ pub struct On {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
     /// A column of the model's part.
-    Model { column: String, name: String, measure: bool, additive: bool },
+    Model { column: String, name: String, measure: bool },
     /// A column of an attached dataset, by alias.
     Dataset { alias: String, column: String, name: String },
 }
@@ -84,8 +85,6 @@ pub struct ModelPart {
     pub rows: Batches,
     /// A model key, as a join writes it, to its column.
     pub keys: BTreeMap<String, String>,
-    /// Columns planned only because a join needs them.
-    pub key_only: Vec<String>,
 }
 
 /// A blend, as data prep runs it.
@@ -147,8 +146,8 @@ fn order(blend: &Blend) -> Result<Vec<&Join>> {
         if j.to != MODEL && !blend.datasets.iter().any(|a| a.alias == j.to) {
             return Err(refuse(format!("'{}' joins to '{}', which is neither the model nor attached", j.join, j.to)));
         }
-        if j.on.is_empty() {
-            return Err(refuse(format!("'{}' joins on nothing; a join names its keys", j.join)));
+        if j.on.is_empty() && j.kind == Kind::Filter {
+            return Err(refuse(format!("'{}' is a filter on nothing; a filter names the keys it keeps", j.join)));
         }
     }
     let mut connected: Vec<&str> = vec![MODEL];
@@ -215,6 +214,9 @@ fn keys(j: &Join, to: &Rel, to_names: &dyn Fn(&str) -> Result<String>, found: &F
 }
 
 fn cond(keys: &[(String, String, ColumnType)], l: &str, r: &str) -> String {
+    if keys.is_empty() {
+        return "true".into();
+    }
     keys.iter()
         .map(|(a, b, t)| format!("CAST({l}.{} AS {}) = CAST({r}.{} AS {})", ident(a), t.sql(), ident(b), t.sql()))
         .collect::<Vec<_>>()
@@ -225,6 +227,12 @@ fn cond(keys: &[(String, String, ColumnType)], l: &str, r: &str) -> String {
 /// joins applied in order, the answer's columns in the request's order.
 pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[Found]) -> Result<Batches> {
     let joins = order(blend)?;
+    for key in joins.iter().filter(|j| j.to == MODEL).flat_map(|j| j.on.iter().map(|o| &o.left)) {
+        let column = model.keys.get(key);
+        if !blend.outputs.iter().any(|o| matches!(o, Output::Model { column: c, .. } if Some(c) == column)) {
+            return Err(refuse(format!("'{key}' joins a dataset to the model, so ask for it too: the dataset is at that grain")));
+        }
+    }
     let found_of = |alias: &str| found.iter().find(|f| f.alias == alias).ok_or_else(|| Error::Internal(format!("'{alias}' was not found")));
 
     // The model's part, held at the types a dataset has, as `model`.
@@ -253,7 +261,9 @@ pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[
     let measures_of = |alias: &str| asked.get(alias).map(|c| c.iter().any(|c| c.role == Role::Measure)).unwrap_or(false);
 
     // An enrich with measures is budget against actual: it joins to the model.
-    let aggregated: Vec<&Join> = joins.iter().copied().filter(|j| j.kind == Kind::Enrich && measures_of(&j.join)).collect();
+    // A cross join (no keys) is not: its rows are set beside every row as they are.
+    let aggregated: Vec<&Join> =
+        joins.iter().copied().filter(|j| j.kind == Kind::Enrich && !j.on.is_empty() && measures_of(&j.join)).collect();
     for j in &aggregated {
         if j.to != MODEL {
             return Err(refuse(format!(
@@ -313,7 +323,11 @@ pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[
                 columns: parent.columns,
             },
             Kind::Enrich => {
-                unique(session, &child, &k, &j.join)?;
+                if k.is_empty() {
+                    cross(session, &parent, &child, &j.join)?;
+                } else {
+                    unique(session, &child, &k, &j.join)?;
+                }
                 let mut columns = parent.columns.clone();
                 let mut select: Vec<String> = parent.columns.iter().map(|(c, _)| format!("p.{}", ident(c))).collect();
                 for (c, t) in &child.columns {
@@ -439,7 +453,11 @@ pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[
                     .ok_or_else(|| Error::Internal(format!("'{written}' is not a key")))
             };
             let lk = keys(l, &root, &parent_names, lf)?;
-            unique(session, &lrel, &lk, &l.join)?;
+            if lk.is_empty() {
+                cross(session, &root, &lrel, &l.join)?;
+            } else {
+                unique(session, &lrel, &lk, &l.join)?;
+            }
             let mut select: Vec<String> = root.columns.iter().map(|(c, _)| format!("p.{}", ident(c))).collect();
             let mut columns = root.columns.clone();
             for c in asked.get(l.join.as_str()).into_iter().flatten() {
@@ -454,22 +472,11 @@ pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[
         }
     }
 
-    // The answer: regrouped to the request's dimensions when a key it did
-    // not ask for made the model's part finer.
-    let finer = model.key_only.iter().any(|k| root.columns.iter().any(|(c, _)| c == k));
+    // The answer: the columns asked for, in order.
     let mut select = Vec::new();
-    let mut group = Vec::new();
     for o in &blend.outputs {
-        let (col, name, measure) = match o {
-            Output::Model { column, name, measure, additive } => {
-                if finer && *measure && !additive {
-                    return Err(refuse(format!(
-                        "'{name}' does not add up, and a join key the request does not show makes the model's part finer than the answer; \
-                         ask for the keys too, or make a dataset from a semantic query at the grain needed"
-                    )));
-                }
-                (column.clone(), name.clone(), *measure)
-            }
+        let (col, name) = match o {
+            Output::Model { column, name, .. } => (column.clone(), name.clone()),
             Output::Dataset { alias, column, name } => {
                 let f = found_of(alias)?;
                 let c = f
@@ -477,28 +484,28 @@ pub(crate) fn run(session: &Session, blend: &Blend, model: &ModelPart, found: &[
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(column))
                     .ok_or_else(|| refuse(format!("dataset '{alias}' has no column '{column}'")))?;
-                (carried(alias, &c.name), name.clone(), c.role == Role::Measure)
+                (carried(alias, &c.name), name.clone())
             }
         };
-        if finer {
-            if measure {
-                // A sum is the type it adds, not the engine's wider one.
-                let t = root.ty(&col)?;
-                select.push(format!("CAST(sum({}) AS {}) AS {}", ident(&col), t.sql(), ident(&name)));
-            } else {
-                select.push(format!("{} AS {}", ident(&col), ident(&name)));
-                group.push(ident(&col));
-            }
-        } else {
-            select.push(format!("{} AS {}", ident(&col), ident(&name)));
-        }
+        select.push(format!("{} AS {}", ident(&col), ident(&name)));
     }
-    let sql = if finer && !group.is_empty() {
-        format!("SELECT {} FROM {} GROUP BY {} ORDER BY {}", select.join(", "), root.sql, group.join(", "), group.join(", "))
-    } else {
-        format!("SELECT {} FROM {}", select.join(", "), root.sql)
-    };
-    session.query(&sql)
+    session.query(&format!("SELECT {} FROM {}", select.join(", "), root.sql))
+}
+
+/// The most rows a cross join may make.
+const CROSS_MAX: u64 = 1_000_000;
+
+/// Refused when a cross join would make more rows than [`CROSS_MAX`].
+fn cross(session: &Session, parent: &Rel, child: &Rel, alias: &str) -> Result<()> {
+    let p = session.count(&format!("SELECT count(*) FROM {}", parent.sql))?;
+    let c = session.count(&format!("SELECT count(*) FROM {}", child.sql))?;
+    if p.saturating_mul(c) > CROSS_MAX {
+        return Err(Error::Unprocessable(format!(
+            "'{alias}' joins on no keys, so each of its {c} rows is set beside each of {p}: more than {CROSS_MAX} rows; \
+             give it keys, or make it smaller in its recipe"
+        )));
+    }
+    Ok(())
 }
 
 /// Refused when a look-up's side repeats a key: it would multiply rows.

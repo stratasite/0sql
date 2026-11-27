@@ -14,7 +14,7 @@ use crate::edits::Edit;
 use crate::error::{Error, Result};
 use crate::formula;
 use crate::lineage::Origin;
-use crate::recipe::{AggregateFn, Case, Mapping, Recipe, SortKey, Step};
+use crate::recipe::{AggregateFn, Mapping, Recipe, SortKey, Step};
 use crate::schema::{ident, literal, Column, ColumnType, Role};
 use crate::source::infer;
 use crate::store::SourceState;
@@ -38,6 +38,9 @@ pub struct Compiled {
     /// Steps and roles that read a column not there; empty when the
     /// recipe runs.
     pub unresolved: Vec<Unresolved>,
+    /// The `sql` steps, by the name of the view each stands for: run in
+    /// a session of their own, not as a view.
+    pub sql: std::collections::BTreeMap<String, crate::sql::SqlStage>,
 }
 
 /// Edits that apply at one point of the recipe: after the first `at`
@@ -61,6 +64,10 @@ pub struct Check {
     /// What a failure says, `{n}` standing for how many failed.
     pub says: String,
 }
+
+/// What a `sql` step's query makes over these columns: DuckDB's answer,
+/// or its refusal in its own words. See `sql::describe`.
+pub type Describe<'a> = &'a dyn Fn(&[(String, ColumnType)], &str) -> Result<std::result::Result<Vec<(String, ColumnType)>, String>>;
 
 /// The other datasets a recipe reads: each one's columns, by id.
 pub type Inputs = std::collections::BTreeMap<String, Vec<Column>>;
@@ -125,6 +132,11 @@ impl Cols {
         self.columns.iter().map(|c| ident(&c.name)).collect::<Vec<_>>().join(", ")
     }
 
+    /// The columns, comma-separated; nothing when there are none.
+    fn list_or_empty(&self) -> String {
+        self.columns.iter().map(|c| ident(&c.name)).collect::<Vec<_>>().join(", ")
+    }
+
     /// The select list with one column's expression replaced.
     fn replacing(&self, i: usize, expr: &str) -> String {
         self.columns
@@ -138,8 +150,14 @@ impl Cols {
 
 /// Compiles a recipe over the sources as they now are, with `today()`
 /// pinned to `pinned_at`.
-pub fn compile(recipe: &Recipe, edits: &[(usize, Edit)], sources: &[SourceState], inputs: &Inputs, pinned_at: &str) -> Result<Compiled> {
-    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, (sources, inputs), pinned_at)
+pub fn compile(
+    recipe: &Recipe,
+    edits: &[(usize, Edit)],
+    (sources, inputs): (&[SourceState], &Inputs),
+    pinned_at: &str,
+    describe: Describe<'_>,
+) -> Result<Compiled> {
+    compile_all(&recipe.steps, &recipe.roles, &recipe.key, edits, (sources, inputs), pinned_at, describe)
 }
 
 /// Steps alone, with no edits and no key.
@@ -149,7 +167,8 @@ pub fn compile_steps(
     sources: &[SourceState],
     pinned_at: &str,
 ) -> Result<Compiled> {
-    compile_all(steps, roles, &[], &[], (sources, &Inputs::new()), pinned_at)
+    let no_engine: Describe<'_> = &|_, _| Ok(Err("no engine here".into()));
+    compile_all(steps, roles, &[], &[], (sources, &Inputs::new()), pinned_at, no_engine)
 }
 
 pub fn compile_all(
@@ -159,7 +178,9 @@ pub fn compile_all(
     edits: &[(usize, Edit)],
     (sources, inputs): (&[SourceState], &Inputs),
     pinned_at: &str,
+    describe: Describe<'_>,
 ) -> Result<Compiled> {
+    let mut sql_stages = std::collections::BTreeMap::new();
     let [source] = sources else {
         return Err(Error::Internal(format!("a dataset has {} sources, and reading more than one comes with combining", sources.len())));
     };
@@ -231,6 +252,42 @@ pub fn compile_all(
             Error::Invalid(m) => Error::Invalid(format!("step {n} ({}): {m}", step.op())),
             other => other,
         };
+        if let Step::Sql { query } = step {
+            let query = crate::sql::checked(query).map_err(at)?;
+            let input: Vec<(String, ColumnType)> = cols.columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
+            match describe(&input, &query)? {
+                Ok(made) => {
+                    // A black box: each column it makes is from all it was given.
+                    let mut from: Vec<Origin> = cols.ancestry.iter().flatten().cloned().collect();
+                    from.sort();
+                    from.dedup();
+                    // A column it keeps by name keeps its role, while it is
+                    // still a number or still not one; the rest are inferred.
+                    let columns: Vec<Column> = made
+                        .iter()
+                        .map(|(name, ty)| {
+                            let kept = cols.find(name).map(|i| &cols.columns[i]).filter(|c| c.ty.is_number() == ty.is_number());
+                            Column { name: name.clone(), ty: *ty, role: kept.map_or_else(|| Role::inferred(name, *ty), |c| c.role) }
+                        })
+                        .collect();
+                    let name = format!("t{n}");
+                    sql_stages.insert(
+                        name.clone(),
+                        crate::sql::SqlStage { step: n, input: prev.clone(), input_columns: input, query, columns: made },
+                    );
+                    cols.ancestry = vec![from; columns.len()];
+                    cols.columns = columns;
+                    views.push((name.clone(), String::new()));
+                    prev = ident(&name);
+                }
+                Err(refusal) => match crate::sql::missing_column(&refusal) {
+                    Some(column) => unresolved.push(Unresolved { column, step: n, op: "sql".into(), edit: None, dataset: None }),
+                    None => return Err(Error::Invalid(format!("step {n} (sql): {refusal}"))),
+                },
+            }
+            edit_stage(n, &mut prev, &cols, &views, &mut unresolved);
+            continue;
+        }
         let select = one(step, n, &prev, &mut cols, &mut checks, (inputs, pinned_at)).map_err(at)?;
         let name = format!("t{n}");
         views.push((name.clone(), select));
@@ -248,21 +305,34 @@ pub fn compile_all(
             unresolved.push(Unresolved { column: k.clone(), step: 0, op: "key".into(), edit: None, dataset: None });
         }
     }
-    Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, edits: stages, unresolved })
+    Ok(Compiled { views, last: prev, columns: cols.columns, ancestry: cols.ancestry, checks, edits: stages, unresolved, sql: sql_stages })
 }
 
 /// The columns a step reads, by name as the step writes them.
 pub fn reads(step: &Step) -> Result<Vec<String>> {
     Ok(match step {
-        Step::Rename { column, .. } | Step::Retype { column, .. } | Step::Fill { column, .. } => vec![column.clone()],
-        Step::Replace { column, .. } | Step::Remap { column, .. } => vec![column.clone()],
-        Step::Remove { columns } | Step::Reorder { columns } | Step::Trim { columns } | Step::Case { columns, .. } => columns.clone(),
-        Step::Dedupe { columns } => columns.clone(),
-        Step::Formula { formula, .. } | Step::Filter { formula } => formula::names(formula)?,
+        Step::RenameColumn { column, .. } | Step::RetypeColumn { column, .. } | Step::FillEmpty { column, .. } => vec![column.clone()],
+        Step::FindAndReplaceVal { column, .. } | Step::RemapVal { column, .. } => vec![column.clone()],
+        Step::RemoveColumns { columns } | Step::ReorderColumns { columns } | Step::TrimVal { columns } => columns.clone(),
+        Step::UpperCase { columns }
+        | Step::LowerCase { columns }
+        | Step::TitleCase { columns }
+        | Step::SnakeCase { columns }
+        | Step::CamelCase { columns } => columns.clone(),
+        Step::Dedupe { columns } | Step::FillDown { columns } => columns.clone(),
+        Step::Unpivot { columns, keep, .. } => columns.iter().chain(keep).cloned().collect(),
+        Step::AddColumn { formula, .. } | Step::Filter { formula } => formula::names(formula)?,
+        // It reads the column it updates, whether its formula does or not.
+        Step::UpdateColumn { column, formula } => {
+            let mut r = formula::names(formula)?;
+            r.push(column.clone());
+            r
+        }
         Step::Sort { by } => by.iter().map(|k| k.column.clone()).collect(),
         Step::Group { by, aggregates } => by.iter().cloned().chain(aggregates.iter().filter_map(|a| a.column.clone())).collect(),
         Step::Join { on, .. } => on.iter().map(|k| k.left.clone()).collect(),
-        Step::Append { .. } => Vec::new(),
+        // A black box: what it reads is found when DuckDB is asked.
+        Step::Append { .. } | Step::Sql { .. } => Vec::new(),
     })
 }
 
@@ -316,7 +386,7 @@ fn one(
 ) -> Result<String> {
     let found = |cols: &Cols, name: &str| cols.find(name).ok_or_else(|| Error::Internal(format!("'{name}' was resolved and is not there")));
     Ok(match step {
-        Step::Rename { column, to } => {
+        Step::RenameColumn { column, to } => {
             let i = found(cols, column)?;
             if !column.eq_ignore_ascii_case(to) {
                 check_name(to, cols, "it renames a column to")?;
@@ -331,7 +401,7 @@ fn one(
                 .collect();
             format!("SELECT {} FROM {prev}", list.join(", "))
         }
-        Step::Retype { column, ty, format } => {
+        Step::RetypeColumn { column, ty, format } => {
             let i = found(cols, column)?;
             let from = cols.columns[i].ty;
             let x = ident(&cols.columns[i].name);
@@ -358,7 +428,7 @@ fn one(
             };
             if failing != "FALSE" {
                 let says = format!(
-                    "step {n} (retype) makes column '{}' {ty} from {from}, and {{n}} value(s) do not convert without loss",
+                    "step {n} (retype_column) makes column '{}' {ty} from {from}, and {{n}} value(s) do not convert without loss",
                     cols.columns[i].name
                 );
                 checks.push(Check { step: n, relation: prev.to_string(), column: cols.columns[i].name.clone(), failing, says });
@@ -369,7 +439,7 @@ fn one(
             }
             format!("SELECT {} FROM {prev}", cols.replacing(i, &expr))
         }
-        Step::Remove { columns } => {
+        Step::RemoveColumns { columns } => {
             if columns.is_empty() {
                 return Err(Error::Invalid("it removes no column".into()));
             }
@@ -386,7 +456,7 @@ fn one(
             });
             format!("SELECT {} FROM {prev}", cols.list())
         }
-        Step::Reorder { columns } => {
+        Step::ReorderColumns { columns } => {
             let mut order: Vec<usize> = Vec::new();
             for c in columns {
                 let i = found(cols, c)?;
@@ -401,7 +471,7 @@ fn one(
             cols.ancestry = order.iter().map(|i| cols.ancestry[*i].clone()).collect();
             format!("SELECT {} FROM {prev}", cols.list())
         }
-        Step::Formula { column, formula } => {
+        Step::AddColumn { column, formula } => {
             check_name(column, cols, "it makes a column")?;
             let f = formula::compile(formula, &formula::Scope { columns: &cols.columns, pinned_at })?;
             let mut from: Vec<Origin> = f.reads.iter().filter_map(|r| cols.find(r)).flat_map(|i| cols.ancestry[i].clone()).collect();
@@ -410,6 +480,21 @@ fn one(
             let select = format!("SELECT *, CAST({} AS {}) AS {} FROM {prev}", f.sql, f.ty.sql(), ident(column));
             cols.columns.push(Column { name: column.clone(), ty: f.ty, role: Role::inferred(column, f.ty) });
             cols.ancestry.push(from);
+            select
+        }
+        Step::UpdateColumn { column, formula } => {
+            let i = found(cols, column)?;
+            let f = formula::compile(formula, &formula::Scope { columns: &cols.columns, pinned_at })?;
+            let mut from: Vec<Origin> = f.reads.iter().filter_map(|r| cols.find(r)).flat_map(|j| cols.ancestry[j].clone()).collect();
+            from.sort();
+            from.dedup();
+            let select = format!("SELECT {} FROM {prev}", cols.replacing(i, &format!("CAST({} AS {})", f.sql, f.ty.sql())));
+            let c = &mut cols.columns[i];
+            c.ty = f.ty;
+            if !f.ty.is_number() {
+                c.role = Role::Dimension;
+            }
+            cols.ancestry[i] = from;
             select
         }
         Step::Filter { formula } => {
@@ -438,14 +523,14 @@ fn one(
                 cols.list()
             )
         }
-        Step::Fill { column, value } => {
+        Step::FillEmpty { column, value } => {
             let i = found(cols, column)?;
             let v = value_sql(value, cols.columns[i].ty, &cols.columns[i].name)?;
             format!("SELECT {} FROM {prev}", cols.replacing(i, &format!("COALESCE({}, {v})", ident(&cols.columns[i].name))))
         }
-        Step::Replace { column, find, with, whole } => {
+        Step::FindAndReplaceVal { column, find, with, whole } => {
             let i = found(cols, column)?;
-            text_column(cols, i, "replace")?;
+            text_column(cols, i, "find_and_replace_val")?;
             if find.is_empty() {
                 return Err(Error::Invalid("it finds nothing: 'find' is empty".into()));
             }
@@ -457,11 +542,16 @@ fn one(
             };
             format!("SELECT {} FROM {prev}", cols.replacing(i, &expr))
         }
-        Step::Remap { column, values } => {
+        Step::RemapVal { column, values } => {
             let i = found(cols, column)?;
             format!("SELECT {} FROM {prev}", cols.replacing(i, &remap_sql(&cols.columns[i], values)?))
         }
-        Step::Trim { columns } | Step::Case { columns, .. } => {
+        Step::TrimVal { columns }
+        | Step::UpperCase { columns }
+        | Step::LowerCase { columns }
+        | Step::TitleCase { columns }
+        | Step::SnakeCase { columns }
+        | Step::CamelCase { columns } => {
             if columns.is_empty() {
                 return Err(Error::Invalid("it names no column".into()));
             }
@@ -471,22 +561,43 @@ fn one(
                 text_column(cols, i, step.op())?;
                 let x = ident(&cols.columns[i].name);
                 let expr = match step {
-                    Step::Case { to: Case::Upper, .. } => format!("upper({x})"),
-                    Step::Case { to: Case::Lower, .. } => format!("lower({x})"),
-                    Step::Case { to: Case::Title, .. } => {
-                        format!("array_to_string(list_transform(string_split({x}, ' '), w -> upper(w[1]) || lower(w[2:])), ' ')")
-                    }
+                    Step::UpperCase { .. } => format!("upper({x})"),
+                    Step::LowerCase { .. } => format!("lower({x})"),
+                    Step::TitleCase { .. } => formula::title_case(&x),
+                    Step::SnakeCase { .. } => formula::snake_case(&x),
+                    Step::CamelCase { .. } => formula::camel_case(&x),
                     _ => format!("trim({x})"),
                 };
                 list[i] = format!("{expr} AS {x}");
             }
             format!("SELECT {} FROM {prev}", list.join(", "))
         }
+        Step::FillDown { columns } => {
+            if columns.is_empty() {
+                return Err(Error::Invalid("it names no column".into()));
+            }
+            let mut list: Vec<String> = cols.columns.iter().map(|c| ident(&c.name)).collect();
+            for c in columns {
+                let i = found(cols, c)?;
+                let x = ident(&cols.columns[i].name);
+                // Blank text is empty too: a step before may have made it.
+                let value = if cols.columns[i].ty == ColumnType::Text { format!("NULLIF(trim({x}), '')") } else { x.clone() };
+                list[i] = format!(
+                    "COALESCE({value}, last_value({value} IGNORE NULLS) OVER (ORDER BY \"__position\" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS {x}"
+                );
+            }
+            format!(
+                "SELECT {} FROM (SELECT *, row_number() OVER () AS \"__position\" FROM {prev}) ORDER BY \"__position\"",
+                list.join(", ")
+            )
+        }
+        Step::Unpivot { columns, keep, name, value, keep_empty } => unpivot(prev, cols, (columns, keep), (name, value), *keep_empty)?,
         Step::Group { by, aggregates } => group(by, aggregates, prev, cols)?,
         Step::Join { dataset, on, kind, columns, prefix } => {
             let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
             join(n, prev, cols, checks, (dataset, input), (on, *kind, columns.as_deref(), prefix.as_deref()))?
         }
+        Step::Sql { .. } => return Err(Error::Internal("a sql step is compiled on its own".into())),
         Step::Append { dataset } => {
             let input = inputs.get(dataset).ok_or_else(|| Error::Internal(format!("{dataset} was resolved and is not there")))?;
             append(prev, cols, dataset, input)?
@@ -594,6 +705,85 @@ fn append(prev: &str, cols: &mut Cols, id: &str, input: &[Column]) -> Result<Str
         cols.ancestry.push(vec![Origin { source: format!("dataset:{id}"), column: r.name.clone() }]);
     }
     Ok(format!("SELECT {} FROM {prev} UNION ALL SELECT {} FROM {}", left.join(", "), right.join(", "), ident(&input_table(id))))
+}
+
+/// The most columns an unpivot makes rows of.
+const UNPIVOT_LIMIT: usize = 1000;
+
+/// Columns made rows, in the order they were columns, each row's after
+/// the row before's.
+fn unpivot(
+    prev: &str,
+    cols: &mut Cols,
+    (columns, keep): (&[String], &[String]),
+    (name, value): (&str, &str),
+    keep_empty: bool,
+) -> Result<String> {
+    let idx = |c: &String| cols.find(c).ok_or_else(|| Error::Internal(format!("'{c}' was resolved and is not there")));
+    let turned: Vec<usize> = match (columns.is_empty(), keep.is_empty()) {
+        (false, true) => {
+            let mut out = Vec::new();
+            for c in columns {
+                let i = idx(c)?;
+                if out.contains(&i) {
+                    return Err(Error::Invalid(format!("it names '{c}' twice")));
+                }
+                out.push(i);
+            }
+            out
+        }
+        (true, false) => {
+            let kept: Vec<usize> = keep.iter().map(idx).collect::<Result<_>>()?;
+            (0..cols.columns.len()).filter(|i| !kept.contains(i)).collect()
+        }
+        _ => return Err(Error::Invalid("name the columns to unpivot, or the ones to keep, and not both".into())),
+    };
+    if turned.is_empty() {
+        return Err(Error::Invalid("every column is kept, so there is nothing to unpivot".into()));
+    }
+    if turned.len() > UNPIVOT_LIMIT {
+        return Err(Error::Invalid(format!("it unpivots {} columns, and the most is {UNPIVOT_LIMIT}", turned.len())));
+    }
+    let mut ty = cols.columns[turned[0]].ty;
+    for &i in &turned[1..] {
+        let c = &cols.columns[i];
+        ty = crate::schema::common(ty, c.ty).ok_or_else(|| {
+            Error::Invalid(format!(
+                "'{}' is {} and the columns before it are {ty}, which do not widen to one type; retype them first",
+                c.name, c.ty
+            ))
+        })?;
+    }
+    let kept = Cols {
+        columns: (0..cols.columns.len()).filter(|i| !turned.contains(i)).map(|i| cols.columns[i].clone()).collect(),
+        ancestry: (0..cols.columns.len()).filter(|i| !turned.contains(i)).map(|i| cols.ancestry[i].clone()).collect(),
+    };
+    check_name(name, &kept, "it puts the column names in")?;
+    check_name(value, &kept, "it puts the values in")?;
+    if name.eq_ignore_ascii_case(value) {
+        return Err(Error::Invalid(format!("the names and the values are both '{name}'")));
+    }
+    let names: Vec<String> = turned.iter().map(|&i| literal(&cols.columns[i].name)).collect();
+    let values: Vec<String> = turned.iter().map(|&i| format!("CAST({} AS {})", ident(&cols.columns[i].name), ty.sql())).collect();
+    let mut from: Vec<Origin> = turned.iter().flat_map(|&i| cols.ancestry[i].clone()).collect();
+    from.sort();
+    from.dedup();
+    let inner = format!(
+        "SELECT {}{}unnest([{}]) AS {}, unnest([{}]) AS {} FROM {prev}",
+        kept.list_or_empty(),
+        if kept.columns.is_empty() { "" } else { ", " },
+        names.join(", "),
+        ident(name),
+        values.join(", "),
+        ident(value)
+    );
+    let select = if keep_empty { inner } else { format!("SELECT * FROM ({inner}) WHERE {} IS NOT NULL", ident(value)) };
+    *cols = kept;
+    cols.columns.push(Column { name: name.to_string(), ty: ColumnType::Text, role: Role::Dimension });
+    cols.ancestry.push(from.clone());
+    cols.columns.push(Column { name: value.to_string(), ty, role: Role::inferred(value, ty) });
+    cols.ancestry.push(from);
+    Ok(select)
 }
 
 fn order_by(by: &[SortKey], cols: &Cols) -> Result<String> {
@@ -744,17 +934,17 @@ mod tests {
     #[test]
     fn steps_shape_rows_and_columns() {
         let (cols, rows) = run(json!([
-            { "op": "remap", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
-            { "op": "trim", "columns": ["store"] },
-            { "op": "case", "columns": ["store"], "to": "upper" },
-            { "op": "fill", "column": "amount", "value": 0 },
-            { "op": "retype", "column": "day", "type": "date" },
-            { "op": "formula", "column": "double", "formula": "amount * 2" },
+            { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
+            { "op": "trim_val", "columns": ["store"] },
+            { "op": "upper_case", "columns": ["store"] },
+            { "op": "fill_empty", "column": "amount", "value": 0 },
+            { "op": "retype_column", "column": "day", "type": "date" },
+            { "op": "add_column", "column": "double", "formula": "amount * 2" },
             { "op": "dedupe" },
             { "op": "filter", "formula": "amount >= 0" },
-            { "op": "rename", "column": "store", "to": "shop" },
-            { "op": "remove", "columns": ["day"] },
-            { "op": "reorder", "columns": ["double"] },
+            { "op": "rename_column", "column": "store", "to": "shop" },
+            { "op": "remove_columns", "columns": ["day"] },
+            { "op": "reorder_columns", "columns": ["double"] },
             { "op": "sort", "by": [{ "column": "double", "desc": true }] },
         ]))
         .unwrap();
@@ -784,12 +974,12 @@ mod tests {
 
     #[test]
     fn a_retype_keeps_only_what_converts() {
-        let e = run(json!([{ "op": "retype", "column": "region", "type": "integer" }])).err().unwrap();
+        let e = run(json!([{ "op": "retype_column", "column": "region", "type": "integer" }])).err().unwrap();
         assert!(e.to_string().contains("do not convert"), "{e}");
-        let e = run(json!([{ "op": "retype", "column": "amount", "type": "integer" }])).err().unwrap();
+        let e = run(json!([{ "op": "retype_column", "column": "amount", "type": "integer" }])).err().unwrap();
         assert!(e.to_string().contains("do not convert"), "5.50 would lose its fraction: {e}");
-        assert!(run(json!([{ "op": "retype", "column": "amount", "type": "decimal(4)" }])).is_ok());
-        let (cols, rows) = run(json!([{ "op": "retype", "column": "day", "type": "date", "format": "%Y-%m-%d" }])).unwrap();
+        assert!(run(json!([{ "op": "retype_column", "column": "amount", "type": "decimal(4)" }])).is_ok());
+        let (cols, rows) = run(json!([{ "op": "retype_column", "column": "day", "type": "date", "format": "%Y-%m-%d" }])).unwrap();
         assert_eq!(cols[3].ty, ColumnType::Date);
         assert_eq!(rows[0][3], "2026-01-31");
     }
@@ -798,10 +988,10 @@ mod tests {
     fn a_step_on_a_column_that_is_not_there_is_named_with_what_follows_from_it() {
         let c = compile_steps(
             &steps(json!([
-                { "op": "formula", "column": "x", "formula": "upper(gone)" },
-                { "op": "remap", "column": "x", "values": [{ "from": "A", "to": "B" }] },
-                { "op": "remove", "columns": ["store"] },
-                { "op": "trim", "columns": ["store"] },
+                { "op": "add_column", "column": "x", "formula": "upper(gone)" },
+                { "op": "remap_val", "column": "x", "values": [{ "from": "A", "to": "B" }] },
+                { "op": "remove_columns", "columns": ["store"] },
+                { "op": "trim_val", "columns": ["store"] },
                 { "op": "sort", "by": [{ "column": "region" }] },
             ])),
             &[("missing".to_string(), Role::Measure)].into_iter().collect(),
@@ -813,9 +1003,9 @@ mod tests {
         assert_eq!(
             said,
             [
-                "step 1 (formula) reads column 'gone', which is not there at that step",
-                "step 2 (remap) reads column 'x', which is not there at that step",
-                "step 4 (trim) reads column 'store', which is not there at that step",
+                "step 1 (add_column) reads column 'gone', which is not there at that step",
+                "step 2 (remap_val) reads column 'x', which is not there at that step",
+                "step 4 (trim_val) reads column 'store', which is not there at that step",
                 "the role given to column 'missing'",
             ]
         );
@@ -825,13 +1015,13 @@ mod tests {
     #[test]
     fn steps_are_refused_plainly() {
         for (v, says) in [
-            (json!([{ "op": "rename", "column": "store", "to": "Region" }]), "there is a column 'region' already"),
-            (json!([{ "op": "trim", "columns": ["amount"] }]), "works on text"),
-            (json!([{ "op": "fill", "column": "amount", "value": "lots" }]), "not a value of column 'amount'"),
+            (json!([{ "op": "rename_column", "column": "store", "to": "Region" }]), "there is a column 'region' already"),
+            (json!([{ "op": "trim_val", "columns": ["amount"] }]), "works on text"),
+            (json!([{ "op": "fill_empty", "column": "amount", "value": "lots" }]), "not a value of column 'amount'"),
             (json!([{ "op": "filter", "formula": "amount + 1" }]), "true or false"),
             (json!([{ "op": "group", "by": ["region"], "aggregates": [{ "column": "store", "fn": "sum", "as": "s" }] }]), "takes a number"),
-            (json!([{ "op": "formula", "column": "", "formula": "1" }]), "not a column name"),
-            (json!([{ "op": "replace", "column": "store", "find": "", "with": "x" }]), "finds nothing"),
+            (json!([{ "op": "add_column", "column": "", "formula": "1" }]), "not a column name"),
+            (json!([{ "op": "find_and_replace_val", "column": "store", "find": "", "with": "x" }]), "finds nothing"),
         ] {
             let e = compile_steps(&steps(v.clone()), &Default::default(), &[source()], "2026-11-26T00:00:00.000Z").err();
             let e = e.unwrap_or_else(|| panic!("{v} compiled"));
@@ -839,14 +1029,14 @@ mod tests {
             assert!(e.to_string().starts_with("step 1 ("), "{e}");
         }
         assert!(serde_json::from_value::<Vec<Step>>(json!([{ "op": "sql", "sql": "DROP TABLE x" }])).is_err(), "no step runs SQL");
-        assert!(serde_json::from_value::<Vec<Step>>(json!([{ "op": "trim", "columns": ["a"], "extra": 1 }])).is_err());
+        assert!(serde_json::from_value::<Vec<Step>>(json!([{ "op": "trim_val", "columns": ["a"], "extra": 1 }])).is_err());
     }
 
     #[test]
     fn ancestry_follows_formulas_and_groups() {
         let c = compile_steps(
             &steps(json!([
-                { "op": "formula", "column": "label", "formula": "region & store" },
+                { "op": "add_column", "column": "label", "formula": "region & store" },
                 { "op": "group", "by": ["label"], "aggregates": [{ "column": "amount", "fn": "sum", "as": "total" }] },
             ])),
             &Default::default(),

@@ -596,35 +596,22 @@ struct Split {
     spec: Value,
     outputs: Vec<zsql_prep::blend::Output>,
     keys: std::collections::BTreeMap<String, String>,
-    key_only: Vec<String>,
 }
 
-/// The field a spec names, and whether it is a measure and one that
-/// adds up: a sum or a count on every table it is on.
-fn field_kind(model: &zsql_core::Model, written: &str) -> (bool, bool) {
+/// Whether the field a spec names is a measure.
+fn is_measure(model: &zsql_core::Model, written: &str) -> bool {
     let (name, suffix) = match written.rsplit_once('@') {
         Some((n, s)) => (n, Some(s)),
         None => (written, None),
     };
     let sem = model.semantic();
     let field = sem.fields().iter().find(|f| f.uid.eq_ignore_ascii_case(name) || f.name.eq_ignore_ascii_case(name));
-    let measure = match (suffix, field) {
+    match (suffix, field) {
         (Some("m"), _) => true,
         (Some("d"), _) => false,
         (_, Some(f)) => f.kind == zsql_semantic::FieldKind::Measure,
         _ => false,
-    };
-    let additive = field.is_some_and(|f| {
-        let sqls: Vec<String> = sem
-            .tables()
-            .iter()
-            .filter_map(|t| sem.expression_for(t.id, f.id))
-            .filter_map(|e| e.sql.as_ref())
-            .map(|s| s.trim().to_lowercase())
-            .collect();
-        !sqls.is_empty() && sqls.iter().all(|s| (s.starts_with("sum(") || s.starts_with("count(")) && !s.contains("distinct"))
-    });
-    (measure, additive)
+    }
 }
 
 fn invalid(m: impl Into<String>) -> ApiError {
@@ -673,38 +660,35 @@ fn split(model: &zsql_core::Model, req: &BlendRequest) -> Result<Split, ApiError
             (written, _) => {
                 let column = format!("__m{}", model_projections.len());
                 let w = written.clone().unwrap_or_default();
-                let (measure, additive) = field_kind(model, &w);
+                let measure = is_measure(model, &w);
                 let mut p = p.clone();
                 p["alias"] = json!(column);
                 model_projections.push(p);
                 if !w.is_empty() {
                     written_of.push((w.to_lowercase(), column.clone()));
                 }
-                outputs.push(zsql_prep::blend::Output::Model { column, name: shown.unwrap_or(w), measure, additive });
+                outputs.push(zsql_prep::blend::Output::Model { column, name: shown.unwrap_or(w), measure });
             }
         }
     }
+    // A model key a join names must be asked for: the dataset is at
+    // that grain, and a key planned only to join on would make the
+    // warehouse send rows finer than the answer, to be added up again.
     let mut keys = std::collections::BTreeMap::new();
-    let mut key_only = Vec::new();
     for j in req.blend.iter().filter(|j| j.to == "model") {
         for on in &j.on {
-            if keys.contains_key(&on.left) {
-                continue;
-            }
-            let column = match written_of.iter().find(|(w, _)| *w == on.left.to_lowercase()) {
-                Some((_, c)) => c.clone(),
-                None => {
-                    let c = format!("__k{}", key_only.len());
-                    model_projections.push(json!({ "field": on.left, "alias": c }));
-                    key_only.push(c.clone());
-                    c
-                }
+            let Some((_, column)) = written_of.iter().find(|(w, _)| *w == on.left.to_lowercase()) else {
+                return Err(invalid(format!(
+                    "'{}' joins '{}' to the model, so ask for it too: add {{\"field\": \"{}\"}} to the projections. \
+                     The dataset is at that grain, and the answer is joined on it",
+                    on.left, j.join, on.left
+                )));
             };
-            keys.insert(on.left.clone(), column);
+            keys.insert(on.left.clone(), column.clone());
         }
     }
     spec["projections"] = Value::Array(model_projections);
-    Ok(Split { spec, outputs, keys, key_only })
+    Ok(Split { spec, outputs, keys })
 }
 
 pub(crate) async fn blend(
@@ -745,7 +729,7 @@ pub(crate) async fn blend(
     blocking(move || {
         let path = app.runs.rows(&record).map_err(crate::exec::internal)?;
         let rows = zsql_exec::page(&path, 0, u64::MAX).map_err(crate::exec::internal)?;
-        let part = zsql_prep::blend::ModelPart { rows, keys: split.keys, key_only: split.key_only };
+        let part = zsql_prep::blend::ModelPart { rows, keys: split.keys };
         let b = prep.blend(&scope, &plan, &part, &record.sql)?;
         let (offset, limit) = page;
         let total = b.rows.num_rows() as u64;

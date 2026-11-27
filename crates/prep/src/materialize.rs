@@ -100,7 +100,7 @@ fn first_rows(batches: &[RecordBatch], n: usize) -> Vec<RecordBatch> {
 /// Creates a compiled recipe's views in the session, and runs its
 /// checks: a conversion that would lose a value fails here, naming the
 /// column, both types and the first values.
-pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<Vec<Outcome>> {
+pub(crate) fn prepare(engine: &crate::engine::Engine, session: &Session, compiled: &Compiled) -> Result<Vec<Outcome>> {
     let mut outcomes = Vec::new();
     let apply_edits = |at: usize, outcomes: &mut Vec<Outcome>| -> Result<()> {
         for stage in compiled.edits.iter().filter(|s| s.at == at) {
@@ -110,7 +110,10 @@ pub(crate) fn prepare(session: &Session, compiled: &Compiled) -> Result<Vec<Outc
     };
     for (i, (name, sql)) in compiled.views.iter().enumerate() {
         apply_edits(i, &mut outcomes)?;
-        session.execute(&format!("CREATE VIEW {} AS {sql}", ident(name)))?;
+        match compiled.sql.get(name) {
+            Some(stage) => crate::sql::run(engine, session, name, stage)?,
+            None => session.execute(&format!("CREATE VIEW {} AS {sql}", ident(name)))?,
+        }
     }
     apply_edits(compiled.views.len(), &mut outcomes)?;
     for c in &compiled.checks {
@@ -139,14 +142,16 @@ pub(crate) fn run(
     let pinned_at = crate::time::now();
     let steps_of = |m: u32| store::read_json::<Recipe>(&store::recipe_path(dir, m)).ok().map(|r| r.steps);
     let edits = crate::edits::in_force(log, upto, &steps_of, &recipe.steps);
-    let compiled = compile::compile(recipe, &edits, &dataset.sources, &inputs_map(inputs), &pinned_at)?;
+    let compiled = compile::compile(recipe, &edits, (&dataset.sources, &inputs_map(inputs)), &pinned_at, &|c, q| {
+        crate::sql::describe(&prep.engine, c, q)
+    })?;
     if !compiled.unresolved.is_empty() {
         return Ok(Run::Held(compiled.unresolved));
     }
     let session = prep.engine.session()?;
     let sources = load_sources(&session, dir, dataset, None)?;
     load_inputs(&session, inputs, None)?;
-    let outcomes = prepare(&session, &compiled)?;
+    let outcomes = prepare(&prep.engine, &session, &compiled)?;
     let list: Vec<String> = compiled.columns.iter().map(|c| ident(&c.name)).collect();
     let rows = session.query(&format!("SELECT {} FROM {}", list.join(", "), compiled.last))?;
     let mut notes = Vec::new();

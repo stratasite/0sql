@@ -151,8 +151,8 @@ async fn a_recipe_of_steps_through_its_routes() {
     let a = s.upload(&base, "region,store,amount\nNY,a,10\nCA,b,5\nNY,c,7\n").await;
     let id = a.body["id"].as_str().unwrap().to_string();
     let steps = json!([
-        { "op": "remap", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
-        { "op": "formula", "column": "label", "formula": "region & '/' & store" },
+        { "op": "remap_val", "column": "region", "values": [{ "from": "NY", "to": "New York" }] },
+        { "op": "add_column", "column": "label", "formula": "region & '/' & store" },
     ]);
 
     let a = s.post_json(&format!("{base}/{id}/preview"), json!({ "steps": steps, "limit": 1 })).await;
@@ -171,7 +171,7 @@ async fn a_recipe_of_steps_through_its_routes() {
     assert_eq!(a.status, StatusCode::BAD_REQUEST);
 
     let a = s.call(Method::GET, &format!("{base}/{id}/impact?column=store")).await;
-    assert_eq!(a.body["said"], json!(["step 2 (formula) reads column 'store', which is not there at that step"]), "{}", a.body);
+    assert_eq!(a.body["said"], json!(["step 2 (add_column) reads column 'store', which is not there at that step"]), "{}", a.body);
 
     // A new snapshot without `store` holds the dataset; confirming drops the formula.
     let a = s.send(Method::PUT, &format!("{base}/{id}/upload"), &[], Some(("text/csv", b"region,amount\nNY,1\n".to_vec()))).await;
@@ -334,6 +334,16 @@ async fn a_blend_sets_a_dataset_beside_the_model() {
     );
     let a = s.post_json(&route, filter).await;
     assert_eq!(a.body["rows"], json!([["books", "30.50"]]), "{}", a.body);
+
+    // A join key the request does not ask for is refused, before the warehouse is asked.
+    let hidden = ask(
+        json!([{ "id": budget, "as": "budget" }]),
+        json!([{ "join": "budget", "to": "model", "on": [{ "left": "Category", "right": "budget.category" }], "kind": "enrich" }]),
+        json!([{ "field": "Revenue" }, { "field": "budget.amount" }]),
+    );
+    let a = s.post_json(&route, hidden).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(a.error().contains("'Category' joins 'budget' to the model, so ask for it too"), "{}", a.body);
 
     // Attached and joined to nothing, an alias the model has, another owner's.
     let lonely = ask(json!([{ "id": budget, "as": "budget" }]), json!([]), json!([{ "field": "Category" }]));

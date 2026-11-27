@@ -615,18 +615,160 @@ fn part_of(args: &[Expr], i: usize, f: &str) -> Result<String> {
 }
 
 /// The formats `to_date` reads, as strptime writes them.
-fn date_format(args: &[Expr], i: usize) -> Result<Option<String>> {
+/// A text value's words, as a list: split at anything not a letter or a
+/// digit, and where a lower-case letter or a digit meets an upper-case
+/// one, so `GroceryStore` and `grocery-store` are both two words.
+fn words(x: &str) -> String {
+    format!(
+        r"string_split(trim(regexp_replace(regexp_replace({x}, '([\p{{Ll}}\pN])(\p{{Lu}})', '\1 \2', 'g'), '[^\pL\pN]+', ' ', 'g')), ' ')"
+    )
+}
+
+/// `Grocery Store`: each word's first letter upper case, the rest lower.
+pub(crate) fn title_case(x: &str) -> String {
+    format!("array_to_string(list_transform(string_split({x}, ' '), lambda w: upper(w[1]) || lower(w[2:])), ' ')")
+}
+
+/// `grocery_store`, from `Grocery Store`, `GroceryStore` or `grocery-store`.
+pub(crate) fn snake_case(x: &str) -> String {
+    format!("lower(array_to_string({}, '_'))", words(x))
+}
+
+/// `groceryStore`.
+pub(crate) fn camel_case(x: &str) -> String {
+    format!("lower({w}[1]) || array_to_string(list_transform({w}[2:], lambda v: upper(v[1]) || lower(v[2:])), '')", w = words(x))
+}
+
+/// What `to_number` gives: exact, with room for a percentage's places.
+const NUMBER: ColumnType = Decimal(6);
+
+/// The decimal mark a number is written with: `.` unless the argument
+/// says `,`. Never guessed: `1,234` is a thousand in one file and a
+/// little over one in another.
+fn decimal_mark(args: &[Expr], i: usize, f: &str) -> Result<char> {
     match args.get(i) {
-        None => Ok(None),
-        Some(Expr::Text(f)) if f.contains('%') && f.len() <= 64 => Ok(Some(f.clone())),
-        _ => Err(Error::Invalid("a date's format is text in strptime's form, such as '%d/%m/%Y'".into())),
+        None => Ok('.'),
+        Some(Expr::Text(m)) if m == "." || m == "," => Ok(m.chars().next().unwrap_or('.')),
+        _ => Err(Error::Invalid(format!("{f}()'s decimal mark is '.' or ','"))),
     }
 }
 
+/// A value read as a number the way people write one: a currency symbol
+/// or a three-letter code at either end, spaces and the thousands
+/// separator dropped; `(500)` is -500 and `12%` is 0.12. Anything else
+/// left over is no number, and gives null.
+fn number_of(x: &str, mark: char) -> String {
+    let (thousands, to_dot) = if mark == ',' { (".", "replace(c, ',', '.')") } else { (",", "c") };
+    let stripped = format!(
+        r"regexp_replace(regexp_replace(trim(CAST({x} AS VARCHAR)), '^\p{{Lu}}{{3}}[\s\x{{00A0}}]*|[\s\x{{00A0}}]*\p{{Lu}}{{3}}$', ''), '[\p{{Sc}}\s\x{{00A0}}\x{{202F}}{thousands}'']', '', 'g')"
+    );
+    format!(
+        r"list_transform([{stripped}], lambda c: CAST((CASE WHEN starts_with(c, '(') AND regexp_matches(c, '\)%?$') THEN -1 ELSE 1 END) * TRY_CAST(regexp_replace({to_dot}, '[()%]', '', 'g') AS {d}) * (CASE WHEN regexp_matches(c, '%\)?$') THEN 0.01 ELSE 1 END) AS {d}))[1]",
+        d = NUMBER.sql()
+    )
+}
+
+/// How `to_date` reads its text: every unambiguous way a date is
+/// written; and also, when asked, a day before its month or a month
+/// before its day, a spreadsheet's serial number, or one format.
+enum DateHow {
+    Auto,
+    DayFirst,
+    MonthFirst,
+    Excel,
+    Format(String),
+}
+
+fn date_how(args: &[Expr], i: usize, f: &str) -> Result<DateHow> {
+    match args.get(i) {
+        None => Ok(DateHow::Auto),
+        Some(Expr::Text(h)) => match h.to_lowercase().as_str() {
+            "dmy" => Ok(DateHow::DayFirst),
+            "mdy" => Ok(DateHow::MonthFirst),
+            "excel" => Ok(DateHow::Excel),
+            _ if h.contains('%') && h.len() <= 64 => Ok(DateHow::Format(h.clone())),
+            _ => Err(bad_how(f)),
+        },
+        _ => Err(bad_how(f)),
+    }
+}
+
+fn bad_how(f: &str) -> Error {
+    Error::Invalid(format!(
+        "{f}()'s second argument is 'dmy' (31/01/2026), 'mdy' (01/31/2026), 'excel' (a spreadsheet's serial number) or a format in strptime's form, such as '%d/%m/%Y'"
+    ))
+}
+
+/// The ways of writing a date with a month's name.
+const MONTH_NAMED: &str =
+    "['%d %b %Y', '%d %B %Y', '%b %d, %Y', '%B %d, %Y', '%b %d %Y', '%B %d %Y', '%d-%b-%Y', '%d-%B-%Y', '%b %Y', '%B %Y']";
+
+/// A value read as a date. Each reading is a whole match, and a date that
+/// does not exist (`2026-13-01`) is null, never another date.
+fn date_of(x: &str, how: &DateHow) -> String {
+    let text = format!("trim(CAST({x} AS VARCHAR))");
+    if let DateHow::Format(f) = how {
+        return format!("TRY_CAST(try_strptime({text}, {}) AS DATE)", literal(f));
+    }
+    // ISO dates and timestamps; year first with dots; YYYYMMDD, YYYYMM,
+    // YYYY-MM; a month's name.
+    let auto = format!(
+        r"COALESCE(TRY_CAST(s AS DATE), CASE
+         WHEN regexp_matches(s, '^\d{{4}}\.\d{{1,2}}\.\d{{1,2}}$') THEN TRY_CAST(replace(s, '.', '-') AS DATE)
+         WHEN regexp_matches(s, '^\d{{8}}$') THEN TRY_CAST(try_strptime(s, '%Y%m%d') AS DATE)
+         WHEN regexp_matches(s, '^\d{{6}}$') THEN TRY_CAST(try_strptime(s, '%Y%m') AS DATE)
+         WHEN regexp_matches(s, '^\d{{4}}[-/.]\d{{1,2}}$') THEN TRY_CAST(try_strptime(regexp_replace(s, '[/.]', '-'), '%Y-%m') AS DATE)
+         WHEN regexp_matches(s, '\pL') THEN TRY_CAST(try_strptime(s, {MONTH_NAMED}) AS DATE) END)"
+    );
+    let extra = match how {
+        DateHow::DayFirst | DateHow::MonthFirst => format!(
+            r"CASE WHEN regexp_matches(s, '^\d{{1,2}}[-/.]\d{{1,2}}[-/.]\d{{4}}$') THEN TRY_CAST(try_strptime(regexp_replace(s, '[-.]', '/', 'g'), '{}') AS DATE) END",
+            if matches!(how, DateHow::DayFirst) { "%d/%m/%Y" } else { "%m/%d/%Y" }
+        ),
+        // Days since 1899-12-30, as Excel and Sheets count them: five
+        // digits at most, which is to 2173, so a mistyped YYYYMM is not
+        // a date centuries away.
+        DateHow::Excel => r"CASE WHEN regexp_matches(s, '^\d{1,5}(\.\d+)?$') AND TRY_CAST(s AS DOUBLE) >= 1
+             THEN CAST(DATE '1899-12-30' + CAST(floor(TRY_CAST(s AS DOUBLE)) AS INTEGER) AS DATE) END"
+            .to_string(),
+        _ => "NULL".to_string(),
+    };
+    format!("list_transform([{text}], lambda s: COALESCE({auto}, {extra}))[1]")
+}
+
+/// A value read as a timestamp: as `to_date` reads a date, at midnight,
+/// and with its time where it has one: ISO, a day-first or month-first
+/// date followed by `HH:MM` or `HH:MM:SS`, an Excel serial's fraction.
+fn timestamp_of(x: &str, how: &DateHow) -> String {
+    let text = format!("trim(CAST({x} AS VARCHAR))");
+    if let DateHow::Format(f) = how {
+        return format!("TRY_CAST(try_strptime({text}, {}) AS TIMESTAMP)", literal(f));
+    }
+    let timed = match how {
+        DateHow::DayFirst | DateHow::MonthFirst => {
+            let d = if matches!(how, DateHow::DayFirst) { "%d/%m/%Y" } else { "%m/%d/%Y" };
+            format!(
+                r"CASE WHEN regexp_matches(s, '^\d{{1,2}}[-/.]\d{{1,2}}[-/.]\d{{4}}[ T]\d{{1,2}}:\d{{2}}(:\d{{2}})?$') THEN TRY_CAST(try_strptime(regexp_replace(regexp_replace(s, '[-.]', '/', 'g'), 'T', ' '), ['{d} %H:%M:%S', '{d} %H:%M']) AS TIMESTAMP) END"
+            )
+        }
+        DateHow::Excel => r"CASE WHEN regexp_matches(s, '^\d{1,5}(\.\d+)?$') AND TRY_CAST(s AS DOUBLE) >= 1
+             THEN CAST(DATE '1899-12-30' AS TIMESTAMP) + to_microseconds(CAST(round(TRY_CAST(s AS DOUBLE) * 86400000000) AS BIGINT)) END"
+            .to_string(),
+        _ => "NULL".to_string(),
+    };
+    format!(
+        "COALESCE(list_transform([{text}], lambda s: COALESCE(TRY_CAST(s AS TIMESTAMP), {timed}))[1], CAST({} AS TIMESTAMP))",
+        date_of(x, how)
+    )
+}
+
 /// The allowlist. A function not here is not a function.
-const FUNCTIONS: [&str; 45] = [
+const FUNCTIONS: [&str; 52] = [
     "upper",
     "lower",
+    "title_case",
+    "snake_case",
+    "camel_case",
     "trim",
     "length",
     "left",
@@ -657,12 +799,16 @@ const FUNCTIONS: [&str; 45] = [
     "date_diff",
     "make_date",
     "if",
+    "ifs",
+    "switch",
     "coalesce",
     "nullif",
     "to_text",
     "to_number",
     "to_integer",
     "to_date",
+    "to_timestamp",
+    "to_boolean",
     "is_number",
     "is_date",
     "weekday",
@@ -699,6 +845,15 @@ fn call(name: &str, a: &[String], t: &[Option<ColumnType>], args: &[Expr], scope
         "upper" | "lower" | "trim" => {
             text1(name)?;
             (format!("{}({})", name, a[0]), Some(Text))
+        }
+        "title_case" | "snake_case" | "camel_case" => {
+            text1(name)?;
+            let sql = match name {
+                "title_case" => title_case(&a[0]),
+                "snake_case" => snake_case(&a[0]),
+                _ => camel_case(&a[0]),
+            };
+            (sql, Some(Text))
         }
         "length" => {
             text1(name)?;
@@ -823,6 +978,73 @@ fn call(name: &str, a: &[String], t: &[Option<ColumnType>], args: &[Expr], scope
             let ty = meet_or_refuse(t[1], t.get(2).copied().flatten(), "if()")?.unwrap_or(Text);
             (format!("CAST(CASE WHEN {} THEN {} ELSE {} END AS {})", a[0], a[1], otherwise, ty.sql()), Some(ty))
         }
+        // switch(x, v1, r1, v2, r2, ..., default?): the result for the
+        // first value x equals; the default, or null, for none.
+        "switch" => {
+            if n < 3 {
+                return Err(Error::Invalid(
+                    "switch() takes a value, then pairs of a value to match and its result, then a default if wanted: switch(region, 'NY', 'New York', region)".into(),
+                ));
+            }
+            let pairs = (n - 1) / 2;
+            let default = n.is_multiple_of(2).then(|| n - 1);
+            let mut key = t[0];
+            for k in 0..pairs {
+                key = meet_or_refuse(key, t[1 + 2 * k], "switch()'s values")?;
+            }
+            let mut ty: Option<ColumnType> = None;
+            for i in (0..pairs).map(|k| 2 + 2 * k).chain(default) {
+                ty = meet_or_refuse(ty, t[i], "switch()'s results")?;
+            }
+            let (key, ty) = (key.unwrap_or(Text), ty.unwrap_or(Text));
+            let arms: Vec<String> = (0..pairs)
+                .map(|k| format!("WHEN CAST({} AS {}) THEN CAST({} AS {})", a[1 + 2 * k], key.sql(), a[2 + 2 * k], ty.sql()))
+                .collect();
+            let otherwise = default.map(|i| format!(" ELSE CAST({} AS {})", a[i], ty.sql())).unwrap_or_default();
+            (format!("CAST(CASE CAST({} AS {}) {}{otherwise} END AS {})", a[0], key.sql(), arms.join(" "), ty.sql()), Some(ty))
+        }
+        // ifs(c1, r1, c2, r2, ..., default?): the result of the first true
+        // condition; the default, or null, for none.
+        "ifs" => {
+            if n < 2 {
+                return Err(Error::Invalid(
+                    "ifs() takes pairs of a condition and its result, then a default if wanted: ifs(amount > 100, 'big', amount > 10, 'mid', 'small')".into(),
+                ));
+            }
+            let pairs = n / 2;
+            let default = (!n.is_multiple_of(2)).then(|| n - 1);
+            let mut ty: Option<ColumnType> = None;
+            for k in 0..pairs {
+                want(t[2 * k], Boolean, "ifs()'s conditions")?;
+                ty = meet_or_refuse(ty, t[2 * k + 1], "ifs()'s results")?;
+            }
+            if let Some(i) = default {
+                ty = meet_or_refuse(ty, t[i], "ifs()'s results")?;
+            }
+            let ty = ty.unwrap_or(Text);
+            let arms: Vec<String> = (0..pairs).map(|k| format!("WHEN {} THEN CAST({} AS {})", a[2 * k], a[2 * k + 1], ty.sql())).collect();
+            let otherwise = default.map(|i| format!(" ELSE CAST({} AS {})", a[i], ty.sql())).unwrap_or_default();
+            (format!("CAST(CASE {}{otherwise} END AS {})", arms.join(" "), ty.sql()), Some(ty))
+        }
+        "to_boolean" => {
+            arity(name, n, 1, 1)?;
+            (
+                format!(
+                    "CASE WHEN lower(trim(CAST({x} AS VARCHAR))) IN ('true', 't', 'yes', 'y', '1') THEN TRUE \
+                     WHEN lower(trim(CAST({x} AS VARCHAR))) IN ('false', 'f', 'no', 'n', '0') THEN FALSE END",
+                    x = a[0]
+                ),
+                Some(Boolean),
+            )
+        }
+        "to_timestamp" => {
+            arity(name, n, 1, 2)?;
+            let how = date_how(args, 1, name)?;
+            if matches!(how, DateHow::Format(_)) {
+                want_text(t[0], "to_timestamp() with a format")?;
+            }
+            (timestamp_of(&a[0], &how), Some(Timestamp))
+        }
         "today" => {
             arity(name, n, 0, 0)?;
             (format!("DATE '{}'", &scope.pinned_at[..10]), Some(Date))
@@ -869,27 +1091,26 @@ fn call(name: &str, a: &[String], t: &[Option<ColumnType>], args: &[Expr], scope
             arity(name, n, 1, 1)?;
             (format!("CAST({} AS VARCHAR)", a[0]), Some(Text))
         }
-        "to_number" => {
-            arity(name, n, 1, 1)?;
-            (format!("TRY_CAST({} AS DOUBLE)", a[0]), Some(Double))
-        }
-        "to_integer" => {
-            arity(name, n, 1, 1)?;
-            (format!("TRY_CAST({} AS BIGINT)", a[0]), Some(Integer))
-        }
-        "is_number" => {
-            arity(name, n, 1, 1)?;
-            (format!("(TRY_CAST({} AS DOUBLE) IS NOT NULL)", a[0]), Some(Boolean))
+        "to_number" | "to_integer" | "is_number" => {
+            arity(name, n, 1, 2)?;
+            let parsed = number_of(&a[0], decimal_mark(args, 1, name)?);
+            match name {
+                "to_number" => (parsed, Some(NUMBER)),
+                // A whole number, or none: 1.5 is not an integer rounded.
+                "to_integer" => (
+                    format!("list_transform([{parsed}], lambda n: CASE WHEN n = trunc(n) THEN TRY_CAST(n AS BIGINT) END)[1]"),
+                    Some(Integer),
+                ),
+                _ => (format!("({parsed} IS NOT NULL)"), Some(Boolean)),
+            }
         }
         "to_date" | "is_date" => {
             arity(name, n, 1, 2)?;
-            let parsed = match date_format(args, 1)? {
-                Some(f) => {
-                    want_text(t[0], &format!("{name}() with a format"))?;
-                    format!("TRY_CAST(try_strptime({}, {}) AS DATE)", a[0], literal(&f))
-                }
-                None => format!("TRY_CAST({} AS DATE)", a[0]),
-            };
+            let how = date_how(args, 1, name)?;
+            if matches!(how, DateHow::Format(_)) {
+                want_text(t[0], &format!("{name}() with a format"))?;
+            }
+            let parsed = date_of(&a[0], &how);
             if name == "is_date" {
                 (format!("({parsed} IS NOT NULL)"), Some(Boolean))
             } else {

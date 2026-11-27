@@ -94,6 +94,39 @@ impl Session {
         Ok(Batches { schema, batches })
     }
 
+    /// A query's rows, interrupted if it runs past `limit`. An engine
+    /// error comes back as its own words, for a step to name.
+    pub fn query_within(&self, sql: &str, limit: std::time::Duration) -> std::result::Result<Batches, String> {
+        let handle = self.conn.interrupt_handle();
+        let (done, waiting) = std::sync::mpsc::channel::<()>();
+        let watch = std::thread::spawn(move || {
+            if waiting.recv_timeout(limit).is_err() {
+                handle.interrupt();
+                return true;
+            }
+            false
+        });
+        let result = (|| -> std::result::Result<Batches, duckdb::Error> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let arrow = stmt.query_arrow([])?;
+            let schema: SchemaRef = arrow.get_schema();
+            let batches: Vec<RecordBatch> = arrow.collect();
+            Ok(Batches { schema, batches })
+        })();
+        let _ = done.send(());
+        let interrupted = watch.join().unwrap_or(false);
+        match result {
+            Ok(b) => Ok(b),
+            Err(_) if interrupted => Err(format!("it ran for more than {} seconds and was stopped", limit.as_secs())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The one text a query answers with, given one text parameter.
+    pub fn text_of(&self, sql: &str, param: &str) -> Result<String> {
+        Ok(self.conn.query_row(sql, [param], |r| r.get::<_, String>(0))?)
+    }
+
     /// One number a query answers with.
     pub fn count(&self, sql: &str) -> Result<u64> {
         Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))?.max(0) as u64)
@@ -130,6 +163,19 @@ pub(crate) mod tests {
             assert!(s.execute(sql).is_err(), "{sql} ran");
         }
         assert!(!std::path::Path::new("/tmp/zsql-prep-escape.csv").exists());
+    }
+
+    #[test]
+    fn a_query_past_its_time_is_stopped() {
+        let s = engine().session().unwrap();
+        let started = std::time::Instant::now();
+        let e = s
+            .query_within("SELECT count(*) FROM range(100000000000) a, range(1000) b", std::time::Duration::from_millis(300))
+            .err()
+            .unwrap();
+        assert!(e.contains("was stopped"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(s.query_within("SELECT 1 AS one", std::time::Duration::from_secs(5)).unwrap().num_rows(), 1);
     }
 
     #[test]

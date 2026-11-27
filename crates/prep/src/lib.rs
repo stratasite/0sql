@@ -45,6 +45,7 @@ pub mod recipe;
 pub mod schema;
 mod snapshot;
 pub mod source;
+pub mod sql;
 pub mod store;
 pub mod time;
 
@@ -595,11 +596,12 @@ impl Prep {
             &edits::in_force(&log, dataset.edits, &steps_of(&dir), &steps),
             (&dataset.sources, &materialize::inputs_map(&inputs)),
             &pinned_at,
+            &|c, q| sql::describe(&self.engine, c, q),
         )?;
         let session = self.engine.session()?;
         materialize::load_sources(&session, &dir, &dataset, Some(PREVIEW_SAMPLE))?;
         materialize::load_inputs(&session, &inputs, Some(PREVIEW_SAMPLE))?;
-        materialize::prepare(&session, &compiled)?;
+        materialize::prepare(&self.engine, &session, &compiled)?;
         let list: Vec<String> = compiled.columns.iter().map(|c| schema::ident(&c.name)).collect();
         let limit = preview.limit.unwrap_or(100).min(PREVIEW_SAMPLE as u64);
         let rows = session.query(&format!("SELECT {} FROM {} LIMIT {limit}", list.join(", "), compiled.last))?;
@@ -613,11 +615,12 @@ impl Prep {
         let recipe: Recipe = store::read_json(&store::recipe_path(&dir, dataset.recipe))?;
         let pinned_at = time::now();
         let empty = std::collections::BTreeMap::new();
+        let describe: compile::Describe<'_> = &|c, q| sql::describe(&self.engine, c, q);
         // Where the column is first there: a source, or the step that makes it.
         let mut made_at = None;
         let all_inputs = materialize::inputs_map(&self.inputs(&dir, &recipe.inputs())?);
         for k in 0..=recipe.steps.len() {
-            let c = compile::compile_all(&recipe.steps[..k], &empty, &[], &[], (&dataset.sources, &all_inputs), &pinned_at)?;
+            let c = compile::compile_all(&recipe.steps[..k], &empty, &[], &[], (&dataset.sources, &all_inputs), &pinned_at, describe)?;
             if c.columns.iter().any(|x| x.name.eq_ignore_ascii_case(column)) {
                 made_at = Some(k);
                 break;
@@ -627,14 +630,14 @@ impl Prep {
             return Err(Error::NotFound(format!("dataset {id} has no column '{column}' at any step")));
         };
         let mut steps = recipe.steps.clone();
-        steps.insert(k, Step::Remove { columns: vec![column.to_string()] });
+        steps.insert(k, Step::RemoveColumns { columns: vec![column.to_string()] });
         let log = edits::read_log(&dir)?;
         let in_force: Vec<(usize, Edit)> = edits::in_force(&log, dataset.edits, &steps_of(&dir), &recipe.steps)
             .into_iter()
             .map(|(a, e)| (if a >= k { a + 1 } else { a }, e))
             .collect();
         let inputs = materialize::inputs_map(&self.inputs(&dir, &recipe.inputs())?);
-        let c = compile::compile_all(&steps, &recipe.roles, &recipe.key, &in_force, (&dataset.sources, &inputs), &pinned_at)?;
+        let c = compile::compile_all(&steps, &recipe.roles, &recipe.key, &in_force, (&dataset.sources, &inputs), &pinned_at, describe)?;
         // And the datasets that read it, by what they name of it.
         let mut c = c;
         if k == recipe.steps.len() {

@@ -130,29 +130,94 @@ forces a change, and the change is reported.
 ## Steps
 
 A **closed set** of declarative operations. Each declares the columns it
-reads and writes and compiles to SQL for DuckDB. No user SQL, anywhere.
+reads and writes and compiles to SQL for DuckDB. The one way to write
+SQL is the `sql` step, a black box with its own rules ("The `sql`
+step", below).
 
-- **Columns:** rename, retype, remove, reorder, a formula column
-  (`rename`, `retype`, `remove`, `reorder`, `formula`).
-- **Rows:** filter, sort, remove duplicates, fill empty values
-  (`filter`, `sort`, `dedupe`, `fill`).
-- **Values:** find and replace, remap a value, trim, change case
-  (`replace`, `remap`, `trim`, `case`).
+Step names say what they act on: a column step ends in `_column` (or
+`_columns`, when it takes a list), a step that rewrites values in
+`_val`, and a case step is named for the case it makes.
+
+- **Columns:** `rename_column`, `retype_column`, `remove_columns`,
+  `reorder_columns`; `add_column`, a new column computed by a formula;
+  `update_column`, a column computed again by a formula, which may read
+  it (`round(price, 2)`), its type becoming the formula's.
+- **Rows:** `filter`, `sort`, `dedupe` (remove duplicates),
+  `fill_empty` (a value given), `fill_down` (the value above).
+- **Values:** `find_and_replace_val` (within a value, or the `whole`
+  value), `remap_val` (whole values made others), `trim_val`, and the
+  cases `upper_case`, `lower_case`, `title_case`, `snake_case`
+  (`Grocery Store` and `GroceryStore` to `grocery_store`) and
+  `camel_case` (to `groceryStore`); each names its `columns`, all text,
+  and each is a formula function too: `snake_case(trim(name))`.
 - **Shape:** group and aggregate (`group`: sum, min, max, avg, count,
-  count_distinct), append (`append`).
+  count_distinct), append (`append`), columns made rows (`unpivot`).
 - **Combine:** join or look up another dataset (`join`, `left` or
   `inner`, with `on` keys, the `columns` brought and a `prefix`).
 - **Edits:** see "Editing a cell".
 
-A step is JSON with an `op`: `{"op": "remap", "column": "region",
+A step is JSON with an `op`: `{"op": "remap_val", "column": "region",
 "values": [{"from": "NY", "to": "New York"}]}`. A step with any other
-`op`, or a field its op does not have, is refused. A retype keeps a
+`op`, or a field its op does not have, is refused. A `retype_column` keeps a
 value only if it converts: text read as a number or a date (with a
 strptime format when it is not ISO), a number narrowed only when it
 comes back the same; the run fails naming the step, the column, both
 types and the first values that do not.
 
-**Formulas have their own language.** A formula column or a filter is
+**Spreadsheet shapes.** Two steps turn what people lay out for reading
+into a table:
+
+- `unpivot` makes columns rows: a budget with a column per month
+  becomes `dept, month, amount`, which joins to a model's month.
+  `{"op": "unpivot", "keep": ["dept"], "name": "month", "value":
+  "amount"}` unpivots every column but `dept`, so a month a later file
+  adds is unpivoted too; `columns` names them instead. The columns meet
+  at the type they all widen to, or the step is refused, saying to
+  retype them first. An empty value makes no row unless `keep_empty`.
+  At most 1,000 columns.
+- `fill_down` gives each empty value of the columns it names the
+  nearest value above it, in the rows' order: a label written once for
+  the rows below it, or the blank a merged cell leaves. Blank text
+  counts as empty. A `sort` before it decides what "above" is.
+
+**The `sql` step** is the escape hatch, for what the steps and formulas
+do not say: a running total, a rank, a regular expression, a pivot.
+`{"op": "sql", "query": "SELECT *, sum(amount) OVER (PARTITION BY
+region ORDER BY month) AS running FROM input"}`. It is a black box:
+
+- **It sees one table, `input`:** the rows of the step before, copied
+  into a DuckDB session of its own. The source, the other steps and the
+  datasets other steps read are not there, so it cannot skip the
+  recipe, and another dataset comes in by a `join` or `append` before
+  it.
+- **It is one `SELECT`, checked by DuckDB's own parser** before it
+  runs, so no quoting hides anything from the check. It reads `input`
+  and the tables its own `WITH` makes (recursive ones too), and no
+  other table, schema or catalog; its table functions are `range`,
+  `generate_series` and `unnest`. A trailing `;` is fine. DuckDB's
+  JSON extension is compiled in for the parse.
+- **It is the same every run.** The clock and randomness (`now()`,
+  `current_date`, `random()`, `uuid()` and the like) are refused; a
+  formula's `today()` is the one clock a recipe has. So is what runs
+  other SQL or reads the engine: `query()`, `getenv()`,
+  `current_setting()`, `duckdb_*`, `pg_*`, `pragma_*` and `read_*`.
+- **Its refusals are DuckDB's words,** without DuckDB's excerpt of the
+  query, which is of the query as it was wrapped.
+- **Its columns are DuckDB's answer,** learned by running it with no
+  rows, each cast to a type a dataset has: a sum's HUGEINT is an
+  integer; a list, a struct or an interval is refused, saying to cast
+  it. Names are DuckDB's too: an expression with no `AS` is named by its
+  text, a repeat is numbered. A column it keeps by name keeps its role
+  while it is still a number, or still not one; the rest are inferred.
+- **What it reads is found when it is compiled:** a column it names
+  that is not there holds the dataset as any step's would, naming the
+  step and the column. Its lineage is coarse: each column it makes is
+  from everything it was given.
+- **It is bounded** by the session's memory and threads, and stopped
+  after 60 seconds. The session has external access off and its
+  configuration locked, as every session does: no file, no URL.
+
+**Formulas have their own language.** A computed column or a filter is
 written in a small expression language of data prep's own: column
 references, literals, operators, and an **allowlist** of functions
 (text, numbers, dates, conditionals), compiled to DuckDB's SQL by data
@@ -160,7 +225,30 @@ prep's compiler. A column is a bare name or `[any name]`; text is
 quoted; `&` joins text; `and`, `or`, `not`, `is null`, `in (...)`.
 Every formula is typed before it runs, every result is cast to its
 type, a division by zero is empty rather than an error, and `today()`
-is the time the run was pinned to. It does not reuse `calc(...)` from the query
+is the time the run was pinned to. `to_number(x)` reads a number the
+way people write one, giving `decimal(6)`: a currency symbol or a
+three-letter code at either end, spaces and thousands separators
+dropped, `(500)` as -500, `12%` as 0.12, and null for anything else;
+`to_number(x, ',')` says the comma is the decimal mark, which is never
+guessed. `to_integer` and `is_number` read the same way, and
+`to_integer` gives null for a number that is not whole. `to_date(x)`
+reads every unambiguous way a date is written: ISO dates and
+timestamps, `2026/1/5`, `2026.01.05`, `20260105`, `202601` and
+`2026-01` (the first of the month), and a month's name (`5 Jan 2026`,
+`January 5, 2026`, `05-jan-2026`, `September 2026`). A day and a month
+both written as numbers with the year last are ambiguous, so
+`31/01/2026` needs `to_date(x, 'dmy')` and `01/31/2026` needs `'mdy'`;
+`'excel'` reads a spreadsheet's serial number (`46027` is 2026-01-05);
+a strptime format reads that one format. A date that does not exist is
+null, never another date. `is_date` reads the same way, and
+`to_timestamp` too, keeping a time where there is one (`2026-01-05
+10:30`, `31/01/2026 14:05` with `'dmy'`, an Excel serial's fraction).
+`to_boolean` reads `true/false`, `yes/no`, `y/n`, `t/f` and `1/0`,
+any case, and anything else as null. `switch(x, 'NY', 'New York',
+'CA', 'California', x)` gives the result for the first value `x`
+equals, then the default, if one is given; `ifs(amount > 100, 'big',
+amount > 10, 'mid', 'small')` the result of the first true condition. A
+`retype_column` stays strict. It does not reuse `calc(...)` from the query
 shorthand, which carries raw SQL. DuckDB is opened in memory with
 external access off and its configuration locked, and it touches no
 file at all: data prep reads and writes every snapshot and
@@ -347,10 +435,6 @@ blend:
     to: budget
     on: [{ left: budget.region, right: owners.region }]
     kind: enrich
-  - join: targets_list
-    to: model
-    on: [{ left: customer.id, right: targets_list.customer_id }]
-    kind: filter
 fields: [store.region, date.month, orders.revenue, budget.amount, owners.manager]
 ```
 
@@ -367,9 +451,19 @@ fields: [store.region, date.month, orders.revenue, budget.amount, owners.manager
   a query can put a mapping beside another dataset without first
   building a combined dataset.
 - **The model's part is still one planned query.** The blend planner
-  collects the model columns every join needs, asks the ordinary
-  planner for them at those dimensions, and does every join after, in
-  DuckDB.
+  asks the ordinary planner for the request's projections, and does
+  every join after, in DuckDB.
+- **Every model key a join names is asked for.** A dataset is at its
+  keys' grain, so the answer is too. Planning a key the request does
+  not show would make the warehouse send rows finer than the answer,
+  only to add them up again, which is wrong for a distinct count or a
+  ratio. A request that joins on `Department` and does not project it
+  is refused before the warehouse is asked, saying to add it.
+- **A join on no keys is a cross join** (`"on": []`, an `enrich` only):
+  each row of the dataset is set beside every row of the side it joins
+  to, as it is: an exchange rate, a target, a few scenarios. It is
+  refused if it would make more than a million rows, and a `filter` on
+  no keys is refused.
 - **Kinds:** `filter` keeps the rows of the side it is joined to whose
   key the dataset has (a semi-join; the dataset need not be unique on
   the key). `enrich` brings the dataset's columns and measures beside
@@ -396,13 +490,11 @@ right:
 - **Every dimension the request asks for must be on both sides,** or be
   a join key. Asking for budget by store, when the budget has no store,
   would repeat each region's budget on every store, and is refused.
-- **The model's measures are only regrouped after the join if they add
-  up.** Asking for a coarser grain than the join keys works for
-  revenue; a distinct count or a ratio there is refused. For example,
-  two Gold customers, A buying p1 and p2 and B buying p2: per-customer
-  distinct products are 2 and 1, adding gives 3, the truth is 2. The
-  refusal says what works: a dataset made from a semantic query at the
-  grain needed, grouped in its own recipe.
+- **Nothing is regrouped after the join.** The join keys are asked
+  for, so the answer is at their grain. For a coarser answer, group
+  the dataset in its own recipe and join on the coarser keys: the
+  warehouse then computes every measure at that grain, a distinct count
+  or a ratio included.
 
 **Limits are the warehouse query's.** A request's limit applies to the
 model's part, to bound what the warehouse sends; the merge takes no
@@ -601,6 +693,6 @@ know about datasets.
   cascade.
 - [x] **6. Blends.** Attachment in the request, the isolation golden
   test, `filter`, `enrich` as a look-up and as budget against actual,
-  regrouping only what adds up, the cache. MCP went to "Later".
+  every model key asked for, cross joins, the cache. MCP went to "Later".
 - [x] **7. The object-store backup** and restore.
 - [ ] **8. Feeds and sharing,** designed then.
