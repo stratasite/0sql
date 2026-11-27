@@ -10,6 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::schema::{ColumnType, DECIMAL_PRECISION, DECIMAL_SCALE_MAX};
+use arrow_array::StringArray;
 use serde::{Deserialize, Serialize};
 
 /// The kinds of source.
@@ -108,7 +109,7 @@ pub struct Renamed {
 /// column. An empty field is a null.
 pub struct Parsed {
     pub columns: Vec<(String, ColumnType)>,
-    pub values: Vec<Vec<Option<String>>>,
+    pub values: Vec<StringArray>,
     pub parse: Parse,
 }
 
@@ -149,7 +150,9 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
 
     // Every record, as text, with the line it started on; a record that
     // is not UTF-8 is a bad row.
-    let mut records: Vec<(u64, Vec<String>)> = Vec::new();
+    // Each is kept as the csv crate holds it, its fields in one buffer,
+    // and copied once more only into the column it is a value of.
+    let mut records: Vec<(u64, csv::StringRecord)> = Vec::new();
     let mut bad: Vec<BadRow> = Vec::new();
     let mut bad_rows = 0usize;
     let mut note_bad = |line: u64, reason: String, bad: &mut Vec<BadRow>| {
@@ -159,9 +162,11 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
         }
     };
     let mut cells = 0usize;
-    for record in reader.byte_records() {
-        match record {
-            Ok(r) => {
+    let mut r = csv::ByteRecord::new();
+    loop {
+        match reader.read_byte_record(&mut r) {
+            Ok(false) => break,
+            Ok(true) => {
                 let line = r.position().map(|p| p.line()).unwrap_or(0);
                 if r.len() > COLUMN_LIMIT {
                     return Err(Error::Unprocessable(format!(
@@ -184,8 +189,8 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
                 if r.len() == 1 && r[0].iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                let fields: std::result::Result<Vec<String>, _> = r.iter().map(|f| std::str::from_utf8(f).map(str::to_string)).collect();
-                match fields {
+                // Valid when every field is, as the crate checks it.
+                match csv::StringRecord::from_byte_record(r.clone()) {
                     Ok(f) => records.push((line, f)),
                     Err(_) => note_bad(line, "is not UTF-8".into(), &mut bad),
                 }
@@ -204,23 +209,24 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
     }
 
     let width = records[0].1.len();
-    let mut rows: Vec<(u64, Vec<String>)> = Vec::with_capacity(records.len());
+    let mut rows: Vec<csv::StringRecord> = Vec::with_capacity(records.len());
     for (i, (line, fields)) in records.into_iter().enumerate() {
         if i > 0 && fields.len() != width {
             note_bad(line, format!("has {} fields where the first row has {width}", fields.len()), &mut bad);
         } else {
-            rows.push((line, fields));
+            rows.push(fields);
         }
     }
 
     // The types of the columns as the rows below the first say, which is
     // what decides whether the first is a header.
-    let types_below: Vec<ColumnType> = (0..width).map(|c| infer(rows.iter().skip(1).map(|(_, r)| r[c].as_str()))).collect();
+    let types_below: Vec<ColumnType> = (0..width).map(|c| infer(rows.iter().skip(1).map(|r| &r[c]))).collect();
+    let first: Vec<String> = rows[0].iter().map(str::to_string).collect();
     let (header, header_detected) = match options.header {
         Some(h) => (h, false),
-        None => (looks_like_a_header(&rows[0].1, &types_below, rows.len()), true),
+        None => (looks_like_a_header(&first, &types_below, rows.len()), true),
     };
-    let names_row = if header { Some(rows.remove(0).1) } else { None };
+    let (names_row, rows) = if header { (Some(first), &rows[1..]) } else { (None, &rows[..]) };
     if rows.len() > max_rows {
         return Err(too_many(max_rows));
     }
@@ -236,33 +242,36 @@ pub fn parse_csv(bytes: &[u8], options: &CsvOptions, max_rows: usize) -> Result<
     }
 
     let (names, renamed) = column_names(names_row.as_deref(), width);
-    let mut values: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); width];
     let row_count = rows.len();
-    for (_, fields) in rows {
-        for (c, field) in fields.into_iter().enumerate() {
-            values[c].push(if field.trim().is_empty() { None } else { Some(field) });
-        }
-    }
     let columns: Vec<(String, ColumnType)> = names
         .into_iter()
         .enumerate()
         .map(|(c, name)| {
-            let ty = if header { types_below[c] } else { infer(values[c].iter().flatten().map(String::as_str)) };
+            let ty = if header { types_below[c] } else { infer(rows.iter().map(|r| &r[c])) };
             (name, ty)
         })
         .collect();
-    // A typed value is kept trimmed, so the engine's cast reads what the
-    // inference read; text is kept as it came.
-    for (c, (_, ty)) in columns.iter().enumerate() {
-        if *ty != ColumnType::Text {
-            for v in values[c].iter_mut().flatten() {
-                let t = v.trim();
-                if t.len() != v.len() {
-                    *v = t.to_string();
+    // An empty field is a null. A typed value is kept trimmed, so the
+    // engine's cast reads what the inference read; text is kept as it
+    // came.
+    let values: Vec<StringArray> = columns
+        .iter()
+        .enumerate()
+        .map(|(c, (_, ty))| {
+            let bytes: usize = rows.iter().map(|r| r[c].len()).sum();
+            let mut b = arrow_array::builder::StringBuilder::with_capacity(rows.len(), bytes);
+            for r in rows {
+                let field = &r[c];
+                let trimmed = field.trim();
+                match (trimmed.is_empty(), *ty == ColumnType::Text) {
+                    (true, _) => b.append_null(),
+                    (false, true) => b.append_value(field),
+                    (false, false) => b.append_value(trimmed),
                 }
             }
-        }
-    }
+            b.finish()
+        })
+        .collect();
     Ok(Parsed {
         columns,
         values,
@@ -505,6 +514,21 @@ mod tests {
         parse_csv(text.as_bytes(), &CsvOptions::default(), 1000).unwrap()
     }
 
+    fn texts(a: &StringArray) -> Vec<Option<String>> {
+        a.iter().map(|v| v.map(str::to_string)).collect()
+    }
+
+    #[test]
+    fn typed_values_are_kept_trimmed_and_text_as_it_came() {
+        let p = parse("a,b\n 1 , x \n2,\ty\n 3,\n");
+        assert_eq!(p.columns, vec![("a".to_string(), Integer), ("b".to_string(), Text)]);
+        assert_eq!(texts(&p.values[0]), vec![Some("1".to_string()), Some("2".to_string()), Some("3".to_string())]);
+        assert_eq!(texts(&p.values[1]), vec![Some(" x ".to_string()), Some("\ty".to_string()), None]);
+        let p = parse_csv(b"a,b\n1,x\n2,\xff\n3,z\n", &CsvOptions { max_bad_rows: Some(1), ..CsvOptions::default() }, 10).unwrap();
+        assert_eq!((p.parse.bad_rows, p.parse.bad_examples[0].line, p.parse.rows), (1, 3, 2));
+        assert_eq!(texts(&p.values[1]), vec![Some("x".to_string()), Some("z".to_string())]);
+    }
+
     #[test]
     fn types_are_inferred_narrowest_first() {
         assert_eq!(infer(["1", "2", "-3"].into_iter()), Integer);
@@ -532,7 +556,7 @@ mod tests {
     fn a_plain_file_parses_with_its_header() {
         let p = parse("region,month,amount\nEMEA,2026-01-01,10.5\nAPAC,2026-02-01,7\n");
         assert_eq!(p.columns, vec![("region".to_string(), Text), ("month".to_string(), Date), ("amount".to_string(), Decimal(1))]);
-        assert_eq!(p.values[2], vec![Some("10.5".to_string()), Some("7".to_string())]);
+        assert_eq!(texts(&p.values[2]), vec![Some("10.5".to_string()), Some("7".to_string())]);
         assert_eq!(p.parse.rows, 2);
         assert!(p.parse.header && p.parse.header_detected && p.parse.delimiter_detected);
         assert_eq!(p.parse.delimiter, ',');
@@ -578,8 +602,8 @@ mod tests {
     #[test]
     fn quoted_fields_hold_delimiters_and_newlines() {
         let p = parse("name,note\n\"Smith, J\",\"two\nlines\"\n");
-        assert_eq!(p.values[0][0].as_deref(), Some("Smith, J"));
-        assert_eq!(p.values[1][0].as_deref(), Some("two\nlines"));
+        assert_eq!(texts(&p.values[0])[0].as_deref(), Some("Smith, J"));
+        assert_eq!(texts(&p.values[1])[0].as_deref(), Some("two\nlines"));
     }
 
     #[test]
@@ -594,7 +618,7 @@ mod tests {
     #[test]
     fn empty_fields_are_nulls() {
         let p = parse("a,b\n1,\n,x\n");
-        assert_eq!(p.values[0], vec![Some("1".to_string()), None]);
-        assert_eq!(p.values[1], vec![None, Some("x".to_string())]);
+        assert_eq!(texts(&p.values[0]), vec![Some("1".to_string()), None]);
+        assert_eq!(texts(&p.values[1]), vec![None, Some("x".to_string())]);
     }
 }

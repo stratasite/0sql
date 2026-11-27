@@ -36,11 +36,11 @@ pub(crate) fn from_csv(session: &Session, bytes: &[u8], options: &CsvOptions, es
 pub(crate) fn from_texts(
     session: &Session,
     columns: &[(String, ColumnType)],
-    values: Vec<Vec<Option<String>>>,
+    values: Vec<StringArray>,
     established: &[Column],
 ) -> Result<Taken> {
     let fields: Vec<Field> = columns.iter().map(|(n, _)| Field::new(n, DataType::Utf8, true)).collect();
-    let arrays: Vec<ArrayRef> = values.into_iter().map(|v| Arc::new(StringArray::from(v)) as ArrayRef).collect();
+    let arrays: Vec<ArrayRef> = values.into_iter().map(|v| Arc::new(v) as ArrayRef).collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
     let raw: Vec<(String, ColumnType)> = columns.iter().map(|(n, _)| (n.clone(), ColumnType::Text)).collect();
     session.load("raw", &raw, &[batch])?;

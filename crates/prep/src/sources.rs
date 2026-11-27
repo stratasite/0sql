@@ -212,7 +212,7 @@ impl Prep {
     fn take_push(&self, dir: &Path, s: &mut Source, pushed: &Pushed) -> Result<Snapshot> {
         let (columns, values) = snapshot::pushed(&pushed.rows, self.settings.max_rows)?;
         let session = self.engine.session()?;
-        let taken = snapshot::from_texts(&session, &columns, values, &s.columns)?;
+        let taken = snapshot::from_texts(&session, &columns, values.into_iter().map(arrow_array::StringArray::from).collect(), &s.columns)?;
         self.keep_snapshot(dir, s, (None, None), None, pushed.origin.clone(), taken)
     }
 
