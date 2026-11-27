@@ -276,9 +276,9 @@ pub(crate) fn projects_of(app: &Shared, org: &str, q: &str) -> Result<Value, Api
     Ok(json!({ "deployments": out }))
 }
 
-/// The orgs with something deployed, and the default one, each with
-/// how many branches it has. For whoever runs the server: a service in
-/// front that keeps orgs apart does not pass this one on.
+/// Every org, the default one included, each with how many branches
+/// it has. For whoever runs the server: a service in front that keeps
+/// orgs apart does not pass this one on.
 pub(crate) async fn orgs(State(app): State<Shared>) -> Json<Value> {
     let orgs: Vec<Value> = app.orgs().iter().map(|org| json!({ "org": org, "deployments": app.of_org(org).len() })).collect();
     Json(json!({ "orgs": orgs }))

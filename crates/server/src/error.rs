@@ -38,6 +38,12 @@ pub(crate) fn not_found(org: &str, uid: &str, branch: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid} branch {branch}{within}"))
 }
 
+/// An org nobody made. Said with how one is made, since the likeliest
+/// cause is a deploy to an org that `POST /orgs` was never asked for.
+pub(crate) fn no_org(org: &str) -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, "NotFound", format!("there is no org {org}: an org is made with POST /orgs, never by a deploy"))
+}
+
 /// An answer that says when to come back.
 pub(crate) fn retry_later(status: StatusCode, class: &'static str, message: String, secs: u64) -> Response {
     let mut res = ApiError(status, class, message).into_response();
@@ -91,18 +97,23 @@ impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Params<
     }
 }
 
-/// The org a request is for: the one its path names, checked, or the
-/// default one when the path names none.
+/// The org a request is for: the one its path names, checked and
+/// made already, or the default one when the path names none. An org
+/// never made is a 404 for every route under it, a deploy included:
+/// only `POST /orgs` makes one.
 pub(crate) struct Org(pub(crate) String);
 
-impl<S: Send + Sync> FromRequestParts<S> for Org {
+impl FromRequestParts<crate::Shared> for Org {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+    async fn from_request_parts(parts: &mut Parts, state: &crate::Shared) -> Result<Self, ApiError> {
         let raw = raw_params(parts, state).await?;
         match raw.iter().find(|(name, _)| *name == ORG) {
             Some((_, org)) => {
                 check_org(org)?;
+                if !state.has_org(org) {
+                    return Err(no_org(org));
+                }
                 Ok(Org(org.to_string()))
             }
             None => Ok(Org(DEFAULT_ORG.to_string())),

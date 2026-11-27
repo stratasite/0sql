@@ -21,8 +21,11 @@
 //! directory and nothing more: `<org>/<project>/<branch>`. Every route
 //! below, down to `/mcp`, is also served under `/orgs/{org}` for that
 //! org's projects, results and MCP endpoint; without the prefix a
-//! request is for the org `default`. Who may ask for which org is,
-//! like everything else, decided in front.
+//! request is for the org `default`. `default` is made at startup if it
+//! is not there; any other org is made by `POST /orgs` (or by its
+//! folder, made by hand), never by a deploy, so a deploy, or anything
+//! else under `/orgs/{org}`, for an org with no directory is a 404.
+//! Who may ask for which org is, like everything else, decided in front.
 //!
 //! ```text
 //! POST /projects/{uid}/branches/{branch}/deploy       body: tar.gz of the project; tests run, results in the answer
@@ -47,7 +50,9 @@
 //! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! ANY  /orgs/{org}/...                                 any route above, for one org
-//! GET  /orgs                                           the orgs with something deployed
+//! GET  /orgs                                           every org, with how many branches each has
+//! POST /orgs                                           {"org": "acme"}: make an org; a deploy never makes one
+//! DELETE /orgs/{org}                                   remove an org, only when it is empty; never default
 //! GET  /healthz
 //! ```
 //!
@@ -164,9 +169,26 @@ impl App {
         out
     }
 
-    /// The orgs with something deployed, and the default one.
+    /// Whether an org exists: the default one always does, and any
+    /// other once `POST /orgs` has made its directory. A deploy never
+    /// makes one, so a mistyped or renamed `org:` in project.yml is
+    /// refused rather than becoming an org of its own. The name is
+    /// checked already.
+    pub(crate) fn has_org(&self, org: &str) -> bool {
+        org == names::DEFAULT_ORG || self.data_dir.join(org).is_dir()
+    }
+
+    /// Every org: the default one, and each directory of the data
+    /// directory an org could be called.
     pub(crate) fn orgs(&self) -> Vec<String> {
-        let mut out: Vec<String> = read(&self.models).keys().filter_map(|k| k.split('/').next()).map(str::to_string).collect();
+        let mut out: Vec<String> = std::fs::read_dir(&self.data_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| names::check_org(name).is_ok())
+            .collect();
         out.push(names::DEFAULT_ORG.to_string());
         out.sort();
         out.dedup();
