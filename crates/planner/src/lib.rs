@@ -6,6 +6,7 @@
 //! plan is refused with [`Error::Unimplemented`] rather than planned
 //! wrong, so the golden scoreboard stays honest.
 
+pub mod columns;
 pub mod dag;
 pub mod lift;
 pub mod profile;
@@ -30,6 +31,9 @@ pub struct Plan {
     pub datasource: String,
     pub datasource_uid: String,
     pub adapter: String,
+    /// The statement's result columns in SELECT order, with how a client
+    /// shows each one.
+    pub columns: Vec<columns::Column>,
     /// The plan explained: phase timings and the node graph. Asked for
     /// with [`Planner::plan_query_explained`].
     pub explain: Option<Explain>,
@@ -363,10 +367,12 @@ fn run_plan<'a>(
     phase!("sql", visitors::sql::run(&graph, semantic, rquery)?);
     let (sql, root_at) = phase!("final_query", visitors::final_query::to_sql(&graph)?);
     let explain = explain.then(|| Explain { nodes: explain_nodes(&graph), phases });
+    let columns = columns::of(&graph);
 
     Ok(Plan {
         sql,
         root_at,
+        columns,
         datasource: graph.datasource.name.clone(),
         datasource_uid: graph.datasource.uid.clone(),
         adapter: graph.datasource.adapter.clone(),

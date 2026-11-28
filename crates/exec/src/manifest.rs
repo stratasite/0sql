@@ -56,13 +56,14 @@ pub struct Manifest {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
-    /// The model's data type when the column is a field of the model.
+    /// The model's data type when the column is a field of the model, or
+    /// the type a calculation declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_type: Option<String>,
-    /// `model` or `unknown`: where `data_type` came from.
+    /// `model`, `calculation` or `unknown`: where `data_type` came from.
     pub source: String,
     /// The type the rows are stored in, as Arrow names it: what the
     /// transport said the warehouse returned, or `Utf8` when it only
@@ -71,6 +72,18 @@ pub struct Column {
     pub arrow_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_uid: Option<String>,
+    /// A truncated date's grain, and an extracted part's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<String>,
+    /// How a client shows the column: the plan's, never applied here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_type: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

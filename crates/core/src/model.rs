@@ -456,6 +456,7 @@ impl Model {
             datasource: p.plan.datasource,
             datasource_uid: p.plan.datasource_uid,
             adapter: p.plan.adapter,
+            columns: p.plan.columns,
             corrections: p.corrections,
             spec: p.spec,
             items: p.items,
@@ -473,6 +474,7 @@ impl Model {
             datasource: p.plan.datasource,
             datasource_uid: p.plan.datasource_uid,
             adapter: p.plan.adapter,
+            columns: p.plan.columns,
             corrections: p.corrections,
             spec: p.spec,
             items: p.items,
@@ -556,6 +558,12 @@ impl Model {
                 "data_type": f.data_type, "description": f.description, "synonyms": f.synonyms, "tags": f.tags, "hidden": f.hidden,
                 "tables": self.tables_of(f.id),
             });
+            if let Some(format) = &f.format {
+                v["format"] = format.clone();
+            }
+            if let Some(display) = &f.display_type {
+                v["display_type"] = display.clone();
+            }
             if let Some(s) = score {
                 v["score"] = json!((s * 100.0).round() / 100.0);
             }

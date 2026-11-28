@@ -79,6 +79,9 @@ match in their own commit before the code changed.
 `display_type` or `secure` in an answer, so this removed a surface and not
 a behavior. `display_type`'s only teeth were a validation refusing a value
 that nothing then used.
+(It came back later with a meaning: a field's and a projection's
+`display_type` now go out with every result column. See
+docs/presentation.md.)
 
 The `display_type` that remains in 17 golden case files is a different
 key: it sits in `spec.projections`, where a caller sends it and nothing

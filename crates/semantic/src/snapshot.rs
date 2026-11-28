@@ -283,7 +283,12 @@ pub struct Field {
     pub tags: Vec<String>,
     #[serde(default)]
     pub grains: Vec<String>,
+    /// How a client shows the value, in `presentation::format`'s shape.
     pub format: Option<Value>,
+    /// How a client renders the formatted value, in
+    /// `presentation::display`'s shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_type: Option<Value>,
     pub exclusion_type: Option<ExclusionType>,
     #[serde(default)]
     pub exclusions: Vec<Exclusion>,
@@ -343,6 +348,7 @@ impl Field {
             tags: vec![],
             grains: vec![],
             format: None,
+            display_type: None,
             exclusion_type: None,
             exclusions: vec![],
             inclusions: None,
