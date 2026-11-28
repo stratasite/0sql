@@ -143,6 +143,7 @@ async fn sources_and_datasets_through_their_routes() {
     assert_eq!((a.status, a.body["live"].clone()), (StatusCode::CREATED, Value::Null), "{}", a.body);
 
     // An org's are its own.
+    s.make_org("acme").await;
     let a = s.deploy_to("acme", CS, "main", archive(CS, "acme")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.error());
     assert_eq!(s.call(Method::GET, &format!("/orgs/acme{datasets}/{id}")).await.status, StatusCode::NOT_FOUND);
