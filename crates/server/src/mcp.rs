@@ -386,6 +386,7 @@ fn tools(settings: &Settings) -> Vec<Value> {
         json!({ "name": "run", "description": describe("run"),
                 "inputSchema": schema(&[&target, &spec_arg, &json!({
                     "fresh": { "type": "boolean", "description": "run even though a stored result would answer" },
+                    "cache_ttl": { "type": ["integer", "string"], "description": "how long the result answers: seconds, or 10s, 30m, 1h, 10d; 0 keeps nothing, -1 never expires" },
                     "offset": { "type": "integer", "description": "rows to skip" },
                     "limit": { "type": "integer", "description": "rows to return, 200 when omitted and 1000 at most" } })],
                     &["project", "spec"], "a query spec to run", true) }),
@@ -448,6 +449,8 @@ struct RunArgs {
     spec: Value,
     #[serde(default)]
     fresh: bool,
+    #[serde(default)]
+    cache_ttl: Option<Value>,
     #[serde(default)]
     offset: Option<u64>,
     #[serde(default)]
@@ -650,8 +653,15 @@ async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &
             let _seat = admit_run(app).await?;
             match (branch_for(app, org, &a.project, a.branch), tool_page(a.offset, a.limit)) {
                 (Ok(branch), Ok(page)) => {
-                    let asked =
-                        crate::exec::ToolRun { org: org.to_string(), uid: a.project, branch, spec: a.spec, context, fresh: a.fresh };
+                    let asked = crate::exec::ToolRun {
+                        org: org.to_string(),
+                        uid: a.project,
+                        branch,
+                        spec: a.spec,
+                        context,
+                        fresh: a.fresh,
+                        cache_ttl: a.cache_ttl,
+                    };
                     crate::exec::run_for_tool(app, asked, TOOL_WAIT, page).await
                 }
                 (Err(e), _) | (_, Err(e)) => Err(e),

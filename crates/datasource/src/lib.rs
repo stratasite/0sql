@@ -30,6 +30,7 @@ mod secret;
 mod sigv4;
 mod source;
 mod tls;
+mod ttl;
 
 use adapters::{athena, bigquery, clickhouse, databricks, druid, duckdb, mysql, postgres, snowflake, sqlite, sqlserver, trino};
 
@@ -42,6 +43,7 @@ pub use rows::Rows;
 pub use secret::{local_entry, secret, secret_env_var, secrets, Secret, Secrets, SECRET_FIELDS};
 pub(crate) use source::Deadline;
 pub use source::{read_only, single_statement, Access, Sink, Source};
+pub use ttl::CacheTtl;
 
 /// Why a driver is not in use here, when it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]

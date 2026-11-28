@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zsql_core::{Model, SqlRequest};
-use zsql_datasource::{Connection, Source};
+use zsql_datasource::{CacheTtl, Connection, Source};
 use zsql_exec::{CacheStatus, Connector, Engine, Limit, Manifest, RunRequest, Store};
 
 /// Where a project's results live: `ZSQL_RESULTS_DIR`, else
@@ -115,8 +115,8 @@ impl Connector for Local_ {
         (!parts.is_empty()).then(|| serde_json::Value::Object(parts).to_string())
     }
 
-    fn cache_ttl(&self, uid: &str) -> Option<Duration> {
-        Connection::read(&self.dir, uid).ok()?.cache_ttl.map(|s| Duration::from_secs(s.max(0) as u64))
+    fn cache_ttl(&self, uid: &str) -> zsql_datasource::Result<Option<CacheTtl>> {
+        Ok(Connection::read(&self.dir, uid)?.cache_ttl)
     }
 }
 
@@ -160,7 +160,7 @@ impl Format {
 impl Default for Options<'_> {
     /// What the repl runs with: the cap, the cache, a table, fifty rows.
     fn default() -> Self {
-        Options { limit: None, all: false, fresh: false, timeout: None, format: None, out: None, head: Some(50), quiet: false }
+        Options { limit: None, all: false, fresh: false, ttl: None, timeout: None, format: None, out: None, head: Some(50), quiet: false }
     }
 }
 
@@ -168,6 +168,8 @@ pub struct Options<'a> {
     pub limit: Option<u64>,
     pub all: bool,
     pub fresh: bool,
+    /// How long this result answers, over the datasource's.
+    pub ttl: Option<CacheTtl>,
     pub timeout: Option<u64>,
     pub format: Option<&'a str>,
     pub out: Option<&'a Path>,
@@ -182,7 +184,8 @@ pub fn run(project: &Project, model: &Model, query: &Query, context: Option<&Val
     let root = results_root(project);
     let engine = Engine::open(root.as_deref())?;
     let connector = Local_ { dir: project.dir.clone(), timeout: opts.timeout };
-    let outcome = engine.run(model, &connector, RunRequest { query: req, limit, fresh: opts.fresh, store: root.is_some() })?;
+    let outcome =
+        engine.run(model, &connector, RunRequest { query: req, limit, fresh: opts.fresh, store: root.is_some(), cache_ttl: opts.ttl })?;
 
     // Printed as text, whatever the types: one rendering for the four
     // formats, the same one a transport without types has always given.

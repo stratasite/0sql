@@ -5,12 +5,15 @@ use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zsql_core::{Model, SqlRequest};
-use zsql_datasource::{Batches, Source};
+use zsql_datasource::{Batches, CacheTtl, Source};
 
 /// Rows a run keeps when the question did not bound itself.
 pub const DEFAULT_CAP: u64 = 10_000;
 /// How long a result answers for a datasource that says nothing.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
+pub const DEFAULT_TTL: CacheTtl = CacheTtl::DEFAULT;
+/// When a result that never expires stops answering: the last day an
+/// RFC 3339 timestamp can say, so every lookup by time still holds.
+pub const NEVER_EXPIRES: &str = "9999-12-31T00:00:00Z";
 
 /// Opens the datasource the planner named. The command line reads
 /// `datasources.yml` and `.zsql`; a server would bring its own.
@@ -18,8 +21,9 @@ pub trait Connector {
     fn open(&self, datasource_uid: &str) -> zsql_datasource::Result<Box<dyn Source>>;
     /// Who the connection is, for the key: never a secret.
     fn identity(&self, datasource_uid: &str) -> Option<String>;
-    /// How long a result from this datasource answers, when it says.
-    fn cache_ttl(&self, datasource_uid: &str) -> Option<Duration>;
+    /// How long a result from this datasource answers, when it says;
+    /// an entry that cannot be read is an error, not a default.
+    fn cache_ttl(&self, datasource_uid: &str) -> zsql_datasource::Result<Option<CacheTtl>>;
 }
 
 /// How many rows a run keeps.
@@ -38,6 +42,9 @@ pub struct RunRequest {
     pub fresh: bool,
     /// Keep nothing: run and answer, write no result.
     pub store: bool,
+    /// How long this result answers, over the datasource's: a stored
+    /// result older than this does not answer it either.
+    pub cache_ttl: Option<CacheTtl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,13 +103,14 @@ impl Engine {
         let adapter = planned.plan.adapter.clone();
         let identity = connector.identity(&datasource_uid);
         let key = cache_key(&datasource_uid, &adapter, identity.as_deref(), &sql, context_digest.as_deref());
-        let ttl = connector.cache_ttl(&datasource_uid).unwrap_or(DEFAULT_TTL);
+        let ttl = CacheTtl::resolve(req.cache_ttl, &datasource_uid, connector.cache_ttl(&datasource_uid)?).map_err(Error::Refused)?;
 
-        // The cache: a committed result under this key, within its TTL.
+        // The cache: a committed result under this key, within its own
+        // TTL and within this request's.
         if let (Some(store), false) = (&self.store, req.fresh) {
-            if ttl.as_secs() > 0 {
+            if ttl.keeps() {
                 if let Some(stored) = store.lookup(&key)? {
-                    if !stored.expired() {
+                    if !stored.expired() && ttl.answers(stored.age()) {
                         tracing::debug!(datasource = %datasource_uid, age_secs = stored.age().as_secs(), "answered from a stored result");
                         let batches = stored.batches()?;
                         return Ok(Outcome {
@@ -197,7 +205,7 @@ impl Engine {
             columns: columns.clone(),
             rows_format: ROWS_FORMAT.into(),
             timings: Timings { plan_us, connect_ms, run_ms },
-            cache_ttl_secs: ttl.as_secs(),
+            cache_ttl_secs: ttl.secs(),
             lineage: Lineage {
                 lineage_format: 1,
                 items: planned.items.clone(),
@@ -262,7 +270,7 @@ fn civil_time(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
 }
 
 /// The inverse, for a manifest's own timestamp; `None` if it is not one.
-pub(crate) fn parse_rfc3339(s: &str) -> Option<u64> {
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let (date, time) = s.split_once('T')?;
     let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
     let (y, m, day) = (d.next()??, d.next()??, d.next()??);

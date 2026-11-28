@@ -30,7 +30,8 @@ mod registry;
 mod runs;
 mod store;
 
-pub use engine::{cache_key, sha256, CacheStatus, Connector, Engine, Limit, Outcome, RunRequest, DEFAULT_CAP, DEFAULT_TTL};
+pub use engine::parse_rfc3339;
+pub use engine::{cache_key, sha256, CacheStatus, Connector, Engine, Limit, Outcome, RunRequest, DEFAULT_CAP, DEFAULT_TTL, NEVER_EXPIRES};
 pub use error::{Error, Result};
 pub use manifest::{Column, Lineage, Manifest, Timings, MANIFEST_FORMAT, ROWS_FORMAT, ROWS_FORMAT_TEXT};
 pub use objects::{Objects, PREFIX};

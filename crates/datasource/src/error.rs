@@ -34,6 +34,8 @@ pub enum Error {
     NoCatalogs(&'static str),
     #[error("{0}: private key: {1}")]
     PrivateKey(String, String),
+    #[error("datasource {0}: {1}")]
+    CacheTtl(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

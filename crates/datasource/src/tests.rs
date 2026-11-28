@@ -1021,8 +1021,14 @@ fn the_timeout_covers_rows_that_are_still_arriving() {
     assert_eq!(conn.wait(), std::time::Duration::from_secs(10));
     let said: serde_yaml::Value = serde_yaml::from_str("adapter: snowflake\nquery_wait_time: 3\ncache_ttl: 0\n").unwrap();
     let read = Connection::from_value("wh", &said).unwrap();
-    assert_eq!((read.wait(), read.cache_ttl), (std::time::Duration::from_secs(3), Some(0)));
+    assert_eq!((read.wait(), read.cache_ttl), (std::time::Duration::from_secs(3), Some(crate::CacheTtl::For(std::time::Duration::ZERO))));
     assert!(CONNECTION_KEYS.contains(&"query_wait_time"));
+    // A TTL with a unit, never, and one that is not a duration, named.
+    let ttl = |v: &str| Connection::from_value("wh", &serde_yaml::from_str(&format!("adapter: snowflake\ncache_ttl: {v}\n")).unwrap());
+    assert_eq!(ttl("30m").unwrap().cache_ttl, Some(crate::CacheTtl::For(std::time::Duration::from_secs(1800))));
+    assert_eq!(ttl("-1").unwrap().cache_ttl, Some(crate::CacheTtl::Never));
+    let err = ttl("1.5h").unwrap_err().to_string();
+    assert!(err.contains("datasource wh") && err.contains("not a duration"), "{err}");
 }
 
 fn sf_key() -> PathBuf {

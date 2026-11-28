@@ -51,7 +51,7 @@ impl Cluster {
             row_limit: None,
             tables: tables.iter().map(|t| t.to_string()).collect(),
             cache_key: Some(run_cache_key(DEFAULT_ORG, "shop", sql)),
-            cache_ttl: Duration::from_secs(ttl),
+            cache_ttl: zsql_datasource::CacheTtl::For(Duration::from_secs(ttl)),
             fresh: false,
             pool_key: None,
             close_first: None,

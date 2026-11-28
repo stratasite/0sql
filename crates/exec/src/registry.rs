@@ -2,7 +2,7 @@
 //! a database every node of a cluster shares, and this node's own disk
 //! when there is none.
 
-use crate::engine::{parse_rfc3339, rfc3339, unix_now};
+use crate::engine::{parse_rfc3339, rfc3339, unix_now, NEVER_EXPIRES};
 use crate::error::{Error, Result};
 use crate::record::{Record, Status};
 use std::collections::HashMap;
@@ -50,6 +50,13 @@ pub trait Registry: Send + Sync {
     /// all of them. A run still in flight is marked too, so what it
     /// returns does not answer either. How many were marked.
     fn mark_dirty(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize>;
+
+    /// What a result run again does to the ones under its cache key it
+    /// replaced. One that never expired ends now: it is marked dirty and
+    /// its `expires_at` is now, so it is cleared away at the next sweep.
+    /// Any other expires no later than `newer` does, and is read by its
+    /// id until then. How many changed.
+    fn supersede(&self, newer: &Record) -> Result<usize>;
 
     /// Results that no longer answer, dirty or expired, and are still
     /// in the object store: at most `limit` of them.
@@ -192,6 +199,30 @@ impl Registry for Local {
             self.save(&record)?;
         }
         Ok(quiet.len())
+    }
+
+    fn supersede(&self, newer: &Record) -> Result<usize> {
+        let (Some(key), Some(until)) = (newer.cache_key.as_deref(), newer.expires_at.as_deref()) else { return Ok(0) };
+        let until_secs = parse_rfc3339(until);
+        let now = rfc3339(unix_now());
+        let mut records = self.lock();
+        let mut changed = 0;
+        for record in records.values_mut() {
+            if record.cache_key.as_deref() != Some(key) || record.id == newer.id || record.status != Status::Succeeded {
+                continue;
+            }
+            if record.expires_at.as_deref() == Some(NEVER_EXPIRES) {
+                record.dirty = true;
+                record.expires_at = Some(now.clone());
+            } else if record.expires_at.as_deref().and_then(parse_rfc3339) > until_secs {
+                record.expires_at = Some(until.to_string());
+            } else {
+                continue;
+            }
+            self.write(record)?;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     fn mark_dirty(&self, org_uid: &str, project_uid: Option<&str>, datasource_uid: &str, tables: &[String]) -> Result<usize> {

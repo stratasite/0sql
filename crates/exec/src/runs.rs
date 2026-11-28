@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use zsql_datasource::{Sink, Source};
+use zsql_datasource::{CacheTtl, Sink, Source};
 
 /// How much runs at once, and how much may wait.
 #[derive(Debug, Clone)]
@@ -85,8 +85,9 @@ pub struct Submit {
     /// What an identical question finds the result by; `None` for a run
     /// that is neither looked up nor found again.
     pub cache_key: Option<String>,
-    /// How long the result answers.
-    pub cache_ttl: Duration,
+    /// How long the result answers; a stored result older than this
+    /// does not answer this request either.
+    pub cache_ttl: CacheTtl,
     /// Run even though a stored result would answer.
     pub fresh: bool,
     /// Connections kept under a key that starts with this are closed
@@ -117,7 +118,7 @@ struct Job {
     pool_key: Option<String>,
     close_first: Option<String>,
     open: Opener,
-    cache_ttl: Duration,
+    cache_ttl: CacheTtl,
     cancel: Arc<AtomicBool>,
 }
 
@@ -241,7 +242,14 @@ impl Runs {
             if !submit.fresh {
                 // A result another node made is found here too, and
                 // answers only where its rows can be read.
-                if let Some(hit) = inner.registry.cached(key)?.filter(|hit| inner.readable(hit)) {
+                // It answers too only when it is young enough for this
+                // request: a result kept for a day by one caller does
+                // not answer another who asked for half an hour.
+                let young = |hit: &Record| {
+                    let finished = hit.finished_at.as_deref().and_then(crate::engine::parse_rfc3339).unwrap_or(0);
+                    submit.cache_ttl.answers(Duration::from_secs(unix_now().saturating_sub(finished)))
+                };
+                if let Some(hit) = inner.registry.cached(key)?.filter(|hit| young(hit) && inner.readable(hit)) {
                     return Ok((hit, How::Hit));
                 }
             }
@@ -713,7 +721,10 @@ impl Inner {
             Ok(rows) => {
                 record.status = Status::Succeeded;
                 record.row_count = Some(rows);
-                record.expires_at = Some(rfc3339(ended + cache_ttl.as_secs()));
+                record.expires_at = Some(match cache_ttl {
+                    CacheTtl::Never => crate::engine::NEVER_EXPIRES.to_string(),
+                    CacheTtl::For(d) => rfc3339(ended.saturating_add(d.as_secs())),
+                });
             }
             Err(_) if cancel.load(Ordering::SeqCst) => {
                 record.status = Status::Cancelled;
@@ -734,6 +745,9 @@ impl Inner {
             "a run ended"
         );
         self.registry.save(&record)?;
+        if record.status == Status::Succeeded && record.cache_key.is_some() {
+            self.registry.supersede(&record)?;
+        }
         Ok(record)
     }
 }

@@ -345,6 +345,31 @@ the datasource or the branch. Two consequences to plan for:
 - A branch whose datasource points at another database shares results
   with the others of its project. `cache_ttl: 0` there as well.
 
+`cache_ttl` is whole seconds (`1800`) or a number with a unit: `10s`,
+`30m`, `1h`, `10d`. `0` keeps nothing and `-1` never expires. A day
+when the datasource says nothing.
+
+A request may send its own `cache_ttl` (`/run`, `/blend`, the MCP
+`run` tool, `zsql run --ttl`), and it wins over the datasource's, with
+one exception: a datasource whose `cache_ttl` is `0` keeps nothing
+whatever the request says. A request that asks to cache a result
+there, by `cache_ttl` or a `cache_ttl` in its `connection`, is refused
+with a 400; `0` or none runs. It works both ways. The result it makes expires that long
+after it finished, and a stored result older than that does not answer
+it, so a request for `30m` is never handed a result another caller
+kept for a day. The response says the TTL the result was kept with as
+`cache_ttl`: seconds, or `"never"`, whose `expires_at` is
+`9999-12-31T00:00:00Z`.
+
+A rerun of the same question (`fresh: true`, or a miss because a
+request's TTL was shorter than the stored result's age) replaces what
+was stored. A result that never expired ends then: it is marked dirty,
+its `expires_at` is set to that moment, and the next sweep clears it,
+so a caller still paging it by id loses it. Any other result it
+replaced is cut to expire when the rerun does, and is read by its id
+until then. Without a rerun or an invalidation, a result that never
+expires stays on disk.
+
 `fresh: true` on a request runs the statement whatever is stored.
 `POST /cache/invalidate` with a datasource and the tables that changed
 stops every result that read them from answering.

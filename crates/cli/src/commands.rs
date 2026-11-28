@@ -38,7 +38,7 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
         Command::Deploy { dry_run, watch, skip_check, clear_secrets, remote } => {
             deploy::deploy(Where::with(project, remote), deploy::How { dry_run, watch, skip_check, clear_secrets })
         }
-        Command::Run { query, limit, all, fresh, timeout, format, out, head, quiet } => {
+        Command::Run { query, limit, all, fresh, ttl, timeout, format, out, head, quiet } => {
             let format = format.or_else(|| tty::agent().then(|| "json".to_string()));
             let (mode, q, context) = query.resolve(here)?;
             let Mode::Local(local) = mode else { unreachable!("no remote flags on run") };
@@ -48,7 +48,7 @@ pub(crate) fn run(command: Command, project: Option<PathBuf>) -> Result<()> {
                 &model,
                 &q,
                 context.as_ref(),
-                run::Options { limit, all, fresh, timeout, format: format.as_deref(), out: out.as_deref(), head, quiet },
+                run::Options { limit, all, fresh, ttl, timeout, format: format.as_deref(), out: out.as_deref(), head, quiet },
             )
         }
         Command::Results { what } => {

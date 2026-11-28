@@ -49,7 +49,8 @@ pub struct Manifest {
     pub columns: Vec<Column>,
     pub rows_format: String,
     pub timings: Timings,
-    pub cache_ttl_secs: u64,
+    /// How long it answers, in seconds; `-1` never expires.
+    pub cache_ttl_secs: i64,
     pub lineage: Lineage,
     #[serde(default)]
     pub warnings: Vec<String>,
