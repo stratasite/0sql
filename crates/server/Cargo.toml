@@ -24,6 +24,7 @@ zsql-core.workspace = true
 tracing.workspace = true
 zsql-datasource.workspace = true
 zsql-exec.workspace = true
+zsql-prep.workspace = true
 # A response body fed by a reader on its own thread.
 futures-core = "0.3"
 serde_yaml.workspace = true

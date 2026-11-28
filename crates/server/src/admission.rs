@@ -32,6 +32,10 @@ pub(crate) enum Class {
     /// and how many wait is the runs' own business; a seat here is
     /// only a request in the server.
     Run,
+    /// data prep: an upload parsed, a recipe run, a page read, each in
+    /// an engine of its own with a memory limit. Seats of their own, so
+    /// a dataset being made never takes one from planning.
+    Prep,
     /// liveness and the root: no admission.
     Exempt,
 }
@@ -44,6 +48,7 @@ impl Class {
             Class::Heavy => "heavy",
             Class::Probe => "probe",
             Class::Run => "run",
+            Class::Prep => "prep",
             Class::Exempt => "exempt",
         }
     }
@@ -65,6 +70,9 @@ pub(crate) fn classify(path: &str) -> Class {
         // itself is the model's, and cheap.
         ["projects", _, "branches", _, "datasources", _, ..] => Class::Probe,
         ["projects", _, "branches", _, "run" | "sql-exec"] | ["results", _] | ["cache", "invalidate"] => Class::Run,
+        ["projects", _, "datasets" | "sources" | "runs" | "preview", ..] | ["projects", _, "branches", _, "blend"] | ["datasets", ..] => {
+            Class::Prep
+        }
         // One HTTP request to /mcp carries one tool call, admitted here
         // as a plan; the explore-class tools take an explore seat too,
         // in mcp.rs. Everything else, a path that matches no route
@@ -92,7 +100,7 @@ fn patience(class: Class) -> Duration {
 pub(crate) fn deadline(class: Class) -> Duration {
     match class {
         // A probe waits on a warehouse, which can take its time to wake.
-        Class::Heavy | Class::Probe | Class::Run => Duration::from_secs(90),
+        Class::Heavy | Class::Probe | Class::Run | Class::Prep => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
@@ -107,6 +115,8 @@ pub struct AdmissionCounts {
     /// Requests for a run in the server at once: every statement that
     /// may run or wait, and as many again asking after them.
     pub run: usize,
+    /// Data prep jobs and reads in the server at once.
+    pub prep: usize,
 }
 
 impl Default for AdmissionCounts {
@@ -114,7 +124,7 @@ impl Default for AdmissionCounts {
     /// is neither.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2, run: 2 * (100 + 5_000) }
+        AdmissionCounts { plan: cores * 4, explore: cores, heavy: 2, probe: cores * 2, run: 2 * (100 + 5_000), prep: (cores / 2).max(2) }
     }
 }
 
@@ -124,6 +134,7 @@ pub(crate) struct Admission {
     heavy: Arc<Semaphore>,
     probe: Arc<Semaphore>,
     run: Arc<Semaphore>,
+    prep: Arc<Semaphore>,
 }
 
 impl Admission {
@@ -134,6 +145,7 @@ impl Admission {
             heavy: Arc::new(Semaphore::new(counts.heavy)),
             probe: Arc::new(Semaphore::new(counts.probe)),
             run: Arc::new(Semaphore::new(counts.run)),
+            prep: Arc::new(Semaphore::new(counts.prep)),
         }
     }
 
@@ -144,6 +156,7 @@ impl Admission {
             Class::Heavy => &self.heavy,
             Class::Probe => &self.probe,
             Class::Run => &self.run,
+            Class::Prep => &self.prep,
             Class::Exempt => return None,
         })
     }
@@ -193,10 +206,20 @@ mod tests {
             ("/orgs/acme/mcp", Plan),
             ("/results/r-1", Run),
             ("/cache/invalidate", Run),
+            ("/projects/a/datasets", Prep),
+            ("/projects/a/datasets/ds_1/rows", Prep),
+            ("/datasets", Prep),
+            ("/datasets/restore", Prep),
+            ("/projects/a/branches/main/blend", Prep),
+            ("/projects/a/sources", Prep),
+            ("/projects/a/sources/src_1/snapshots", Prep),
+            ("/projects/a/runs", Prep),
+            ("/projects/a/runs/r-1", Prep),
+            ("/projects/a/preview", Prep),
         ] {
             assert_eq!(classify(p), want, "{p}");
             // Under an org a route costs what it costs without one.
-            if p.starts_with("/projects") || p.starts_with("/results") || p.starts_with("/cache") {
+            if p.starts_with("/projects") || p.starts_with("/results") || p.starts_with("/cache") || p.starts_with("/datasets") {
                 assert_eq!(classify(&format!("/orgs/acme{p}")), want, "/orgs/acme{p}");
             }
         }

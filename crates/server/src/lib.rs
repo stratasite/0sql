@@ -48,6 +48,7 @@
 //! POST /projects/{uid}/branches/{branch}/sql-exec      {"datasource": "...", "sql": "..."}: one statement, run as written
 //! GET  /results/{id}                                   a run: its record and a page of rows; DELETE cancels it
 //! POST /cache/invalidate                               {"datasource": "...", "tables": [...]}: results that read them stop answering
+//! /projects/{uid}/sources|datasets|runs|preview    data prep, beside the model: sources, datasets, runs of graphs (see datasets.rs)
 //! POST /mcp                                            the same reads, as MCP tools (see mcp.rs)
 //! ANY  /orgs/{org}/...                                 any route above, for one org
 //! GET  /orgs                                           every org, with how many branches each has
@@ -71,11 +72,13 @@
 //!   the connection the request sends
 //! - `error`: the one error the API answers with
 //! - `mcp`: the same reads as MCP tools
+//! - `datasets`: the routes of data prep, which is `zsql-prep`'s
 //! - `run`: configuration, the router and the server's life
 
 pub mod admission;
 mod archive;
 mod credentials;
+mod datasets;
 mod deploy;
 mod error;
 mod exec;
@@ -89,6 +92,7 @@ mod run;
 pub use admission::AdmissionCounts;
 pub use mcp::Settings as McpSettings;
 pub use run::{run, run_blocking, serve, Config, RunLimits};
+pub use zsql_prep::Settings as PrepSettings;
 
 use crate::admission::Admission;
 use crate::error::{not_found, ApiError};
@@ -134,6 +138,8 @@ pub(crate) struct App {
     /// The row limit a run is given when its request has none. `None`
     /// leaves it without one: a bound is the caller's to set.
     default_sql_limit: Option<u64>,
+    /// Data prep, unless it is turned off.
+    prep: Option<Arc<zsql_prep::Prep>>,
 }
 
 /// A deployment's key in the models map. None of the three names can
@@ -252,8 +258,21 @@ fn hostname() -> String {
 /// Runs work that would hold a runtime thread for seconds on a blocking
 /// thread instead, so a deploy never stalls the planning the rest of
 /// the server is doing.
+///
+/// The work holds the request's admission seat until it ends. A request
+/// that passes its deadline is answered, but its work goes on, and the
+/// seat must stay taken while it does, or work past its deadline would
+/// pile up past the cap.
 pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
-    match tokio::task::spawn_blocking(work).await {
+    let seat = guard::seat();
+    match tokio::task::spawn_blocking(move || {
+        let held = seat;
+        let result = work();
+        drop(held);
+        result
+    })
+    .await
+    {
         Ok(result) => result,
         Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("this request did not finish: {e}"))),
     }

@@ -5,7 +5,7 @@
 use crate::admission::{Admission, AdmissionCounts};
 use crate::deploy::is_swap_leftover;
 use crate::guard::guard;
-use crate::{deploy, exec, mcp, probe, reads, write, App, Shared};
+use crate::{datasets, deploy, exec, mcp, probe, reads, write, App, Shared};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::collections::HashMap;
@@ -122,14 +122,15 @@ fn reload_project(app: &App, org: &str, uid: &str, project_dir: &std::path::Path
 /// Every route, behind the guard, over the app. Built here so the
 /// tests drive the same router the binary serves.
 pub(crate) fn router(app: Shared) -> Router {
+    let upload_limit = app.prep.as_ref().map(|p| p.settings().max_bytes as usize).unwrap_or(JSON_LIMIT);
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .route("/orgs", get(reads::orgs).post(deploy::create_org))
         .route("/orgs/{org}", delete(deploy::delete_org))
         // Once for the default org, and once for the org the path names.
-        .merge(of_an_org())
-        .nest("/orgs/{org}", of_an_org())
+        .merge(of_an_org(upload_limit))
+        .nest("/orgs/{org}", of_an_org(upload_limit))
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         // Every route but a deploy takes a small JSON body; the archive
         // routes raise their own limit above.
@@ -140,7 +141,8 @@ pub(crate) fn router(app: Shared) -> Router {
 /// Everything that is one org's: its projects, its results and its
 /// MCP endpoint. Which org is the handler's to read, with
 /// [`crate::error::Org`]: the one in the path, or the default.
-fn of_an_org() -> Router<Shared> {
+fn of_an_org(upload_limit: usize) -> Router<Shared> {
+    let upload = axum::extract::DefaultBodyLimit::max(upload_limit);
     Router::new()
         .route("/projects", get(reads::projects))
         .route("/projects/{uid}", delete(deploy::remove_project))
@@ -163,9 +165,24 @@ fn of_an_org() -> Router<Shared> {
         .route("/projects/{uid}/branches/{branch}/datasources/{datasource}/tables/{table}", post(probe::table))
         .route("/projects/{uid}/branches/{branch}/run", post(exec::run))
         .route("/projects/{uid}/branches/{branch}/sql-exec", post(exec::sql_exec))
+        .route("/projects/{uid}/branches/{branch}/blend", post(datasets::blend))
         .route("/results/{id}", get(exec::result).delete(exec::cancel))
         .route("/cache/invalidate", post(exec::invalidate))
         .route(mcp::PATH, post(mcp::endpoint))
+        .route("/projects/{uid}/sources", get(datasets::sources).post(datasets::create_source).layer(upload))
+        .route("/projects/{uid}/sources/{id}", get(datasets::get_source).patch(datasets::change_source).delete(datasets::delete_source))
+        .route("/projects/{uid}/sources/{id}/snapshots", get(datasets::snapshots).post(datasets::add_snapshot).layer(upload))
+        .route("/projects/{uid}/sources/{id}/snapshots/{n}", get(datasets::snapshot))
+        .route("/projects/{uid}/sources/{id}/rows", get(datasets::source_rows))
+        .route("/projects/{uid}/datasets", get(datasets::list).post(datasets::create))
+        .route("/projects/{uid}/datasets/{id}", get(datasets::get).delete(datasets::delete))
+        .route("/projects/{uid}/datasets/{id}/rows", get(datasets::rows))
+        .route("/projects/{uid}/datasets/{id}/lineage", get(datasets::lineage))
+        .route("/projects/{uid}/datasets/{id}/versions/{k}", get(datasets::version))
+        .route("/projects/{uid}/runs", post(datasets::run))
+        .route("/projects/{uid}/runs/{id}", get(datasets::get_run))
+        .route("/projects/{uid}/preview", post(datasets::preview))
+        .route("/datasets/restore", post(datasets::restore))
 }
 
 async fn root() -> String {
@@ -194,6 +211,8 @@ pub struct Config {
     /// How many statements run at once, how many may wait, and the row
     /// limit a run is given when its request has none.
     pub runs: RunLimits,
+    /// What data prep is allowed; `None` turns datasets off.
+    pub datasets: Option<zsql_prep::Settings>,
 }
 
 /// What bounds the statements a server runs.
@@ -241,12 +260,13 @@ impl Config {
     /// MCP wording.
     pub fn local(data_dir: PathBuf, bind: String) -> Config {
         Config {
-            data_dir,
             bind,
             public_url: None,
             admission: AdmissionCounts::default(),
             mcp: mcp::Settings::builtin(),
             runs: RunLimits::default(),
+            datasets: Some(zsql_prep::Settings::defaults(&data_dir)),
+            data_dir,
         }
     }
 }
@@ -272,6 +292,20 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // a runtime of its own: not something to do on a thread of this one.
     let (dir, limits) = (config.data_dir.clone(), config.runs.clone());
     let runs = tokio::task::spawn_blocking(move || crate::open_runs(&dir, &limits)).await??;
+    let prep = match config.datasets.clone() {
+        Some(settings) => {
+            let dir = config.data_dir.clone();
+            // With an object store, each dataset is copied there as it changes.
+            let objects = runs.objects().cloned();
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || zsql_prep::Prep::open(&dir, settings).map(|p| p.with_backup(objects))).await??,
+            ))
+        }
+        None => {
+            tracing::info!("datasets are off");
+            None
+        }
+    };
     let app: Shared = Arc::new(App {
         dialects,
         data_dir: config.data_dir,
@@ -284,6 +318,7 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
         deploying: std::sync::Mutex::new(()),
         runs,
         default_sql_limit: config.runs.default_sql_limit,
+        prep,
     });
     let (n, skipped) = reload(&app)?;
     tracing::info!("{n} deployment(s) loaded from {}", app.data_dir.display());
@@ -298,7 +333,30 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     // The handlers are installed before the address is announced, so a
     // signal sent the moment the listening line is read is a graceful
     // stop and not the default disposition's instant death.
-    let shutdown = shutdown_signal();
+    //
+    // On the signal, data prep stops beside the requests: its jobs get a
+    // grace, and those still running are interrupted, which the server
+    // waits for before it returns. Nothing is resumed at the next start:
+    // the application decides what to send again.
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = {
+        let signal = shutdown_signal();
+        let prep = app.prep.clone();
+        async move {
+            signal.await;
+            match prep {
+                Some(prep) => {
+                    tokio::task::spawn_blocking(move || {
+                        prep.stop(PREP_GRACE);
+                        let _ = stopped_tx.send(());
+                    });
+                }
+                None => {
+                    let _ = stopped_tx.send(());
+                }
+            }
+        }
+    };
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     // The address actually bound, so a port of 0 is answered with the
     // port it got.
@@ -314,9 +372,15 @@ pub async fn serve(config: Config, listening: impl FnOnce(SocketAddr) + Send + '
     }
     listening(addr);
     axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
+    let _ = stopped_rx.await;
     tracing::info!("stopped");
     Ok(())
 }
+
+/// How long data prep's jobs are given to finish when the server stops,
+/// before what still runs is interrupted. Inside the twenty seconds
+/// `zsql server stop` waits before it kills.
+const PREP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// [`serve`] on a runtime of its own, for a caller that is not async.
 pub fn run_blocking(config: Config, listening: impl FnOnce(SocketAddr) + Send + 'static) -> anyhow::Result<()> {

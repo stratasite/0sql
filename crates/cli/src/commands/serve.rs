@@ -72,6 +72,7 @@ impl ServeArgs {
             ("ZSQL_ADMIT_EXPLORE", &mut a.explore),
             ("ZSQL_ADMIT_HEAVY", &mut a.heavy),
             ("ZSQL_ADMIT_PROBE", &mut a.probe),
+            ("ZSQL_ADMIT_PREP", &mut a.prep),
         ] {
             if let Some(v) = var(name) {
                 *slot = number(&v, name)?;
@@ -125,6 +126,26 @@ impl ServeArgs {
         if let Some(v) = var("ZSQL_CACHE_SWEEP_SECS") {
             cfg.runs.cache_sweep = Duration::from_secs(number(&v, "ZSQL_CACHE_SWEEP_SECS")?.max(1) as u64);
         }
+        // Data prep: on unless turned off, and bounded.
+        match var("ZSQL_DATASETS").as_deref().map(str::trim) {
+            Some("off" | "0" | "false" | "no") => cfg.datasets = None,
+            Some("on" | "1" | "true" | "yes") | None => {}
+            Some(other) => bail!("ZSQL_DATASETS is on or off; it is {other}"),
+        }
+        if let Some(d) = cfg.datasets.as_mut() {
+            if let Some(v) = var("ZSQL_DATASET_MAX_ROWS") {
+                d.max_rows = number(&v, "ZSQL_DATASET_MAX_ROWS")?;
+            }
+            if let Some(v) = var("ZSQL_DATASET_MAX_BYTES") {
+                d.max_bytes = number(&v, "ZSQL_DATASET_MAX_BYTES")? as u64;
+            }
+            if let Some(v) = var("ZSQL_PREP_MEMORY") {
+                d.engine.memory = v;
+            }
+            if let Some(v) = var("ZSQL_PREP_THREADS") {
+                d.engine.threads = number(&v, "ZSQL_PREP_THREADS")?;
+            }
+        }
         let tools = var("ZSQL_MCP_TOOLS").map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
         cfg.mcp = McpSettings::new(file("ZSQL_MCP_PROMPTS")?.as_deref(), file("ZSQL_MCP_SPEC_SCHEMA")?.as_deref(), tools)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -160,6 +181,9 @@ pub enum ServerCommand {
         args: ServeArgs,
     },
     /// Stop the background server (SIGTERM, then wait for it to finish).
+    /// Data prep jobs still running after a grace period are marked
+    /// interrupted by the stop; nothing is resumed, the application
+    /// sends again what it wants run.
     Stop,
     /// Whether the background server is running, and whether it answers;
     /// also whether a foreground `zsql serve` holds the data directory.
@@ -497,8 +521,9 @@ fn start(args: ServeArgs, at: Where) -> Result<()> {
     Ok(())
 }
 
-/// SIGTERM, which finishes what is in flight; then, if the server has
-/// not gone in fifteen seconds, SIGKILL, since a request that long is
+/// SIGTERM, which finishes what is in flight and interrupts the data
+/// prep jobs still running after their grace; then, if the server has
+/// not gone in twenty seconds, SIGKILL, since a request that long is
 /// not worth a server that cannot be stopped.
 fn stop() -> Result<()> {
     let Some(s) = running()? else {
@@ -511,19 +536,19 @@ fn stop() -> Result<()> {
     let t0 = Instant::now();
     let mut killed = false;
     while alive(s.pid) {
-        if !killed && t0.elapsed() > Duration::from_secs(15) {
+        if !killed && t0.elapsed() > Duration::from_secs(20) {
             #[cfg(unix)]
             signal(s.pid, libc::SIGKILL);
             killed = true;
         }
-        if t0.elapsed() > Duration::from_secs(20) {
+        if t0.elapsed() > Duration::from_secs(25) {
             bail!("process {} has not stopped", s.pid);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = std::fs::remove_file(pid_file()?);
     if killed {
-        println!("killed process {} after 15 s; it did not finish on its own", s.pid);
+        println!("killed process {} after 20 s; it did not finish on its own", s.pid);
     } else {
         println!("stopped process {}", s.pid);
     }

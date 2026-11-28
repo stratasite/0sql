@@ -447,14 +447,21 @@ pub(crate) async fn remove_project(
             let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!(" in org {org}") };
             return Err(ApiError(StatusCode::NOT_FOUND, "NotFound", format!("no deployment for project {uid}{within}")));
         }
+        // Its datasets go with it, through data prep's own delete, which
+        // is what removes everything else a dataset has; the directory
+        // removal below would take their files anyway.
+        let datasets = match &app.prep {
+            Some(prep) => prep.delete_project(&org, &uid)?,
+            None => Vec::new(),
+        };
         if existed {
             std::fs::remove_dir_all(&dir)
                 .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not remove {uid}: {e}")))?;
         }
         branches.sort();
-        tracing::info!("removed {org}/{uid} and its branches {}", branches.join(", "));
+        tracing::info!("removed {org}/{uid}, its branches {} and {} dataset(s)", branches.join(", "), datasets.len());
         let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
-        Ok(Json(json!({ "removed": format!("{within}{uid}"), "branches": branches })))
+        Ok(Json(json!({ "removed": format!("{within}{uid}"), "branches": branches, "datasets": datasets })))
     })
     .await
 }

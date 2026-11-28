@@ -58,10 +58,19 @@ fn app_with(data_dir: &std::path::Path, limits: &crate::RunLimits) -> Shared {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(data_dir, limits).unwrap(),
         default_sql_limit: None,
+        prep: Some(Arc::new(zsql_prep::Prep::open(data_dir, test_prep_settings(data_dir)).unwrap())),
     })
 }
 
+fn test_prep_settings(data_dir: &std::path::Path) -> zsql_prep::Settings {
+    let mut s = zsql_prep::Settings::defaults(data_dir);
+    s.engine.memory = "256MB".into();
+    s.engine.threads = 1;
+    s
+}
+
 mod archive;
+mod datasets;
 
 /// A status and a JSON body (null when the body is not JSON).
 #[derive(Debug)]
@@ -1381,6 +1390,7 @@ async fn a_default_limit_and_a_datasource_that_keeps_nothing() {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: Some(2),
+        prep: None,
     });
     let s = Server { router: router(app.clone()), app, data_dir };
     let file = sales("limits");
@@ -1503,6 +1513,7 @@ async fn the_tools_that_run_are_offered_only_when_named() {
         deploying: std::sync::Mutex::new(()),
         runs: crate::open_runs(&data_dir, &crate::RunLimits::default()).unwrap(),
         default_sql_limit: None,
+        prep: None,
     });
     let s = Server { router: router(app.clone()), app, data_dir };
     let file = sales("tools");

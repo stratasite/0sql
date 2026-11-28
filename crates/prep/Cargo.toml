@@ -1,0 +1,33 @@
+[package]
+name = "zsql-prep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+description = "Data prep: datasets as recipes over sources, kept beside the model and never part of it"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# A page of rows as JSON, and the batches it is read from, as a run's are.
+zsql-exec.workspace = true
+zsql-datasource.workspace = true
+sha2 = "0.10"
+csv = "1"
+# The engine, opened in memory with external access off: every file a
+# dataset has is read and written here, in Rust, and DuckDB only ever
+# sees tables it was handed. `appender-arrow` is Rust only and adds no
+# C++ to the bundled build the rest of the workspace already compiles.
+duckdb = { version = "1.20000.0", features = ["bundled", "appender-arrow", "json"] }
+# Snapshots and materializations are Arrow IPC files, as results are.
+arrow-ipc = { version = "60", features = ["lz4"] }
+arrow-array = "60"
+arrow-schema = "60"
+arrow-cast = "60"
+
+[lints]
+workspace = true
