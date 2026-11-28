@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4466,7 +4466,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zsql-cli"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-core"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "flate2",
  "regex",
@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-datasource"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -4548,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-dialect"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "serde_json",
  "serde_yaml",
@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-exec"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4585,14 +4585,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-formation"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "zsql-semantic",
 ]
 
 [[package]]
 name = "zsql-golden"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "regex",
@@ -4608,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-log"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-planner"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "chrono",
  "md5",
@@ -4633,7 +4633,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-prep"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4652,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-project"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "flate2",
  "serde",
@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-semantic"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "flate2",
  "serde",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "zsql-server"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "arrow-ipc",
@@ -4709,14 +4709,14 @@ dependencies = [
 
 [[package]]
 name = "zsql-shorthand"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "zsql-spec"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "regex",
  "serde",
