@@ -1190,6 +1190,34 @@ fn a_run_id_sent_twice_at_once_is_begun_once() {
 }
 
 #[test]
+fn two_edits_nodes_in_one_graph_each_set_delete_and_add() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, SALES);
+    let edits = |id: &str, input: &str, store: &str, gone: &str, new: &str| {
+        json!({ "id": id, "kind": "edits", "input": input, "key": ["store"], "edits": [
+            { "id": "s", "kind": "set", "column": "amount", "key": { "store": store }, "to": 99 },
+            { "id": "d", "kind": "delete", "key": { "store": gone } },
+            { "id": "a", "kind": "add", "key": { "store": new }, "values": { "region": "WA", "amount": 1 } },
+        ]})
+    };
+    let g = graph(json!([
+        { "id": "in", "kind": "source", "source": s.id },
+        edits("first", "in", "a", "b", "x"),
+        { "id": "mid", "kind": "steps", "input": "first", "steps": [{ "op": "sort", "by": [{ "column": "store" }] }] },
+        edits("second", "mid", "c", "x", "y"),
+        { "id": "out", "kind": "output", "input": "second" },
+    ]));
+    let r = ran(&prep, &ann, &d.id, g);
+    let applied = |n: &NodeRecord| n.edits.iter().all(|o| o.state == State::Applied);
+    assert!(r.nodes.iter().filter(|n| n.kind == "edits").all(applied), "{:?}", r.nodes);
+    let rows = rows_of(&prep, &ann, &d.id);
+    let stores: Vec<&str> = rows.iter().map(|r| r[1].as_str().unwrap()).collect();
+    assert_eq!(stores, ["a", "c", "y"], "b deleted by the first, x added by the first and deleted by the second");
+    assert_eq!((rows[0][2].clone(), rows[1][2].clone()), (json!(99), json!(99)));
+}
+
+#[test]
 fn a_dataset_deleted_takes_its_run_records_with_it() {
     let (_dir, prep) = prep();
     let ann = scope();

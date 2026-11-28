@@ -427,7 +427,7 @@ fn apply_run(
                 _ => None,
             })
             .collect();
-        let m = format!("__set{tag}_{gi}");
+        let m = format!("{output}__set{tag}_{gi}");
         load_texts(session, &m, &names, &rows)?;
         let x = ident(&target.name);
         let counted = session.query(&format!(
@@ -535,7 +535,7 @@ fn apply_run(
                 _ => None,
             })
             .collect();
-        let m = format!("__delete{tag}_{gi}");
+        let m = format!("{output}__delete{tag}_{gi}");
         load_texts(session, &m, &names, &rows)?;
         let counted = session.query(&format!(
             "SELECT m.\"__id\", CAST(count(r.\"__one\") AS BIGINT), FALSE FROM {m} m \
@@ -626,8 +626,9 @@ fn apply_run(
             outcomes.push(Outcome { id: id.clone(), state: State::Applied, detail: None });
         }
         if !rows.is_empty() {
-            let add = ident(&format!("__add{tag}"));
-            load_texts(session, &format!("__add{tag}"), &names, &rows)?;
+            // Named for its node: two edits nodes of a graph share a session.
+            let add = ident(&format!("{output}__add{tag}"));
+            load_texts(session, &format!("{output}__add{tag}"), &names, &rows)?;
             let casts: Vec<String> =
                 columns.iter().map(|c| format!("TRY_CAST({} AS {}) AS {}", ident(&c.name), c.ty.sql(), ident(&c.name))).collect();
             next(format!("SELECT {} FROM {rel} UNION ALL SELECT {} FROM {add}", list(""), casts.join(", ")), rel)?;
