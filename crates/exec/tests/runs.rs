@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use zsql_datasource::CacheTtl;
 use zsql_exec::{run_cache_key, How, Kind, Limits, Local, Record, Registry, Runs, Status, Submit, DEFAULT_ORG, RESTARTED};
 
 struct Scratch(PathBuf);
@@ -44,7 +45,7 @@ impl Scratch {
             row_limit: None,
             tables: vec!["t".into()],
             cache_key: Some(run_cache_key(DEFAULT_ORG, "shop", sql)),
-            cache_ttl: Duration::from_secs(3600),
+            cache_ttl: zsql_datasource::CacheTtl::For(Duration::from_secs(3600)),
             fresh: false,
             pool_key: None,
             close_first: None,
@@ -151,6 +152,72 @@ fn an_identical_question_attaches_then_hits_and_fresh_runs_again() {
     assert_eq!((how_a, how_b), (How::Started, How::Started));
     assert_ne!(a.id, b.id, "two identical statements are two runs");
     assert!(a.cache_key.is_none());
+}
+
+/// A request's `cache_ttl` sets when its result stops answering, `-1`
+/// never, and a stored result older than a request's TTL does not
+/// answer that request, though it still answers one that keeps longer.
+#[test]
+fn a_request_sets_its_own_ttl_and_finds_only_what_is_young_enough() {
+    let scratch = Scratch::new("ttl");
+    let runs = scratch.runs(4, 10);
+    let secs = |s: u64| CacheTtl::For(Duration::from_secs(s));
+    let finished = |r: &Record| r.finished_at.clone().unwrap();
+
+    // Kept for half an hour: it expires 1800 s after it finished.
+    let (r, _) = runs.submit(Submit { cache_ttl: secs(1800), ..scratch.submit("SELECT 1") }).unwrap();
+    let r = runs.wait(&r.id, Duration::from_secs(20)).unwrap().unwrap();
+    let gap = |r: &Record| {
+        let at = |s: &str| chrono_secs(s);
+        at(r.expires_at.as_deref().unwrap()) - at(&finished(r))
+    };
+    assert_eq!(gap(&r), 1800, "{r:?}");
+
+    // Never expires.
+    let (n, _) = runs.submit(Submit { cache_ttl: CacheTtl::Never, ..scratch.submit("SELECT 2") }).unwrap();
+    let n = runs.wait(&n.id, Duration::from_secs(20)).unwrap().unwrap();
+    assert_eq!(n.expires_at.as_deref(), Some(zsql_exec::NEVER_EXPIRES));
+    let (hit, how) = runs.submit(Submit { cache_ttl: CacheTtl::Never, ..scratch.submit("SELECT 2") }).unwrap();
+    assert_eq!((how, hit.id.as_str()), (How::Hit, n.id.as_str()));
+
+    // Two seconds on, a request that keeps one second is too strict
+    // for it and runs again; one that keeps an hour is answered.
+    std::thread::sleep(Duration::from_millis(2100));
+    let (strict, how) = runs.submit(Submit { cache_ttl: secs(1), ..scratch.submit("SELECT 1") }).unwrap();
+    assert_eq!(how, How::Started, "a result two seconds old does not answer a one-second TTL");
+    let strict = runs.wait(&strict.id, Duration::from_secs(20)).unwrap().unwrap();
+    assert_eq!(gap(&strict), 1);
+    let (hit, how) = runs.submit(Submit { cache_ttl: secs(3600), ..scratch.submit("SELECT 2") }).unwrap();
+    assert_eq!((how, hit.id), (How::Hit, n.id.clone()), "a never-expiring result answers any TTL that keeps");
+
+    // Run again fresh, never expiring too: the one it replaces ends now.
+    let (again, _) = runs.submit(Submit { fresh: true, cache_ttl: CacheTtl::Never, ..scratch.submit("SELECT 2") }).unwrap();
+    let again = runs.wait(&again.id, Duration::from_secs(20)).unwrap().unwrap();
+    let old = runs.get(&n.id).unwrap().unwrap();
+    assert!(old.dirty, "{old:?}");
+    assert!(chrono_secs(old.expires_at.as_deref().unwrap()) <= chrono_secs(&finished(&again)) + 1, "{old:?}");
+    let (hit, how) = runs.submit(Submit { cache_ttl: CacheTtl::Never, ..scratch.submit("SELECT 2") }).unwrap();
+    assert_eq!((how, hit.id.as_str()), (How::Hit, again.id.as_str()), "the rerun is what answers");
+
+    // A result with an ordinary TTL replaced by a shorter one is not
+    // dirty: it ends when its replacement does, read by its id till then.
+    let (long, _) = runs.submit(Submit { cache_ttl: secs(86_400), ..scratch.submit("SELECT 3") }).unwrap();
+    let long = runs.wait(&long.id, Duration::from_secs(20)).unwrap().unwrap();
+    let (short, _) = runs.submit(Submit { fresh: true, cache_ttl: secs(3600), ..scratch.submit("SELECT 3") }).unwrap();
+    let short = runs.wait(&short.id, Duration::from_secs(20)).unwrap().unwrap();
+    let long = runs.get(&long.id).unwrap().unwrap();
+    assert_eq!((long.expires_at, long.dirty), (short.expires_at, false));
+}
+
+/// Seconds since the epoch of an RFC 3339 UTC timestamp, for the test.
+fn chrono_secs(s: &str) -> i64 {
+    let (date, time) = s.trim_end_matches('Z').split_once('T').unwrap();
+    let d: Vec<i64> = date.split('-').map(|p| p.parse().unwrap()).collect();
+    let t: Vec<i64> = time.split(':').map(|p| p.parse().unwrap()).collect();
+    let (y, m) = if d[1] <= 2 { (d[0] - 1, d[1] + 9) } else { (d[0], d[1] - 3) };
+    let (era, yoe) = (y.div_euclid(400), y.rem_euclid(400));
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * m + 2) / 5 + d[2] - 1;
+    (era * 146_097 + doe - 719_468) * 86_400 + t[0] * 3600 + t[1] * 60 + t[2]
 }
 
 #[test]

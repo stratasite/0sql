@@ -1232,6 +1232,90 @@ fn sales(name: &str) -> std::path::PathBuf {
     path
 }
 
+/// A request's `cache_ttl` is over the datasource's: written with a
+/// unit or as seconds, `-1` never expires and `0` keeps nothing, and a
+/// stored result older than a request's TTL does not answer it.
+#[tokio::test]
+async fn a_run_takes_its_own_cache_ttl() {
+    let s = server();
+    assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
+    let file = sales("ttl");
+    let run = format!("/projects/{CS}/branches/main/run");
+    let ask = |expr: &str, ttl: Value| json!({ "expr": expr, "cache_ttl": ttl, "connection": { "file": file.to_str().unwrap() } });
+
+    let half = s.post(&run, ask("category asc, revenue", json!("30m"))).await;
+    assert_eq!(
+        (half.status, &half.body["cache"], &half.body["cache_ttl"]),
+        (StatusCode::OK, &json!("miss"), &json!(1800)),
+        "{}",
+        half.body
+    );
+    let read = s.get(&format!("/results/{}", half.body["id"].as_str().unwrap())).await;
+    assert_eq!(read.body["cache_ttl"], 1800, "the result says it when read again");
+    let again = s.post(&run, ask("category asc, revenue", json!(3600))).await;
+    assert_eq!((&again.body["cache"], &again.body["id"]), (&json!("hit"), &half.body["id"]), "young enough for an hour");
+
+    let never = s.post(&run, ask("category desc, revenue", json!(-1))).await;
+    assert_eq!((&never.body["cache_ttl"], &never.body["expires_at"]), (&json!("never"), &json!("9999-12-31T00:00:00Z")), "{}", never.body);
+    let found = s.post(&run, ask("category desc, revenue", json!("-1"))).await;
+    assert_eq!((&found.body["cache"], &found.body["id"]), (&json!("hit"), &never.body["id"]));
+
+    // A second on, a one-second TTL is too strict for what is stored.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let strict = s.post(&run, ask("category asc, revenue", json!("1s"))).await;
+    assert_eq!((&strict.body["cache"], &strict.body["cache_ttl"]), (&json!("miss"), &json!(1)), "{}", strict.body);
+    assert_ne!(strict.body["id"], half.body["id"]);
+
+    // Zero keeps nothing: two of them are two runs, and neither says a TTL.
+    let (x, y) = (s.post(&run, ask("revenue", json!(0))).await, s.post(&run, ask("revenue", json!("0"))).await);
+    assert_eq!((&x.body["cache"], &y.body["cache"]), (&json!("miss"), &json!("miss")));
+    assert_ne!(x.body["id"], y.body["id"]);
+    assert!(x.body.get("cache_ttl").is_none(), "{}", x.body);
+
+    // The datasource's own, with a unit, when the request says none.
+    let by_source = |ttl: &str| json!({ "expr": "category, revenue", "connection": { "file": file.to_str().unwrap(), "cache_ttl": ttl } });
+    let ds = s.post(&run, by_source("2h")).await;
+    assert_eq!((ds.status, &ds.body["cache_ttl"]), (StatusCode::OK, &json!(7200)), "{}", ds.body);
+    let wrong = s.post(&run, by_source("2 hours")).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
+    assert!(wrong.body.to_string().contains("not a duration"), "{}", wrong.body);
+
+    for bad in [json!("1.5h"), json!("1h30m"), json!(-2), json!(true), json!("10w")] {
+        let r = s.post(&run, ask("revenue", bad.clone())).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.body);
+        assert!(r.body.to_string().contains("not a duration"), "{bad}: {}", r.body);
+    }
+}
+
+/// A datasource deployed to keep nothing keeps nothing: a request that
+/// asks to cache its result there is refused, by `cache_ttl` or by a
+/// `cache_ttl` in its connection, and one that asks for none still runs.
+#[tokio::test]
+async fn a_datasource_that_keeps_nothing_refuses_a_request_to_cache() {
+    let s = server();
+    let file = sales("never-cache");
+    let mut files = fixture_files(CS, "one");
+    files.iter_mut().find(|(p, _)| p == "datasources.yml").unwrap().1 =
+        format!("dw:\n  name: Warehouse\n  adapter: duckdb\n  tier: hot\n  cache_ttl: 0\n  file: {}\n", file.display());
+    assert_eq!(s.deploy(CS, "main", archive_of(&files)).await.status, StatusCode::OK);
+    let run = format!("/projects/{CS}/branches/main/run");
+
+    for body in [
+        json!({ "expr": "category, revenue", "cache_ttl": "1h" }),
+        json!({ "expr": "category, revenue", "cache_ttl": -1 }),
+        json!({ "expr": "category, revenue", "connection": { "cache_ttl": "30m" } }),
+    ] {
+        let r = s.post(&run, body.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{body}: {}", r.body);
+        assert!(r.body.to_string().contains("datasource dw keeps no results"), "{body}: {}", r.body);
+    }
+    for body in [json!({ "expr": "category, revenue" }), json!({ "expr": "category, revenue", "cache_ttl": 0 })] {
+        let (a, b) = (s.post(&run, body.clone()).await, s.post(&run, body.clone()).await);
+        assert_eq!((a.status, &a.body["cache"], &b.body["cache"]), (StatusCode::OK, &json!("miss"), &json!("miss")), "{body}: {}", a.body);
+        assert_ne!(a.body["id"], b.body["id"], "nothing is kept");
+    }
+}
+
 /// A plan is run: the rows come back with their types, the record says
 /// where they came from, an identical question is answered from what is
 /// stored, and a result is read again by its id, a page at a time or
@@ -1265,6 +1349,7 @@ async fn a_run_answers_with_rows_and_is_found_again() {
     assert_eq!((&a.body["tables"], &a.body["dirty"], &a.body["row_limit"]), (&json!(["sales"]), &json!(false), &Value::Null));
     assert!(a.body["sql"].as_str().unwrap().contains("sales T0"), "{}", a.body["sql"]);
     assert!(a.body["expires_at"].as_str() > a.body["finished_at"].as_str());
+    assert_eq!(a.body["cache_ttl"], 86_400, "a datasource that says nothing keeps a result a day");
     assert!(!String::from_utf8_lossy(&a.raw).contains("never-echoed"), "a credential is in no answer");
     let id = a.body["id"].as_str().unwrap().to_string();
 

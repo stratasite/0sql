@@ -441,6 +441,27 @@ impl Registry for Postgres {
         .map(|n| n as usize)
     }
 
+    fn supersede(&self, newer: &Record) -> Result<usize> {
+        let (Some(key), Some(until)) = (newer.cache_key.clone(), newer.expires_at.clone()) else { return Ok(0) };
+        let (id, never) = (newer.id.clone(), crate::engine::NEVER_EXPIRES.to_string());
+        self.with(move |client| async move {
+            // Every SET reads the row as it was, so a result that never
+            // expired is told apart before its expiry is changed.
+            client
+                .execute(
+                    "UPDATE zsql_results SET \
+                       dirty = dirty OR expires_at >= $4::text::timestamptz, \
+                       expires_at = CASE WHEN expires_at >= $4::text::timestamptz THEN now() ELSE $3::text::timestamptz END, \
+                       updated_at = now() \
+                     WHERE cache_key = $1 AND id <> $2 AND status = 'succeeded' \
+                       AND (expires_at >= $4::text::timestamptz OR expires_at > $3::text::timestamptz)",
+                    &[&key, &id, &until, &never],
+                )
+                .await
+        })
+        .map(|n| n as usize)
+    }
+
     fn stale_objects(&self, limit: usize) -> Result<Vec<Record>> {
         let limit = limit as i64;
         let rows = self.with(move |client| async move {

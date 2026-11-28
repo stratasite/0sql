@@ -26,7 +26,7 @@
 //! GET    /projects/{uid}/runs/{id}
 //! POST   /projects/{uid}/preview                          {"graph", "node", "whole", "limit", "context", "connection", "wait"}
 //! POST   /datasets/restore                                every dataset and source of the org the object store has and this node does not
-//! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "offset", "limit"}
+//! POST   /projects/{uid}/branches/{branch}/blend          {"spec", "datasets": [{"id", "as"}], "blend": [...], "context", "connection", "wait", "fresh", "cache_ttl", "offset", "limit"}
 //! ```
 //!
 //! Sources and datasets are their project's, addressed by id. Who may
@@ -632,8 +632,10 @@ async fn pull(
     crate::names::check_branch(&p.query.branch)?;
     let (record, _, _) = {
         let (app, org, uid, q) = (app.clone(), scope.org.clone(), scope.project.clone(), p.query.clone());
-        blocking(move || crate::exec::submit_spec(&app, (&org, &uid, &q.branch), (q.spec, q.expr), context, connection, Some(0.0), fresh))
-            .await?
+        blocking(move || {
+            crate::exec::submit_spec(&app, (&org, &uid, &q.branch), (q.spec, q.expr), context, connection, Some(0.0), (fresh, None))
+        })
+        .await?
     };
     let record = crate::exec::settled(app, record, wait).await?;
     if !record.status.is_final() {
@@ -788,6 +790,9 @@ pub(crate) struct BlendRequest {
     wait: Option<f64>,
     #[serde(default)]
     fresh: bool,
+    /// As `/run` takes it: how long the model part's result answers.
+    #[serde(default)]
+    cache_ttl: Option<Value>,
     #[serde(default)]
     offset: Option<u64>,
     #[serde(default)]
@@ -905,8 +910,17 @@ pub(crate) async fn blend(
     let (record, _, wait) = {
         let (app, scope, branch, spec) = (app.clone(), scope.clone(), branch.clone(), split.spec.clone());
         let (context, connection, wait, fresh) = (req.context.clone(), req.connection.clone(), req.wait, req.fresh);
+        let ttl = req.cache_ttl.clone();
         blocking(move || {
-            crate::exec::submit_spec(&app, (&scope.org, &scope.project, &branch), (Some(spec), None), context, connection, wait, fresh)
+            crate::exec::submit_spec(
+                &app,
+                (&scope.org, &scope.project, &branch),
+                (Some(spec), None),
+                context,
+                connection,
+                wait,
+                (fresh, ttl),
+            )
         })
         .await?
     };

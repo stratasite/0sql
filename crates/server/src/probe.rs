@@ -188,6 +188,9 @@ pub(crate) fn connection_of(
     if let Some(seconds) = deployed.query_timeout {
         settings.insert("query_timeout".into(), Value::from(seconds));
     }
+    // What the datasource was deployed to keep: a request may shorten
+    // it, but not make one that keeps nothing keep its result.
+    let deployed_ttl = settings.get("cache_ttl").and_then(|v| zsql_datasource::CacheTtl::from_json(v).ok());
     for (key, value) in sent {
         if !CONNECTION_KEYS.contains(&key.as_str()) && !SECRET_FIELDS.contains(&key.as_str()) {
             return Err(invalid(format!("connection.{key} is not a connection setting")));
@@ -201,6 +204,10 @@ pub(crate) fn connection_of(
                 "datasource {datasource} is deployed as {adapter}; the connection says {}",
                 value.as_str().unwrap_or_default().trim()
             )));
+        }
+        if key == "cache_ttl" {
+            let sent = zsql_datasource::CacheTtl::from_json(&value).map_err(invalid)?;
+            zsql_datasource::CacheTtl::resolve(Some(sent), datasource, deployed_ttl).map_err(invalid)?;
         }
         for names in ALIASES.iter().filter(|names| names.contains(&key.as_str())) {
             for name in names.iter() {

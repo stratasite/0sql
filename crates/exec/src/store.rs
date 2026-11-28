@@ -397,7 +397,7 @@ impl Stored {
     }
 
     pub fn expired(&self) -> bool {
-        self.age() > Duration::from_secs(self.manifest.cache_ttl_secs)
+        !zsql_datasource::CacheTtl::from_secs(self.manifest.cache_ttl_secs).answers(self.age())
     }
 }
 

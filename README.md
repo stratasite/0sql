@@ -154,8 +154,9 @@ the model, joins and security in about ten minutes.
   and you run the statement yourself: nothing connects until a run is
   asked for.
 - **Remembers the answer.** A result answers the same question again
-  until the datasource's `cache_ttl` passes, or until you say a table
-  it read has changed.
+  until its `cache_ttl` passes (the datasource's, or the request's:
+  `30m`, `1h`, `-1` for never), or until you say a table it read has
+  changed.
 - **Works with agents.** `POST /mcp` offers the same reads as MCP
   tools, so an agent plans against the model instead of guessing at the
   schema, and can be given tools to run what it plans. The shorthand (`country, revenue, country =
@@ -206,7 +207,9 @@ is the database's to enforce, not the server's.
 **The cache.** A result is found by the project and the planned
 statement, which already carries the row policies; not by the user or
 the credential. `fresh: true` runs anyway, `cache_ttl: 0` on a
-datasource keeps nothing, and `POST /cache/invalidate` with a
+datasource keeps nothing and refuses a request to cache, `cache_ttl` on a request (`1800`, `30m`,
+`1h`, `10d`, `-1` for never) keeps that result as long as it says and
+is answered only by a result that young, and `POST /cache/invalidate` with a
 datasource and the tables that changed stops every result that read
 them from answering.
 

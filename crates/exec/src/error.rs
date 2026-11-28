@@ -2,6 +2,9 @@
 pub enum Error {
     #[error("planning: {0}")]
     Plan(String),
+    /// A request that asked for what its datasource does not allow.
+    #[error("{0}")]
+    Refused(String),
     #[error("{0}")]
     Source(#[from] zsql_datasource::Error),
     #[error("{0}: {1}")]

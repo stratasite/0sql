@@ -62,6 +62,11 @@ pub(crate) struct RunRequest {
     /// Run even though a stored result would answer.
     #[serde(default)]
     fresh: bool,
+    /// How long this result answers, over the datasource's `cache_ttl`:
+    /// seconds, or `10s`, `30m`, `1h`, `10d`; `0` keeps nothing and `-1`
+    /// never expires. A stored result older than it does not answer.
+    #[serde(default)]
+    cache_ttl: Option<Value>,
     #[serde(default)]
     offset: Option<u64>,
     #[serde(default)]
@@ -169,9 +174,11 @@ fn submit(app: &Shared, org: &str, uid: &str, branch: &str, req: RunRequest) -> 
     // credential it is run with: nothing here checks it.
     conn.access = zsql_datasource::Access::Unchecked;
     let wait = wait_of(req.wait, conn.wait())?;
-    // A datasource that keeps nothing is neither looked up nor found.
-    let ttl = conn.cache_ttl.map(|s| Duration::from_secs(s.max(0) as u64)).unwrap_or(zsql_exec::DEFAULT_TTL);
-    let cache_key = (!ttl.is_zero()).then(|| zsql_exec::run_cache_key(org, uid, &sql));
+    // The request's TTL over the datasource's. One that keeps nothing
+    // is neither looked up nor found.
+    let asked = req.cache_ttl.as_ref().map(zsql_datasource::CacheTtl::from_json).transpose().map_err(invalid)?;
+    let ttl = zsql_datasource::CacheTtl::resolve(asked, &conn.uid, conn.cache_ttl).map_err(invalid)?;
+    let cache_key = ttl.keeps().then(|| zsql_exec::run_cache_key(org, uid, &sql));
 
     let (record, how) = app
         .runs
@@ -300,9 +307,9 @@ pub(crate) fn submit_spec(
     context: Option<SecurityContext>,
     connection: Map<String, Value>,
     wait: Option<f64>,
-    fresh: bool,
+    (fresh, cache_ttl): (bool, Option<Value>),
 ) -> Result<(Record, How, Duration), ApiError> {
-    let req = RunRequest { spec, expr, context, connection, wait, fresh, ..RunRequest::default() };
+    let req = RunRequest { spec, expr, context, connection, wait, fresh, cache_ttl, ..RunRequest::default() };
     submit(app, org, uid, branch, req)
 }
 
@@ -362,6 +369,20 @@ pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, pa
             How::Started => "miss",
         });
     }
+    // How long it answers, from when it finished to when it stops:
+    // seconds, or "never".
+    if let (Some(finished), Some(expires)) = (record.finished_at.as_deref(), record.expires_at.as_deref()) {
+        if record.cache_key.is_some() {
+            body["cache_ttl"] = if expires == zsql_exec::NEVER_EXPIRES {
+                json!("never")
+            } else {
+                match (zsql_exec::parse_rfc3339(finished), zsql_exec::parse_rfc3339(expires)) {
+                    (Some(f), Some(e)) => json!(e.saturating_sub(f)),
+                    _ => Value::Null,
+                }
+            };
+        }
+    }
     if record.status == Status::Succeeded {
         let (runs, read) = (app.runs.clone(), record.clone());
         let (offset, limit) = page;
@@ -391,8 +412,8 @@ pub(crate) async fn described(app: &Shared, record: Record, how: Option<How>, pa
 /// a model has none to send. What comes back is the record and a page, as `described`
 /// gives them.
 pub(crate) async fn run_for_tool(app: &Shared, asked: ToolRun, wait: Duration, page: (u64, u64)) -> Result<Value, ApiError> {
-    let ToolRun { org, uid, branch, spec, context, fresh } = asked;
-    let req = RunRequest { spec: Some(spec), context, fresh, wait: Some(wait.as_secs_f64()), ..RunRequest::default() };
+    let ToolRun { org, uid, branch, spec, context, fresh, cache_ttl } = asked;
+    let req = RunRequest { spec: Some(spec), context, fresh, cache_ttl, wait: Some(wait.as_secs_f64()), ..RunRequest::default() };
     let planning = app.clone();
     let (record, how, wait) = blocking(move || submit(&planning, &org, &uid, &branch, req)).await?;
     let record = settled(app, record, wait).await?;
@@ -407,6 +428,7 @@ pub(crate) struct ToolRun {
     pub(crate) spec: Value,
     pub(crate) context: Option<SecurityContext>,
     pub(crate) fresh: bool,
+    pub(crate) cache_ttl: Option<Value>,
 }
 
 /// A result asked after by a tool, by its id.

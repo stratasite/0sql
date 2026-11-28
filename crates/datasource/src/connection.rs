@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Access, Error, Result};
+use crate::{Access, CacheTtl, Error, Result};
 
 // ------------------------------------------------------------------ sslmode
 
@@ -128,9 +128,10 @@ pub struct Connection {
     pub output_location: Option<String>,
     /// A named profile in the AWS shared credentials file.
     pub profile: Option<String>,
-    /// Seconds a stored result from this datasource answers for; `0`
-    /// keeps nothing. Read by `zsql run`, ignored by the loader.
-    pub cache_ttl: Option<i64>,
+    /// How long a stored result from this datasource answers: seconds,
+    /// or `10s`, `30m`, `1h`, `10d`; `0` keeps nothing and `-1` never
+    /// expires. Read by whatever runs statements, ignored by the loader.
+    pub cache_ttl: Option<CacheTtl>,
     /// Seconds a request for a run waits for its rows before it is
     /// answered with the run's id instead. Ten when not said. Read by a
     /// server that runs statements, ignored by the loader.
@@ -199,7 +200,10 @@ impl Connection {
             workgroup: s("workgroup"),
             output_location: s("output_location").or_else(|| s("s3_output_location")),
             profile: s("profile"),
-            cache_ttl: i("cache_ttl"),
+            cache_ttl: match d.get("cache_ttl").filter(|v| !v.is_null()) {
+                Some(v) => Some(CacheTtl::from_yaml(v).map_err(|e| Error::CacheTtl(uid.trim().to_lowercase(), e))?),
+                None => None,
+            },
             query_wait_time: i("query_wait_time"),
             access: Access::default(),
         })
@@ -294,8 +298,9 @@ pub const CONNECTION_KEYS: [&str; 37] = [
     "query_wait_time",
 ];
 
-/// The settings that are numbers; every other one is text.
-pub const NUMBERS: [&str; 4] = ["port", "query_timeout", "cache_ttl", "query_wait_time"];
+/// The settings that are numbers; every other one is text. `cache_ttl`
+/// is neither: a number of seconds, or text with a unit.
+pub const NUMBERS: [&str; 3] = ["port", "query_timeout", "query_wait_time"];
 
 /// The settings with more than one spelling, the one read first first.
 pub const ALIASES: [&[&str]; 9] = [

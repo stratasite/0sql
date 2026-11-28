@@ -345,6 +345,9 @@ pub(crate) enum Command {
         /// Run it even when a result within its TTL is stored, and replace that result.
         #[arg(long)]
         fresh: bool,
+        /// How long this result answers, over the datasource's cache_ttl: seconds, or 10s, 30m, 1h, 10d; 0 keeps nothing, -1 never expires.
+        #[arg(long, allow_hyphen_values = true, value_parser = parse_ttl)]
+        ttl: Option<zsql_datasource::CacheTtl>,
         /// Statement timeout in seconds for this run.
         #[arg(long)]
         timeout: Option<u64>,
@@ -779,6 +782,11 @@ pub(crate) fn read_json(path: Option<PathBuf>) -> Result<Option<Value>> {
     })
 }
 
+/// `--ttl` as `cache_ttl` is written.
+fn parse_ttl(s: &str) -> Result<zsql_datasource::CacheTtl, String> {
+    zsql_datasource::CacheTtl::parse(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +874,7 @@ mod tests {
             limit: None,
             all: false,
             fresh: false,
+            ttl: None,
             timeout: None,
             format: Some("json".into()),
             out: None,

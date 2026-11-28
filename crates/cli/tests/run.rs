@@ -95,6 +95,24 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--fresh"]));
     assert!(ok && err.contains("ran fresh") && !err.contains("cached"), "{err}");
 
+    // --ttl is kept on the result, and a result older than a request's
+    // TTL does not answer it; -1 never expires; a bad one is refused.
+    let (ok, out, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "30m", "--format", "json"]));
+    assert!(ok, "{out}{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["cache"]["hit"], true, "young enough for half an hour: {v}");
+    let (ok, out, _) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "-1", "--fresh", "--format", "json"]));
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["manifest"]["cache_ttl_secs"], -1, "{v}");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "1s"]));
+    assert!(ok && !err.contains("cached"), "two seconds old is too old for one: {err}");
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "1.5h"]));
+    assert!(!ok && err.contains("not a duration"), "{err}");
+    // Back to the datasource's day, so what follows finds it stored.
+    assert!(run(zsql(&home, &project).args(["run", "--expr", "status, total", "--fresh"])).0);
+
     // Another question is another result; a context is another key.
     let (ok, out, err) = run(zsql(&home, &project).args(["run", "--expr", "region, total"]));
     assert!(ok && out.contains("north") && !err.contains("cached"), "{out}{err}");
@@ -189,6 +207,18 @@ fn a_query_runs_is_kept_and_answers_again_from_the_store() {
     assert!(ok && out.starts_with("Status,Total\n"), "{out}");
     let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--out", "x.parquet"]));
     assert!(!ok && err.contains("say --format for this extension"), "{err}");
+
+    // A datasource that keeps nothing refuses --ttl that would keep,
+    // runs with --ttl 0, and a datasources.yml that does not read says so.
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n  cache_ttl: 0\n").unwrap();
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "1h"]));
+    assert!(!ok && err.contains("datasource local keeps no results"), "{err}");
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total", "--ttl", "0"]));
+    assert!(ok && !err.contains("cached"), "{err}");
+    std::fs::write(project.join("datasources.yml"), "local:\n  adapter: sqlite\n  tier: hot\n  file: ./shop.db\n  cache_ttl: soon\n")
+        .unwrap();
+    let (ok, _, err) = run(zsql(&home, &project).args(["run", "--expr", "status, total"]));
+    assert!(!ok && err.contains("not a duration"), "{err}");
 }
 
 /// A cached result must belong to the database it came from. The key once

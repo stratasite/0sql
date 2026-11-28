@@ -115,6 +115,31 @@ fn the_records_of_runs_in_postgres() {
     db.save(&gone).unwrap();
     assert!(db.cached(&key).unwrap().is_none(), "nor does an expired one");
 
+    // A result that never expires reads back as it was written; a newer
+    // one under its key ends it now, and an ordinary one it caps.
+    let ttl_key = run_cache_key(DEFAULT_ORG, "shop", "SELECT 3");
+    let mut never = record("r-20261124-never", Some(&ttl_key), Status::Succeeded, "node-a", "2026-11-24T12:00:00Z");
+    never.finished_at = Some("2026-11-24T12:00:01Z".into());
+    never.expires_at = Some(zsql_exec::NEVER_EXPIRES.into());
+    db.insert(&never).unwrap();
+    assert_eq!(db.get("r-20261124-never").unwrap().unwrap().expires_at.as_deref(), Some(zsql_exec::NEVER_EXPIRES));
+    let mut newer = record("r-20261124-newer", Some(&ttl_key), Status::Succeeded, "node-a", "2026-11-24T12:05:00Z");
+    newer.finished_at = Some("2026-11-24T12:05:01Z".into());
+    newer.expires_at = Some("2999-06-01T00:00:00Z".into());
+    db.insert(&newer).unwrap();
+    let mut longer = record("r-20261124-longer", Some(&ttl_key), Status::Succeeded, "node-a", "2026-11-24T12:01:00Z");
+    longer.finished_at = Some("2026-11-24T12:01:01Z".into());
+    longer.expires_at = Some("2999-12-01T00:00:00Z".into());
+    db.insert(&longer).unwrap();
+    assert_eq!(db.supersede(&newer).unwrap(), 2);
+    let ended = db.get("r-20261124-never").unwrap().unwrap();
+    assert!(ended.dirty && ended.expires_at.as_deref() < Some("2999"), "it ends now: {ended:?}");
+    assert!(db.cached(&ttl_key).unwrap().is_some_and(|r| r.id == "r-20261124-newer"));
+    let capped = db.get("r-20261124-longer").unwrap().unwrap();
+    assert_eq!((capped.expires_at.as_ref(), capped.dirty), (newer.expires_at.as_ref(), false));
+    assert_eq!(db.supersede(&newer).unwrap(), 0, "what already ends with it is left");
+    assert_eq!(db.get("r-20261124-newer").unwrap().unwrap().expires_at, newer.expires_at, "nor is the newer one touched");
+
     // Invalidation by table, and what cleanup is told still sits in the store.
     let other = run_cache_key(DEFAULT_ORG, "shop", "SELECT 2");
     let mut kept = record("r-20261124-kept", Some(&other), Status::Succeeded, "node-a", "2026-11-24T11:00:00Z");
@@ -161,7 +186,7 @@ fn the_records_of_runs_in_postgres() {
             row_limit: None,
             tables: vec!["t".into()],
             cache_key: Some(run_cache_key(DEFAULT_ORG, "shop", sql)),
-            cache_ttl: Duration::from_secs(3600),
+            cache_ttl: zsql_datasource::CacheTtl::For(Duration::from_secs(3600)),
             fresh: false,
             pool_key: None,
             close_first: None,
