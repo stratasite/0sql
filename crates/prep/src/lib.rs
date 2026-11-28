@@ -194,6 +194,19 @@ pub struct Prep {
     busy: Mutex<HashSet<PathBuf>>,
     /// The datasets a run is making, by their directory: one at a time.
     running: Mutex<HashMap<PathBuf, (Scope, String)>>,
+    /// The snapshots each run going reads, by its dataset's directory: a
+    /// source's directory and snapshot number. A source read by a run is
+    /// not deleted under it, nor a snapshot it reads pruned, so a run
+    /// never ends pointing at rows that are gone.
+    holds: Mutex<HashMap<PathBuf, Vec<(PathBuf, u32)>>>,
+    /// The sources being deleted, by directory: a run that would read
+    /// one is refused. Changed only with `holds` locked first.
+    deleting: Mutex<HashSet<PathBuf>>,
+    /// The run ids being asked for now: a run id is begun by one request
+    /// at a time, so a retry sent while the first is checked waits, and
+    /// is answered what the first came to.
+    claims: Mutex<HashSet<PathBuf>>,
+    claimed: std::sync::Condvar,
     /// The object store each dataset and source is copied to.
     backup: Option<std::sync::Arc<zsql_exec::Objects>>,
     /// Set when the server stops: no job starts.
@@ -209,6 +222,20 @@ pub struct Prep {
 
 /// How long a run waits for another job on a source it pulled to end.
 const RUN_JOB_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A run id claimed by one request; let go, and the next waiting woken,
+/// when dropped.
+pub(crate) struct Claim<'a> {
+    prep: &'a Prep,
+    path: PathBuf,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        lock(&self.prep.claims).remove(&self.path);
+        self.prep.claimed.notify_all();
+    }
+}
 
 /// A source or dataset held for one job; let go when dropped. Its
 /// marker goes with it, unless a stop suspended it.
@@ -226,7 +253,7 @@ impl Drop for Job<'_> {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -248,6 +275,10 @@ impl Prep {
             duckdb_version,
             busy: Mutex::new(HashSet::new()),
             running: Mutex::new(HashMap::new()),
+            holds: Mutex::new(HashMap::new()),
+            deleting: Mutex::new(HashSet::new()),
+            claims: Mutex::new(HashSet::new()),
+            claimed: std::sync::Condvar::new(),
             backup: None,
             stopping: std::sync::atomic::AtomicBool::new(false),
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -363,6 +394,32 @@ impl Prep {
 
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Claims a run id, at `path`, waiting while another request has it.
+    pub(crate) fn claim(&self, path: &Path) -> Claim<'_> {
+        let mut claims = lock(&self.claims);
+        while claims.contains(path) {
+            claims = self.claimed.wait(claims).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        claims.insert(path.to_path_buf());
+        Claim { prep: self, path: path.to_path_buf() }
+    }
+
+    /// A run's dataset let go, with the snapshots it held.
+    pub(crate) fn release(&self, dir: &Path) {
+        lock(&self.running).remove(dir);
+        lock(&self.holds).remove(dir);
+    }
+
+    /// Holds a snapshot for the run making the dataset at `dir`.
+    pub(crate) fn hold(&self, dir: &Path, source: PathBuf, n: u32) {
+        lock(&self.holds).entry(dir.to_path_buf()).or_default().push((source, n));
+    }
+
+    /// The snapshots of the source at `source` that runs going hold.
+    pub(crate) fn held(&self, source: &Path) -> HashSet<u32> {
+        lock(&self.holds).values().flatten().filter(|(s, _)| s == source).map(|(_, n)| *n).collect()
     }
 
     /// Whether a stop's grace is over: what still runs is suspended.

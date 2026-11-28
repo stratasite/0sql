@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::source::{Kind, Query, SemanticRead};
 use crate::store::{self, Materialization, Snapshot, Source};
 use crate::{
-    description_of, is_source_id, name_of, new_source_id, recovery, sha256, snapshot, time, Arrived, Page, Prep, Scope, Upload, View,
+    description_of, is_source_id, lock, name_of, new_source_id, recovery, sha256, snapshot, time, Arrived, Page, Prep, Scope, Upload, View,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -196,7 +196,7 @@ impl Prep {
         let snap = take(self, &dir, &mut s)?;
         s.interrupted = None;
         store::write_json(&dir.join(store::SOURCE), &s)?;
-        self.prune(&self.root(scope), &dir, &s);
+        self.prune(scope, &dir, &s);
         drop(held);
         self.backed_up(&dir);
         Ok((self.source(scope, id)?, snap))
@@ -287,11 +287,13 @@ impl Prep {
 
     /// Lets go of a source's oldest snapshots past what it keeps, but
     /// never one an output points to, or a live output read.
-    fn prune(&self, root: &Path, dir: &Path, s: &Source) {
+    fn prune(&self, scope: &Scope, dir: &Path, s: &Source) {
         if (s.snapshot as usize) <= SNAPSHOTS_KEPT {
             return;
         }
-        let mut pinned: HashSet<u32> = HashSet::new();
+        let root = &self.root(scope);
+        // What a run going reads, or pulled, stays until it ends.
+        let mut pinned: HashSet<u32> = self.held(dir);
         for (ddir, d) in store::datasets_in(root) {
             for v in recovery::entries(&ddir) {
                 let Ok(m) = store::read_json::<Materialization>(&v.join("manifest.json")) else { continue };
@@ -307,8 +309,9 @@ impl Prep {
         for n in 1..=oldest_kept {
             let sd = store::snapshot_dir(dir, n);
             if !pinned.contains(&n) && sd.exists() {
-                if let Err(e) = store::remove(&sd) {
-                    tracing::warn!("snapshot {n} of source {} was to go and did not: {e}", s.id);
+                match store::remove(&sd) {
+                    Ok(()) => self.forget_backup(&scope.org, &scope.project, &["sources", &s.id, "snapshots", &n.to_string()]),
+                    Err(e) => tracing::warn!("snapshot {n} of source {} was to go and did not: {e}", s.id),
                 }
             }
         }
@@ -372,6 +375,16 @@ impl Prep {
     pub fn delete_source(&self, scope: &Scope, id: &str) -> Result<Vec<String>> {
         let (dir, _) = self.find_source(scope, id)?;
         let held = self.job(&dir, recovery::JobKind::Delete)?;
+        // A run reading it keeps it until it ends; past this, no run
+        // starts reading it.
+        {
+            let holds = lock(&self.holds);
+            if holds.values().flatten().any(|(s, _)| *s == dir) {
+                return Err(Error::Conflict(format!("source {id} is read by a run going now; delete it when that is done")));
+            }
+            lock(&self.deleting).insert(dir.clone());
+        }
+        let _unmark = Unmark(self, dir.clone());
         let root = self.root(scope);
         let mut copied = Vec::new();
         for (ddir, d) in store::datasets_in(&root) {
@@ -396,5 +409,15 @@ impl Prep {
         self.forget_backup(&scope.org, &scope.project, &["sources", id]);
         tracing::info!("source {id} removed from {}/{}", scope.org, scope.project);
         Ok(copied)
+    }
+}
+
+/// A source's delete, unmarked when it is over, however it ends.
+struct Unmark<'a>(&'a Prep, PathBuf);
+
+impl Drop for Unmark<'_> {
+    fn drop(&mut self) {
+        let _holds = lock(&self.0.holds);
+        lock(&self.0.deleting).remove(&self.1);
     }
 }

@@ -612,6 +612,9 @@ impl Prep {
         let root = self.root(scope);
         let asked = sha256(&serde_json::to_vec(&(&request.dataset, &request.graph, keys))?);
         let path = store::run_path(&root, &request.id);
+        // One request at a time begins a run id: a retry waits here for
+        // the first to be checked, then reads what it came to.
+        let _claim = self.claim(&path);
         if let Ok(r) = store::read_json::<RunRecord>(&path) {
             if r.request != asked {
                 return Err(Error::Conflict(format!(
@@ -644,7 +647,16 @@ impl Prep {
                     request.dataset
                 )));
             }
+            // What it reads is held until it ends, under the same lock a
+            // source's delete looks for holds and marks itself with.
+            let mut holds = lock(&self.holds);
+            let deleting = lock(&self.deleting);
+            let reads: Vec<(PathBuf, u32)> = r.sources.values().map(|(s, snap)| (store::source_dir(&root, &s.id), snap.number)).collect();
+            if let Some((s, _)) = r.sources.values().find(|(s, _)| deleting.contains(&store::source_dir(&root, &s.id))) {
+                return Err(Error::Conflict(format!("source {} is being deleted", s.id)));
+            }
             running.insert(dir.clone(), (scope.clone(), request.id.clone()));
+            holds.insert(dir.clone(), reads);
         }
         let started = time::now();
         let pulling: Vec<String> = r.pulls.iter().map(|p| p.name.clone()).collect();
@@ -666,7 +678,7 @@ impl Prep {
             interrupted: None,
         };
         if let Err(e) = store::write_json(&path, &record) {
-            lock(&self.running).remove(&dir);
+            self.release(&dir);
             return Err(e);
         }
         let _ = std::fs::remove_file(dir.join(recovery::INTERRUPTED));
@@ -688,6 +700,7 @@ impl Prep {
     pub fn pulled_for(&self, ticket: &mut Ticket, source: &str, arrived: Arrived) -> Result<()> {
         let (_, snap) = self.pulled(&ticket.scope, source, arrived)?;
         let (dir, _) = self.find_source(&ticket.scope, source)?;
+        self.hold(&ticket.dir, dir.clone(), snap.number);
         let rows = store::snapshot_dir(&dir, snap.number).join(store::ROWS);
         ticket.pulled.insert(source.to_string(), Took { snap, rows, kept: true });
         Ok(())
@@ -715,7 +728,7 @@ impl Prep {
             r.state = RunState::Suspended;
             let _ = store::write_json(&store::run_path(&self.root(&ticket.scope), &ticket.id), &r);
         }
-        lock(&self.running).remove(&ticket.dir);
+        self.release(&ticket.dir);
         r
     }
 
@@ -748,7 +761,7 @@ impl Prep {
             tracing::warn!("run {} could not be recorded: {e}", ticket.id);
         }
         self.last_run(&ticket.dir, &r);
-        lock(&self.running).remove(&ticket.dir);
+        self.release(&ticket.dir);
         evict(&root.join(store::RUNS), RUNS_KEPT);
         tracing::info!("run {} of {} in {}/{}: {:?}", r.id, r.dataset, ticket.scope.org, ticket.scope.project, r.state);
         r

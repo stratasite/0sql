@@ -168,7 +168,8 @@ live version, or the version it names.
   live source, so a run can be done again on the same data, and a tool
   is not called again to repeat one.
 - **A source keeps its 20 newest snapshots,** and every one an output
-  points to, or a live output read.
+  points to, a live output read, or a run going reads; one let go
+  leaves the backup too.
 
 **A CSV upload** says, or has detected and recorded: encoding (UTF-8,
 with a BOM accepted), delimiter, quote, whether there is a header. Types
@@ -189,7 +190,9 @@ in the order first seen, its type inferred as a file's is.
 
 A request is the graph, the output dataset it makes, the context, and a
 **run id** the application chooses. A run id sent again answers what the
-first one did, in flight or done, so a retry makes nothing twice. One run
+first one did, in flight or done, so a retry makes nothing twice; one
+sent again while the first is still being checked waits for that check,
+and is answered what it came to (the same refusal, if it was refused). One run
 per output dataset at a time; another is 409, class `Conflict`.
 
 The graph is nodes, each with the application's id, which 0sql never
@@ -684,7 +687,9 @@ recent blends.
 of it, and its copy in the object-store backup, are removed, and the
 kept blends that cite it go. Its sources stay: other pipelines may read
 them, and which do is the application's to know, since it keeps the
-pipelines. A source's delete removes every snapshot of it; a dataset
+pipelines. A source's delete removes every snapshot of it, and is
+409 while a run going reads it (no run starts reading it once its delete
+has begun); a dataset
 output that is one of its snapshots as it is is given those rows first,
 so it keeps answering, and a pipeline that reads it fails its next run,
 saying so. A project's removal, `DELETE /projects/{uid}`, removes its

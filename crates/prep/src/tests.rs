@@ -1126,6 +1126,70 @@ fn two_runs_pulling_one_source_at_once_both_keep_what_they_pulled() {
 }
 
 #[test]
+fn a_source_a_run_reads_is_not_deleted_or_pruned_under_it() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, _) = upload(&prep, &ann, SALES);
+    let d = prep.create_dataset(&ann, Named::default(), None).unwrap();
+    let g = graph(json!([
+        { "id": "in", "kind": "source", "source": s.id, "read": { "snapshot": 1 } },
+        { "id": "out", "kind": "output", "input": "in" },
+    ]));
+    let Begun::Started(t) = prep.begin(&ann, RunRequest { id: run_id(), dataset: d.id.clone(), graph: g }, &Keys::new(ANN)).unwrap() else {
+        panic!()
+    };
+    // Its delete waits for the run.
+    let e = prep.delete_source(&ann, &s.id).err().unwrap();
+    assert!(matches!(&e, Error::Conflict(m) if m.contains("read by a run going now")), "{e}");
+    // Snapshot 1 is past what is kept, and held.
+    for _ in 0..21 {
+        prep.add_upload(&ann, &s.id, csv(SALES)).unwrap();
+    }
+    assert!(prep.snapshot(&ann, &s.id, Some(1)).is_ok(), "held while the run reads it");
+    let r = prep.execute(*t);
+    assert_eq!(r.state, RunState::Succeeded, "{}", r.summary);
+    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 3);
+    // Let go: the delete goes ahead, and the output keeps its rows.
+    assert!(prep.delete_source(&ann, &s.id).unwrap().contains(&d.id));
+    assert_eq!(rows_of(&prep, &ann, &d.id).len(), 3);
+}
+
+#[test]
+fn a_run_id_sent_twice_at_once_is_begun_once() {
+    let (_dir, prep) = prep();
+    let ann = scope();
+    let (s, d) = upload(&prep, &ann, SALES);
+    let g = steps_graph(&s.id, json!([{ "op": "sort", "by": [{ "column": "amount" }] }]));
+    for k in 0..10 {
+        let id = format!("twice-{k}");
+        let gate = std::sync::Barrier::new(2);
+        let begun: Vec<Begun> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..2)
+                .map(|_| {
+                    let (prep, ann, gate, g, id, ds) = (&prep, &ann, &gate, g.clone(), id.clone(), d.id.clone());
+                    scope.spawn(move || {
+                        gate.wait();
+                        prep.begin(ann, RunRequest { id, dataset: ds, graph: g }, &Keys::new(ANN)).unwrap()
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        let mut started = 0;
+        for b in begun {
+            match b {
+                Begun::Started(t) => {
+                    started += 1;
+                    assert_eq!(prep.execute(*t).state, RunState::Succeeded);
+                }
+                Begun::Answered(r) => assert_eq!(r.id, id),
+            }
+        }
+        assert_eq!(started, 1, "one of the two begins it, the other is answered");
+    }
+}
+
+#[test]
 fn a_dataset_deleted_takes_its_run_records_with_it() {
     let (_dir, prep) = prep();
     let ann = scope();
