@@ -16,7 +16,7 @@ tracing.workspace = true
 # A page of rows as JSON, and the batches it is read from, as a run's are.
 zsql-exec.workspace = true
 zsql-datasource.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 csv = "1"
 # The engine, opened in memory with external access off: every file a
 # dataset has is read and written here, in Rust, and DuckDB only ever
