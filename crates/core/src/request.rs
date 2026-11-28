@@ -50,6 +50,9 @@ pub struct SqlResponse {
     pub datasource: String,
     pub datasource_uid: String,
     pub adapter: String,
+    /// The statement's result columns in SELECT order: the field each is,
+    /// and the format and display type a client shows it with.
+    pub columns: Vec<zsql_planner::columns::Column>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub corrections: Vec<zsql_spec::fuzzy::Correction>,
     /// The spec a shorthand `expr` made, and how each item was read.
@@ -67,6 +70,7 @@ pub struct ExplainResponse {
     pub datasource: String,
     pub datasource_uid: String,
     pub adapter: String,
+    pub columns: Vec<zsql_planner::columns::Column>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub corrections: Vec<zsql_spec::fuzzy::Correction>,
     #[serde(skip_serializing_if = "Option::is_none")]

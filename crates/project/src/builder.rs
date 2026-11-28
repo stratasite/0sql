@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as Json;
 use serde_yaml::Value as Yaml;
 use zsql_dialect::Dialects;
+use zsql_semantic::presentation::Scope;
 use zsql_semantic::{
     BranchRef, Cardinality, DataType, Datasource, Exclusion, ExclusionScope, ExclusionType, Expression, Field, FieldKind, FilterMode, Id,
     Inclusion, JoinDef, JoinType, Partition, PermissionSource, PermissionValueFrom, PolicyMode, Predicate, ProjectRef, SecurityPolicy,
@@ -111,6 +112,7 @@ const FIELD_KEYS: &[&str] = &[
     "grains",
     "data_type",
     "format",
+    "display_type",
     "snapshot",
     "exclusion_type",
     "exclusions",
@@ -574,11 +576,25 @@ impl<'d> Builder<'d> {
             return Err(invalid(file, format!("Field {name} errors: Exclusions should be empty when exclusion_type is exclude_all")));
         }
         let inclusions = self.inclusion(file, &name, fm)?;
+        // How a client shows the value: checked here, carried as it is
+        // and never applied. `raw` and `none` say nothing on a field.
+        let present = |e: String| invalid(file, format!("Field {name} errors: {e}"));
         let format = match get(fm, "format") {
             None => None,
-            Some(Yaml::String(s)) => parse_format_syntax(s),
-            Some(v @ Yaml::Mapping(_)) => normalize_format(yaml_to_json(v)),
-            Some(_) => return Err(invalid(file, format!("Field {name} errors: format must be a shortcut string or a mapping"))),
+            Some(v @ (Yaml::String(_) | Yaml::Mapping(_))) => {
+                zsql_semantic::presentation::format(&yaml_to_json(v), Scope::Field).map_err(present)?.filter(|f| f["type"] != "raw")
+            }
+            Some(_) => return Err(present("format must be a shortcut string or a mapping".into())),
+        };
+        let data_type_name = serde_json::to_value(data_type).ok().and_then(|v| v.as_str().map(str::to_string));
+        let display_type = match get(fm, "display_type") {
+            None => None,
+            Some(v @ (Yaml::String(_) | Yaml::Mapping(_))) => {
+                zsql_semantic::presentation::display(&yaml_to_json(v), data_type_name.as_deref(), Scope::Field)
+                    .map_err(present)?
+                    .filter(|d| d["type"] != "none")
+            }
+            Some(_) => return Err(present("display_type must be a name or a mapping".into())),
         };
 
         let key = (kind, name.trim().to_lowercase());
@@ -602,6 +618,7 @@ impl<'d> Builder<'d> {
                     tags: vec![],
                     grains: vec![],
                     format: None,
+                    display_type: None,
                     exclusion_type: None,
                     exclusions: vec![],
                     inclusions: None,
@@ -676,6 +693,9 @@ impl<'d> Builder<'d> {
             if let Some(f) = &format {
                 spoke.push(("format", f.to_string()));
             }
+            if let Some(d) = &display_type {
+                spoke.push(("display_type", d.to_string()));
+            }
             let f = &mut self.fields[field_index];
             f.name = name.clone();
             // Semantics: the last definition decides, stated or not.
@@ -695,6 +715,9 @@ impl<'d> Builder<'d> {
             }
             if format.is_some() {
                 f.format = format;
+            }
+            if display_type.is_some() {
+                f.display_type = display_type;
             }
             if said("enable_sampling") {
                 f.enable_sampling = bool_of(fm, "enable_sampling").unwrap_or(false);
@@ -1555,108 +1578,8 @@ fn parse_filter_mode(s: Option<String>) -> Option<FilterMode> {
     }
 }
 
-/// Rails `FormatParseable#parse_format_syntax`: `number:2:abbreviate`,
-/// `currency:2:USD`, `percent:1`, `date:short`, `datetime:iso`, `html:...`,
-/// `javascript:...`.
+/// A format shortcut (`currency:2`, `date:short`) in its mapping shape,
+/// or nothing when it is not one; `zsql_semantic::presentation` says why.
 pub fn parse_format_syntax(syntax: &str) -> Option<Json> {
-    let syntax = syntax.trim();
-    if syntax.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = syntax.split(':').collect();
-    let mut f = serde_json::Map::new();
-    let precision = |p: Option<&&str>| p.filter(|s| !s.is_empty() && **s != "abbreviate").and_then(|s| s.parse::<i64>().ok());
-    match parts[0] {
-        "number" => {
-            f.insert("type".into(), Json::from("number"));
-            if let Some(p) = precision(parts.get(1)) {
-                f.insert("precision".into(), Json::from(p));
-            }
-            if parts.contains(&"abbreviate") {
-                f.insert("abbreviate".into(), Json::from(true));
-            }
-        }
-        "currency" => {
-            f.insert("type".into(), Json::from("currency"));
-            f.insert("precision".into(), Json::from(precision(parts.get(1)).unwrap_or(2)));
-            if let Some(unit) = parts.get(2).filter(|s| !s.is_empty() && **s != "abbreviate") {
-                f.insert("unit".into(), Json::from(*unit));
-            }
-            if parts.contains(&"abbreviate") {
-                f.insert("abbreviate".into(), Json::from(true));
-            }
-        }
-        "percent" => {
-            f.insert("type".into(), Json::from("percent"));
-            f.insert("precision".into(), Json::from(precision(parts.get(1)).unwrap_or(2)));
-        }
-        "date" => {
-            f.insert("type".into(), Json::from("date"));
-            let pattern = match parts.get(1).copied() {
-                Some("short") => "%b %d, %Y".to_string(),
-                Some("long") => "%B %d, %Y".to_string(),
-                Some("iso") | None | Some("") => "%Y-%m-%d".to_string(),
-                Some(style) => style.to_string(),
-            };
-            f.insert("pattern".into(), Json::from(pattern));
-        }
-        "datetime" => {
-            f.insert("type".into(), Json::from("datetime"));
-            let pattern = match parts.get(1).copied() {
-                Some("short") => "%b %d, %Y %I:%M %p".to_string(),
-                Some("long") => "%B %d, %Y at %I:%M:%S %p".to_string(),
-                Some("iso") | None | Some("") => "%Y-%m-%d %H:%M:%S".to_string(),
-                Some(style) => style.to_string(),
-            };
-            f.insert("pattern".into(), Json::from(pattern));
-        }
-        "html" => {
-            f.insert("type".into(), Json::from("html"));
-            if parts.len() > 1 && !parts[1].is_empty() {
-                f.insert("template".into(), Json::from(parts[1..].join(":")));
-            }
-        }
-        "javascript" => {
-            f.insert("type".into(), Json::from("javascript"));
-            if parts.len() > 1 && !parts[1].is_empty() {
-                f.insert("function".into(), Json::from(parts[1..].join(":")));
-            }
-        }
-        _ => return None,
-    }
-    Some(Json::Object(f))
-}
-
-/// Rails `normalize_format_hash`: blanks dropped, precision an integer,
-/// abbreviate kept only when true.
-fn normalize_format(v: Json) -> Option<Json> {
-    let Json::Object(m) = v else { return None };
-    let mut out = serde_json::Map::new();
-    for (k, v) in m {
-        match (k.as_str(), &v) {
-            (_, Json::Null) => {}
-            (_, Json::String(s)) if s.is_empty() => {}
-            ("precision", Json::Number(n)) => {
-                out.insert(k, Json::from(n.as_f64().unwrap_or(0.0) as i64));
-            }
-            ("precision", Json::String(s)) => {
-                out.insert(k, Json::from(s.trim().parse::<i64>().unwrap_or(0)));
-            }
-            ("abbreviate", Json::Bool(true)) => {
-                out.insert(k, Json::from(true));
-            }
-            ("abbreviate", Json::String(s)) if matches!(s.to_lowercase().as_str(), "true" | "1" | "yes") => {
-                out.insert(k, Json::from(true));
-            }
-            ("abbreviate", _) => {}
-            _ => {
-                out.insert(k, v);
-            }
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(Json::Object(out))
-    }
+    zsql_semantic::presentation::format_shortcut(syntax).ok().flatten()
 }

@@ -433,6 +433,7 @@ mod tests {
                 source: "model".into(),
                 arrow_type: Some("Utf8".into()),
                 field_uid: Some("status".into()),
+                ..Default::default()
             }],
             rows_format: ROWS_FORMAT.into(),
             timings: Timings::default(),
@@ -587,7 +588,7 @@ mod tests {
         }
         let mut old =
             Manifest { format: 1, key: old_key.clone(), rows_format: ROWS_FORMAT_TEXT.into(), transport: None, ..manifest.clone() };
-        old.columns.push(Column { name: "n".into(), data_type: None, source: "unknown".into(), arrow_type: None, field_uid: None });
+        old.columns.push(Column { name: "n".into(), source: "unknown".into(), ..Default::default() });
         std::fs::write(old_dir.join("manifest.json"), serde_json::to_string(&old).unwrap()).unwrap();
         let read = store.lookup(&old_key).unwrap().unwrap();
         let old_rows = vec![vec![Some("paid".to_string()), Some("3".to_string())], vec![None, Some("1".to_string())]];

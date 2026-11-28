@@ -197,6 +197,8 @@ fields:\n\
   #   data_type: string               # string | integer | bigint | decimal | date | date_time | boolean\n\
   #   synonyms: [dept]\n\
   #   tags: []                        # policy triggers, e.g. [pii]\n\
+  #   hidden: false                   # left out of listings and search; still queryable\n\
+  #   display_type: link              # how a client renders it: link | email | phone | image | html | markdown | transcript | json | x-yours\n\
   #   enable_sampling: true           # collect this dimension's values into samples/values.jsonl.gz\n\
   #   sample_size: 1000               # how many values, most frequent first; at most 20000\n\
   #   sample_sql: |                   # your own query instead of the generated one\n\
@@ -208,7 +210,7 @@ fields:\n\
   # - type: measure\n\
   #   name: Revenue\n\
   #   data_type: decimal\n\
-  #   format: currency:2\n\
+  #   format: currency:2              # number | currency | percent | date | datetime | template; the engine never applies it\n\
   #   expression:\n\
   #     sql: sum(revenue)\n"
     )

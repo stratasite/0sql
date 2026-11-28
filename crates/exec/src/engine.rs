@@ -155,13 +155,40 @@ impl Engine {
         }
 
         let s = model.semantic().snapshot();
+        // The plan names the statement's columns in SELECT order; a
+        // column the transport reports under that name at that place is
+        // the plan's. Anything else is matched to the model by name, as
+        // a column of a statement written by hand would be.
+        let planned_columns = &planned.plan.columns;
         let columns: Vec<Column> = batches
             .schema
             .fields()
             .iter()
-            .map(|column| {
+            .enumerate()
+            .map(|(i, column)| {
                 let name = column.name();
                 let arrow_type = Some(column.data_type().to_string());
+                if let Some(c) = planned_columns.get(i).filter(|c| c.name.eq_ignore_ascii_case(name)) {
+                    return Column {
+                        name: name.clone(),
+                        data_type: c.data_type.clone(),
+                        source: if c.data_type.is_none() {
+                            "unknown"
+                        } else if c.calculation {
+                            "calculation"
+                        } else {
+                            "model"
+                        }
+                        .into(),
+                        arrow_type,
+                        field_uid: c.field_uid.clone(),
+                        grain: c.grain.clone(),
+                        extract: c.extract.clone(),
+                        format: c.format.clone(),
+                        display_type: c.display_type.clone(),
+                        hidden: c.hidden,
+                    };
+                }
                 match s.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name) || f.uid.eq_ignore_ascii_case(name)) {
                     Some(f) => Column {
                         name: name.clone(),
@@ -169,8 +196,9 @@ impl Engine {
                         source: "model".into(),
                         arrow_type,
                         field_uid: Some(f.uid.clone()),
+                        ..Default::default()
                     },
-                    None => Column { name: name.clone(), data_type: None, source: "unknown".into(), arrow_type, field_uid: None },
+                    None => Column { name: name.clone(), source: "unknown".into(), arrow_type, ..Default::default() },
                 }
             })
             .collect();

@@ -170,6 +170,10 @@ pub struct ProjectionSpec {
     pub order_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,
+    /// A name (`link`) or a mapping (`{type: link, href: ...}`); see
+    /// `zsql_semantic::presentation`. `default` keeps the field's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_type: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -185,8 +189,6 @@ pub struct ProjectionSpec {
     // Bookkeeping Rails' serializer emits and the spec never reads.
     #[serde(default, skip_serializing)]
     pub id: Option<Value>,
-    #[serde(default, skip_serializing)]
-    pub display_type: Option<Value>,
     #[serde(default, skip_serializing)]
     pub schema_type: Option<Value>,
     #[serde(default, skip_serializing)]
@@ -541,6 +543,8 @@ pub fn lower(spec: &Spec, semantic: &SemanticModel, dialect: &Dialect) -> Result
     for (i, s) in spec.segments.iter().enumerate() {
         segments.push(lower_segment(&cx, s, i, &mut projections)?);
     }
+    // After the segments: an expanding one adds the columns it carries.
+    present(&cx, &mut projections)?;
 
     Ok(Query {
         corrections: cx.corrections.take(),
@@ -601,6 +605,7 @@ fn lower_field_projection(cx: &Cx, p: &ProjectionSpec, reference: String, ordina
         measure_refs: vec![],
         projection_refs: vec![],
         format: p.format.clone().filter(|v| !v.is_null()),
+        display_type: p.display_type.clone().filter(|v| !v.is_null()),
         decorators,
         parent: None,
         is_static: false,
@@ -734,6 +739,7 @@ fn lower_calculation(cx: &Cx, p: &ProjectionSpec, reference: String, ordinal: i6
         measure_refs,
         projection_refs,
         format: p.format.clone().filter(|v| !v.is_null()),
+        display_type: p.display_type.clone().filter(|v| !v.is_null()),
         decorators,
         parent: None,
         is_static: false,
@@ -969,6 +975,37 @@ fn humanize(s: &str) -> String {
         out.replace_range(..1, &upper);
     }
     out
+}
+
+/// Each projection's format and display type checked and put in one
+/// shape, now that every column the query names is known: a projection's
+/// template may read another of them. A projection that says nothing
+/// keeps nothing here; the field's are taken where the columns are made.
+fn present(cx: &Cx, projections: &mut [Projection]) -> Result<()> {
+    use zsql_semantic::presentation::{self, Scope};
+    let columns: Vec<String> = projections.iter().map(|p| display_alias(cx, p)).collect();
+    for (i, p) in projections.iter_mut().enumerate() {
+        let owner = &columns[i];
+        let bad = |e: String| record_invalid(format!("Projection {owner}: {e}"));
+        // A decorated column is not the field's type (an extracted month
+        // is a number), so only a bare one is held to the field's.
+        let data_type = match (&p.calculation_data_type, &p.field_uid) {
+            (Some(t), _) => Some(t.clone()),
+            (None, Some(uid)) if p.decorators.is_empty() => cx
+                .semantic
+                .field_by_uid(uid, p.field_kind)
+                .and_then(|f| serde_json::to_value(f.data_type).ok())
+                .and_then(|v| v.as_str().map(str::to_string)),
+            _ => None,
+        };
+        if let Some(f) = p.format.take() {
+            p.format = presentation::format(&f, Scope::Query(&columns)).map_err(bad)?;
+        }
+        if let Some(d) = p.display_type.take() {
+            p.display_type = presentation::display(&d, data_type.as_deref(), Scope::Query(&columns)).map_err(bad)?;
+        }
+    }
+    Ok(())
 }
 
 fn display_alias(cx: &Cx, p: &Projection) -> String {
@@ -1434,6 +1471,7 @@ fn segment_projection(reference: String, f: &Field, ordinal: i64, kind: Projecti
         measure_refs: vec![],
         projection_refs: vec![],
         format: None,
+        display_type: None,
         decorators: vec![],
         parent: None,
         is_static: false,
@@ -1549,6 +1587,7 @@ fn projection_spec(p: &Projection) -> ProjectionSpec {
         axis: Some(p.axis.clone()).filter(|a| a != "row"),
         order_by: p.order_by.map(|o| o.sql().to_string()),
         format: p.format.clone(),
+        display_type: p.display_type.clone(),
         hidden: if p.hidden { Some(true) } else { None },
         decorators: p.decorators.iter().map(decorator_spec).collect(),
         ..Default::default()

@@ -188,3 +188,189 @@ fn refusals_carry_their_class() {
     let e = model.sql(SqlRequest { spec: None, expr: Some("no such field at all".into()), context: None }, &unlimited).unwrap_err();
     assert_eq!(e.kind, Kind::Unprocessable, "{e}");
 }
+
+/// A project whose fields say how they are shown: a format, a display
+/// type, both, or neither.
+fn presented(root: &std::path::Path, fields: &str) -> Result<Model, crate::LoadError> {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::write(root.join("project.yml"), "name: P\nuid: p\n").unwrap();
+    std::fs::write(root.join("datasources.yml"), "wh:\n  adapter: postgres\n").unwrap();
+    std::fs::write(
+        root.join("models/tbl.accounts.yml"),
+        format!("name: Accounts\nphysical_name: accounts\ndatasource: wh\ncost: 1\nfields:\n{fields}"),
+    )
+    .unwrap();
+    Model::from_dir(root, crate::Trust::Owned, dialects())
+}
+
+const PRESENTED: &str = "  - type: dimension
+    name: Account Id
+    data_type: integer
+    hidden: true
+    expression: id
+  - type: dimension
+    name: Account Name
+    data_type: string
+    display_type: { type: link, href: 'https://crm.example.com/{{value}}' }
+    expression: name
+  - type: dimension
+    name: Signed Up
+    data_type: date
+    format: date:short
+    expression: signed_up
+  - type: measure
+    name: Revenue
+    data_type: decimal
+    format: currency:2
+    expression: sum(revenue)
+  - type: measure
+    name: Accounts
+    data_type: integer
+    expression: count(*)
+";
+
+fn columns_of(model: &Model, spec: Value) -> Vec<Value> {
+    let r = model.sql(SqlRequest { spec: Some(spec), expr: None, context: None }, &unlimited).expect("plans");
+    serde_json::to_value(&r).unwrap()["columns"].as_array().cloned().unwrap()
+}
+
+#[test]
+fn columns_carry_the_fields_format_and_display_type() {
+    let root = std::env::temp_dir().join(format!("zsql-presented-{}", std::process::id()));
+    let model = presented(&root, PRESENTED).expect("loads");
+    let cols = columns_of(&model, json!({ "projections": [{ "field": "Account Name" }, { "field": "Revenue" }, { "field": "Accounts" }] }));
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[0]["name"], "Account Name");
+    assert_eq!(cols[0]["kind"], "dimension");
+    assert_eq!(cols[0]["data_type"], "string");
+    assert_eq!(cols[0]["display_type"], json!({ "type": "link", "href": "https://crm.example.com/{{value}}" }));
+    assert_eq!(cols[1]["format"], json!({ "type": "currency", "precision": 2 }));
+    assert!(cols[2].get("format").is_none() && cols[2].get("display_type").is_none(), "{}", cols[2]);
+
+    // fields() says the same of the field.
+    let f = model.fields("Revenue", false);
+    assert_eq!(f["fields"][0]["format"], json!({ "type": "currency", "precision": 2 }));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_projection_overrides_and_reads_other_columns() {
+    let root = std::env::temp_dir().join(format!("zsql-presented-over-{}", std::process::id()));
+    let model = presented(&root, PRESENTED).expect("loads");
+    let cols = columns_of(
+        &model,
+        json!({ "projections": [
+            { "field": "Account Id", "hidden": true },
+            { "field": "Account Name", "display_type": { "type": "link", "href": "https://crm.example.com/accounts/{{account id}}" } },
+            { "field": "Revenue", "format": "raw" },
+            { "field": "Accounts", "format": "number:0", "display_type": "default" },
+        ] }),
+    );
+    assert_eq!(cols[0]["hidden"], true);
+    // The slot is spelled as the column it reads.
+    assert_eq!(cols[1]["display_type"]["href"], "https://crm.example.com/accounts/{{Account Id}}");
+    assert!(cols[2].get("format").is_none(), "raw clears the field's: {}", cols[2]);
+    assert_eq!(cols[3]["format"], json!({ "type": "number", "precision": 0 }));
+
+    // `none` clears a field's display type.
+    let cols = columns_of(&model, json!({ "projections": [{ "field": "Account Name", "display_type": "none" }] }));
+    assert!(cols[0].get("display_type").is_none(), "{}", cols[0]);
+
+    // A slot naming a column the query does not carry is refused.
+    let e = model
+        .sql(
+            SqlRequest {
+                spec: Some(json!({ "projections": [{ "field": "Account Name", "display_type": { "type": "link", "href": "/a/{{Account Id}}" } }] })),
+                expr: None,
+                context: None,
+            },
+            &unlimited,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not a column of this query"), "{e}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_decorator_that_changes_the_value_changes_how_it_shows() {
+    let root = std::env::temp_dir().join(format!("zsql-presented-dec-{}", std::process::id()));
+    let model = presented(&root, PRESENTED).expect("loads");
+    let cols = columns_of(
+        &model,
+        json!({ "projections": [
+            { "field": "Signed Up", "decorators": [{ "type": "truncate", "grain": "month" }] },
+            { "field": "Signed Up", "alias": "Weekday", "decorators": [{ "type": "extract", "extract": "day_name" }] },
+            { "field": "Revenue" },
+            { "field": "Revenue", "decorators": [{ "type": "contribute" }] },
+        ] }),
+    );
+    // A month keeps the date's format and says its grain.
+    assert_eq!(cols[0]["grain"], "month");
+    assert_eq!(cols[0]["format"]["type"], "date");
+    // A weekday is not a date.
+    assert_eq!(cols[1]["extract"], "day_name");
+    assert!(cols[1].get("format").is_none() && cols[1].get("data_type").is_none(), "{}", cols[1]);
+    // A share of the total is a percent, not money.
+    assert_eq!(cols[3]["format"], json!({ "type": "percent" }));
+    assert_eq!((cols[3]["field_uid"].as_str(), cols[3].get("hidden")), (Some("revenue"), None), "{}", cols[3]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_loader_refuses_what_a_client_could_not_show() {
+    let root = std::env::temp_dir().join(format!("zsql-presented-bad-{}", std::process::id()));
+    let field = |extra: &str| format!("  - type: dimension\n    name: Name\n    data_type: string\n{extra}    expression: name\n");
+    for (extra, says) in [
+        ("    format: nope\n", "not a format"),
+        ("    format: 'html:<b>{{value}}</b>'\n", "display_type: html"),
+        ("    format: { type: javascript, function: 'x => x' }\n", "not supported"),
+        ("    format: { type: template, template: '/a/{{Other}}' }\n", "reads only {{value}}"),
+        ("    display_type: sparkle\n", "x-"),
+    ] {
+        let e = presented(&root, &field(extra)).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains(says), "{extra}: {e}");
+    }
+    let e = presented(
+        &root,
+        "  - type: measure\n    name: N\n    data_type: integer\n    display_type: transcript\n    expression: count(*)\n",
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(e.contains("renders text"), "{e}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Across every golden case, the columns a plan reports are the ones its
+/// final SELECT names, each once and in order.
+#[test]
+fn every_planned_column_is_one_the_statement_selects() {
+    let fx = Fixtures::open(Fixtures::default_root());
+    let d = dialects();
+    let mut models: std::collections::HashMap<String, Model> = Default::default();
+    let mut checked = 0;
+    for cases in fx.cases().expect("golden cases").into_values() {
+        for case in cases {
+            let model = models
+                .entry(case.universe.clone())
+                .or_insert_with(|| Model::build("g", &case.universe, fx.snapshot(&case.universe).expect("snapshot"), d).expect("universe"));
+            let req = SqlRequest { spec: Some(case.spec.clone()), expr: None, context: case.context.clone() };
+            let Ok(p) = model.plan_request(req, false, &unlimited) else { continue };
+            let root = &p.plan.sql[p.plan.root_at..];
+            let mut from = 0;
+            for c in &p.plan.columns {
+                let at = root[from..].find(&format!(" AS {}", quoted(&c.name))).map(|i| i + from);
+                assert!(at.is_some(), "{}: column {:?} is not selected, in order, by\n{root}", case.id, c.name);
+                from = at.unwrap() + 1;
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "only {checked} cases planned");
+}
+
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}

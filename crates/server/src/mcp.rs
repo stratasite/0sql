@@ -616,6 +616,12 @@ async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &
             }
             branch_for(app, org, &a.project, a.branch)
                 .and_then(|b| fields_of(app, org, &a.project, &b, FieldsQuery { q, hidden: a.hidden }))
+                .map(|mut v| {
+                    for f in v["fields"].as_array_mut().into_iter().flatten() {
+                        lean_presentation(f);
+                    }
+                    v
+                })
         }
         "tables" => {
             let a: BranchArgs = args(arguments)?;
@@ -645,7 +651,7 @@ async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &
                 } else {
                     explain_of(app, org, &a.project, &b, req).map(|r| serde_json::to_value(r).expect("a plan serializes"))
                 };
-                planned.map_err(|e| with_candidates(app, org, &a.project, &b, e))
+                planned.map(lean_columns).map_err(|e| with_candidates(app, org, &a.project, &b, e))
             })
         }
         "run" => {
@@ -687,6 +693,35 @@ async fn call(app: &Shared, org: &str, context: Option<SecurityContext>, name: &
             json!({ "content": [{ "type": "text", "text": format!("{class} ({}): {message}", status.as_u16()) }], "isError": true })
         }
     })
+}
+
+/// What an agent reading a field or a column needs of how it is shown:
+/// the format's type alone, which says that 0.12 is 12% or an amount is
+/// money. Display types, templates and patterns are a UI's, and cost the
+/// agent tokens for nothing.
+fn lean_presentation(v: &mut Value) {
+    let Some(m) = v.as_object_mut() else { return };
+    m.remove("display_type");
+    if let Some(kind) = m.get("format").and_then(|f| f.get("type")).cloned() {
+        m.insert("format".into(), kind);
+    }
+}
+
+/// A plan's columns, for an agent: only those with a format, by name and
+/// the format's type; none at all when no column has one.
+fn lean_columns(mut v: Value) -> Value {
+    let Some(m) = v.as_object_mut() else { return v };
+    let lean: Vec<Value> = m
+        .remove("columns")
+        .and_then(|c| c.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| Some(json!({ "name": c.get("name")?, "format": c.get("format")?.get("type")? })))
+        .collect();
+    if !lean.is_empty() {
+        m.insert("columns".into(), Value::Array(lean));
+    }
+    v
 }
 
 #[cfg(test)]

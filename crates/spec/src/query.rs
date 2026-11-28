@@ -186,7 +186,10 @@ pub struct Projection {
     pub dimension_refs: Vec<String>,
     pub measure_refs: Vec<String>,
     pub projection_refs: Vec<String>,
+    /// How a client shows this column, in `zsql_semantic::presentation`'s
+    /// shapes; absent, the field's own. Neither is read by the planner.
     pub format: Option<Value>,
+    pub display_type: Option<Value>,
     pub decorators: Vec<Decorator>,
     pub parent: Option<String>,
     /// Engine-injected and read-only: rendered, never validated, and not a

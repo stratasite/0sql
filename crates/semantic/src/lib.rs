@@ -8,6 +8,7 @@
 //! in-memory form the planner works against.
 
 pub mod model;
+pub mod presentation;
 pub mod snapshot;
 
 pub use model::{BuildError, SemanticModel};
