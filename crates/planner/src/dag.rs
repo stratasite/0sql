@@ -117,9 +117,39 @@ impl<'a> Filtered<'a> {
     pub fn is_date(&self) -> bool {
         self.filter.is_date()
     }
-    /// Rails `Filtered#to_s`; part of node identity.
+    pub fn is_comparison(&self) -> bool {
+        self.filter.is_comparison()
+    }
+    /// The fields a comparison compares `field` with.
+    pub fn others(&self) -> &[&'a Field] {
+        &self.filter.others
+    }
+    /// Every field the filter reads.
+    pub fn fields(&self) -> impl Iterator<Item = &'a Field> + '_ {
+        self.filter.fields()
+    }
+    /// Whether the filter reads the field, on either side.
+    pub fn reads(&self, id: Id) -> bool {
+        self.fields().any(|f| f.id == id)
+    }
+    /// Whether none of the fields it reads is among `ids`: a rule that
+    /// sets a field's filters aside sets aside a comparison with it too.
+    pub fn reads_none_of(&self, ids: &[Id]) -> bool {
+        self.fields().all(|f| !ids.contains(&f.id))
+    }
+    /// Whether every field it reads is among `ids`.
+    pub fn reads_only(&self, ids: &[Id]) -> bool {
+        self.fields().all(|f| ids.contains(&f.id))
+    }
+    /// Rails `Filtered#to_s`; part of node identity. A comparison names
+    /// the fields it compares with where a value would be.
     pub fn identity(&self) -> String {
-        format!("<f:{}:{}:{}>", field_identity(self.field()), self.predicate.name(), self.filter_value.clone().unwrap_or_default())
+        let value = if self.is_comparison() {
+            self.others().iter().map(|f| format!("[{}]", field_identity(f))).collect::<Vec<_>>().join(":")
+        } else {
+            self.filter_value.clone().unwrap_or_default()
+        };
+        format!("<f:{}:{}:{}>", field_identity(self.field()), self.predicate.name(), value)
     }
 }
 
@@ -365,7 +395,7 @@ impl<'a> Node<'a> {
     /// Rails `Node#delete(field)`: every projection and filter on the field.
     pub fn delete_field(&mut self, field_id: Id) {
         self.projections.retain(|p| p.field().map(|f| f.id != field_id).unwrap_or(true));
-        self.filters.retain(|f| f.field().id != field_id);
+        self.filters.retain(|f| !f.reads(field_id));
     }
 
     pub fn is_strategy_input(&self, id: NodeId) -> bool {
@@ -455,9 +485,7 @@ impl<'a> Node<'a> {
             }
         }
         for f in &self.filters {
-            if f.is_dimension() {
-                out.push(f.field());
-            }
+            out.extend(f.fields().filter(|x| x.is_dimension()));
         }
         out
     }
@@ -472,9 +500,7 @@ impl<'a> Node<'a> {
             }
         }
         for f in &self.filters {
-            if f.is_measure() {
-                out.push(f.field());
-            }
+            out.extend(f.fields().filter(|x| x.is_measure()));
         }
         out
     }
@@ -485,7 +511,7 @@ impl<'a> Node<'a> {
 
     pub fn has_field(&self, id: Id) -> bool {
         self.projections.iter().any(|p| p.field().map(|f| f.id == id).unwrap_or(false))
-            || self.filters.iter().any(|f| f.field().id == id)
+            || self.filters.iter().any(|f| f.reads(id))
             || self.projections.iter().filter(|p| p.is_calculation()).any(|p| p.proj.field_refs.iter().any(|f| f.id == id))
     }
 

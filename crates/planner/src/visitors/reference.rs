@@ -65,7 +65,7 @@ fn only_carried(graph: &Graph, id: NodeId, field: &Field) -> bool {
     let n = &graph.nodes[id];
     let projs: Vec<_> =
         n.projections.iter().filter(|p| !p.is_calculation() && p.field().map(|f| f.id == field.id).unwrap_or(false)).collect();
-    !projs.is_empty() && projs.iter().all(|p| p.proj.is_carried()) && !n.filters.iter().any(|f| f.field().id == field.id)
+    !projs.is_empty() && projs.iter().all(|p| p.proj.is_carried()) && !n.filters.iter().any(|f| f.reads(field.id))
 }
 
 /// Rails `create_reference`: the field's expression on the cheapest path
@@ -338,23 +338,25 @@ fn visit_merge_node<'a>(graph: &mut Graph<'a>, id: NodeId, semantic: &'a Semanti
             }
         }
     }
-    let filters: Vec<_> = graph.nodes[id].filters.iter().map(|f| f.filter.clone()).collect();
-    for f in filters {
-        build_out_multi_source_reference(graph, id, semantic, RefKey::Field(f.field.id))?;
-        if graph.nodes[id].field_refs.contains_key(&RefKey::Field(f.field.id)) {
+    // Every field a filter reads, a comparison's other side included: the
+    // two measures of one may come from different inputs.
+    let fields: Vec<&'a Field> = graph.nodes[id].filters.iter().flat_map(|f| f.fields().collect::<Vec<_>>()).collect();
+    for field in fields {
+        build_out_multi_source_reference(graph, id, semantic, RefKey::Field(field.id))?;
+        if graph.nodes[id].field_refs.contains_key(&RefKey::Field(field.id)) {
             continue;
         }
         let source = inputs
             .iter()
             .copied()
-            .find(|i| graph.nodes[*i].projections.iter().any(|p| p.field().map(|x| x.id == f.field.id).unwrap_or(false)));
+            .find(|i| graph.nodes[*i].projections.iter().any(|p| p.field().map(|x| x.id == field.id).unwrap_or(false)));
         let Some(source) = source else {
             return Err(Error::Resolution(format!(
                 "The filter on {} cannot be applied at the final pass: no input outputs that column. Filter a projected copy of the field, or remove the filter.",
-                f.field.name
+                field.name
             )));
         };
-        graph.nodes[id].field_refs.insert(RefKey::Field(f.field.id), Reference::Node { entity: Entity::Field(f.field), node: source });
+        graph.nodes[id].field_refs.insert(RefKey::Field(field.id), Reference::Node { entity: Entity::Field(field), node: source });
     }
     Ok(())
 }

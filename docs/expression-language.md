@@ -160,15 +160,18 @@ Filter      <- Conj (_ OR SP Conj)*                     # and/or may start a con
 Conj        <- Pred (_ AND SP Pred)*
 Pred        <- '(' _ Filter _ ')'
              / Ref WS Test
-Test        <- CmpOp WS Value                           # a value never comes from the next line
+Test        <- CmpOp WS Operand                         # a value never comes from the next line
              / (NOT SP)? IN WS List
-             / BETWEEN SP Value SP AND SP Value
-             / (NOT SP)? (CONTAINS / STARTS SP WITH / ENDS SP WITH) SP Value
+             / BETWEEN SP Operand SP AND SP Operand
+             / (NOT SP)? (CONTAINS / STARTS SP WITH / ENDS SP WITH) SP Operand
              / IS SP (NOT SP)? NULL
              / TOP SP Int (SP BY SP Field)?
              / KEYWORD WS List
 CmpOp       <- ('>=' / '<=' / '!=' / '<>' / '=' / '>' / '<') ![=<>!]
 List        <- '(' _ ListValue (_ ',' _ ListValue)* (_ ',')? _ ')'
+
+# An operand is a field to compare with, bracketed, or a value.
+Operand     <- Bracketed Kind? / Value
 
 # A value is a string, or plain text to the next separator. In a list
 # the text runs to the next comma or parenthesis, so `and` and `or` are
@@ -362,6 +365,9 @@ order date >= 28d                    description keyword (sale, clearance)
 net paid@m > 1000                    (country = Canada or region = West) and revenue > 10
 "Is Active" = true                   [Sign In Date] >= 7d
 name = 'Rock and Roll'               title = 'Toys, games (new)'
+ship date > [order date]             net paid > [wholesale cost]
+event date between [start date] and [end date]
+bill city not contains [ship city]
 ```
 
 Commas between items are AND, as now. `and`, `or` and parentheses
@@ -378,6 +384,20 @@ and `false` as booleans, and everything else as the text written. A
 leading zero keeps a value text, so `02134` stays a code; `1.10`
 becomes the number 1.1 and is single-quoted when it must stay text. A
 measure filter is a HAVING, as in the spec.
+
+A `[bracketed]` name in a value's place is a field, and the filter
+compares the two: it lowers to `value_field` (and `value_end_field`
+for `between`) instead of `value`. Only brackets mark it. A bare name
+there is a value as always, and a double-quoted one stays the error
+it was, since `country = "Canada"` is far more often a value written
+the SQL way than a field meant. Both sides are numbers, dates, strings
+or booleans alike; numbers and dates take the six operators and
+`between`, strings `=`, `!=` and the `contains` family (case-insensitive,
+as with values), booleans `=` and `!=`. A measure on either side makes
+the filter a HAVING, applied where every measure it reads is aggregated
+at the query's grain: the one aggregation, or the final merge when
+the measures come from different universes. A measure compared with a
+dimension needs that dimension among the projections, undecorated.
 
 `not` goes before the predicate word and only before the four that
 have a negated form in the spec (`in`, `contains`, `starts with`, `ends
@@ -452,10 +472,10 @@ partition, is replaced by an explicit `by`.
 | query | name, description, classification, limit, projections, calculations, filters, segments, view, db_settings, hints | 6 | name, description, classification, view, db_settings |
 | projection | field, field_type, alias, order_by, format, decorators, calculation, sql, data_type | 8 | format |
 | decorator | type, grain, extract, transform, percent_change, mode, function, size, offset, buckets, partition_refs, order_by, ignore_partition_filters, custom_sql | 14 | |
-| filter | field, field_type, predicate, value, value_end, top_n_measure, and/or tree | 7 | the `custom` predicate |
+| filter | field, field_type, predicate, value, value_end, top_n_measure, value_field, value_end_field, and/or tree | 9 | the `custom` predicate |
 | segment | name, mode, keys, measures, filters, apply_to, expanding field, expanding alias, join, pair_dedupe | 10 | |
 
-45 of 51 attributes have a native spelling and all 51 are reachable;
+47 of 53 attributes have a native spelling and all 53 are reachable;
 `axis` and `hidden` are left out of the count because they are leaving
 the spec. The six without are carried, not planned, and the `custom`
 predicate, which the planner does not implement, is not given a

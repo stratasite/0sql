@@ -137,6 +137,20 @@ impl Dialect {
         self.render("lower_case", &[("exp", exp)])
     }
 
+    /// Whether `exp` holds `needle`, begins with it or ends with it: a
+    /// filter comparing two string fields, so a search, never a pattern.
+    pub fn string_contains(&self, exp: &str, needle: &str) -> Result<String, Error> {
+        self.render("string_contains", &[("exp", exp), ("needle", needle)])
+    }
+
+    pub fn string_starts_with(&self, exp: &str, needle: &str) -> Result<String, Error> {
+        self.render("string_starts_with", &[("exp", exp), ("needle", needle)])
+    }
+
+    pub fn string_ends_with(&self, exp: &str, needle: &str) -> Result<String, Error> {
+        self.render("string_ends_with", &[("exp", exp), ("needle", needle)])
+    }
+
     pub fn cast(&self, exp: &str, ty: &str) -> Result<String, Error> {
         self.render("cast", &[("exp", exp), ("type", ty)])
     }
@@ -533,6 +547,26 @@ mod tests {
 
     /// BigQuery refuses parentheses and operators in a column name even
     /// quoted, so a generated name is renamed there and nowhere else.
+    /// A comparison of two string fields renders on every warehouse, each
+    /// side exactly once, and with the warehouse's own search function.
+    #[test]
+    fn every_builtin_dialect_searches_one_string_for_another() {
+        let dialects = Dialects::builtin();
+        for name in dialects.names().unwrap() {
+            let d = dialects.get(&name).unwrap();
+            for sql in [d.string_contains("A.x", "B.y").unwrap(), d.string_starts_with("A.x", "B.y").unwrap()] {
+                assert!(sql.matches("A.x").count() == 1 && sql.matches("B.y").count() == 1 && !sql.contains("LIKE"), "{name}: {sql}");
+            }
+            let ends = d.string_ends_with("A.x", "B.y").unwrap();
+            assert!(ends.contains("A.x") && ends.contains("B.y") && !ends.contains("LIKE"), "{name}: {ends}");
+        }
+        let get = |n: &str| dialects.get(n).unwrap();
+        assert_eq!(get("postgres").string_contains("a", "b").unwrap(), "STRPOS(a, b) > 0");
+        assert_eq!(get("sqlserver").string_starts_with("a", "b").unwrap(), "CHARINDEX(b, a) = 1");
+        assert_eq!(get("snowflake").string_contains("a", "b").unwrap(), "POSITION(b, a) > 0");
+        assert_eq!(get("sqlite").string_ends_with("a", "b").unwrap(), "SUBSTR(a, -LENGTH(b)) = b");
+    }
+
     #[test]
     fn bigquery_column_names_drop_what_it_refuses() {
         let dialects = Dialects::builtin();

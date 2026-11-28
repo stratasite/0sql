@@ -428,8 +428,8 @@ the server's own process, below.)
 
 A project belongs to an org, and a server may keep the projects of
 several. An org is a name and a directory, and nothing else: the
-server has no list of orgs, no settings for one and no idea who is in
-it. Two orgs may each have a project of the same uid.
+server has no settings for one and no idea who is in it. Two orgs may
+each have a project of the same uid.
 
 - **The org is in the path.** Every route that is about a project, a
   result or the cache, and the MCP endpoint, is served under
@@ -440,7 +440,21 @@ it. Two orgs may each have a project of the same uid.
   `/projects/shop/branches/main/sql` and
   `/orgs/default/projects/shop/branches/main/sql` are the same request.
 - **A name** is lower-case letters, digits, `-` and `_`, as a project's
-  uid is. An org exists once something is deployed to it.
+  uid is.
+- **An org is made explicitly, never by a deploy.** `POST /orgs` with
+  `{"org": "acme"}` makes `acme` (201); an org that exists already is
+  a 409. A folder of that name made by hand in the data directory is
+  an org too. `default` is made at startup when it is not there. A
+  deploy to an org with no folder is a 404 that leaves nothing behind,
+  so an `org:` in `project.yml` that is mistyped, or changed in the
+  hope of renaming the org, cannot make a new one; every other route
+  under `/orgs/{org}`, the MCP endpoint included, is a 404 for it too.
+  `zsql serve` is no exception: make the org before serving a project
+  that names one.
+- **An org is removed only when empty.** `DELETE /orgs/{org}` is a 409
+  that names what is in the way while the org holds anything; remove
+  its projects first. `default` is never removed. Stored results and
+  what the object store keeps of past deploys are not removed with it.
 - **`zsql` takes the org from `org:` in `project.yml`**, or from
   `--org`, which wins. With neither, the default org.
 - **Nothing crosses.** A listing, the catalog an MCP client is handed
@@ -454,8 +468,10 @@ it. Two orgs may each have a project of the same uid.
 - **Who may ask for which org is decided in front**, like everything
   else. A proxy that keeps orgs apart allows each caller the one prefix
   `/orgs/<theirs>/` and nothing outside it; the unprefixed routes are
-  the default org's, and `GET /orgs`, which lists every org with
-  something deployed, is for whoever runs the server.
+  the default org's, and `GET /orgs`, which lists every org and how
+  many branches each has, `POST /orgs`, which makes one, and
+  `DELETE /orgs/{org}`, which removes an empty one, are for whoever
+  runs the server.
 - **To give the default org's projects to a named one**, stop the
   server, rename `default` in the data directory to the org's name,
   and start it: the directory's name is the org. An empty `default` is

@@ -265,7 +265,7 @@ fn create_non_local_measure_graph<'a>(
         .filters
         .iter()
         .filter(|f| f.is_dimension())
-        .chain(q.filters.iter().filter(|f| f.field.id == component.field().id))
+        .chain(q.filters.iter().filter(|f| f.field.id == component.field().id && !f.is_comparison()))
         .cloned()
         .collect();
     let name = format!("{}-subgraph", q.def.name.clone().unwrap_or_default());
@@ -314,7 +314,7 @@ fn create_segmented_component_graph<'a>(
         .filters
         .iter()
         .filter(|f| f.is_dimension())
-        .chain(q.filters.iter().filter(|f| f.field.id == component.field.expect("measure").id))
+        .chain(q.filters.iter().filter(|f| f.field.id == component.field.expect("measure").id && !f.is_comparison()))
         .cloned()
         .collect();
     let sub = ResolvedQuery {

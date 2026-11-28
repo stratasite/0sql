@@ -58,3 +58,8 @@ extra_aggregate_functions:
   - boolor_agg
   - booland_agg
   - approx_percentile
+
+# string search, for a filter comparing two string fields
+string_contains: "POSITION(@needle, @exp) > 0"
+string_starts_with: "POSITION(@needle, @exp) = 1"
+string_ends_with: "POSITION(REVERSE(@needle), REVERSE(@exp)) = 1"

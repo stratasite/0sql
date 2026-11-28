@@ -263,7 +263,8 @@ fn inside_a_project_it_serves_that_project_and_minus_r_reaches_it() {
 
 /// A project that names an org in project.yml is deployed under it and
 /// asked for under it, with no flag; `--org` asks another org, which
-/// has nothing of this one's.
+/// was never made. `serve` makes no org: a deploy never does, so acme
+/// is made first, here as an operator would, by its folder.
 #[cfg(unix)]
 #[test]
 fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
@@ -273,6 +274,7 @@ fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
     let yml = project.join("project.yml");
     std::fs::write(&yml, format!("{}\norg: acme\n", std::fs::read_to_string(&yml).unwrap().trim_end())).unwrap();
     let data = root.path("data");
+    std::fs::create_dir_all(data.join("acme")).unwrap();
     let s = Server::start(&project, &root.path("home"), &["--data-dir", data.to_str().unwrap()]);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !get(&s.addr, "/orgs/acme/projects").1.contains("\"grocery-store\"") {
@@ -299,7 +301,7 @@ fn a_project_with_an_org_is_deployed_and_asked_for_under_it() {
     let none = run(&["list", "--org", "default"]);
     assert!(none.status.success() && !said(&none).contains("grocery-store"), "{}", said(&none));
     let elsewhere = run(&["status", "-r", "--branch", "main", "--org", "globex"]);
-    assert!(!elsewhere.status.success() && said(&elsewhere).contains("in org globex"), "{}", said(&elsewhere));
+    assert!(!elsewhere.status.success() && said(&elsewhere).contains("no org globex"), "{}", said(&elsewhere));
 
     let (status, _) = s.stop();
     assert!(status.success());

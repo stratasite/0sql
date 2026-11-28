@@ -272,17 +272,48 @@ pub struct ResolvedFilter<'a> {
     pub fid: usize,
     pub def: Filter,
     pub field: &'a Field,
+    /// The fields a comparison filter compares `field` with: the value
+    /// field, then `between`'s upper bound. Empty for a filter on a value.
+    pub others: Vec<&'a Field>,
 }
 
 impl<'a> ResolvedFilter<'a> {
+    /// A filter on a value; a comparison resolves through `resolve`.
+    pub fn new(fid: usize, def: Filter, field: &'a Field) -> Self {
+        ResolvedFilter { fid, def, field, others: vec![] }
+    }
+
+    /// The filter with its comparison operands looked up in the model.
+    pub fn resolve(semantic: &'a SemanticModel, fid: usize, def: Filter, field: &'a Field) -> Result<Self> {
+        let mut others = Vec::new();
+        for o in def.value_field.iter().chain(def.value_end_field.iter()) {
+            let f = semantic.field_by_uid(&o.field_uid, Some(o.field_kind)).ok_or_else(|| {
+                Error::Resolution(format!("Query is not valid: [\"Filters Field {} is no longer available in this branch\"]", o.field_uid))
+            })?;
+            others.push(f);
+        }
+        Ok(ResolvedFilter { fid, def, field, others })
+    }
+
+    /// Whether `field` is compared with other fields rather than a value.
+    /// A measure on either side is `field`, so `is_measure` covers both.
+    pub fn is_comparison(&self) -> bool {
+        !self.others.is_empty()
+    }
+    /// Every field the filter reads: its own, then the ones compared with.
+    pub fn fields(&self) -> impl Iterator<Item = &'a Field> + '_ {
+        std::iter::once(self.field).chain(self.others.iter().copied())
+    }
     pub fn is_measure(&self) -> bool {
         self.field.is_measure()
     }
     pub fn is_dimension(&self) -> bool {
         self.field.is_dimension()
     }
+    /// A filter on a date value. A comparison of two dates is not one:
+    /// there is no literal to widen, apply greedily or match to a partition.
     pub fn is_date(&self) -> bool {
-        self.field.is_date()
+        self.field.is_date() && !self.is_comparison()
     }
 }
 
@@ -503,7 +534,7 @@ impl<'a> ResolvedQuery<'a> {
                 Error::Resolution(format!("Query is not valid: [\"Filters Field {} is no longer available in this branch\"]", f.field_uid))
             })?;
             by_ref.insert(f.reference.as_str(), i);
-            filters.push(Rc::new(ResolvedFilter { fid: i, def: f.clone(), field }));
+            filters.push(Rc::new(ResolvedFilter::resolve(semantic, i, f.clone(), field)?));
         }
         let tree = match &def.filter_tree {
             Some(t) => FilledTree::from_tree(t, &by_ref).unwrap_or(FilledTree::Group("and".into(), vec![])),
@@ -555,7 +586,7 @@ impl<'a> ResolvedQuery<'a> {
                     Error::Resolution(format!("Query is not valid: [\"Segment filter field {} is no longer available\"]", f.field_uid))
                 })?;
                 sby_ref.insert(f.reference.as_str(), fid);
-                sfilters.push(Rc::new(ResolvedFilter { fid, def: f.clone(), field }));
+                sfilters.push(Rc::new(ResolvedFilter::resolve(semantic, fid, f.clone(), field)?));
                 fid += 1;
             }
             let (stree, custom) = match &s.filter_tree {
@@ -724,6 +755,39 @@ pub fn check_supported(q: &ResolvedQuery, semantic: &SemanticModel, principal: O
             }
         }
     }
+    comparison_grain(&q.projections, &q.filters, "query")?;
+    // A segment's measures define membership at its keys' grain, a
+    // separate plan; comparing them there is not built yet.
+    for seg in &q.segments {
+        if let Some(f) = seg.filters.iter().find(|f| f.is_measure() && f.is_comparison()) {
+            return Err(Error::Resolution(format!(
+                "Segment {} compares the measure {} with another field; a segment's filters compare dimensions only.",
+                seg.name(),
+                f.field.name
+            )));
+        }
+    }
     let _ = (principal, semantic);
+    Ok(())
+}
+
+/// A measure compares with a dimension at the grain it is aggregated to,
+/// so the dimension has to be part of that grain: projected as it is.
+/// Otherwise the comparison is a row-level question about the measure's
+/// inputs, which a calculated dimension asks, not a filter.
+fn comparison_grain(projections: &[Rc<ResolvedProjection>], filters: &[Rc<ResolvedFilter>], whose: &str) -> Result<()> {
+    for f in filters.iter().filter(|f| f.is_measure() && f.is_comparison()) {
+        for d in f.others.iter().filter(|d| d.is_dimension()) {
+            let grouped = projections
+                .iter()
+                .any(|p| !p.is_calculation() && !p.def.is_expansion() && p.field_id() == Some(d.id) && p.def.decorators.is_empty());
+            if !grouped {
+                return Err(Error::Resolution(format!(
+                    "The filter comparing {} with {} needs {} among the {whose}'s dimensions, undecorated: a measure is compared with a dimension at the grain it is aggregated to.",
+                    f.field.name, d.name, d.name
+                )));
+            }
+        }
+    }
     Ok(())
 }

@@ -176,6 +176,13 @@ impl Server {
         out
     }
 
+    /// An org made, as `POST /orgs` makes one: the only way a test's
+    /// deploys to a named org have somewhere to go.
+    async fn make_org(&self, org: &str) {
+        let a = self.post("/orgs", json!({ "org": org })).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{org}: {}", a.body);
+    }
+
     /// A deploy under an org.
     async fn deploy_to(&self, org: &str, uid: &str, branch: &str, archive: Vec<u8>) -> Answer {
         self.send(Method::POST, &format!("/orgs/{org}/projects/{uid}/branches/{branch}/deploy"), &[], Some(("application/gzip", archive)))
@@ -397,6 +404,7 @@ async fn each_branch_is_its_own_deployment() {
 #[tokio::test]
 async fn removing_a_project_takes_every_branch_of_it() {
     let s = server();
+    s.make_org("acme").await;
     for (uid, branch, marker) in [(CS, "main", "cs-main"), (CS, "dev", "cs-dev"), ("billing", "main", "billing")] {
         let a = s.deploy(uid, branch, archive(uid, marker)).await;
         assert_eq!(a.status, StatusCode::OK, "{}", a.error());
@@ -1551,6 +1559,9 @@ async fn the_tools_that_run_are_offered_only_when_named() {
 #[tokio::test]
 async fn an_org_is_its_own_set_of_projects() {
     let s = server();
+    s.make_org("acme").await;
+    s.make_org("globex").await;
+    s.make_org("passing").await;
     assert_eq!(s.deploy(CS, "main", archive(CS, "plain")).await.status, StatusCode::OK);
     for org in ["acme", "globex"] {
         let a = s.deploy_to(org, CS, "main", archive(CS, org)).await;
@@ -1579,10 +1590,15 @@ async fn an_org_is_its_own_set_of_projects() {
     };
     assert_eq!(s.listing().await, ["customer-service/main"]);
     assert_eq!(listed(s.get("/orgs/acme/projects").await), ["billing/main", "customer-service/main"]);
-    assert_eq!(listed(s.get("/orgs/nobody/projects").await), Vec::<String>::new(), "an org with nothing deployed has nothing");
+    assert_eq!(listed(s.get("/orgs/passing/projects").await), Vec::<String>::new(), "an org with nothing deployed has nothing");
     assert_eq!(
         s.get("/orgs").await.body["orgs"],
-        json!([{ "org": "acme", "deployments": 2 }, { "org": "default", "deployments": 1 }, { "org": "globex", "deployments": 1 }])
+        json!([
+            { "org": "acme", "deployments": 2 },
+            { "org": "default", "deployments": 1 },
+            { "org": "globex", "deployments": 1 },
+            { "org": "passing", "deployments": 0 }
+        ])
     );
 
     // What one org has, another does not, and is told so by name.
@@ -1629,6 +1645,88 @@ async fn an_org_is_its_own_set_of_projects() {
     assert_eq!(keys, s.on_disk());
 }
 
+/// Only `POST /orgs` makes an org, and `DELETE /orgs/{org}` removes one
+/// only once it is empty. A deploy or a validation to an org
+/// nobody made is refused and leaves nothing behind, so an `org:` in
+/// project.yml that is mistyped, or changed to rename the org, makes
+/// no org; nothing else under the org's prefix answers either. An org
+/// is made once, `default` is there from the start, and a made org
+/// with nothing in it is still one after a restart.
+#[tokio::test]
+async fn only_the_create_endpoint_makes_an_org() {
+    let s = server();
+    let a = s.deploy_to("acme", CS, "main", archive(CS, "acme")).await;
+    assert_eq!((a.status, a.class()), (StatusCode::NOT_FOUND, "NotFound"), "{}", a.body);
+    assert!(a.error().contains("POST /orgs"), "{}", a.error());
+    let a = s
+        .send(
+            Method::POST,
+            &format!("/orgs/acme/projects/{CS}/branches/main/validate"),
+            &[],
+            Some(("application/gzip", archive(CS, "acme"))),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    for path in ["/orgs/acme/projects", "/orgs/acme/projects/shop/datasets"] {
+        assert_eq!(s.get(path).await.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    assert!(!s.data_dir.join("acme").exists(), "a refused deploy makes no directory");
+    assert_eq!(s.get("/orgs").await.body["orgs"], json!([{ "org": "default", "deployments": 0 }]));
+
+    // The default org needs no making, and cannot be made again.
+    assert_eq!(s.deploy(CS, "main", archive(CS, "plain")).await.status, StatusCode::OK);
+    assert_eq!(s.deploy_to("default", CS, "dev", archive(CS, "plain")).await.status, StatusCode::OK);
+    let a = s.post("/orgs", json!({ "org": "default" })).await;
+    assert_eq!((a.status, a.class()), (StatusCode::CONFLICT, "Conflict"), "{}", a.body);
+
+    // Made, it takes a deploy; made twice, it is told it exists.
+    let a = s.post("/orgs", json!({ "org": "acme" })).await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::CREATED, json!({ "org": "acme" })));
+    assert_eq!(s.post("/orgs", json!({ "org": "acme" })).await.status, StatusCode::CONFLICT);
+    assert_eq!(s.deploy_to("acme", CS, "main", archive(CS, "acme")).await.status, StatusCode::OK);
+
+    // A rename by project.yml is a deploy to an org nobody made.
+    let a = s.deploy_to("acme-renamed", CS, "main", archive(CS, "acme")).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    assert_eq!(s.on_disk(), ["acme/customer-service/main", "default/customer-service/dev", "default/customer-service/main"]);
+
+    // A name is checked as any org's is, and the body is only a name.
+    for bad in [json!({ "org": "Acme" }), json!({ "org": ".cache" }), json!({ "org": "lock" }), json!({ "org": "../x" })] {
+        let a = s.post("/orgs", bad.clone()).await;
+        assert_eq!((a.status, a.class()), (StatusCode::BAD_REQUEST, "Invalid"), "{bad}: {}", a.body);
+    }
+    assert_eq!(s.post("/orgs", json!({ "org": "x", "owner": "y" })).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // An org with nothing in it is one still, after a restart too.
+    s.make_org("globex").await;
+    let again = app_over(&s.data_dir);
+    reload(&again).unwrap();
+    let restarted = Server { router: router(again.clone()), app: again, data_dir: s.data_dir.clone() };
+    assert_eq!(restarted.get("/orgs/globex/projects").await.status, StatusCode::OK);
+    assert_eq!(
+        restarted.get("/orgs").await.body["orgs"],
+        json!([{ "org": "acme", "deployments": 1 }, { "org": "default", "deployments": 2 }, { "org": "globex", "deployments": 0 }])
+    );
+
+    // An org is removed only when empty, and default never is.
+    let a = restarted.send(Method::DELETE, "/orgs/acme", &[], None).await;
+    assert_eq!((a.status, a.class()), (StatusCode::CONFLICT, "Conflict"), "{}", a.body);
+    assert!(a.error().contains(CS), "it says what is in the way: {}", a.error());
+    let a = restarted.send(Method::DELETE, "/orgs/default", &[], None).await;
+    assert_eq!((a.status, a.class()), (StatusCode::CONFLICT, "Conflict"), "{}", a.body);
+    assert_eq!(restarted.send(Method::DELETE, "/orgs/nobody", &[], None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(restarted.send(Method::DELETE, "/orgs/Bad.Name", &[], None).await.status, StatusCode::BAD_REQUEST);
+    let a = restarted.send(Method::DELETE, "/orgs/globex", &[], None).await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::OK, json!({ "removed": "globex" })));
+    assert!(!s.data_dir.join("globex").exists());
+    // Its projects removed, acme is empty and goes; a deploy to it is refused again.
+    assert_eq!(restarted.send(Method::DELETE, &format!("/orgs/acme/projects/{CS}"), &[], None).await.status, StatusCode::OK);
+    assert_eq!(restarted.send(Method::DELETE, "/orgs/acme", &[], None).await.status, StatusCode::OK);
+    assert_eq!(restarted.deploy_to("acme", CS, "main", archive(CS, "acme")).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(restarted.get("/orgs").await.body["orgs"], json!([{ "org": "default", "deployments": 2 }]));
+    std::mem::forget(restarted);
+}
+
 /// An org is what its directory is called. `default` renamed while the
 /// server is down is that org when it starts again, and what was
 /// deployed with no org is the new org's. A deployment laid out as
@@ -1667,6 +1765,7 @@ async fn a_renamed_directory_is_that_org_and_an_old_layout_is_said() {
 #[tokio::test]
 async fn an_orgs_agent_is_told_of_no_other_org() {
     let s = server();
+    s.make_org("acme").await;
     assert_eq!(s.deploy(CS, "main", archive(CS, "plain")).await.status, StatusCode::OK);
     assert_eq!(s.deploy(CS, "dev", archive(CS, "plain-dev")).await.status, StatusCode::OK);
     assert_eq!(s.deploy_to("acme", CS, "dev", archive(CS, "acme")).await.status, StatusCode::OK);
@@ -1691,8 +1790,9 @@ async fn an_orgs_agent_is_told_of_no_other_org() {
     // An org is not a tool's to name.
     let a = s.tool(&[], "fields", json!({ "project": CS, "org": "acme" })).await;
     assert!(a.body["error"].is_object(), "{}", a.body);
+    // Nor is there an endpoint for an org nobody made.
     let a = s.tool_of("nobody", "fields", json!({ "project": CS })).await;
-    assert_eq!(a.body["result"]["isError"], true, "{}", a.body);
+    assert_eq!((a.status, a.class()), (StatusCode::NOT_FOUND, "NotFound"), "{}", a.body);
 }
 
 /// A result is its org's alone. The same question in two orgs is two
@@ -1702,6 +1802,8 @@ async fn an_orgs_agent_is_told_of_no_other_org() {
 #[tokio::test]
 async fn a_result_is_its_orgs_alone() {
     let s = server();
+    s.make_org("acme").await;
+    s.make_org("globex").await;
     assert_eq!(s.deploy(CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
     assert_eq!(s.deploy_to("acme", CS, "main", archive(CS, "one")).await.status, StatusCode::OK);
     let file = sales("orgs");
@@ -1746,6 +1848,7 @@ async fn a_result_is_its_orgs_alone() {
 #[tokio::test]
 async fn a_datasources_credential_is_the_one_it_was_deployed_with() {
     let s = server();
+    s.make_org("acme").await;
     let file = sales("credentials");
     let entry = |extra: &str| {
         let mut files = fixture_files(CS, "one");

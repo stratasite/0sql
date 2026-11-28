@@ -215,7 +215,8 @@ projects of several. Every route above is also served under
 `/orgs/{org}`; without the prefix the org is `default`. Nothing
 crosses: a listing, a stored result, an invalidation and a warehouse
 connection are one org's. An org is a directory of the data directory
-and nothing more, and `zsql` reads it from `org:` in `project.yml` or
+and nothing more, made by `POST /orgs` (or by hand) and never by a deploy, removed by
+`DELETE /orgs/{org}` only when empty (`default` always exists), and `zsql` reads it from `org:` in `project.yml` or
 `--org`.
 
 **Credentials.** On your machine a datasource is its entry in

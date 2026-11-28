@@ -126,7 +126,8 @@ pub(crate) fn router(app: Shared) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
-        .route("/orgs", get(reads::orgs))
+        .route("/orgs", get(reads::orgs).post(deploy::create_org))
+        .route("/orgs/{org}", delete(deploy::delete_org))
         // Once for the default org, and once for the org the path names.
         .merge(of_an_org(upload_limit))
         .nest("/orgs/{org}", of_an_org(upload_limit))

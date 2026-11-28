@@ -70,6 +70,7 @@ fn archive_with_secrets(uid: &str) -> Vec<u8> {
 #[tokio::test]
 async fn a_deploy_is_kept_in_the_object_store_without_its_secrets() {
     let (s, store) = server_with_store();
+    s.make_org("acme").await;
     let a = s.deploy_to("acme", "shop", "main", archive_with_secrets("shop")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
 

@@ -23,10 +23,13 @@ pub enum Kind {
 
 /// A filter value: the text written, and whether it was quoted, which
 /// decides whether the lowering may read it as a number or a boolean.
+/// A `[bracketed]` or `"quoted"` name in a value's place is a field the
+/// filter compares with, and `field` holds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Val {
     pub text: String,
     pub quoted: bool,
+    pub field: Option<Field>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1164,11 +1167,20 @@ impl<'a> P<'a> {
         Ok(None)
     }
 
-    /// A value: a string, or text to the next separator.
+    /// A value: a string, a field to compare with, or text to the next separator.
     fn value(&mut self) -> R<Val> {
         match self.peek() {
-            Some('\'') => Ok(Val { text: self.string()?, quoted: true }),
-            Some('"') => self.err(self.i, "a value is single-quoted; double quotes name a field"),
+            Some('\'') => Ok(Val { text: self.string()?, quoted: true, field: None }),
+            // Only brackets: a double-quoted value is far more often a
+            // value written the SQL way than a field meant, so it stays an error.
+            Some('"') => {
+                self.err(self.i, "a value is single-quoted; double quotes name a field, and a field to compare with is bracketed: [Name]")
+            }
+            Some('[') => {
+                let at = self.i;
+                let Some(f) = self.field(Mode::Top)? else { return self.err(at, "expected a field name") };
+                Ok(Val { text: f.name.clone(), quoted: false, field: Some(f) })
+            }
             _ => {
                 let start = self.i;
                 let rest = self.rest();
@@ -1192,7 +1204,7 @@ impl<'a> P<'a> {
                     return self.err(start, "expected a value");
                 }
                 self.i = start + text.len();
-                Ok(Val { text: text.to_string(), quoted: false })
+                Ok(Val { text: text.to_string(), quoted: false, field: None })
             }
         }
     }
@@ -1211,7 +1223,7 @@ impl<'a> P<'a> {
             }
             let at = self.i;
             let v = match self.peek() {
-                Some('\'') => Val { text: self.string()?, quoted: true },
+                Some('\'') => Val { text: self.string()?, quoted: true, field: None },
                 Some('"') => return self.err(at, "a value is single-quoted; double quotes name a field"),
                 _ => {
                     let rest = self.rest();
@@ -1221,7 +1233,7 @@ impl<'a> P<'a> {
                         return self.err(at, "expected a value in the list");
                     }
                     self.i += text.len();
-                    Val { text, quoted: false }
+                    Val { text, quoted: false, field: None }
                 }
             };
             if v.text.contains(',') {

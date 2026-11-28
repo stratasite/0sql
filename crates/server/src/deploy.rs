@@ -1,10 +1,11 @@
 //! A project archive in, a model out: unpacked within limits, loaded,
 //! tested, written beside the branch and swapped in whole. And the
-//! removal of a branch, which takes the same lock.
+//! removal of a branch, which takes the same lock, and the making of
+//! an org, which is the one thing a deploy may never do.
 
-use crate::error::{not_found, ApiError, Org, Params, Search};
+use crate::error::{not_found, ApiError, Input, Org, Params, Search};
 use crate::guard::Held;
-use crate::names::{check_branch, check_uid};
+use crate::names::{check_branch, check_org, check_uid};
 use crate::{blocking, lock, write, Shared};
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, State};
@@ -461,6 +462,72 @@ pub(crate) async fn remove_project(
         tracing::info!("removed {org}/{uid}, its branches {} and {} dataset(s)", branches.join(", "), datasets.len());
         let within = if org == crate::names::DEFAULT_ORG { String::new() } else { format!("{org}/") };
         Ok(Json(json!({ "removed": format!("{within}{uid}"), "branches": branches, "datasets": datasets })))
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewOrg {
+    org: String,
+}
+
+/// `POST /orgs`: make an org. Its folder made by hand is one too, but a
+/// deploy never makes one. A deploy
+/// to an org nobody made is refused, so an `org:` in project.yml that
+/// is mistyped or changed cannot make one, nor move a project to a new
+/// name. Made once: an org that exists, `default` among them, is a 409.
+pub(crate) async fn create_org(State(app): State<Shared>, Input(new): Input<NewOrg>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let org = new.org;
+    check_org(&org)?;
+    blocking(move || {
+        let taken = || ApiError(StatusCode::CONFLICT, "Conflict", format!("org {org} exists already"));
+        if app.has_org(&org) {
+            return Err(taken());
+        }
+        // Not create_dir_all: of two asking at once, one makes it and
+        // the other is told it exists.
+        match std::fs::create_dir(app.data_dir.join(&org)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(taken()),
+            Err(e) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not make org {org}: {e}"))),
+        }
+        tracing::info!("made org {org}");
+        Ok((StatusCode::CREATED, Json(json!({ "org": org }))))
+    })
+    .await
+}
+
+/// `DELETE /orgs/{org}`: an org, only once it is empty. Its projects
+/// are removed first, each by its own route, so nothing of an org goes
+/// with it by accident. `default` is never removed: startup would only
+/// make it again.
+pub(crate) async fn delete_org(State(app): State<Shared>, Org(org): Org) -> Result<Json<Value>, ApiError> {
+    if org == crate::names::DEFAULT_ORG {
+        return Err(ApiError(StatusCode::CONFLICT, "Conflict", format!("org {org} is always there and cannot be removed")));
+    }
+    blocking(move || {
+        // Under the deploy lock: a deploy in flight would otherwise
+        // write a branch into the directory as it goes.
+        let _writing = lock(&app.deploying);
+        let dir = app.data_dir.join(&org);
+        let internal =
+            |e: std::io::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal", format!("could not remove org {org}: {e}"));
+        let mut held: Vec<String> =
+            std::fs::read_dir(&dir).map_err(internal)?.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        if !held.is_empty() {
+            held.sort();
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Conflict",
+                format!("org {org} is not empty: it holds {}; remove its projects first", held.join(", ")),
+            ));
+        }
+        // remove_dir, not remove_dir_all: what lands in it after the
+        // look above is refused by the filesystem, not taken with it.
+        std::fs::remove_dir(&dir).map_err(internal)?;
+        tracing::info!("removed org {org}");
+        Ok(Json(json!({ "removed": org })))
     })
     .await
 }

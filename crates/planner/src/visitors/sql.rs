@@ -248,6 +248,7 @@ fn apply_advanced_array_filter_handling<'a>(cx: &Ctx<'_, 'a>, sql: &mut Builder,
             |f| matches!(node.field_refs.get(&RefKey::Field(f.field().id)), Some(Reference::Table { expression, .. }) if expression.array),
         )
         .filter(|f| node.projections.iter().any(|p| p.field().map(|x| x.id == f.field().id).unwrap_or(false)))
+        .filter(|f| !f.is_comparison())
         .collect();
     for f in array_filters {
         let Some(r) = node.field_refs.get(&RefKey::Field(f.field().id)) else { continue };
@@ -979,8 +980,48 @@ fn filter_expression_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>
     Ok(if wrap { format!("max({sql})") } else { sql })
 }
 
+/// A filter comparing two fields: each side is its column, lower-cased
+/// when a string as a literal is, and a measure re-aggregated on a
+/// grouping merge as `filter_expression_sql` does. Lowering has already
+/// checked the sides share a type and the predicate suits it.
+fn comparison_to_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Result<String> {
+    use Predicate::*;
+    let side = |field: &'a Field| -> Result<String> {
+        let r = node
+            .field_refs
+            .get(&RefKey::Field(field.id))
+            .ok_or_else(|| Error::Resolution(format!("No field reference found for filter on {}", field.name)))?;
+        if r.expression().map(|e| e.array).unwrap_or(false) {
+            return Err(Error::Resolution(format!("{} is an array, and a filter compares single values with another field", field.name)));
+        }
+        let sql = ref_to_sql_any(cx, r, node)?;
+        let sql = if node.is_merge() && node.group_by() && field.is_measure() { format!("max({sql})") } else { sql };
+        lower_sql(cx, &sql, field)
+    };
+    let lhs = side(f.field())?;
+    let rhs = f.others().iter().map(|o| side(o)).collect::<Result<Vec<_>>>()?;
+    let d = &cx.graph.dialect;
+    let not = |s: String| format!("NOT ({s})");
+    Ok(match f.predicate {
+        Between => format!("{lhs} BETWEEN {} AND {}", rhs[0], rhs[1]),
+        Contains => d.string_contains(&lhs, &rhs[0])?,
+        StartsWith => d.string_starts_with(&lhs, &rhs[0])?,
+        EndsWith => d.string_ends_with(&lhs, &rhs[0])?,
+        DoesNotContain => not(d.string_contains(&lhs, &rhs[0])?),
+        DoesNotStartWith => not(d.string_starts_with(&lhs, &rhs[0])?),
+        DoesNotEndWith => not(d.string_ends_with(&lhs, &rhs[0])?),
+        Equals | DoesNotEqual | GreaterThan | GreaterThanOrEqualTo | LessThan | LessThanOrEqualTo => {
+            format!("{lhs} {} {}", predicate_op(f.predicate).expect("comparison operator"), rhs[0])
+        }
+        other => return Err(Error::Resolution(format!("Predicate {} cannot compare two fields", other.name()))),
+    })
+}
+
 fn filter_to_sql<'a>(cx: &Ctx<'_, 'a>, node: &Node<'a>, f: &Filtered<'a>) -> Result<Option<String>> {
     use Predicate::*;
+    if f.is_comparison() {
+        return comparison_to_sql(cx, node, f).map(Some);
+    }
     let value = f.filter_value.clone().unwrap_or_default();
     let out = match f.predicate {
         TopN => return Ok(None),

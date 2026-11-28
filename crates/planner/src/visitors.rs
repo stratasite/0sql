@@ -3,6 +3,7 @@
 //! queries that would need the others.
 
 pub mod alias;
+pub mod comparison;
 pub mod complex_measure;
 pub mod contribution;
 pub mod exclusion;

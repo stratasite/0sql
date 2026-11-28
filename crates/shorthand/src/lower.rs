@@ -100,6 +100,16 @@ fn field_ref(f: &Field, into: &mut Map<String, Value>) {
     }
 }
 
+/// A compared field as the spec reads a reference: its name, with the
+/// kind as a suffix when one was written.
+fn operand_ref(f: &Field) -> String {
+    match f.kind {
+        Some(Kind::Dimension) => format!("{}@d", f.name),
+        Some(Kind::Measure) => format!("{}@m", f.name),
+        None => f.name.clone(),
+    }
+}
+
 fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Dimension => "dimension",
@@ -289,11 +299,31 @@ fn leaf(l: &Leaf) -> Value {
         Pred::Keyword { values } => ("keyword", Some(joined(values)), None, None),
     };
     m.insert("predicate".into(), Value::String(predicate.into()));
-    if let Some(v) = value {
-        m.insert("value".into(), v);
+    // A field in a value's place is the field compared with.
+    let (compared, compared_end) = match &l.pred {
+        Pred::Cmp { value, .. } | Pred::Like { value, .. } => (value.field.as_ref(), None),
+        Pred::Between { low, high } => (low.field.as_ref(), high.field.as_ref()),
+        _ => (None, None),
+    };
+    match compared {
+        Some(f) => {
+            m.insert("value_field".into(), Value::String(operand_ref(f)));
+        }
+        None => {
+            if let Some(v) = value {
+                m.insert("value".into(), v);
+            }
+        }
     }
-    if let Some(v) = value_end {
-        m.insert("value_end".into(), v);
+    match compared_end {
+        Some(f) => {
+            m.insert("value_end_field".into(), Value::String(operand_ref(f)));
+        }
+        None => {
+            if let Some(v) = value_end {
+                m.insert("value_end".into(), v);
+            }
+        }
     }
     if let Some(f) = top_by {
         m.insert("top_n_measure".into(), Value::String(f.name.clone()));
@@ -484,6 +514,15 @@ fn expr(e: &Expr) -> String {
 }
 
 fn val(v: &Val) -> String {
+    if let Some(f) = &v.field {
+        // Always bracketed: in a value's place a bare name is a value.
+        let suffix = match f.kind {
+            Some(Kind::Dimension) => "@d",
+            Some(Kind::Measure) => "@m",
+            None => "",
+        };
+        return format!("[{}]{suffix}", f.name);
+    }
     if v.quoted {
         format!("'{}'", v.text.replace('\'', "''"))
     } else {

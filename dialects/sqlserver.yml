@@ -41,6 +41,9 @@ cast: "CAST(@exp AS @type)"
 # string functions
 trim: "TRIM(@exp)"
 lower_case: "LOWER(@exp)"
+string_contains: "CHARINDEX(@needle, @exp) > 0"
+string_starts_with: "CHARINDEX(@needle, @exp) = 1"
+string_ends_with: "CHARINDEX(REVERSE(@needle), REVERSE(@exp)) = 1"
 upper_case: "UPPER(@exp)"
 
 # null handling
